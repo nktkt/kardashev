@@ -47,6 +47,19 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "codegen",
+    srcs = ["src/codegen.cpp"],
+    hdrs = ["include/kardashev/codegen.hpp"],
+    strip_include_prefix = "include",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":ast",
+        ":typecheck",
+        "@llvm//:llvm",
+    ],
+)
+
 cc_binary(
     name = "kardc",
     srcs = ["src/main.cpp"],

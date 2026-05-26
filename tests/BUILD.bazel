@@ -27,3 +27,14 @@ cc_test(
         "//compiler:typecheck",
     ],
 )
+
+cc_test(
+    name = "codegen_test",
+    srcs = ["codegen_test.cpp"],
+    deps = [
+        "//compiler:codegen",
+        "//compiler:parser",
+        "//compiler:typecheck",
+        "@llvm//:llvm",
+    ],
+)

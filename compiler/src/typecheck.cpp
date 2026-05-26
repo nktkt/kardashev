@@ -189,10 +189,25 @@ private:
 
     TypePtr checkBlock(const ast::BlockExpr& block) {
         scopes_.push_back({});
+        bool diverges = false;
         for (const auto& stmt : block.stmts) {
             checkStmt(*stmt);
+            if (dynamic_cast<const ast::ReturnStmt*>(stmt.get())) {
+                diverges = true;
+            }
         }
-        TypePtr result = block.tail ? checkExpr(*block.tail) : makeUnit();
+        TypePtr result;
+        if (block.tail) {
+            result = checkExpr(*block.tail);
+        } else if (diverges) {
+            // Control never reaches a tail value (block ended in `return`).
+            // Give it a fresh type variable so unification with a sibling
+            // branch (e.g. the other arm of an `if`) succeeds — bottom
+            // unifies with anything.
+            result = makeFreshVar();
+        } else {
+            result = makeUnit();
+        }
         scopes_.pop_back();
         return result;
     }
