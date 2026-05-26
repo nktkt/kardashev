@@ -223,6 +223,64 @@ void test_forward_reference() {
     expectEquals(v, 6, "forward_reference");
 }
 
+void test_struct_pass_and_field_access() {
+    // Phase 2.1 headline: struct by-value param + field access.
+    auto v = compileAndRun(
+        "struct Point { x: i64, y: i64 }\n"
+        "fn sum(p: Point) -> i64 { p.x + p.y }\n"
+        "fn main() -> i64 { sum(Point { x: 3, y: 4 }) }",
+        "main", "struct_pass_and_field_access");
+    expectEquals(v, 7, "struct_pass_and_field_access");
+}
+
+void test_struct_let_bound() {
+    auto v = compileAndRun(
+        "struct Point { x: i64, y: i64 }\n"
+        "fn main() -> i64 {\n"
+        "    let p = Point { x: 10, y: 32 };\n"
+        "    p.x + p.y\n"
+        "}",
+        "main", "struct_let_bound");
+    expectEquals(v, 42, "struct_let_bound");
+}
+
+void test_struct_literal_field_order_swapped() {
+    // Source order is y-then-x; codegen must still place each value at its
+    // declared index, so x.x == 3 and y.y == 4, giving x - y == -1.
+    auto v = compileAndRun(
+        "struct Point { x: i64, y: i64 }\n"
+        "fn main() -> i64 {\n"
+        "    let p = Point { y: 4, x: 3 };\n"
+        "    p.x - p.y\n"
+        "}",
+        "main", "struct_literal_field_order_swapped");
+    expectEquals(v, -1, "struct_literal_field_order_swapped");
+}
+
+void test_struct_return_from_fn() {
+    auto v = compileAndRun(
+        "struct Point { x: i64, y: i64 }\n"
+        "fn make(a: i64, b: i64) -> Point { Point { x: a, y: b } }\n"
+        "fn main() -> i64 {\n"
+        "    let p = make(11, 31);\n"
+        "    p.x + p.y\n"
+        "}",
+        "main", "struct_return_from_fn");
+    expectEquals(v, 42, "struct_return_from_fn");
+}
+
+void test_nested_struct() {
+    auto v = compileAndRun(
+        "struct Inner { v: i64 }\n"
+        "struct Outer { inner: Inner, k: i64 }\n"
+        "fn main() -> i64 {\n"
+        "    let o = Outer { inner: Inner { v: 40 }, k: 2 };\n"
+        "    o.inner.v + o.k\n"
+        "}",
+        "main", "nested_struct");
+    expectEquals(v, 42, "nested_struct");
+}
+
 } // namespace
 
 int main() {
@@ -241,6 +299,11 @@ int main() {
     test_recursive_fib_10();   // MVP: fib(10) == 55
     test_recursive_fib_20();   // 6765 — exercises ~13.5k recursive calls
     test_forward_reference();
-    std::cout << "All codegen tests passed (15 cases) — fib(10) == 55\n";
+    test_struct_pass_and_field_access();
+    test_struct_let_bound();
+    test_struct_literal_field_order_swapped();
+    test_struct_return_from_fn();
+    test_nested_struct();
+    std::cout << "All codegen tests passed (20 cases) — Phase 2.1 structs\n";
     return 0;
 }

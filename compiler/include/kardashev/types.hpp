@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace kardashev {
@@ -30,6 +31,7 @@ enum class TypeKind {
     Unit,
     Function,
     Var,
+    Struct,
 };
 
 struct Type;
@@ -45,6 +47,10 @@ struct Type {
     // Var:
     int varId = -1;
     TypePtr link; // union-find link; null while unbound
+
+    // Struct:
+    std::string structName;
+    std::vector<std::pair<std::string, TypePtr>> structFields;
 };
 
 TypePtr makeInt();
@@ -52,6 +58,7 @@ TypePtr makeBool();
 TypePtr makeUnit();
 TypePtr makeFunction(std::vector<TypePtr> args, TypePtr ret);
 TypePtr makeFreshVar();
+TypePtr makeStruct(std::string name, std::vector<std::pair<std::string, TypePtr>> fields);
 
 // Follow the union-find link chain to the representative. Performs
 // path compression as a side effect.

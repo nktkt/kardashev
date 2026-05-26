@@ -136,6 +136,42 @@ void test_invalid_char() {
     ASSERT_KIND(t[2], TokenKind::Identifier);
 }
 
+void test_struct_keyword() {
+    auto t = lex("struct");
+    assert(t.size() == 2);
+    ASSERT_KIND(t[0], TokenKind::KwStruct);
+    assert(t[0].lexeme == "struct");
+    ASSERT_KIND(t[1], TokenKind::EndOfInput);
+}
+
+void test_dot_token() {
+    auto t = lex(".");
+    assert(t.size() == 2);
+    ASSERT_KIND(t[0], TokenKind::Dot);
+    assert(t[0].lexeme == ".");
+    ASSERT_KIND(t[1], TokenKind::EndOfInput);
+}
+
+void test_struct_decl_and_member_access() {
+    auto t = lex("struct Point { x : i64 } p . x");
+    ASSERT_KIND(t[0], TokenKind::KwStruct);
+    ASSERT_KIND(t[1], TokenKind::Identifier);
+    assert(t[1].lexeme == "Point");
+    ASSERT_KIND(t[2], TokenKind::LBrace);
+    ASSERT_KIND(t[3], TokenKind::Identifier);
+    assert(t[3].lexeme == "x");
+    ASSERT_KIND(t[4], TokenKind::Colon);
+    ASSERT_KIND(t[5], TokenKind::Identifier);
+    assert(t[5].lexeme == "i64");
+    ASSERT_KIND(t[6], TokenKind::RBrace);
+    ASSERT_KIND(t[7], TokenKind::Identifier);
+    assert(t[7].lexeme == "p");
+    ASSERT_KIND(t[8], TokenKind::Dot);
+    ASSERT_KIND(t[9], TokenKind::Identifier);
+    assert(t[9].lexeme == "x");
+    ASSERT_KIND(t[10], TokenKind::EndOfInput);
+}
+
 } // namespace
 
 int main() {
@@ -148,6 +184,9 @@ int main() {
     test_line_column_tracking();
     test_fib_signature();
     test_invalid_char();
-    std::cout << "All lexer tests passed (9 cases)\n";
+    test_struct_keyword();
+    test_dot_token();
+    test_struct_decl_and_member_access();
+    std::cout << "All lexer tests passed (12 cases)\n";
     return 0;
 }

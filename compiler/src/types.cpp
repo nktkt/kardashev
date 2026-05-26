@@ -40,6 +40,14 @@ TypePtr makeFreshVar() {
     return t;
 }
 
+TypePtr makeStruct(std::string name, std::vector<std::pair<std::string, TypePtr>> fields) {
+    auto t = std::make_shared<Type>();
+    t->kind = TypeKind::Struct;
+    t->structName = std::move(name);
+    t->structFields = std::move(fields);
+    return t;
+}
+
 TypePtr resolve(const TypePtr& t) {
     if (t->kind != TypeKind::Var || !t->link) return t;
     TypePtr rep = resolve(t->link);
@@ -86,6 +94,16 @@ bool unify(const TypePtr& a, const TypePtr& b) {
         return unify(ra->ret, rb->ret);
     }
 
+    if (ra->kind == TypeKind::Struct) {
+        if (ra->structName != rb->structName) return false;
+        if (ra->structFields.size() != rb->structFields.size()) return false;
+        for (std::size_t i = 0; i < ra->structFields.size(); ++i) {
+            if (ra->structFields[i].first != rb->structFields[i].first) return false;
+            if (!unify(ra->structFields[i].second, rb->structFields[i].second)) return false;
+        }
+        return true;
+    }
+
     // Same primitive kind (Int=Int, Bool=Bool, Unit=Unit).
     return true;
 }
@@ -107,6 +125,7 @@ std::string typeToString(const TypePtr& t) {
         s += typeToString(r->ret);
         return s;
     }
+    case TypeKind::Struct: return r->structName;
     }
     return "?";
 }

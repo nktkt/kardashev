@@ -20,12 +20,14 @@ namespace {
 
 class Codegen {
 public:
-    Codegen()
-        : ctx_(std::make_unique<llvm::LLVMContext>()),
+    explicit Codegen(const TypeCheckResult& tc)
+        : tc_(tc),
+          ctx_(std::make_unique<llvm::LLVMContext>()),
           module_(std::make_unique<llvm::Module>("kardashev", *ctx_)),
           builder_(std::make_unique<llvm::IRBuilder<>>(*ctx_)) {}
 
     void run(const ast::Program& program) {
+        declareAllStructs();
         declareAllFunctions(program);
         for (const auto& fn : program.functions) {
             emitFunction(fn);
@@ -42,6 +44,7 @@ public:
     }
 
 private:
+    const TypeCheckResult& tc_;
     std::unique_ptr<llvm::LLVMContext> ctx_;
     std::unique_ptr<llvm::Module> module_;
     std::unique_ptr<llvm::IRBuilder<>> builder_;
@@ -50,13 +53,53 @@ private:
     // Module-wide: fn name -> LLVM Function declaration.
     std::unordered_map<std::string, llvm::Function*> declaredFns_;
 
+    // Module-wide: struct name -> LLVM struct type.
+    std::unordered_map<std::string, llvm::StructType*> structTypes_;
+
     // Per-fn locals: variable name -> alloca pointer.
     std::unordered_map<std::string, llvm::AllocaInst*> locals_;
     llvm::Function* currentFn_ = nullptr;
 
+    // Create one opaque llvm::StructType per kardashev struct, then set
+    // bodies in a second pass so struct fields can reference any other
+    // struct regardless of declaration order.
+    void declareAllStructs() {
+        for (const auto& [name, _ty] : tc_.structs) {
+            structTypes_[name] = llvm::StructType::create(*ctx_, name);
+        }
+        for (const auto& [name, ty] : tc_.structs) {
+            std::vector<llvm::Type*> elems;
+            elems.reserve(ty->structFields.size());
+            for (const auto& [_fname, fty] : ty->structFields) {
+                elems.push_back(mapKardashevType(fty));
+            }
+            structTypes_[name]->setBody(elems);
+        }
+    }
+
+    llvm::Type* mapKardashevType(const TypePtr& t) {
+        auto r = resolve(t);
+        switch (r->kind) {
+            case TypeKind::Int:  return llvm::Type::getInt64Ty(*ctx_);
+            case TypeKind::Bool: return llvm::Type::getInt1Ty(*ctx_);
+            case TypeKind::Unit: return llvm::Type::getVoidTy(*ctx_);
+            case TypeKind::Struct: {
+                auto it = structTypes_.find(r->structName);
+                if (it != structTypes_.end()) return it->second;
+                errors_.push_back("codegen: unresolved struct " + r->structName);
+                return llvm::Type::getInt64Ty(*ctx_);
+            }
+            default:
+                errors_.push_back("codegen: unsupported type for codegen");
+                return llvm::Type::getInt64Ty(*ctx_);
+        }
+    }
+
     llvm::Type* mapTypeRef(const ast::TypeRef& tr) {
         if (tr.name == "i64") return llvm::Type::getInt64Ty(*ctx_);
         if (tr.name == "bool") return llvm::Type::getInt1Ty(*ctx_);
+        auto it = structTypes_.find(tr.name);
+        if (it != structTypes_.end()) return it->second;
         errors_.push_back("codegen: unknown type " + tr.name);
         return llvm::Type::getInt64Ty(*ctx_);
     }
@@ -187,7 +230,66 @@ private:
         if (auto* block = dynamic_cast<const ast::BlockExpr*>(&e)) {
             return emitBlock(*block);
         }
+        if (auto* sl = dynamic_cast<const ast::StructLitExpr*>(&e)) {
+            return emitStructLit(*sl);
+        }
+        if (auto* fe = dynamic_cast<const ast::FieldExpr*>(&e)) {
+            return emitFieldAccess(*fe);
+        }
         errors_.push_back("codegen: unknown expression kind");
+        return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
+    }
+
+    llvm::Value* emitStructLit(const ast::StructLitExpr& sl) {
+        auto stIt = structTypes_.find(sl.structName);
+        auto layoutIt = tc_.structs.find(sl.structName);
+        if (stIt == structTypes_.end() || layoutIt == tc_.structs.end()) {
+            errors_.push_back("codegen: unknown struct " + sl.structName);
+            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
+        }
+        llvm::StructType* st = stIt->second;
+
+        std::unordered_map<std::string, llvm::Value*> values;
+        values.reserve(sl.fields.size());
+        for (const auto& [name, expr] : sl.fields) {
+            values[name] = emitExpr(*expr);
+        }
+
+        const auto& fields = layoutIt->second->structFields;
+        llvm::Value* agg = llvm::UndefValue::get(st);
+        for (unsigned i = 0; i < fields.size(); ++i) {
+            auto vIt = values.find(fields[i].first);
+            if (vIt == values.end()) {
+                errors_.push_back("codegen: missing field " + fields[i].first +
+                                  " in literal of " + sl.structName);
+                continue;
+            }
+            agg = builder_->CreateInsertValue(agg, vIt->second, {i},
+                                              "fld_" + fields[i].first);
+        }
+        return agg;
+    }
+
+    llvm::Value* emitFieldAccess(const ast::FieldExpr& fe) {
+        auto tyIt = tc_.exprTypes.find(fe.object.get());
+        if (tyIt == tc_.exprTypes.end()) {
+            errors_.push_back("codegen: no type for field-access object");
+            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
+        }
+        TypePtr objTy = resolve(tyIt->second);
+        if (objTy->kind != TypeKind::Struct) {
+            errors_.push_back("codegen: field access on non-struct value");
+            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
+        }
+        for (unsigned i = 0; i < objTy->structFields.size(); ++i) {
+            if (objTy->structFields[i].first == fe.fieldName) {
+                llvm::Value* obj = emitExpr(*fe.object);
+                return builder_->CreateExtractValue(obj, {i},
+                                                    "f_" + fe.fieldName);
+            }
+        }
+        errors_.push_back("codegen: no field " + fe.fieldName + " on struct " +
+                          objTy->structName);
         return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
     }
 
@@ -277,14 +379,7 @@ private:
 
 CodegenResult codegen(const ast::Program& program,
                        const TypeCheckResult& tc) {
-    // The TypeCheckResult is required to have already succeeded on this
-    // program, but codegen currently re-derives types from the AST shape
-    // directly rather than consulting the type-of-each-Expr map, so the
-    // argument is unused. Keep it in the signature so callers continue
-    // to thread it through (and so we can start using exprTypes later
-    // without API churn — e.g. when generics arrive in Phase 3).
-    (void)tc;
-    Codegen cg;
+    Codegen cg(tc);
     cg.run(program);
     return cg.finish();
 }

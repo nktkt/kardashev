@@ -1,5 +1,6 @@
 #include "kardashev/typecheck.hpp"
 
+#include <unordered_set>
 #include <utility>
 
 namespace kardashev {
@@ -8,7 +9,29 @@ namespace {
 class TypeChecker {
 public:
     TypeCheckResult check(const ast::Program& program) {
-        // Pass 1: register every fn signature so calls can see siblings
+        // Pass 1a: register every struct declaration so subsequent
+        // TypeRef resolution (in fn signatures and other struct fields)
+        // can see them.
+        for (const auto& sd : program.structs) {
+            if (structs_.count(sd.name)) {
+                error("struct redefined: " + sd.name, sd.line, sd.column);
+                continue;
+            }
+            std::vector<std::pair<std::string, TypePtr>> resolvedFields;
+            resolvedFields.reserve(sd.fields.size());
+            std::unordered_set<std::string> seen;
+            for (const auto& f : sd.fields) {
+                if (!seen.insert(f.name).second) {
+                    error("duplicate field '" + f.name + "' in struct '" +
+                              sd.name + "'",
+                          sd.line, sd.column);
+                    continue;
+                }
+                resolvedFields.emplace_back(f.name, resolveTypeRef(f.type));
+            }
+            structs_[sd.name] = makeStruct(sd.name, std::move(resolvedFields));
+        }
+        // Pass 1b: register every fn signature so calls can see siblings
         // (and the function can recurse into itself).
         for (const auto& fn : program.functions) {
             std::vector<TypePtr> argTypes;
@@ -26,13 +49,14 @@ public:
         for (const auto& fn : program.functions) {
             checkFunction(fn);
         }
-        return {std::move(errors_), std::move(exprTypes_)};
+        return {std::move(errors_), std::move(exprTypes_), std::move(structs_)};
     }
 
 private:
     using Scope = std::unordered_map<std::string, TypePtr>;
 
     std::unordered_map<std::string, TypePtr> functions_;
+    std::unordered_map<std::string, TypePtr> structs_;
     std::unordered_map<const ast::Expr*, TypePtr> exprTypes_;
     std::vector<TypeError> errors_;
     std::vector<Scope> scopes_;
@@ -45,6 +69,8 @@ private:
     TypePtr resolveTypeRef(const ast::TypeRef& tr) {
         if (tr.name == "i64") return makeInt();
         if (tr.name == "bool") return makeBool();
+        auto it = structs_.find(tr.name);
+        if (it != structs_.end()) return it->second;
         error("unknown type: " + tr.name, tr.line, tr.column);
         return makeInt(); // fallback so downstream code keeps running
     }
@@ -110,7 +136,75 @@ private:
         if (auto* block = dynamic_cast<const ast::BlockExpr*>(&e)) {
             return checkBlock(*block);
         }
+        if (auto* sl = dynamic_cast<const ast::StructLitExpr*>(&e)) {
+            return checkStructLit(*sl);
+        }
+        if (auto* fe = dynamic_cast<const ast::FieldExpr*>(&e)) {
+            return checkField(*fe);
+        }
         error("unknown expression kind", e.line, e.column);
+        return makeInt();
+    }
+
+    TypePtr checkStructLit(const ast::StructLitExpr& sl) {
+        auto it = structs_.find(sl.structName);
+        if (it == structs_.end()) {
+            error("unknown struct: " + sl.structName, sl.line, sl.column);
+            for (const auto& f : sl.fields) checkExpr(*f.second);
+            return makeInt();
+        }
+        const TypePtr& structType = it->second;
+        std::unordered_map<std::string, TypePtr> declared;
+        declared.reserve(structType->structFields.size());
+        for (const auto& df : structType->structFields) {
+            declared.emplace(df.first, df.second);
+        }
+        std::unordered_set<std::string> initialised;
+        for (const auto& f : sl.fields) {
+            TypePtr valT = checkExpr(*f.second);
+            auto declIt = declared.find(f.first);
+            if (declIt == declared.end()) {
+                error("unknown field '" + f.first + "' for struct '" +
+                          sl.structName + "'",
+                      f.second->line, f.second->column);
+                continue;
+            }
+            if (!initialised.insert(f.first).second) {
+                error("duplicate field '" + f.first + "' in struct literal",
+                      f.second->line, f.second->column);
+                continue;
+            }
+            if (!unify(valT, declIt->second)) {
+                error("field '" + f.first + "' of struct '" + sl.structName +
+                          "' has type " + typeToString(declIt->second) +
+                          ", got " + typeToString(valT),
+                      f.second->line, f.second->column);
+            }
+        }
+        for (const auto& df : structType->structFields) {
+            if (!initialised.count(df.first)) {
+                error("missing field '" + df.first + "' in struct '" +
+                          sl.structName + "' literal",
+                      sl.line, sl.column);
+            }
+        }
+        return structType;
+    }
+
+    TypePtr checkField(const ast::FieldExpr& fe) {
+        TypePtr objT = checkExpr(*fe.object);
+        TypePtr r = resolve(objT);
+        if (r->kind != TypeKind::Struct) {
+            error("field access on non-struct type " + typeToString(objT),
+                  fe.line, fe.column);
+            return makeInt();
+        }
+        for (const auto& f : r->structFields) {
+            if (f.first == fe.fieldName) return f.second;
+        }
+        error("no field '" + fe.fieldName + "' on struct '" + r->structName +
+                  "'",
+              fe.line, fe.column);
         return makeInt();
     }
 

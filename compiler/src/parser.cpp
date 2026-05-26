@@ -19,8 +19,10 @@ public:
             if (errors_.size() > 20) break;
             if (check(TokenKind::KwFn)) {
                 prog.functions.push_back(parseFnDecl());
+            } else if (check(TokenKind::KwStruct)) {
+                prog.structs.push_back(parseStructDecl());
             } else {
-                errorHere(std::string("expected 'fn' at top level, got ") +
+                errorHere(std::string("expected 'fn' or 'struct' at top level, got ") +
                           std::string(tokenKindName(peek().kind)));
                 advance();
             }
@@ -32,6 +34,7 @@ private:
     std::vector<Token> tokens_;
     std::size_t pos_ = 0;
     std::vector<ParseError> errors_;
+    bool restrictStructLit_ = false;
 
     const Token& peek(std::size_t offset = 0) const {
         std::size_t idx = pos_ + offset;
@@ -102,6 +105,27 @@ private:
         return {nameTok.lexeme, parseTypeRef()};
     }
 
+    ast::StructDecl parseStructDecl() {
+        Token structTok = expect(TokenKind::KwStruct, "struct");
+        ast::StructDecl decl;
+        decl.line = structTok.line;
+        decl.column = structTok.column;
+
+        Token nameTok = expect(TokenKind::Identifier, "struct name");
+        decl.name = nameTok.lexeme;
+
+        expect(TokenKind::LBrace, "{");
+        if (!check(TokenKind::RBrace)) {
+            while (true) {
+                decl.fields.push_back(parseParam());
+                if (!accept(TokenKind::Comma)) break;
+                if (check(TokenKind::RBrace)) break; // trailing comma
+            }
+        }
+        expect(TokenKind::RBrace, "}");
+        return decl;
+    }
+
     ast::TypeRef parseTypeRef() {
         Token t = expect(TokenKind::Identifier, "type name");
         return {t.lexeme, t.line, t.column};
@@ -114,6 +138,8 @@ private:
         auto block = std::make_unique<ast::BlockExpr>();
         block->line = lbrace.line;
         block->column = lbrace.column;
+        bool prevBlockRestrict = restrictStructLit_;
+        restrictStructLit_ = false;
 
         while (!check(TokenKind::RBrace) && !check(TokenKind::EndOfInput)) {
             if (errors_.size() > 20) break;
@@ -143,6 +169,7 @@ private:
             }
         }
         expect(TokenKind::RBrace, "}");
+        restrictStructLit_ = prevBlockRestrict;
         return block;
     }
 
@@ -213,7 +240,7 @@ private:
     ast::ExprPtr parseExpr() { return parseExprPrec(1); }
 
     ast::ExprPtr parseExprPrec(int minPrec) {
-        auto lhs = parsePrimary();
+        auto lhs = parsePostfix();
         while (true) {
             int prec = binPrec(peek().kind);
             if (prec == 0 || prec < minPrec) break;
@@ -228,6 +255,21 @@ private:
             lhs = std::move(bin);
         }
         return lhs;
+    }
+
+    ast::ExprPtr parsePostfix() {
+        auto expr = parsePrimary();
+        while (check(TokenKind::Dot)) {
+            Token dotTok = consume();
+            Token nameTok = expect(TokenKind::Identifier, "field name after '.'");
+            auto fe = std::make_unique<ast::FieldExpr>();
+            fe->line = dotTok.line;
+            fe->column = dotTok.column;
+            fe->object = std::move(expr);
+            fe->fieldName = nameTok.lexeme;
+            expr = std::move(fe);
+        }
+        return expr;
     }
 
     ast::ExprPtr parsePrimary() {
@@ -255,14 +297,20 @@ private:
                 call->line = tok.line;
                 call->column = tok.column;
                 call->callee = tok.lexeme;
+                bool prevCallRestrict = restrictStructLit_;
+                restrictStructLit_ = false;
                 if (!check(TokenKind::RParen)) {
                     while (true) {
                         call->args.push_back(parseExpr());
                         if (!accept(TokenKind::Comma)) break;
                     }
                 }
+                restrictStructLit_ = prevCallRestrict;
                 expect(TokenKind::RParen, ")");
                 return call;
+            }
+            if (!restrictStructLit_ && check(TokenKind::LBrace)) {
+                return parseStructLit(tok);
             }
             auto e = std::make_unique<ast::IdentExpr>();
             e->line = tok.line;
@@ -273,7 +321,10 @@ private:
 
         if (t.kind == TokenKind::LParen) {
             advance();
+            bool prev = restrictStructLit_;
+            restrictStructLit_ = false;
             auto e = parseExpr();
+            restrictStructLit_ = prev;
             expect(TokenKind::RParen, ")");
             return e;
         }
@@ -298,7 +349,10 @@ private:
 
     ast::ExprPtr parseIfExpr() {
         Token ifTok = expect(TokenKind::KwIf, "if");
+        bool prev = restrictStructLit_;
+        restrictStructLit_ = true;
         auto cond = parseExpr();
+        restrictStructLit_ = prev;
         auto thenBlock = parseBlockExpr();
         expect(TokenKind::KwElse, "else");
         auto elseBlock = parseBlockExpr();
@@ -309,6 +363,29 @@ private:
         ie->thenBranch = std::move(thenBlock);
         ie->elseBranch = std::move(elseBlock);
         return ie;
+    }
+
+    ast::ExprPtr parseStructLit(const Token& nameTok) {
+        expect(TokenKind::LBrace, "{");
+        auto lit = std::make_unique<ast::StructLitExpr>();
+        lit->line = nameTok.line;
+        lit->column = nameTok.column;
+        lit->structName = nameTok.lexeme;
+        bool prev = restrictStructLit_;
+        restrictStructLit_ = false;
+        if (!check(TokenKind::RBrace)) {
+            while (true) {
+                Token fnameTok = expect(TokenKind::Identifier, "field name");
+                expect(TokenKind::Colon, ":");
+                auto value = parseExpr();
+                lit->fields.emplace_back(fnameTok.lexeme, std::move(value));
+                if (!accept(TokenKind::Comma)) break;
+                if (check(TokenKind::RBrace)) break; // trailing comma
+            }
+        }
+        restrictStructLit_ = prev;
+        expect(TokenKind::RBrace, "}");
+        return lit;
     }
 };
 

@@ -130,6 +130,102 @@ void test_if_cond_must_be_bool() {
               "if_cond_must_be_bool");
 }
 
+void test_struct_decl_alone() {
+    expectOk("struct Point { x: i64, y: i64 }", "struct_decl_alone");
+}
+
+void test_struct_decl_empty() {
+    expectOk("struct Empty {}", "struct_decl_empty");
+}
+
+void test_struct_param_and_field_access() {
+    expectOk(
+        "struct Point { x: i64, y: i64 }\n"
+        "fn f(p: Point) -> i64 { p.x + p.y }",
+        "struct_param_and_field_access");
+}
+
+void test_struct_literal_value() {
+    expectOk(
+        "struct Point { x: i64, y: i64 }\n"
+        "fn make() -> Point { Point { x: 1, y: 2 } }",
+        "struct_literal_value");
+}
+
+void test_struct_decl_exposed_in_result() {
+    auto pr = kardashev::parse("struct Point { x: i64, y: i64 }");
+    assert(pr.ok());
+    auto r = kardashev::typecheck(pr.program);
+    if (!r.ok()) {
+        std::cerr << "[struct_decl_exposed_in_result] expected ok, got "
+                     "errors:\n";
+        dump(r);
+        std::abort();
+    }
+    assert(r.structs.count("Point") == 1);
+    assert(r.structs["Point"]->kind == kardashev::TypeKind::Struct);
+    assert(r.structs["Point"]->structFields.size() == 2);
+}
+
+void test_duplicate_struct_decl() {
+    expectErr(
+        "struct Point { x: i64 }\n"
+        "struct Point { y: i64 }",
+        "duplicate_struct_decl");
+}
+
+void test_duplicate_field_in_struct_decl() {
+    expectErr("struct Point { x: i64, x: i64 }",
+              "duplicate_field_in_struct_decl");
+}
+
+void test_unknown_field_in_struct_literal() {
+    expectErr(
+        "struct Point { x: i64, y: i64 }\n"
+        "fn make() -> Point { Point { x: 1, y: 2, z: 3 } }",
+        "unknown_field_in_struct_literal");
+}
+
+void test_missing_field_in_struct_literal() {
+    expectErr(
+        "struct Point { x: i64, y: i64 }\n"
+        "fn make() -> Point { Point { x: 1 } }",
+        "missing_field_in_struct_literal");
+}
+
+void test_duplicate_field_in_struct_literal() {
+    expectErr(
+        "struct Point { x: i64, y: i64 }\n"
+        "fn make() -> Point { Point { x: 1, x: 2, y: 3 } }",
+        "duplicate_field_in_struct_literal");
+}
+
+void test_struct_literal_field_type_mismatch() {
+    expectErr(
+        "struct Point { x: i64, y: i64 }\n"
+        "fn make() -> Point { Point { x: true, y: 2 } }",
+        "struct_literal_field_type_mismatch");
+}
+
+void test_field_access_on_non_struct() {
+    expectErr(
+        "fn f() -> i64 { let x = 1; x.foo }",
+        "field_access_on_non_struct");
+}
+
+void test_field_access_missing_field() {
+    expectErr(
+        "struct Point { x: i64, y: i64 }\n"
+        "fn f(p: Point) -> i64 { p.z }",
+        "field_access_missing_field");
+}
+
+void test_typeref_unknown_struct_name() {
+    expectErr(
+        "fn f(p: Nope) -> i64 { 0 }",
+        "typeref_unknown_struct_name");
+}
+
 } // namespace
 
 int main() {
@@ -147,6 +243,20 @@ int main() {
     test_if_branch_mismatch();
     test_wrong_return_type();
     test_if_cond_must_be_bool();
-    std::cout << "All typecheck tests passed (14 cases)\n";
+    test_struct_decl_alone();
+    test_struct_decl_empty();
+    test_struct_param_and_field_access();
+    test_struct_literal_value();
+    test_struct_decl_exposed_in_result();
+    test_duplicate_struct_decl();
+    test_duplicate_field_in_struct_decl();
+    test_unknown_field_in_struct_literal();
+    test_missing_field_in_struct_literal();
+    test_duplicate_field_in_struct_literal();
+    test_struct_literal_field_type_mismatch();
+    test_field_access_on_non_struct();
+    test_field_access_missing_field();
+    test_typeref_unknown_struct_name();
+    std::cout << "All typecheck tests passed (28 cases)\n";
     return 0;
 }

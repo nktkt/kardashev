@@ -34,6 +34,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unistd.h> // isatty
 #include <utility>
 
@@ -103,13 +104,14 @@ std::optional<std::int64_t> compileAndRun(const std::string& src,
     return fn();
 }
 
-// Heuristic: a line whose first non-whitespace token is `fn ` is treated
-// as a fn definition to add to the accumulator. Anything else is parsed
-// as an expression and evaluated.
-bool looksLikeFnDecl(const std::string& line) {
+// Heuristic: a line whose first non-whitespace token is `fn ` or
+// `struct ` is treated as a top-level decl to add to the accumulator.
+// Anything else is parsed as an expression and evaluated.
+bool looksLikeTopLevelDecl(const std::string& line) {
     std::size_t i = 0;
     while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
-    return i + 3 <= line.size() && line.substr(i, 3) == "fn ";
+    const auto rest = std::string_view(line).substr(i);
+    return rest.substr(0, 3) == "fn " || rest.substr(0, 7) == "struct ";
 }
 
 int runREPL() {
@@ -128,7 +130,7 @@ int runREPL() {
         if (!std::getline(std::cin, line)) break;
         if (line.empty()) continue;
 
-        if (looksLikeFnDecl(line)) {
+        if (looksLikeTopLevelDecl(line)) {
             // Validate trial = accumulated + line. Only commit on success.
             std::string trial = accumulated + line + "\n";
             auto pr = kardashev::parse(trial);

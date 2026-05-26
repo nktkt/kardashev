@@ -20,6 +20,7 @@ TokenKind keywordOrIdent(std::string_view s) {
     if (s == "if") return TokenKind::KwIf;
     if (s == "else") return TokenKind::KwElse;
     if (s == "return") return TokenKind::KwReturn;
+    if (s == "struct") return TokenKind::KwStruct;
     return TokenKind::Identifier;
 }
 
@@ -136,6 +137,7 @@ std::vector<Token> lex(std::string_view source) {
         case ',': push1(TokenKind::Comma, startCol); continue;
         case ';': push1(TokenKind::Semi, startCol); continue;
         case ':': push1(TokenKind::Colon, startCol); continue;
+        case '.': push1(TokenKind::Dot, startCol); continue;
         default: break;
         }
 
@@ -158,6 +160,7 @@ std::string_view tokenKindName(TokenKind kind) {
     case TokenKind::KwIf: return "KwIf";
     case TokenKind::KwElse: return "KwElse";
     case TokenKind::KwReturn: return "KwReturn";
+    case TokenKind::KwStruct: return "KwStruct";
     case TokenKind::Plus: return "Plus";
     case TokenKind::Minus: return "Minus";
     case TokenKind::Star: return "Star";
@@ -177,6 +180,7 @@ std::string_view tokenKindName(TokenKind kind) {
     case TokenKind::Comma: return "Comma";
     case TokenKind::Semi: return "Semi";
     case TokenKind::Colon: return "Colon";
+    case TokenKind::Dot: return "Dot";
     case TokenKind::EndOfInput: return "EndOfInput";
     case TokenKind::Invalid: return "Invalid";
     }

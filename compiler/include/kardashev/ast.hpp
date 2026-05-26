@@ -1,8 +1,10 @@
 // Untyped AST for the kardashev V1 surface syntax.
 //
 // Grammar (informal):
-//   program       := fn_decl*
+//   program       := (fn_decl | struct_decl)*
 //   fn_decl       := 'fn' Ident '(' params? ')' '->' type_ref block_expr
+//   struct_decl   := 'struct' Ident '{' field_decl (',' field_decl)* ','? '}'
+//   field_decl    := Ident ':' type_ref
 //   params        := param (',' param)*
 //   param         := Ident ':' type_ref
 //   type_ref      := Ident                       -- e.g. i64
@@ -13,10 +15,13 @@
 //   expr_stmt     := expr ';'
 //   tail_expr     := expr                        -- block's value (no trailing ';')
 //   expr          := <pratt-parsed binary>
-//                 |  primary
-//   primary       := Integer | Ident | call | '(' expr ')' | if_expr | block_expr
+//                 |  postfix
+//   postfix       := primary ('.' Ident)*        -- field access
+//   primary       := Integer | Ident | call | struct_lit | '(' expr ')' | if_expr | block_expr
 //   call          := Ident '(' arglist? ')'
 //   arglist       := expr (',' expr)*
+//   struct_lit    := Ident '{' (field_init (',' field_init)* ','?)? '}'
+//   field_init    := Ident ':' expr
 //   if_expr       := 'if' expr block_expr 'else' block_expr
 //
 // Precedence (low to high): comparisons < additive < multiplicative.
@@ -30,6 +35,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace kardashev::ast {
@@ -80,6 +86,16 @@ struct CallExpr : Expr {
     std::vector<ExprPtr> args;
 };
 
+struct StructLitExpr : Expr {
+    std::string structName;
+    std::vector<std::pair<std::string, ExprPtr>> fields;
+};
+
+struct FieldExpr : Expr {
+    ExprPtr object;
+    std::string fieldName;
+};
+
 struct IfExpr : Expr {
     ExprPtr cond;
     ExprPtr thenBranch; // a BlockExpr
@@ -128,8 +144,16 @@ struct FnDecl {
     std::size_t column = 1;
 };
 
+struct StructDecl {
+    std::string name;
+    std::vector<Param> fields;
+    std::size_t line = 1;
+    std::size_t column = 1;
+};
+
 struct Program {
     std::vector<FnDecl> functions;
+    std::vector<StructDecl> structs;
 };
 
 } // namespace kardashev::ast
