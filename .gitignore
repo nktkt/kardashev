@@ -1,0 +1,23 @@
+# Bazel
+bazel-*
+MODULE.bazel.lock
+
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.dylib
+
+# LLVM intermediates
+*.bc
+*.ll
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
