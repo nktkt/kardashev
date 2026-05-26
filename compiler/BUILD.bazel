@@ -1,4 +1,12 @@
-load("@rules_cc//cc:defs.bzl", "cc_binary")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+
+cc_library(
+    name = "lexer",
+    srcs = ["src/lexer.cpp"],
+    hdrs = ["include/kardashev/lexer.hpp"],
+    strip_include_prefix = "include",
+    visibility = ["//visibility:public"],
+)
 
 cc_binary(
     name = "kardc",

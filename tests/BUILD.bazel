@@ -1,7 +1,14 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
 sh_test(
     name = "smoke_test",
     srcs = ["smoke_test.sh"],
     data = ["//compiler:kardc"],
+)
+
+cc_test(
+    name = "lexer_test",
+    srcs = ["lexer_test.cpp"],
+    deps = ["//compiler:lexer"],
 )
