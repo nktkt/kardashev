@@ -14,9 +14,11 @@
 #include "kardashev/pattern_match.hpp"
 
 #include <cassert>
+#include <cstddef>
 #include <memory>
 #include <set>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -29,7 +31,13 @@ namespace {
 struct PatView;
 using PatViewPtr = std::shared_ptr<PatView>;
 
-struct Wild {};
+struct Wild {
+    // If non-empty, this wildcard came from a `VarPat` that the user
+    // wrote as a real binding (not a unit-constructor). Decision-tree
+    // compilation uses this to emit `(name, occurrence-path)` bindings on
+    // Leaf nodes. Coverage logic ignores this field entirely.
+    std::string bindingName;
+};
 struct Lit {
     std::int64_t value;
 };
@@ -44,6 +52,9 @@ struct PatView {
 
 PatViewPtr mkWild() {
     return std::make_shared<PatView>(PatView{Wild{}});
+}
+PatViewPtr mkWildNamed(std::string name) {
+    return std::make_shared<PatView>(PatView{Wild{std::move(name)}});
 }
 PatViewPtr mkLit(std::int64_t value) {
     return std::make_shared<PatView>(PatView{Lit{value}});
@@ -71,8 +82,9 @@ PatViewPtr view(
             // Bare ident that names a constructor → unit-Ctor.
             return mkCtor(vp->name, {});
         }
-        // Real binding — wildcard-equivalent for coverage.
-        return mkWild();
+        // Real binding — wildcard-equivalent for coverage, but remember
+        // the name so decision-tree compilation can emit a binding.
+        return mkWildNamed(vp->name);
     }
     if (auto cp = dynamic_cast<const ast::CtorPat*>(&p)) {
         std::vector<PatViewPtr> subs;
@@ -393,6 +405,305 @@ UsefulResult useful(const Matrix& P, const Row& q, const ColumnTypes& cols) {
     return {true, std::move(out)};
 }
 
+// -------------------- Decision-tree compilation --------------------
+
+// Flat layout of an enum value is `{ i32 tag, var0_payload0,
+// var0_payload1, ..., var1_payload0, ... }` (matching codegen's
+// `enumPayloadIndices_`). For variant `v` of an enum E with variants
+// `[V0(arity=a0), V1(arity=a1), ...]`, variant `v`'s payload position
+// `k` lives at field index:
+//   1 + sum(a0..a{v-1}) + k
+// where the leading `1` accounts for the tag at field 0.
+unsigned payloadFieldIndex(const TypePtr& enumType, unsigned variantIdx,
+                           unsigned payloadPos) {
+    TypePtr r = resolve(enumType);
+    assert(r && r->kind == TypeKind::Enum);
+    unsigned base = 1; // tag at field 0
+    for (unsigned i = 0; i < variantIdx && i < r->enumVariants.size(); ++i) {
+        base += static_cast<unsigned>(r->enumVariants[i].payloadTypes.size());
+    }
+    return base + payloadPos;
+}
+
+// Build a single-column matrix-row from one arm's pattern.
+Row rowFromArm(
+    const ast::MatchArm& a,
+    const std::unordered_map<std::string, std::pair<std::string, unsigned>>&
+        variantIndex) {
+    Row r;
+    r.push_back(view(*a.pattern, variantIndex));
+    return r;
+}
+
+// A row of the working matrix that remembers which source arm it came
+// from. The decision-tree compiler tracks this so a Leaf can name the
+// arm index without recomputing it.
+struct DTRow {
+    Row pats;
+    unsigned armIndex = 0;
+};
+using DTMatrix = std::vector<DTRow>;
+
+// Specialize the DTMatrix on a constructor.
+DTMatrix dtSpecialize(const DTMatrix& P, std::size_t col,
+                      const std::string& ctorName, unsigned arity) {
+    DTMatrix R;
+    for (const auto& dr : P) {
+        const Row& row = dr.pats;
+        assert(col < row.size());
+        const PatView& head = *row[col];
+        if (auto c = std::get_if<Ctor>(&head.v)) {
+            if (c->name == ctorName) {
+                Row newRow;
+                newRow.reserve(row.size() - 1 + arity);
+                for (std::size_t i = 0; i < col; ++i) newRow.push_back(row[i]);
+                for (const auto& s : c->subs) newRow.push_back(s);
+                for (std::size_t i = col + 1; i < row.size(); ++i)
+                    newRow.push_back(row[i]);
+                R.push_back({std::move(newRow), dr.armIndex});
+            }
+        } else if (std::holds_alternative<Wild>(head.v)) {
+            Row newRow;
+            newRow.reserve(row.size() - 1 + arity);
+            for (std::size_t i = 0; i < col; ++i) newRow.push_back(row[i]);
+            for (unsigned k = 0; k < arity; ++k) newRow.push_back(mkWild());
+            for (std::size_t i = col + 1; i < row.size(); ++i)
+                newRow.push_back(row[i]);
+            R.push_back({std::move(newRow), dr.armIndex});
+        }
+        // Lit head with a Ctor column would be ill-typed; skip.
+    }
+    return R;
+}
+
+// Specialize the DTMatrix on an integer literal at `col`. Literal column
+// has no payload — drop it.
+DTMatrix dtSpecializeLit(const DTMatrix& P, std::size_t col,
+                         std::int64_t value) {
+    DTMatrix R;
+    for (const auto& dr : P) {
+        const Row& row = dr.pats;
+        assert(col < row.size());
+        const PatView& head = *row[col];
+        if (auto lit = std::get_if<Lit>(&head.v)) {
+            if (lit->value == value) {
+                Row newRow;
+                newRow.reserve(row.size() - 1);
+                for (std::size_t i = 0; i < row.size(); ++i)
+                    if (i != col) newRow.push_back(row[i]);
+                R.push_back({std::move(newRow), dr.armIndex});
+            }
+        } else if (std::holds_alternative<Wild>(head.v)) {
+            Row newRow;
+            newRow.reserve(row.size() - 1);
+            for (std::size_t i = 0; i < row.size(); ++i)
+                if (i != col) newRow.push_back(row[i]);
+            R.push_back({std::move(newRow), dr.armIndex});
+        }
+        // Ctor head with a Lit column would be ill-typed; skip.
+    }
+    return R;
+}
+
+// Default matrix at column `col`: keep only rows whose head is wildcard,
+// dropping the column.
+DTMatrix dtDefaultMatrix(const DTMatrix& P, std::size_t col) {
+    DTMatrix R;
+    for (const auto& dr : P) {
+        const Row& row = dr.pats;
+        assert(col < row.size());
+        if (std::holds_alternative<Wild>(row[col]->v)) {
+            Row newRow;
+            newRow.reserve(row.size() - 1);
+            for (std::size_t i = 0; i < row.size(); ++i)
+                if (i != col) newRow.push_back(row[i]);
+            R.push_back({std::move(newRow), dr.armIndex});
+        }
+    }
+    return R;
+}
+
+// Is every entry in `row` a Wild? (Note: Lit and Ctor are NOT wild.)
+bool rowAllWild(const Row& row) {
+    for (const auto& p : row) {
+        if (!std::holds_alternative<Wild>(p->v)) return false;
+    }
+    return true;
+}
+
+// Pick the leftmost column whose head in the first row is non-wildcard.
+// Precondition: first row is not all-wildcard.
+std::size_t pickColumn(const Row& firstRow) {
+    for (std::size_t i = 0; i < firstRow.size(); ++i) {
+        if (!std::holds_alternative<Wild>(firstRow[i]->v)) return i;
+    }
+    // Should never reach here when row is not all-wild.
+    return 0;
+}
+
+// Collect head constructor names from a column.
+std::set<std::string> dtCollectCtors(const DTMatrix& P, std::size_t col) {
+    std::set<std::string> s;
+    for (const auto& dr : P) {
+        if (auto c = std::get_if<Ctor>(&dr.pats[col]->v)) {
+            s.insert(c->name);
+        }
+    }
+    return s;
+}
+
+// Collect head literal values from a column, preserving source order
+// (first appearance).
+std::vector<std::int64_t> dtCollectLitsInOrder(const DTMatrix& P,
+                                               std::size_t col) {
+    std::vector<std::int64_t> vs;
+    std::set<std::int64_t> seen;
+    for (const auto& dr : P) {
+        if (auto l = std::get_if<Lit>(&dr.pats[col]->v)) {
+            if (seen.insert(l->value).second) vs.push_back(l->value);
+        }
+    }
+    return vs;
+}
+
+std::unique_ptr<DecisionTree> dtCompile(
+    const DTMatrix& P,
+    const std::vector<std::vector<unsigned>>& occurrences,
+    const ColumnTypes& cols,
+    const std::unordered_map<std::string, TypePtr>& enums);
+
+std::unique_ptr<DecisionTree> makeFail() {
+    auto t = std::make_unique<DecisionTree>();
+    t->kind = DecisionTree::Fail;
+    return t;
+}
+
+std::unique_ptr<DecisionTree> makeLeaf(const DTRow& dr,
+                                       const std::vector<std::vector<unsigned>>&
+                                           occurrences) {
+    auto t = std::make_unique<DecisionTree>();
+    t->kind = DecisionTree::Leaf;
+    t->armIndex = dr.armIndex;
+    // Walk the row; for each Wild with a non-empty bindingName, record
+    // (name, occurrence-path).
+    assert(dr.pats.size() == occurrences.size());
+    for (std::size_t i = 0; i < dr.pats.size(); ++i) {
+        if (auto w = std::get_if<Wild>(&dr.pats[i]->v)) {
+            if (!w->bindingName.empty()) {
+                t->bindings.push_back({w->bindingName, occurrences[i]});
+            }
+        }
+    }
+    return t;
+}
+
+std::unique_ptr<DecisionTree> dtCompile(
+    const DTMatrix& P,
+    const std::vector<std::vector<unsigned>>& occurrences,
+    const ColumnTypes& cols,
+    const std::unordered_map<std::string, TypePtr>& enums) {
+    if (P.empty()) {
+        return makeFail();
+    }
+    const Row& firstRow = P[0].pats;
+    if (rowAllWild(firstRow)) {
+        return makeLeaf(P[0], occurrences);
+    }
+
+    // Pick a column to dispatch on.
+    std::size_t col = pickColumn(firstRow);
+    TypePtr colType = (col < cols.size()) ? resolve(cols[col]) : nullptr;
+
+    if (colType && colType->kind == TypeKind::Enum) {
+        auto tree = std::make_unique<DecisionTree>();
+        tree->kind = DecisionTree::Switch;
+        tree->occurrence = occurrences[col];
+
+        const auto& variants = colType->enumVariants;
+        std::set<std::string> heads = dtCollectCtors(P, col);
+        bool complete = !variants.empty();
+        for (const auto& v : variants) {
+            if (heads.count(v.name) == 0) { complete = false; break; }
+        }
+
+        for (unsigned vi = 0; vi < variants.size(); ++vi) {
+            const auto& v = variants[vi];
+            unsigned arity = static_cast<unsigned>(v.payloadTypes.size());
+            DTMatrix Pspec = dtSpecialize(P, col, v.name, arity);
+
+            // New occurrences: drop col, insert `arity` payload occurrences
+            // at that position.
+            std::vector<std::vector<unsigned>> newOccs;
+            newOccs.reserve(occurrences.size() - 1 + arity);
+            for (std::size_t i = 0; i < col; ++i)
+                newOccs.push_back(occurrences[i]);
+            for (unsigned k = 0; k < arity; ++k) {
+                std::vector<unsigned> path = occurrences[col];
+                path.push_back(payloadFieldIndex(colType, vi, k));
+                newOccs.push_back(std::move(path));
+            }
+            for (std::size_t i = col + 1; i < occurrences.size(); ++i)
+                newOccs.push_back(occurrences[i]);
+
+            // New column types: drop col, insert payload types.
+            ColumnTypes newCols;
+            newCols.reserve(cols.size() - 1 + arity);
+            for (std::size_t i = 0; i < col; ++i) newCols.push_back(cols[i]);
+            for (const auto& pt : v.payloadTypes) newCols.push_back(pt);
+            for (std::size_t i = col + 1; i < cols.size(); ++i)
+                newCols.push_back(cols[i]);
+
+            DecisionTree::Case c;
+            c.discKind = DecisionTree::Case::DiscCtor;
+            c.ctorName = v.name;
+            c.ctorTag = vi;
+            c.child = dtCompile(Pspec, newOccs, newCols, enums);
+            tree->cases.push_back(std::move(c));
+        }
+        if (complete) {
+            tree->defaultCase = nullptr;
+        } else {
+            // Non-exhaustive enum — produce a Fail default for safety.
+            tree->defaultCase = makeFail();
+        }
+        return tree;
+    }
+
+    if (colType && colType->kind == TypeKind::Int) {
+        auto tree = std::make_unique<DecisionTree>();
+        tree->kind = DecisionTree::Switch;
+        tree->occurrence = occurrences[col];
+
+        std::vector<std::int64_t> lits = dtCollectLitsInOrder(P, col);
+        // Compute occurrences/cols once for the case-children (col is dropped).
+        std::vector<std::vector<unsigned>> newOccs;
+        newOccs.reserve(occurrences.size() - 1);
+        for (std::size_t i = 0; i < occurrences.size(); ++i)
+            if (i != col) newOccs.push_back(occurrences[i]);
+        ColumnTypes newCols;
+        newCols.reserve(cols.size() - 1);
+        for (std::size_t i = 0; i < cols.size(); ++i)
+            if (i != col) newCols.push_back(cols[i]);
+
+        for (std::int64_t v : lits) {
+            DTMatrix Pspec = dtSpecializeLit(P, col, v);
+            DecisionTree::Case c;
+            c.discKind = DecisionTree::Case::DiscLit;
+            c.litValue = v;
+            c.child = dtCompile(Pspec, newOccs, newCols, enums);
+            tree->cases.push_back(std::move(c));
+        }
+        // Int columns always need a default.
+        DTMatrix Pdef = dtDefaultMatrix(P, col);
+        tree->defaultCase = dtCompile(Pdef, newOccs, newCols, enums);
+        return tree;
+    }
+
+    // Non-enum / non-int column with non-wildcard heads — shouldn't happen
+    // for V1, but be defensive.
+    return makeFail();
+}
+
 } // namespace
 
 std::optional<Witness> checkExhaustiveness(
@@ -423,6 +734,62 @@ std::optional<Witness> checkExhaustiveness(
     assert(!r.witness.empty());
     w.text = render(*r.witness[0]);
     return w;
+}
+
+std::vector<unsigned> findRedundantArms(
+    const TypePtr& scrutineeType,
+    const std::vector<ast::MatchArm>& arms,
+    const std::unordered_map<std::string, TypePtr>& /*enums*/,
+    const std::unordered_map<std::string, std::pair<std::string, unsigned>>&
+        variantIndex) {
+    std::vector<unsigned> result;
+    // Build rows up-front so we can share state.
+    std::vector<Row> rows;
+    rows.reserve(arms.size());
+    for (const auto& a : arms) {
+        rows.push_back(rowFromArm(a, variantIndex));
+    }
+
+    // M[0..i-1] is the matrix of all preceding arms. Arm i is redundant
+    // iff `useful(M, rows[i], cols)` is false.
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        Matrix M;
+        M.reserve(i);
+        for (std::size_t j = 0; j < i; ++j) {
+            M.push_back(rows[j]);
+        }
+        Row q = rows[i];
+        ColumnTypes cols;
+        cols.push_back(scrutineeType);
+        UsefulResult r = useful(M, q, cols);
+        if (!r.useful) {
+            result.push_back(static_cast<unsigned>(i));
+        }
+    }
+    return result;
+}
+
+std::unique_ptr<DecisionTree> compileDecisionTree(
+    const TypePtr& scrutineeType,
+    const std::vector<ast::MatchArm>& arms,
+    const std::unordered_map<std::string, TypePtr>& enums,
+    const std::unordered_map<std::string, std::pair<std::string, unsigned>>&
+        variantIndex) {
+    DTMatrix P;
+    P.reserve(arms.size());
+    for (std::size_t i = 0; i < arms.size(); ++i) {
+        DTRow dr;
+        dr.pats = rowFromArm(arms[i], variantIndex);
+        dr.armIndex = static_cast<unsigned>(i);
+        P.push_back(std::move(dr));
+    }
+
+    std::vector<std::vector<unsigned>> occurrences;
+    occurrences.push_back({}); // root scrutinee
+    ColumnTypes cols;
+    cols.push_back(scrutineeType);
+
+    return dtCompile(P, occurrences, cols, enums);
 }
 
 } // namespace kardashev::pattern_match

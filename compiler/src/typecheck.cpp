@@ -119,9 +119,14 @@ public:
         for (const auto& fn : program.functions) {
             checkFunction(fn);
         }
-        return {std::move(errors_), std::move(exprTypes_),
-                std::move(structs_), std::move(enums_),
-                std::move(variantIndex_)};
+        TypeCheckResult result;
+        result.errors = std::move(errors_);
+        result.exprTypes = std::move(exprTypes_);
+        result.structs = std::move(structs_);
+        result.enums = std::move(enums_);
+        result.variantIndex = std::move(variantIndex_);
+        result.matchTrees = std::move(matchTrees_);
+        return result;
     }
 
 private:
@@ -134,6 +139,9 @@ private:
     std::unordered_map<std::string, std::pair<std::string, unsigned>>
         variantIndex_;
     std::unordered_map<const ast::Expr*, TypePtr> exprTypes_;
+    std::unordered_map<const ast::MatchExpr*,
+                       std::unique_ptr<pattern_match::DecisionTree>>
+        matchTrees_;
     std::vector<TypeError> errors_;
     std::vector<Scope> scopes_;
     TypePtr currentReturnType_;
@@ -448,6 +456,16 @@ private:
                   me.line, me.column);
             return makeFreshVar();
         }
+        // Snapshot error count before arm checking; if it grows during arm
+        // pattern/body checks the patterns are likely malformed (wrong
+        // arity, unknown ctor, duplicate binding, etc.). We skip the
+        // pattern_match calls in that case to avoid feeding malformed
+        // inputs through `findRedundantArms` / `compileDecisionTree`,
+        // which can trip internal invariants. The match still gets a
+        // proper TypeError report; codegen only consumes the DT when the
+        // program is `ok()`, so a missing DT entry for an ill-typed match
+        // is harmless.
+        const std::size_t errsBeforeArms = errors_.size();
         TypePtr unified;
         for (const auto& arm : me.arms) {
             scopes_.push_back({});
@@ -474,6 +492,24 @@ private:
                 scrutT, me.arms, enums_, variantIndex_)) {
             error("non-exhaustive match: missing pattern `" + w->text + "`",
                   me.line, me.column);
+        }
+        const bool armsClean = (errors_.size() == errsBeforeArms);
+        if (armsClean) {
+            // Redundancy: report each arm unreachable given the arms before it.
+            auto redundant = pattern_match::findRedundantArms(
+                scrutT, me.arms, enums_, variantIndex_);
+            for (unsigned idx : redundant) {
+                if (idx >= me.arms.size()) continue;
+                const auto& arm = me.arms[idx];
+                error("unreachable match arm: pattern already covered by an "
+                      "earlier arm",
+                      arm.line, arm.column);
+            }
+            // Build the Maranget decision tree for codegen. Always store
+            // (even when non-exhaustive — the tree bottoms out at Fail
+            // nodes), as long as arm patterns were well-typed.
+            matchTrees_[&me] = pattern_match::compileDecisionTree(
+                scrutT, me.arms, enums_, variantIndex_);
         }
         return unified;
     }
@@ -595,6 +631,17 @@ private:
 };
 
 } // namespace
+
+// Out-of-line special members: the `matchTrees` field holds
+// unique_ptr<pattern_match::DecisionTree>, which is incomplete in the
+// public header. Defining these here (where the full type is visible via
+// the pattern_match.hpp include above) lets `unique_ptr` instantiate its
+// deleter correctly.
+TypeCheckResult::TypeCheckResult() = default;
+TypeCheckResult::~TypeCheckResult() = default;
+TypeCheckResult::TypeCheckResult(TypeCheckResult&&) noexcept = default;
+TypeCheckResult& TypeCheckResult::operator=(TypeCheckResult&&) noexcept =
+    default;
 
 TypeCheckResult typecheck(const ast::Program& program) {
     TypeChecker tc;

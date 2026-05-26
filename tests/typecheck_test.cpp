@@ -574,6 +574,212 @@ void test_match_records_unified_result_type() {
     assert(sawMatch);
 }
 
+// ---- Phase 2.3b: redundancy ----
+
+void test_redundant_two_wildcards() {
+    // Arm 1 (the second `_`) is unreachable; the first wildcard catches all.
+    // Match expression layout: "match n { _ => 1, _ => 2 }" — arm 1 starts at
+    // the second `_`. Source column hand-computed from the literal below.
+    // line 2: "    match n { _ => 1, _ => 2 }"
+    //                                ^-- this is arm 1's pattern
+    // columns: 1=' ' 2=' ' 3=' ' 4=' ' 5='m' ... let's compute precisely.
+    auto r = tc(
+        "fn f(n: i64) -> i64 {\n"
+        "    match n { _ => 1, _ => 2 }\n"
+        "}");
+    bool sawRedundancy = false;
+    for (const auto& e : r.errors) {
+        if (e.message.find("unreachable match arm") != std::string::npos) {
+            sawRedundancy = true;
+            // The redundant arm is the second one (arm index 1), so report
+            // on line 2 at the second `_`'s column.
+            assert(e.line == 2);
+        }
+    }
+    if (!sawRedundancy) {
+        std::cerr << "[redundant_two_wildcards] expected unreachable arm "
+                     "error, got:\n";
+        dump(r);
+        std::abort();
+    }
+}
+
+void test_redundant_var_then_wildcard() {
+    // Arm 1 is unreachable: arm 0's VarPat `x` already catches every i64.
+    auto r = tc(
+        "fn f(n: i64) -> i64 {\n"
+        "    match n { x => 1, _ => 2 }\n"
+        "}");
+    bool sawRedundancy = false;
+    for (const auto& e : r.errors) {
+        if (e.message.find("unreachable match arm") != std::string::npos) {
+            sawRedundancy = true;
+            assert(e.line == 2);
+        }
+    }
+    if (!sawRedundancy) {
+        std::cerr << "[redundant_var_then_wildcard] expected unreachable "
+                     "arm error, got:\n";
+        dump(r);
+        std::abort();
+    }
+}
+
+void test_redundant_duplicate_literal() {
+    // Arm 1 (the second `0 => 2`) is unreachable: arm 0 already matched 0.
+    auto r = tc(
+        "fn f(n: i64) -> i64 {\n"
+        "    match n { 0 => 1, 0 => 2, _ => 3 }\n"
+        "}");
+    int sawCount = 0;
+    for (const auto& e : r.errors) {
+        if (e.message.find("unreachable match arm") != std::string::npos) {
+            ++sawCount;
+            assert(e.line == 2);
+        }
+    }
+    if (sawCount == 0) {
+        std::cerr << "[redundant_duplicate_literal] expected unreachable "
+                     "arm error, got:\n";
+        dump(r);
+        std::abort();
+    }
+}
+
+void test_redundant_literal_after_wildcard() {
+    // Arm 2 (`1 => 3`) is unreachable: the wildcard at arm 1 absorbs all i64.
+    auto r = tc(
+        "fn f(n: i64) -> i64 {\n"
+        "    match n { 0 => 1, _ => 2, 1 => 3 }\n"
+        "}");
+    bool saw = false;
+    for (const auto& e : r.errors) {
+        if (e.message.find("unreachable match arm") != std::string::npos) {
+            saw = true;
+            assert(e.line == 2);
+        }
+    }
+    if (!saw) {
+        std::cerr << "[redundant_literal_after_wildcard] expected error, "
+                     "got:\n";
+        dump(r);
+        std::abort();
+    }
+}
+
+void test_redundant_some_wild_then_some_zero() {
+    // Arm 1 (`Some(0) => 2`) is unreachable: `Some(_)` in arm 0 covers it.
+    auto r = tc(
+        "enum Maybe { Some(i64), None }\n"
+        "fn f(m: Maybe) -> i64 {\n"
+        "    match m { Some(_) => 1, Some(0) => 2, None => 3 }\n"
+        "}");
+    bool saw = false;
+    for (const auto& e : r.errors) {
+        if (e.message.find("unreachable match arm") != std::string::npos) {
+            saw = true;
+            assert(e.line == 3);
+        }
+    }
+    if (!saw) {
+        std::cerr << "[redundant_some_wild_then_some_zero] expected error, "
+                     "got:\n";
+        dump(r);
+        std::abort();
+    }
+}
+
+void test_redundant_none_some_no_redundancy() {
+    // Sanity check: `Some(_) => 1, None => 0` has no redundancy.
+    expectOk(
+        "enum Maybe { Some(i64), None }\n"
+        "fn f(m: Maybe) -> i64 {\n"
+        "    match m { Some(_) => 1, None => 0 }\n"
+        "}",
+        "redundant_none_some_no_redundancy");
+}
+
+void test_redundant_color_full_no_redundancy() {
+    expectOk(
+        "enum Color { Red, Green, Blue }\n"
+        "fn f(c: Color) -> i64 {\n"
+        "    match c { Red => 1, Green => 2, Blue => 3 }\n"
+        "}",
+        "redundant_color_full_no_redundancy");
+}
+
+void test_redundant_wildcard_before_color() {
+    // Arm 1 (`Red => 2`) is unreachable: the wildcard catches every Color.
+    auto r = tc(
+        "enum Color { Red, Green, Blue }\n"
+        "fn f(c: Color) -> i64 {\n"
+        "    match c { _ => 1, Red => 2 }\n"
+        "}");
+    bool saw = false;
+    for (const auto& e : r.errors) {
+        if (e.message.find("unreachable match arm") != std::string::npos) {
+            saw = true;
+            assert(e.line == 3);
+        }
+    }
+    if (!saw) {
+        std::cerr << "[redundant_wildcard_before_color] expected error, "
+                     "got:\n";
+        dump(r);
+        std::abort();
+    }
+}
+
+// ---- Phase 2.3c: decision tree storage ----
+
+void test_decision_tree_stored_for_match() {
+    // After typechecking a program containing a match, the result must
+    // expose a decision tree keyed by that MatchExpr's address.
+    auto pr = kardashev::parse(
+        "enum Maybe { Some(i64), None }\n"
+        "fn unwrap_or(m: Maybe, d: i64) -> i64 {\n"
+        "    match m { Some(x) => x, None => d }\n"
+        "}");
+    assert(pr.ok());
+    auto r = kardashev::typecheck(pr.program);
+    if (!r.ok()) {
+        std::cerr << "[decision_tree_stored_for_match] expected ok, got "
+                     "errors:\n";
+        dump(r);
+        std::abort();
+    }
+    // At least one decision tree was stored (and it's keyed by a real
+    // MatchExpr* present in exprTypes).
+    assert(r.matchTrees.size() >= 1);
+    bool keyMatchesExprTypes = false;
+    for (const auto& kv : r.matchTrees) {
+        if (r.exprTypes.count(static_cast<const kardashev::ast::Expr*>(
+                kv.first)) == 1) {
+            keyMatchesExprTypes = true;
+            // The stored DT itself must be non-null.
+            assert(kv.second != nullptr);
+        }
+    }
+    assert(keyMatchesExprTypes);
+}
+
+void test_decision_tree_count_matches_match_count() {
+    // Two match expressions in the same program → two decision trees.
+    auto pr = kardashev::parse(
+        "enum Maybe { Some(i64), None }\n"
+        "fn a(m: Maybe) -> i64 { match m { Some(x) => x, None => 0 } }\n"
+        "fn b(n: i64) -> i64 { match n { 0 => 1, _ => 2 } }");
+    assert(pr.ok());
+    auto r = kardashev::typecheck(pr.program);
+    if (!r.ok()) {
+        std::cerr << "[decision_tree_count_matches_match_count] expected "
+                     "ok, got errors:\n";
+        dump(r);
+        std::abort();
+    }
+    assert(r.matchTrees.size() == 2);
+}
+
 } // namespace
 
 int main() {
@@ -644,6 +850,17 @@ int main() {
     test_exhaustive_color_full_ok();
     test_exhaustive_nested_missing_inner();
     test_exhaustive_var_binding_catchall_ok();
-    std::cout << "All typecheck tests passed (64 cases)\n";
+    // Phase 2.3b redundancy + 2.3c decision-tree storage
+    test_redundant_two_wildcards();
+    test_redundant_var_then_wildcard();
+    test_redundant_duplicate_literal();
+    test_redundant_literal_after_wildcard();
+    test_redundant_some_wild_then_some_zero();
+    test_redundant_none_some_no_redundancy();
+    test_redundant_color_full_no_redundancy();
+    test_redundant_wildcard_before_color();
+    test_decision_tree_stored_for_match();
+    test_decision_tree_count_matches_match_count();
+    std::cout << "All typecheck tests passed (74 cases)\n";
     return 0;
 }

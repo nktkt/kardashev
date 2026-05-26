@@ -7,6 +7,7 @@
 #include "kardashev/pattern_match.hpp"
 
 #include <cassert>
+#include <cstdint>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -20,6 +21,9 @@ using kardashev::makeEnum;
 using kardashev::makeInt;
 using kardashev::makeStruct;
 using kardashev::pattern_match::checkExhaustiveness;
+using kardashev::pattern_match::compileDecisionTree;
+using kardashev::pattern_match::DecisionTree;
+using kardashev::pattern_match::findRedundantArms;
 using kardashev::pattern_match::Witness;
 
 namespace ast = kardashev::ast;
@@ -368,6 +372,418 @@ void test_maybe_some_with_inner_int_lit_no_wildcard() {
                         "maybe_some_with_inner_int_lit_no_wildcard");
 }
 
+// --- 2.3b: findRedundantArms helpers / tests ---
+
+void expectRedundant(const TypePtr& ty,
+                     std::vector<ast::MatchArm> arms,
+                     const EnumMap& enums,
+                     const VariantIndex& vidx,
+                     const std::vector<unsigned>& expected,
+                     const char* label) {
+    auto got = findRedundantArms(ty, arms, enums, vidx);
+    if (got.size() != expected.size()) {
+        std::cerr << "[" << label << "] redundant count mismatch: expected "
+                  << expected.size() << ", got " << got.size() << " (indices:";
+        for (auto i : got) std::cerr << ' ' << i;
+        std::cerr << ")\n";
+        std::abort();
+    }
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        if (got[i] != expected[i]) {
+            std::cerr << "[" << label << "] redundant index " << i
+                      << " mismatch: expected " << expected[i] << ", got "
+                      << got[i] << '\n';
+            std::abort();
+        }
+    }
+}
+
+void test_redundant_single_arm() {
+    std::vector<ast::MatchArm> arms;
+    arms.push_back(arm(wild()));
+    expectRedundant(makeInt(), std::move(arms), {}, {}, {},
+                    "redundant_single_arm");
+}
+
+void test_redundant_second_after_wildcard() {
+    std::vector<ast::MatchArm> arms;
+    arms.push_back(arm(wild()));
+    arms.push_back(arm(lit(0)));
+    expectRedundant(makeInt(), std::move(arms), {}, {}, {1},
+                    "redundant_second_after_wildcard");
+}
+
+void test_redundant_two_useful() {
+    std::vector<ast::MatchArm> arms;
+    arms.push_back(arm(lit(0)));
+    arms.push_back(arm(wild()));
+    expectRedundant(makeInt(), std::move(arms), {}, {}, {},
+                    "redundant_two_useful");
+}
+
+void test_redundant_third_arm() {
+    std::vector<ast::MatchArm> arms;
+    arms.push_back(arm(lit(0)));
+    arms.push_back(arm(lit(1)));
+    arms.push_back(arm(lit(0))); // duplicate of arm 0 → redundant
+    expectRedundant(makeInt(), std::move(arms), {}, {}, {2},
+                    "redundant_third_arm");
+}
+
+void test_redundant_none_no_redundancy_non_exhaustive() {
+    // Not exhaustive (no wildcard), but no arm is redundant.
+    std::vector<ast::MatchArm> arms;
+    arms.push_back(arm(lit(0)));
+    arms.push_back(arm(lit(1)));
+    arms.push_back(arm(lit(2)));
+    expectRedundant(makeInt(), std::move(arms), {}, {}, {},
+                    "redundant_none_no_redundancy_non_exhaustive");
+}
+
+void test_redundant_maybe_some_covers_some_zero() {
+    // `Some(x) => ..., None => ..., Some(0) => ...` — third arm is
+    // redundant: Some(x) covers everything Some(0) covers.
+    auto ty = maybeType();
+    VariantIndex vidx;
+    vidx["Some"] = {"Maybe", 0};
+    vidx["None"] = {"Maybe", 1};
+    EnumMap em; em["Maybe"] = ty;
+    std::vector<ast::MatchArm> arms;
+    {
+        std::vector<ast::PatternPtr> subs; subs.push_back(var("x"));
+        arms.push_back(arm(ctor("Some", std::move(subs))));
+    }
+    arms.push_back(arm(ctor("None")));
+    {
+        std::vector<ast::PatternPtr> subs; subs.push_back(lit(0));
+        arms.push_back(arm(ctor("Some", std::move(subs))));
+    }
+    expectRedundant(ty, std::move(arms), em, vidx, {2},
+                    "redundant_maybe_some_covers_some_zero");
+}
+
+void test_redundant_wildcard_then_some() {
+    // `_ => ..., Some(x) => ...` — second arm is redundant (first catches all).
+    auto ty = maybeType();
+    VariantIndex vidx;
+    vidx["Some"] = {"Maybe", 0};
+    vidx["None"] = {"Maybe", 1};
+    EnumMap em; em["Maybe"] = ty;
+    std::vector<ast::MatchArm> arms;
+    arms.push_back(arm(wild()));
+    {
+        std::vector<ast::PatternPtr> subs; subs.push_back(var("x"));
+        arms.push_back(arm(ctor("Some", std::move(subs))));
+    }
+    expectRedundant(ty, std::move(arms), em, vidx, {1},
+                    "redundant_wildcard_then_some");
+}
+
+void test_redundant_nested_outer_inner() {
+    // Outer = O(Inner) | N; Inner = A | B.
+    // Arms: O(A), O(_), N, O(B). Fourth arm is redundant — O(_) covers it.
+    auto oi = outerInnerTypes();
+    VariantIndex vidx;
+    vidx["A"] = {"Inner", 0};
+    vidx["B"] = {"Inner", 1};
+    vidx["O"] = {"Outer", 0};
+    vidx["N"] = {"Outer", 1};
+    EnumMap em; em["Inner"] = oi.inner; em["Outer"] = oi.outer;
+    std::vector<ast::MatchArm> arms;
+    {
+        std::vector<ast::PatternPtr> subs; subs.push_back(ctor("A"));
+        arms.push_back(arm(ctor("O", std::move(subs))));
+    }
+    {
+        std::vector<ast::PatternPtr> subs; subs.push_back(wild());
+        arms.push_back(arm(ctor("O", std::move(subs))));
+    }
+    arms.push_back(arm(ctor("N")));
+    {
+        std::vector<ast::PatternPtr> subs; subs.push_back(ctor("B"));
+        arms.push_back(arm(ctor("O", std::move(subs))));
+    }
+    expectRedundant(oi.outer, std::move(arms), em, vidx, {3},
+                    "redundant_nested_outer_inner");
+}
+
+// --- 2.3c: DecisionTree tests ---
+
+void test_dt_single_wildcard() {
+    std::vector<ast::MatchArm> arms;
+    arms.push_back(arm(wild()));
+    auto t = compileDecisionTree(makeInt(), arms, {}, {});
+    if (t->kind != DecisionTree::Leaf) {
+        std::cerr << "[dt_single_wildcard] expected Leaf\n"; std::abort();
+    }
+    if (t->armIndex != 0) {
+        std::cerr << "[dt_single_wildcard] expected armIndex 0\n"; std::abort();
+    }
+    if (!t->bindings.empty()) {
+        std::cerr << "[dt_single_wildcard] expected no bindings, got "
+                  << t->bindings.size() << '\n'; std::abort();
+    }
+}
+
+void test_dt_single_var_int() {
+    std::vector<ast::MatchArm> arms;
+    arms.push_back(arm(var("x"))); // VarPat -> binding "x"
+    auto t = compileDecisionTree(makeInt(), arms, {}, {});
+    if (t->kind != DecisionTree::Leaf) {
+        std::cerr << "[dt_single_var_int] expected Leaf\n"; std::abort();
+    }
+    if (t->armIndex != 0) {
+        std::cerr << "[dt_single_var_int] expected armIndex 0\n"; std::abort();
+    }
+    if (t->bindings.size() != 1 || t->bindings[0].first != "x" ||
+        !t->bindings[0].second.empty()) {
+        std::cerr << "[dt_single_var_int] binding mismatch\n"; std::abort();
+    }
+}
+
+void test_dt_int_zero_and_wildcard() {
+    // 0 => ..., _ => ...
+    std::vector<ast::MatchArm> arms;
+    arms.push_back(arm(lit(0)));
+    arms.push_back(arm(wild()));
+    auto t = compileDecisionTree(makeInt(), arms, {}, {});
+    if (t->kind != DecisionTree::Switch) {
+        std::cerr << "[dt_int_zero_and_wildcard] expected Switch\n"; std::abort();
+    }
+    if (!t->occurrence.empty()) {
+        std::cerr << "[dt_int_zero_and_wildcard] expected empty occurrence\n";
+        std::abort();
+    }
+    if (t->cases.size() != 1) {
+        std::cerr << "[dt_int_zero_and_wildcard] expected 1 case, got "
+                  << t->cases.size() << '\n'; std::abort();
+    }
+    if (t->cases[0].discKind != DecisionTree::Case::DiscLit ||
+        t->cases[0].litValue != 0) {
+        std::cerr << "[dt_int_zero_and_wildcard] expected DiscLit 0\n"; std::abort();
+    }
+    if (!t->cases[0].child || t->cases[0].child->kind != DecisionTree::Leaf ||
+        t->cases[0].child->armIndex != 0) {
+        std::cerr << "[dt_int_zero_and_wildcard] case child not Leaf{0}\n";
+        std::abort();
+    }
+    if (!t->defaultCase || t->defaultCase->kind != DecisionTree::Leaf ||
+        t->defaultCase->armIndex != 1) {
+        std::cerr << "[dt_int_zero_and_wildcard] default not Leaf{1}\n";
+        std::abort();
+    }
+}
+
+void test_dt_maybe_some_x_and_none() {
+    // Some(x) => x, None => 0
+    auto ty = maybeType();
+    VariantIndex vidx;
+    vidx["Some"] = {"Maybe", 0};
+    vidx["None"] = {"Maybe", 1};
+    EnumMap em; em["Maybe"] = ty;
+    std::vector<ast::MatchArm> arms;
+    {
+        std::vector<ast::PatternPtr> subs; subs.push_back(var("x"));
+        arms.push_back(arm(ctor("Some", std::move(subs))));
+    }
+    arms.push_back(arm(ctor("None")));
+
+    auto t = compileDecisionTree(ty, arms, em, vidx);
+    if (t->kind != DecisionTree::Switch) {
+        std::cerr << "[dt_maybe] expected Switch\n"; std::abort();
+    }
+    if (!t->occurrence.empty()) {
+        std::cerr << "[dt_maybe] expected empty occurrence\n"; std::abort();
+    }
+    if (t->cases.size() != 2) {
+        std::cerr << "[dt_maybe] expected 2 cases, got " << t->cases.size()
+                  << '\n'; std::abort();
+    }
+    // Case 0: Some (variant 0)
+    const auto& c0 = t->cases[0];
+    if (c0.discKind != DecisionTree::Case::DiscCtor || c0.ctorName != "Some" ||
+        c0.ctorTag != 0) {
+        std::cerr << "[dt_maybe] case 0 not DiscCtor(Some, 0)\n"; std::abort();
+    }
+    if (!c0.child || c0.child->kind != DecisionTree::Leaf ||
+        c0.child->armIndex != 0) {
+        std::cerr << "[dt_maybe] case 0 child not Leaf{0}\n"; std::abort();
+    }
+    // The Some(x) binding should have name "x" and path {1} — payload at
+    // field index 1 of the flat enum struct.
+    if (c0.child->bindings.size() != 1 ||
+        c0.child->bindings[0].first != "x" ||
+        c0.child->bindings[0].second.size() != 1 ||
+        c0.child->bindings[0].second[0] != 1) {
+        std::cerr << "[dt_maybe] case 0 binding mismatch — got "
+                  << c0.child->bindings.size() << " bindings\n";
+        if (!c0.child->bindings.empty()) {
+            std::cerr << "  first: " << c0.child->bindings[0].first
+                      << " path:";
+            for (auto p : c0.child->bindings[0].second) std::cerr << ' ' << p;
+            std::cerr << '\n';
+        }
+        std::abort();
+    }
+    // Case 1: None (variant 1)
+    const auto& c1 = t->cases[1];
+    if (c1.discKind != DecisionTree::Case::DiscCtor || c1.ctorName != "None" ||
+        c1.ctorTag != 1) {
+        std::cerr << "[dt_maybe] case 1 not DiscCtor(None, 1)\n"; std::abort();
+    }
+    if (!c1.child || c1.child->kind != DecisionTree::Leaf ||
+        c1.child->armIndex != 1) {
+        std::cerr << "[dt_maybe] case 1 child not Leaf{1}\n"; std::abort();
+    }
+    if (!c1.child->bindings.empty()) {
+        std::cerr << "[dt_maybe] case 1 unexpected bindings\n"; std::abort();
+    }
+    if (t->defaultCase) {
+        std::cerr << "[dt_maybe] expected null defaultCase\n"; std::abort();
+    }
+}
+
+void test_dt_nested_outer_inner() {
+    // Outer = O(Inner) | N; Inner = A | B
+    // Arms: O(A) => 1, O(B) => 2, N => 0
+    auto oi = outerInnerTypes();
+    VariantIndex vidx;
+    vidx["A"] = {"Inner", 0};
+    vidx["B"] = {"Inner", 1};
+    vidx["O"] = {"Outer", 0};
+    vidx["N"] = {"Outer", 1};
+    EnumMap em; em["Inner"] = oi.inner; em["Outer"] = oi.outer;
+    std::vector<ast::MatchArm> arms;
+    {
+        std::vector<ast::PatternPtr> subs; subs.push_back(ctor("A"));
+        arms.push_back(arm(ctor("O", std::move(subs))));
+    }
+    {
+        std::vector<ast::PatternPtr> subs; subs.push_back(ctor("B"));
+        arms.push_back(arm(ctor("O", std::move(subs))));
+    }
+    arms.push_back(arm(ctor("N")));
+
+    auto t = compileDecisionTree(oi.outer, arms, em, vidx);
+    if (t->kind != DecisionTree::Switch) {
+        std::cerr << "[dt_nested] root expected Switch\n"; std::abort();
+    }
+    if (!t->occurrence.empty()) {
+        std::cerr << "[dt_nested] root occurrence not empty\n"; std::abort();
+    }
+    if (t->cases.size() != 2) {
+        std::cerr << "[dt_nested] expected 2 cases at root, got "
+                  << t->cases.size() << '\n'; std::abort();
+    }
+    // Case 0: O(Inner) — inner switch on payload field at index 1.
+    const auto& cO = t->cases[0];
+    if (cO.ctorName != "O" || cO.ctorTag != 0) {
+        std::cerr << "[dt_nested] case 0 not O,0\n"; std::abort();
+    }
+    if (!cO.child || cO.child->kind != DecisionTree::Switch) {
+        std::cerr << "[dt_nested] O child not Switch\n"; std::abort();
+    }
+    if (cO.child->occurrence.size() != 1 || cO.child->occurrence[0] != 1) {
+        std::cerr << "[dt_nested] inner occurrence not {1}\n"; std::abort();
+    }
+    if (cO.child->cases.size() != 2) {
+        std::cerr << "[dt_nested] inner case count != 2\n"; std::abort();
+    }
+    if (cO.child->cases[0].ctorName != "A" ||
+        cO.child->cases[0].ctorTag != 0 ||
+        !cO.child->cases[0].child ||
+        cO.child->cases[0].child->kind != DecisionTree::Leaf ||
+        cO.child->cases[0].child->armIndex != 0) {
+        std::cerr << "[dt_nested] inner case A wrong\n"; std::abort();
+    }
+    if (cO.child->cases[1].ctorName != "B" ||
+        cO.child->cases[1].ctorTag != 1 ||
+        !cO.child->cases[1].child ||
+        cO.child->cases[1].child->kind != DecisionTree::Leaf ||
+        cO.child->cases[1].child->armIndex != 1) {
+        std::cerr << "[dt_nested] inner case B wrong\n"; std::abort();
+    }
+    if (cO.child->defaultCase) {
+        std::cerr << "[dt_nested] inner default should be null\n"; std::abort();
+    }
+    // Case 1: N
+    const auto& cN = t->cases[1];
+    if (cN.ctorName != "N" || cN.ctorTag != 1 ||
+        !cN.child || cN.child->kind != DecisionTree::Leaf ||
+        cN.child->armIndex != 2) {
+        std::cerr << "[dt_nested] N case wrong\n"; std::abort();
+    }
+    if (t->defaultCase) {
+        std::cerr << "[dt_nested] root default should be null\n"; std::abort();
+    }
+}
+
+void test_dt_empty_arms_fail() {
+    // Zero arms → Fail at the root.
+    std::vector<ast::MatchArm> arms;
+    auto t = compileDecisionTree(makeInt(), arms, {}, {});
+    if (t->kind != DecisionTree::Fail) {
+        std::cerr << "[dt_empty_arms_fail] expected Fail\n"; std::abort();
+    }
+}
+
+void test_dt_int_lits_no_wildcard_default_fail() {
+    // `0 => ..., 1 => ...` — no wildcard, default case is Fail.
+    std::vector<ast::MatchArm> arms;
+    arms.push_back(arm(lit(0)));
+    arms.push_back(arm(lit(1)));
+    auto t = compileDecisionTree(makeInt(), arms, {}, {});
+    if (t->kind != DecisionTree::Switch) {
+        std::cerr << "[dt_int_lits_no_wildcard] expected Switch\n"; std::abort();
+    }
+    if (t->cases.size() != 2) {
+        std::cerr << "[dt_int_lits_no_wildcard] expected 2 cases\n"; std::abort();
+    }
+    if (t->cases[0].litValue != 0 || t->cases[1].litValue != 1) {
+        std::cerr << "[dt_int_lits_no_wildcard] lit values wrong\n"; std::abort();
+    }
+    if (!t->defaultCase || t->defaultCase->kind != DecisionTree::Fail) {
+        std::cerr << "[dt_int_lits_no_wildcard] default not Fail\n"; std::abort();
+    }
+}
+
+void test_dt_varpat_unit_ctor_no_binding() {
+    // VarPat names that resolve to unit ctors should NOT become bindings.
+    // Arms: Red, Green, Blue — all unit ctors via variantIndex rewrite.
+    auto ty = colorType();
+    VariantIndex vidx;
+    vidx["Red"] = {"Color", 0};
+    vidx["Green"] = {"Color", 1};
+    vidx["Blue"] = {"Color", 2};
+    EnumMap em; em["Color"] = ty;
+    std::vector<ast::MatchArm> arms;
+    arms.push_back(arm(var("Red")));
+    arms.push_back(arm(var("Green")));
+    arms.push_back(arm(var("Blue")));
+    auto t = compileDecisionTree(ty, arms, em, vidx);
+    if (t->kind != DecisionTree::Switch) {
+        std::cerr << "[dt_varpat_unit_ctor_no_binding] expected Switch\n";
+        std::abort();
+    }
+    if (t->cases.size() != 3) {
+        std::cerr << "[dt_varpat_unit_ctor_no_binding] expected 3 cases\n";
+        std::abort();
+    }
+    for (unsigned i = 0; i < 3; ++i) {
+        const auto& c = t->cases[i];
+        if (!c.child || c.child->kind != DecisionTree::Leaf ||
+            c.child->armIndex != i || !c.child->bindings.empty()) {
+            std::cerr << "[dt_varpat_unit_ctor_no_binding] case " << i
+                      << " wrong (bindings expected empty)\n";
+            std::abort();
+        }
+    }
+    if (t->defaultCase) {
+        std::cerr << "[dt_varpat_unit_ctor_no_binding] default should be null\n";
+        std::abort();
+    }
+}
+
 } // namespace
 
 int main() {
@@ -388,6 +804,24 @@ int main() {
     test_varpat_unit_ctor_rewrite();
     test_int_literals_with_wildcard();
     test_maybe_some_with_inner_int_lit_no_wildcard();
-    std::cout << "All pattern_match tests passed (17 cases)\n";
+    // 2.3b: redundancy
+    test_redundant_single_arm();
+    test_redundant_second_after_wildcard();
+    test_redundant_two_useful();
+    test_redundant_third_arm();
+    test_redundant_none_no_redundancy_non_exhaustive();
+    test_redundant_maybe_some_covers_some_zero();
+    test_redundant_wildcard_then_some();
+    test_redundant_nested_outer_inner();
+    // 2.3c: decision tree
+    test_dt_single_wildcard();
+    test_dt_single_var_int();
+    test_dt_int_zero_and_wildcard();
+    test_dt_maybe_some_x_and_none();
+    test_dt_nested_outer_inner();
+    test_dt_empty_arms_fail();
+    test_dt_int_lits_no_wildcard_default_fail();
+    test_dt_varpat_unit_ctor_no_binding();
+    std::cout << "All pattern_match tests passed (33 cases)\n";
     return 0;
 }

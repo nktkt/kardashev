@@ -381,6 +381,57 @@ void test_enum_with_struct_payload() {
     expectEquals(v, 42, "enum_with_struct_payload");
 }
 
+// --- Phase 2.3c: decision-tree codegen tests ---
+
+// 10 literal arms — exercises the linear-chain Switch on i64. The
+// previous quadratic emit-arm-by-arm path duplicated payload checks per
+// arm; the DT version compares each literal once.
+void test_dt_10_arm_literal_match() {
+    auto v = compileAndRun(
+        "fn classify(n: i64) -> i64 {\n"
+        "    match n {\n"
+        "         0 =>   0,\n"
+        "         1 =>  10,\n"
+        "         2 =>  20,\n"
+        "         3 =>  30,\n"
+        "         4 =>  40,\n"
+        "         5 =>  50,\n"
+        "         6 =>  60,\n"
+        "         7 =>  70,\n"
+        "         8 =>  80,\n"
+        "         9 =>  90,\n"
+        "         _ => 999,\n"
+        "    }\n"
+        "}\n"
+        "fn main() -> i64 { classify(7) + classify(42) }",
+        "main", "dt_10_arm_literal_match");
+    // classify(7) == 70, classify(42) == 999 (default).
+    expectEquals(v, 70 + 999, "dt_10_arm_literal_match");
+}
+
+// Multiple arms sharing the same outer ctor — the DT should switch
+// on the outer tag once, then dispatch on inner sub-patterns. Previously
+// the linear lowering re-checked the outer tag per arm.
+void test_dt_shared_outer_ctor() {
+    auto v = compileAndRun(
+        "enum Inner { A(i64), B(i64), C }\n"
+        "enum Outer { O(Inner), Z }\n"
+        "fn pick(x: Outer) -> i64 {\n"
+        "    match x {\n"
+        "        O(A(n)) => n + 1,\n"
+        "        O(B(n)) => n + 2,\n"
+        "        O(C)    => 3,\n"
+        "        Z       => 4,\n"
+        "    }\n"
+        "}\n"
+        "fn main() -> i64 {\n"
+        "    pick(O(A(100))) + pick(O(B(200))) + pick(O(C)) + pick(Z)\n"
+        "}",
+        "main", "dt_shared_outer_ctor");
+    // 101 + 202 + 3 + 4 == 310
+    expectEquals(v, 310, "dt_shared_outer_ctor");
+}
+
 } // namespace
 
 int main() {
@@ -413,6 +464,8 @@ int main() {
     test_enum_all_unit();
     test_nested_ctor_pattern();
     test_enum_with_struct_payload();
-    std::cout << "All codegen tests passed (29 cases) — Phase 2.2 enums + match\n";
+    test_dt_10_arm_literal_match();
+    test_dt_shared_outer_ctor();
+    std::cout << "All codegen tests passed (31 cases) — Phase 2.3c decision-tree codegen\n";
     return 0;
 }

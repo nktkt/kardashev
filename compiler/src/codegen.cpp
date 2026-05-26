@@ -5,6 +5,8 @@
 #include <utility>
 #include <vector>
 
+#include "kardashev/pattern_match.hpp"
+
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -414,35 +416,129 @@ private:
         return agg;
     }
 
+    // Walk an occurrence path (sequence of LLVM field indices) from
+    // `scrutinee`, chaining ExtractValues. Empty path returns the
+    // scrutinee unchanged.
+    llvm::Value* walkOccurrence(llvm::Value* scrutinee,
+                                 const std::vector<unsigned>& path) {
+        llvm::Value* cur = scrutinee;
+        for (unsigned idx : path) {
+            cur = builder_->CreateExtractValue(cur, {idx}, "occ");
+        }
+        return cur;
+    }
+
+    // Lower a Maranget decision tree. The scrutinee value is constant
+    // throughout the recursion — occurrences are paths *into* it.
+    void emitDecisionTree(
+            const pattern_match::DecisionTree& dt,
+            llvm::Value* scrutinee,
+            llvm::BasicBlock* mergeBB,
+            std::vector<std::pair<llvm::BasicBlock*, llvm::Value*>>& incoming,
+            const ast::MatchExpr& me) {
+        using DT = pattern_match::DecisionTree;
+        switch (dt.kind) {
+            case DT::Fail: {
+                builder_->CreateUnreachable();
+                return;
+            }
+            case DT::Leaf: {
+                auto savedLocals = locals_;
+                for (const auto& [name, path] : dt.bindings) {
+                    llvm::Value* sub = walkOccurrence(scrutinee, path);
+                    auto* alloca = builder_->CreateAlloca(sub->getType(),
+                                                          nullptr, name);
+                    builder_->CreateStore(sub, alloca);
+                    locals_[name] = alloca;
+                }
+                if (dt.armIndex < me.arms.size()) {
+                    llvm::Value* bodyVal = emitExpr(*me.arms[dt.armIndex].body);
+                    auto* bodyEnd = builder_->GetInsertBlock();
+                    if (!bodyEnd->getTerminator()) {
+                        builder_->CreateBr(mergeBB);
+                        if (bodyVal) incoming.push_back({bodyEnd, bodyVal});
+                    }
+                } else {
+                    errors_.push_back("codegen: leaf armIndex out of range");
+                    builder_->CreateUnreachable();
+                }
+                locals_ = savedLocals;
+                return;
+            }
+            case DT::Switch: {
+                llvm::Value* subVal = walkOccurrence(scrutinee, dt.occurrence);
+                // Pre-compute the tag (extract once if any case is DiscCtor;
+                // safe and cheap for mixed/all-DiscLit since LLVM dead-code
+                // eliminates an unused extract anyway).
+                llvm::Value* tag = nullptr;
+                for (const auto& c : dt.cases) {
+                    if (c.discKind == DT::Case::DiscCtor) {
+                        tag = builder_->CreateExtractValue(subVal, {0}, "tag");
+                        break;
+                    }
+                }
+                // Chain: for each case, compare; on match -> case child,
+                // on miss -> next case's compare block (or default).
+                for (std::size_t i = 0; i < dt.cases.size(); ++i) {
+                    const auto& c = dt.cases[i];
+                    llvm::Value* eq = nullptr;
+                    if (c.discKind == DT::Case::DiscCtor) {
+                        eq = builder_->CreateICmpEQ(
+                            tag,
+                            llvm::ConstantInt::get(
+                                llvm::Type::getInt32Ty(*ctx_), c.ctorTag),
+                            "tagmatch");
+                    } else {
+                        llvm::Value* litV = llvm::ConstantInt::get(
+                            llvm::Type::getInt64Ty(*ctx_),
+                            static_cast<uint64_t>(c.litValue),
+                            /*isSigned=*/true);
+                        eq = builder_->CreateICmpEQ(subVal, litV, "litmatch");
+                    }
+                    auto* hitBB = llvm::BasicBlock::Create(
+                        *ctx_, "case", currentFn_);
+                    auto* missBB = llvm::BasicBlock::Create(
+                        *ctx_, "next", currentFn_);
+                    builder_->CreateCondBr(eq, hitBB, missBB);
+
+                    builder_->SetInsertPoint(hitBB);
+                    if (c.child) {
+                        emitDecisionTree(*c.child, scrutinee, mergeBB,
+                                         incoming, me);
+                    } else {
+                        builder_->CreateUnreachable();
+                    }
+
+                    builder_->SetInsertPoint(missBB);
+                }
+                // After all cases miss, fall through to default (or
+                // unreachable for an exhaustive enum signature with no
+                // default).
+                if (dt.defaultCase) {
+                    emitDecisionTree(*dt.defaultCase, scrutinee, mergeBB,
+                                     incoming, me);
+                } else {
+                    builder_->CreateUnreachable();
+                }
+                return;
+            }
+        }
+    }
+
     llvm::Value* emitMatch(const ast::MatchExpr& me) {
         llvm::Value* scrutinee = emitExpr(*me.scrutinee);
         auto* mergeBB = llvm::BasicBlock::Create(*ctx_, "matchmerge",
                                                   currentFn_);
-
         std::vector<std::pair<llvm::BasicBlock*, llvm::Value*>> incoming;
 
-        for (std::size_t i = 0; i < me.arms.size(); ++i) {
-            const auto& arm = me.arms[i];
-            const bool isLast = (i + 1 == me.arms.size());
-            llvm::BasicBlock* failBB = llvm::BasicBlock::Create(
-                *ctx_, isLast ? "matchfail" : "armnext", currentFn_);
-
-            auto savedLocals = locals_;
-            emitPatternMatch(*arm.pattern, scrutinee, failBB);
-
-            llvm::Value* bodyVal = emitExpr(*arm.body);
-            auto* bodyEnd = builder_->GetInsertBlock();
-            if (!bodyEnd->getTerminator()) {
-                builder_->CreateBr(mergeBB);
-                if (bodyVal) incoming.push_back({bodyEnd, bodyVal});
-            }
-            locals_ = savedLocals;
-
-            builder_->SetInsertPoint(failBB);
+        auto it = tc_.matchTrees.find(&me);
+        if (it == tc_.matchTrees.end() || !it->second) {
+            errors_.push_back("codegen: no decision tree for match");
+            builder_->CreateUnreachable();
+            builder_->SetInsertPoint(mergeBB);
+            return llvm::UndefValue::get(llvm::Type::getInt64Ty(*ctx_));
         }
-        // Whatever fell off the last arm is unreachable territory in V1
-        // (no exhaustiveness yet — that arrives in Phase 2.3).
-        builder_->CreateUnreachable();
+        emitDecisionTree(*it->second, scrutinee, mergeBB, incoming, me);
 
         builder_->SetInsertPoint(mergeBB);
         if (incoming.empty()) {
@@ -453,83 +549,6 @@ private:
                                          incoming.size(), "matchval");
         for (auto& [bb, val] : incoming) phi->addIncoming(val, bb);
         return phi;
-    }
-
-    // After this returns, the builder's insertion block is the success
-    // path for `pat` (with bindings present in `locals_`); any failure
-    // along the way branched to `failBB`.
-    void emitPatternMatch(const ast::Pattern& pat, llvm::Value* scrutinee,
-                          llvm::BasicBlock* failBB) {
-        if (auto* lit = dynamic_cast<const ast::LitIntPat*>(&pat)) {
-            llvm::Value* litV = llvm::ConstantInt::get(
-                llvm::Type::getInt64Ty(*ctx_),
-                static_cast<uint64_t>(lit->value), /*isSigned=*/true);
-            llvm::Value* eq = builder_->CreateICmpEQ(scrutinee, litV,
-                                                     "litmatch");
-            auto* okBB = llvm::BasicBlock::Create(*ctx_, "litok", currentFn_);
-            builder_->CreateCondBr(eq, okBB, failBB);
-            builder_->SetInsertPoint(okBB);
-            return;
-        }
-        if (dynamic_cast<const ast::WildPat*>(&pat)) {
-            return;
-        }
-        if (auto* var = dynamic_cast<const ast::VarPat*>(&pat)) {
-            // The typechecker has already validated whether this is a
-            // real binding or a unit-ctor masquerading as a VarPat. We
-            // re-do the lookup to drive the lowering.
-            auto vit = tc_.variantIndex.find(var->name);
-            if (vit != tc_.variantIndex.end()) {
-                emitTagCheck(scrutinee, vit->second.second, failBB);
-                return;
-            }
-            auto* alloca = builder_->CreateAlloca(scrutinee->getType(),
-                                                   nullptr, var->name);
-            builder_->CreateStore(scrutinee, alloca);
-            locals_[var->name] = alloca;
-            return;
-        }
-        if (auto* cp = dynamic_cast<const ast::CtorPat*>(&pat)) {
-            auto vit = tc_.variantIndex.find(cp->ctorName);
-            if (vit == tc_.variantIndex.end()) {
-                errors_.push_back("codegen: unknown constructor " +
-                                  cp->ctorName);
-                builder_->CreateBr(failBB);
-                auto* dead = llvm::BasicBlock::Create(*ctx_, "dead",
-                                                      currentFn_);
-                builder_->SetInsertPoint(dead);
-                return;
-            }
-            const auto& [enumName, variantIdx] = vit->second;
-            emitTagCheck(scrutinee, variantIdx, failBB);
-            const auto& payloadSlots =
-                enumPayloadIndices_[enumName][variantIdx];
-            for (std::size_t i = 0;
-                 i < cp->subpatterns.size() && i < payloadSlots.size(); ++i) {
-                llvm::Value* sub = builder_->CreateExtractValue(
-                    scrutinee, {payloadSlots[i]}, "pld");
-                emitPatternMatch(*cp->subpatterns[i], sub, failBB);
-            }
-            return;
-        }
-        errors_.push_back("codegen: unknown pattern kind");
-        builder_->CreateBr(failBB);
-        auto* dead = llvm::BasicBlock::Create(*ctx_, "dead", currentFn_);
-        builder_->SetInsertPoint(dead);
-    }
-
-    void emitTagCheck(llvm::Value* scrutinee, unsigned expectedIdx,
-                       llvm::BasicBlock* failBB) {
-        llvm::Value* tag = builder_->CreateExtractValue(scrutinee, {0},
-                                                         "tag");
-        llvm::Value* eq = builder_->CreateICmpEQ(
-            tag,
-            llvm::ConstantInt::get(llvm::Type::getInt32Ty(*ctx_),
-                                    expectedIdx),
-            "tagmatch");
-        auto* okBB = llvm::BasicBlock::Create(*ctx_, "tagok", currentFn_);
-        builder_->CreateCondBr(eq, okBB, failBB);
-        builder_->SetInsertPoint(okBB);
     }
 
     llvm::Value* emitIf(const ast::IfExpr& ie) {

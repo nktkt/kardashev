@@ -68,6 +68,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":ast",
+        ":pattern_match",
         ":typecheck",
         "@llvm//:llvm",
     ],
