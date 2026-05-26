@@ -1,11 +1,30 @@
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 
 cc_library(
+    name = "ast",
+    hdrs = ["include/kardashev/ast.hpp"],
+    strip_include_prefix = "include",
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "lexer",
     srcs = ["src/lexer.cpp"],
     hdrs = ["include/kardashev/lexer.hpp"],
     strip_include_prefix = "include",
     visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "parser",
+    srcs = ["src/parser.cpp"],
+    hdrs = ["include/kardashev/parser.hpp"],
+    strip_include_prefix = "include",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":ast",
+        ":lexer",
+    ],
 )
 
 cc_binary(
