@@ -3,7 +3,7 @@
 // Recognized tokens:
 //   - Integer literals: [0-9]+
 //   - Identifiers:      [A-Za-z_][A-Za-z0-9_]*
-//   - Keywords:         fn let if else return struct enum match trait impl for
+//   - Keywords:         fn let if else return struct enum match trait impl for mod
 //   - Operators:        +  -  *  /  <  <=  >  >=  ==  !=  =  ->  =>  ?  !
 //   - Punctuation:      (  )  {  }  ,  ;  :  .  _  &
 //   - Skipped:          whitespace, `// ... \n` line comments
@@ -36,6 +36,7 @@ enum class TokenKind {
     KwTrait,
     KwImpl,
     KwFor,
+    KwMod, // Phase 7: `mod foo;` file-import
     // `Self` and `self` stay as Identifiers — the typechecker rewrites
     // `Self` to the implementing type inside trait method sigs / impl
     // bodies, and `self` is just a parameter name.

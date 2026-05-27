@@ -54,7 +54,9 @@
 #include <string>
 #include <string_view>
 #include <unistd.h> // isatty
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -76,6 +78,82 @@ std::string applyPrelude(const std::string& userSrc) {
         prelude += "enum Result<T, E> { Ok(T), Err(E) }\n";
     }
     return prelude + userSrc;
+}
+
+// Phase 7.1: resolve `mod foo;` directives by reading sibling `.kd`
+// files and merging their declarations into the caller's program. The
+// merge is FLAT — module contents become part of the top-level program
+// with no namespacing — so duplicate-decl errors surface at typecheck
+// as usual. Recursive: a module may itself declare more `mod` entries
+// and they're resolved transitively.
+//
+// `parentDir` is the directory of the file currently being resolved.
+// `visited` tracks absolute module paths so a cycle reports an error
+// rather than recursing forever.
+//
+// Returns true on success; on file-read errors the message is appended
+// to `errors` and the partial program is left in `out`.
+bool resolveModules(const std::string& srcRaw,
+                     const std::string& parentDir,
+                     std::unordered_set<std::string>& visited,
+                     kardashev::ast::Program& out,
+                     std::vector<std::string>& errors);
+
+// Read a file fully into a string. Empty optional on I/O failure.
+std::optional<std::string> readFile(const std::string& path) {
+    std::ifstream f(path);
+    if (!f) return std::nullopt;
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+// Naive `dirname`: returns the substring up to the last '/'. Returns "."
+// when the path has no slash. Works for forward-slash paths on Linux /
+// macOS (the platforms the build matrix exercises).
+std::string dirOf(const std::string& path) {
+    auto slash = path.find_last_of('/');
+    if (slash == std::string::npos) return ".";
+    return path.substr(0, slash);
+}
+
+bool resolveModules(const std::string& srcRaw,
+                     const std::string& parentDir,
+                     std::unordered_set<std::string>& visited,
+                     kardashev::ast::Program& out,
+                     std::vector<std::string>& errors) {
+    auto pr = kardashev::parse(srcRaw);
+    if (!pr.ok()) {
+        for (const auto& e : pr.errors) {
+            errors.push_back("parse error " + std::to_string(e.line) + ":" +
+                              std::to_string(e.column) + ": " + e.message);
+        }
+        return false;
+    }
+    // Merge this program's decls into `out`. We move so the program's
+    // internal pointers / unique_ptrs end up owned by `out`.
+    for (auto& fn : pr.program.functions) out.functions.push_back(std::move(fn));
+    for (auto& sd : pr.program.structs) out.structs.push_back(std::move(sd));
+    for (auto& ed : pr.program.enums) out.enums.push_back(std::move(ed));
+    for (auto& td : pr.program.traits) out.traits.push_back(std::move(td));
+    for (auto& impl : pr.program.impls) out.impls.push_back(std::move(impl));
+
+    // Recurse into each `mod foo;` reference.
+    for (const auto& m : pr.program.mods) {
+        std::string modPath = parentDir + "/" + m.name + ".kd";
+        if (!visited.insert(modPath).second) continue; // already merged
+        auto content = readFile(modPath);
+        if (!content) {
+            errors.push_back("mod resolve error: cannot open `" + modPath +
+                              "` (declared at " + std::to_string(m.line) +
+                              ":" + std::to_string(m.column) + ")");
+            continue;
+        }
+        if (!resolveModules(*content, dirOf(modPath), visited, out, errors)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void reportParseErrors(const kardashev::ParseResult& r) {
@@ -102,25 +180,49 @@ void reportBorrowErrors(const kardashev::BorrowCheckResult& r) {
 // Compile `src` through the full pipeline and JIT-call the named entry
 // (which must be a no-arg function returning i64). Diagnostics go to
 // stderr. Returns the i64 result on success, nullopt otherwise.
-std::optional<std::int64_t> compileAndRun(const std::string& srcRaw,
-                                          const std::string& entry) {
+// Build a merged Program from `srcRaw`, resolving any `mod foo;`
+// references relative to `srcDir`. Prelude is applied to the root source
+// (modules are imported as-is — they can reference Option / Result
+// without redeclaring them since the merged program inherits the
+// prelude declarations once).
+//
+// On success, returns the merged Program inside the optional. On
+// parse / file-read failure, error messages are printed to stderr and
+// nullopt is returned.
+std::optional<kardashev::ast::Program> buildProgram(
+    const std::string& srcRaw, const std::string& srcDir) {
     const std::string src = applyPrelude(srcRaw);
-    auto pr = kardashev::parse(src);
-    if (!pr.ok()) {
-        reportParseErrors(pr);
+    kardashev::ast::Program merged;
+    std::unordered_set<std::string> visited;
+    std::vector<std::string> errors;
+    if (!resolveModules(src, srcDir, visited, merged, errors)) {
+        for (const auto& e : errors) std::cerr << e << '\n';
         return std::nullopt;
     }
-    auto tcr = kardashev::typecheck(pr.program);
+    if (!errors.empty()) {
+        for (const auto& e : errors) std::cerr << e << '\n';
+        return std::nullopt;
+    }
+    return merged;
+}
+
+std::optional<std::int64_t> compileAndRun(const std::string& srcRaw,
+                                          const std::string& entry,
+                                          const std::string& srcDir = ".") {
+    auto progOpt = buildProgram(srcRaw, srcDir);
+    if (!progOpt) return std::nullopt;
+    auto& program = *progOpt;
+    auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
         reportTypeErrors(tcr);
         return std::nullopt;
     }
-    auto bcr = kardashev::borrow_check(pr.program, tcr);
+    auto bcr = kardashev::borrow_check(program, tcr);
     if (!bcr.ok()) {
         reportBorrowErrors(bcr);
         return std::nullopt;
     }
-    auto cgr = kardashev::codegen(pr.program, tcr);
+    auto cgr = kardashev::codegen(program, tcr);
     if (!cgr.ok()) {
         for (const auto& msg : cgr.errors) {
             std::cerr << "codegen error: " << msg << '\n';
@@ -222,14 +324,12 @@ int runREPL() {
 }
 
 int runFile(const char* path) {
-    std::ifstream f(path);
-    if (!f) {
+    auto src = readFile(path);
+    if (!src) {
         std::cerr << "kardc: cannot open file: " << path << '\n';
         return 1;
     }
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    if (auto result = compileAndRun(ss.str(), "main")) {
+    if (auto result = compileAndRun(*src, "main", dirOf(path))) {
         std::cout << *result << '\n';
         return 0;
     }
@@ -320,24 +420,22 @@ bool emitObject(llvm::Module& module, const std::string& outObjPath) {
 // the system `clang` to link the emitted object — this is the same
 // linker our CI / Bazel build already depends on, so AOT mode adds no
 // new system requirement beyond what JIT mode needed.
-int runAot(const std::string& srcRaw, const std::string& outExePath) {
-    const std::string src = applyPrelude(srcRaw);
-    auto pr = kardashev::parse(src);
-    if (!pr.ok()) {
-        reportParseErrors(pr);
-        return 1;
-    }
-    auto tcr = kardashev::typecheck(pr.program);
+int runAot(const std::string& srcRaw, const std::string& outExePath,
+            const std::string& srcDir = ".") {
+    auto progOpt = buildProgram(srcRaw, srcDir);
+    if (!progOpt) return 1;
+    auto& program = *progOpt;
+    auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
         reportTypeErrors(tcr);
         return 1;
     }
-    auto bcr = kardashev::borrow_check(pr.program, tcr);
+    auto bcr = kardashev::borrow_check(program, tcr);
     if (!bcr.ok()) {
         reportBorrowErrors(bcr);
         return 1;
     }
-    auto cgr = kardashev::codegen(pr.program, tcr);
+    auto cgr = kardashev::codegen(program, tcr);
     if (!cgr.ok()) {
         for (const auto& msg : cgr.errors) {
             std::cerr << "codegen error: " << msg << '\n';
@@ -403,14 +501,12 @@ int main(int argc, char** argv) {
             std::cerr << "kardc: -o requires an input file\n";
             return 2;
         }
-        std::ifstream f(inputPath);
-        if (!f) {
+        auto src = readFile(inputPath);
+        if (!src) {
             std::cerr << "kardc: cannot open file: " << inputPath << '\n';
             return 1;
         }
-        std::ostringstream ss;
-        ss << f.rdbuf();
-        return runAot(ss.str(), outPath);
+        return runAot(*src, outPath, dirOf(inputPath));
     }
     if (!inputPath.empty()) {
         return runFile(inputPath.c_str());

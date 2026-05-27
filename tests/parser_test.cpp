@@ -872,6 +872,30 @@ void test_no_effect_row_defaults_pure() {
     assert(r.program.functions[0].effects.labels.empty());
 }
 
+void test_mod_decl_basic() {
+    auto r = parse("mod util;\nfn main() -> i64 { 0 }");
+    if (!r.ok()) {
+        std::cerr << "parse failed\n";
+        for (const auto& e : r.errors) {
+            std::cerr << "  " << e.line << ":" << e.column << ": "
+                      << e.message << '\n';
+        }
+        std::abort();
+    }
+    assert(r.program.mods.size() == 1);
+    assert(r.program.mods[0].name == "util");
+    assert(r.program.functions.size() == 1);
+}
+
+void test_mod_multiple() {
+    auto r = parse("mod a;\nmod b;\nmod c;\nfn main() -> i64 { 0 }");
+    assert(r.ok());
+    assert(r.program.mods.size() == 3);
+    assert(r.program.mods[0].name == "a");
+    assert(r.program.mods[1].name == "b");
+    assert(r.program.mods[2].name == "c");
+}
+
 } // namespace
 
 int main() {
@@ -934,6 +958,9 @@ int main() {
     test_effect_row_on_fn_decl();
     test_effect_row_empty_braces();
     test_no_effect_row_defaults_pure();
-    std::cout << "All parser tests passed (54 cases)\n";
+    // Phase 7 mod
+    test_mod_decl_basic();
+    test_mod_multiple();
+    std::cout << "All parser tests passed (56 cases)\n";
     return 0;
 }

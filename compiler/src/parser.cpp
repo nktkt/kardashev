@@ -27,9 +27,12 @@ public:
                 prog.traits.push_back(parseTraitDecl());
             } else if (check(TokenKind::KwImpl)) {
                 prog.impls.push_back(parseImplDecl());
+            } else if (check(TokenKind::KwMod)) {
+                prog.mods.push_back(parseModDecl());
             } else {
                 errorHere(std::string("expected 'fn', 'struct', 'enum', "
-                                      "'trait' or 'impl' at top level, got ") +
+                                      "'trait', 'impl' or 'mod' at top "
+                                      "level, got ") +
                           std::string(tokenKindName(peek().kind)));
                 advance();
             }
@@ -82,6 +85,17 @@ private:
     }
 
     // --- Top-level ---
+
+    ast::ModDecl parseModDecl() {
+        Token modTok = expect(TokenKind::KwMod, "mod");
+        ast::ModDecl decl;
+        decl.line = modTok.line;
+        decl.column = modTok.column;
+        Token nameTok = expect(TokenKind::Identifier, "module name");
+        decl.name = nameTok.lexeme;
+        expect(TokenKind::Semi, ";");
+        return decl;
+    }
 
     ast::FnDecl parseFnDecl() {
         Token fnTok = expect(TokenKind::KwFn, "fn");

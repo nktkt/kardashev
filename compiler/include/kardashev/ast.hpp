@@ -1,7 +1,8 @@
 // Untyped AST for the kardashev V1 surface syntax.
 //
 // Grammar (informal):
-//   program       := (fn_decl | struct_decl | enum_decl | trait_decl | impl_decl)*
+//   program       := (mod_decl | fn_decl | struct_decl | enum_decl | trait_decl | impl_decl)*
+//   mod_decl      := 'mod' Ident ';'              -- Phase 7: pulls in <Ident>.kd
 //   fn_decl       := 'fn' Ident generic_params? '(' params? ')' '->' type_ref effect_row? block_expr
 //   generic_params:= '<' generic_param (',' generic_param)* ','? '>'
 //   generic_param := Ident (':' Ident)?           -- optional single-trait bound
@@ -328,12 +329,22 @@ struct MethodCallExpr : Expr {
     std::vector<ExprPtr> args;
 };
 
+// Phase 7: `mod foo;` references — the resolver loads `foo.kd` next to
+// the source file and merges its decls into the program. After resolution
+// these entries are erased; downstream passes see one flat Program.
+struct ModDecl {
+    std::string name;
+    std::size_t line = 1;
+    std::size_t column = 1;
+};
+
 struct Program {
     std::vector<FnDecl> functions;
     std::vector<StructDecl> structs;
     std::vector<EnumDecl> enums;
     std::vector<TraitDecl> traits;
     std::vector<ImplDecl> impls;
+    std::vector<ModDecl> mods;
 };
 
 } // namespace kardashev::ast

@@ -50,12 +50,13 @@ Effect sets are unioned across the call graph and checked at definition sites; n
 
 ## Status
 
-Phases 0–5a + 5b (prelude) land; row-polymorphic effects (`! {e}`) and
-stdlib types that need a heap (`Vec`, `String`) wait for first-class
-function values + a small runtime in Phase 6. Built locally with `bazel
-build //... && bazel test //...` or, when Bazel isn't available, the
-`Makefile.local` shim (LLVM + clang). The CI matrix runs both
-ubuntu-latest and macos-latest via Bazel on every push.
+Phases 0–5 (AOT + prelude) and Phase 7.1 (`mod foo;` flat import) land;
+row-polymorphic effects (`! {e}`) and stdlib types that need a heap
+(`Vec`, `String`) wait for first-class function values + a small runtime
+in Phase 6. Built locally with `bazel build //... && bazel test //...`
+or, when Bazel isn't available, the `Makefile.local` shim (LLVM +
+clang). The CI matrix runs both ubuntu-latest and macos-latest via
+Bazel on every push.
 
 What works today:
 
@@ -92,6 +93,19 @@ fn main() -> i64 ! { io, alloc } { raw_read() }    // pure-caller would error
 so user programs can use `Some` / `None` / `Ok` / `Err` without
 redeclaring them.
 
+Multi-file programs (Phase 7.1): write `mod foo;` at the top of a `.kd`
+file to pull in `foo.kd` from the same directory. Modules are inlined
+flat (no path syntax yet) and resolution is recursive and cycle-safe.
+
+```
+// util.kd
+fn double(n: i64) -> i64 { n + n }
+
+// main.kd
+mod util;
+fn main() -> i64 { double(21) }
+```
+
 Three driver modes:
 
 ```
@@ -118,7 +132,7 @@ JIT (or AOT).
 | 4 | Effect labels in signatures (the signature feature lands here) | ✅ (concrete labels; row-polymorphic `! {e}` waits for fn-pointer values in Phase 6) |
 | 5 | AOT pipeline + minimal stdlib (`Option`, `Result`, `Vec`, `String`) | ✅ AOT + Option/Result prelude; Vec/String wait for the Phase 6 runtime |
 | 6 | `async` / `await` + state-machine transform + basic executor | — |
-| 7 | Module system + complete `rules_kardashev` + `kard` CLI | — |
+| 7 | Module system + complete `rules_kardashev` + `kard` CLI | 🟡 `mod foo;` flat import lands (recursive, cycle-safe); `rules_kardashev` Starlark macros + a `kard` driver thin-wrapping kardc still to come |
 | 8 | Optimization passes + LSP + docs site | — |
 
 ## Why "kardashev"?
