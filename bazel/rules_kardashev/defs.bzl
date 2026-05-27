@@ -70,6 +70,17 @@ def _kardashev_binary_impl(ctx):
         outputs = [out],
         mnemonic = "KardashevCompile",
         progress_message = "Compiling kardashev binary %{label}",
+        # kardc shells out to clang for the link step. On Linux,
+        # Bazel's default sandbox hides the system `ld` from clang
+        # (only the explicitly-declared inputs are visible). Mark the
+        # action no-sandbox so the host's linker stays reachable. The
+        # trade-off — losing strict input declaration for this step —
+        # is acceptable because the link only consumes the .o we just
+        # produced + the system libc that kardc programs always need.
+        execution_requirements = {"no-sandbox": "1"},
+        # Forward the host environment (PATH etc) so clang finds its
+        # toolchain components on both Linux and macOS.
+        use_default_shell_env = True,
     )
 
     return [
