@@ -326,6 +326,122 @@ void test_ref_is_copy_ok() {
              "ref_is_copy_ok");
 }
 
+// --- Phase 2.4c: mutable references + NLL ---
+
+void test_nll_borrow_dies_before_move_ok() {
+    // r's last use is in `read(r)`. After that, the borrow is dead, so
+    // `consume(p)` is allowed.
+    expectOk("struct P { x: i64 }\n"
+             "fn read(p: &P) -> i64 { p.x }\n"
+             "fn consume(p: P) -> i64 { p.x }\n"
+             "fn main() -> i64 {\n"
+             "    let p = P { x: 7 };\n"
+             "    let r = &p;\n"
+             "    let a = read(r);\n"
+             "    let b = consume(p);\n"
+             "    a + b\n"
+             "}",
+             "nll_borrow_dies_before_move_ok");
+}
+
+void test_nll_borrow_alive_across_move_errors() {
+    // r is used AFTER the move attempt, so the borrow is still alive at
+    // the move site.
+    expectErr("struct P { x: i64 }\n"
+              "fn read(p: &P) -> i64 { p.x }\n"
+              "fn consume(p: P) -> i64 { p.x }\n"
+              "fn main() -> i64 {\n"
+              "    let p = P { x: 7 };\n"
+              "    let r = &p;\n"
+              "    let a = consume(p);\n"
+              "    let b = read(r);\n"
+              "    a + b\n"
+              "}",
+              "nll_borrow_alive_across_move_errors");
+}
+
+void test_two_shared_borrows_named_ok() {
+    expectOk("struct P { x: i64 }\n"
+             "fn read2(a: &P, b: &P) -> i64 { a.x + b.x }\n"
+             "fn main() -> i64 {\n"
+             "    let p = P { x: 7 };\n"
+             "    let r1 = &p;\n"
+             "    let r2 = &p;\n"
+             "    read2(r1, r2)\n"
+             "}",
+             "two_shared_borrows_named_ok");
+}
+
+void test_nll_shared_then_mut_ok() {
+    // r (shared) ends at read(r); then &mut p is allowed.
+    expectOk("struct P { x: i64 }\n"
+             "fn read(p: &P) -> i64 { p.x }\n"
+             "fn write(p: &mut P) -> i64 { p.x }\n"
+             "fn main() -> i64 {\n"
+             "    let p = P { x: 7 };\n"
+             "    let r = &p;\n"
+             "    let a = read(r);\n"
+             "    let m = &mut p;\n"
+             "    let b = write(m);\n"
+             "    a + b\n"
+             "}",
+             "nll_shared_then_mut_ok");
+}
+
+void test_mut_while_shared_errors() {
+    expectErr("struct P { x: i64 }\n"
+              "fn read(p: &P) -> i64 { p.x }\n"
+              "fn write(p: &mut P) -> i64 { p.x }\n"
+              "fn main() -> i64 {\n"
+              "    let p = P { x: 7 };\n"
+              "    let r = &p;\n"
+              "    let m = &mut p;\n"
+              "    let a = read(r);\n"
+              "    let b = write(m);\n"
+              "    a + b\n"
+              "}",
+              "mut_while_shared_errors");
+}
+
+void test_two_mut_errors() {
+    expectErr("struct P { x: i64 }\n"
+              "fn write(p: &mut P) -> i64 { p.x }\n"
+              "fn main() -> i64 {\n"
+              "    let p = P { x: 7 };\n"
+              "    let m1 = &mut p;\n"
+              "    let m2 = &mut p;\n"
+              "    write(m1) + write(m2)\n"
+              "}",
+              "two_mut_errors");
+}
+
+void test_shared_while_mut_errors() {
+    expectErr("struct P { x: i64 }\n"
+              "fn read(p: &P) -> i64 { p.x }\n"
+              "fn write(p: &mut P) -> i64 { p.x }\n"
+              "fn main() -> i64 {\n"
+              "    let p = P { x: 7 };\n"
+              "    let m = &mut p;\n"
+              "    let r = &p;\n"
+              "    write(m) + read(r)\n"
+              "}",
+              "shared_while_mut_errors");
+}
+
+void test_mut_borrow_then_move_errors() {
+    expectErr("struct P { x: i64 }\n"
+              "fn write(p: &mut P) -> i64 { p.x }\n"
+              "fn consume(p: P) -> i64 { p.x }\n"
+              "fn main() -> i64 {\n"
+              "    let p = P { x: 7 };\n"
+              "    let m = &mut p;\n"
+              "    let a = consume(p);\n"
+              "    let b = write(m);\n"
+              "    a + b\n"
+              "}",
+              "mut_borrow_then_move_errors");
+}
+
 } // namespace
 
 int main() {
@@ -352,7 +468,15 @@ int main() {
     test_borrow_then_move_ok();
     test_borrow_of_moved_errors();
     test_ref_is_copy_ok();
-    std::cout << "All borrow_check tests passed (23 cases) — Phase 2.4b "
-                 "shared references\n";
+    test_nll_borrow_dies_before_move_ok();
+    test_nll_borrow_alive_across_move_errors();
+    test_two_shared_borrows_named_ok();
+    test_nll_shared_then_mut_ok();
+    test_mut_while_shared_errors();
+    test_two_mut_errors();
+    test_shared_while_mut_errors();
+    test_mut_borrow_then_move_errors();
+    std::cout << "All borrow_check tests passed (31 cases) — Phase 2.4c "
+                 "NLL + mutable references\n";
     return 0;
 }
