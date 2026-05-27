@@ -432,6 +432,242 @@ void test_dt_shared_outer_ctor() {
     expectEquals(v, 310, "dt_shared_outer_ctor");
 }
 
+// --- Phase 3.1: generic-function end-to-end codegen tests ---
+
+// Simplest possible monomorphization: a single generic `id<T>` instantiated
+// at i64. Verifies the lazy emission path produces a working `id__i64`
+// specialization that main() calls.
+void test_generic_identity_i64() {
+    auto v = compileAndRun(
+        "fn id<T>(x: T) -> T { x }\n"
+        "fn main() -> i64 { id(42) }",
+        "main", "generic_identity_i64");
+    expectEquals(v, 42, "generic_identity_i64");
+}
+
+// Two type parameters — exercises the mangler producing a multi-type
+// suffix (`first__i64_i64`) and the substitution map handling more than
+// one binding.
+void test_generic_two_params_returns_first() {
+    auto v = compileAndRun(
+        "fn first<A, B>(a: A, b: B) -> A { a }\n"
+        "fn main() -> i64 { first(7, 100) }",
+        "main", "generic_two_params_returns_first");
+    expectEquals(v, 7, "generic_two_params_returns_first");
+}
+
+// A generic function calling another generic function — emitCall inside
+// wrap<U>'s body must route to the right `id` specialization based on
+// the outer instance's substitution (U == i64 here, so id is instantiated
+// at i64).
+void test_generic_calling_generic() {
+    auto v = compileAndRun(
+        "fn id<T>(x: T) -> T { x }\n"
+        "fn wrap<U>(u: U) -> U { id(u) }\n"
+        "fn main() -> i64 { wrap(123) }",
+        "main", "generic_calling_generic");
+    expectEquals(v, 123, "generic_calling_generic");
+}
+
+// Two distinct instances of `id` — `id__Point` and `id__i64`. Confirms
+// pendingInstances_ tracks unique (fnName, [type args]) tuples and emits
+// both specializations.
+void test_generic_multiple_instances() {
+    auto v = compileAndRun(
+        "struct Point { x: i64, y: i64 }\n"
+        "fn id<T>(x: T) -> T { x }\n"
+        "fn main() -> i64 {\n"
+        "    let p = Point { x: 3, y: 4 };\n"
+        "    let q = id(p);\n"
+        "    let n = id(99);\n"
+        "    n + q.x\n"
+        "}",
+        "main", "generic_multiple_instances");
+    // 99 + 3 == 102
+    expectEquals(v, 102, "generic_multiple_instances");
+}
+
+// --- Phase 3.2: generic structs and enums end-to-end codegen ---
+
+// Simplest generic struct: Box<T> literal + field access at T = i64.
+void test_generic_struct_box() {
+    auto v = compileAndRun(
+        "struct Box<T> { value: T }\n"
+        "fn main() -> i64 { let b = Box { value: 42 }; b.value }",
+        "main", "generic_struct_box");
+    expectEquals(v, 42, "generic_struct_box");
+}
+
+// Generic enum with a single payload variant: Maybe<T> match at T = i64.
+void test_generic_enum_maybe_match() {
+    auto v = compileAndRun(
+        "enum Maybe<T> { Mk(T) }\n"
+        "fn main() -> i64 { let m = Mk(99); match m { Mk(v) => v } }",
+        "main", "generic_enum_maybe_match");
+    expectEquals(v, 99, "generic_enum_maybe_match");
+}
+
+// Generic function returning a generic struct: monomorphizes both
+// make_pair<i64,i64> and Pair<i64,i64>.
+void test_generic_fn_returns_generic_struct() {
+    auto v = compileAndRun(
+        "struct Pair<A, B> { first: A, second: B }\n"
+        "fn make_pair<X, Y>(x: X, y: Y) -> Pair<X, Y> {\n"
+        "    Pair { first: x, second: y }\n"
+        "}\n"
+        "fn main() -> i64 {\n"
+        "    let p = make_pair(7, 100);\n"
+        "    p.first + p.second\n"
+        "}",
+        "main", "generic_fn_returns_generic_struct");
+    expectEquals(v, 107, "generic_fn_returns_generic_struct");
+}
+
+// Option<T> with both Some and None branches exercised; verifies
+// instantiation reuse and that the None unit variant carries through.
+void test_generic_option_unwrap_or() {
+    auto v = compileAndRun(
+        "enum Option<T> { Some(T), None }\n"
+        "fn unwrap_or(o: Option<i64>, def: i64) -> i64 {\n"
+        "    match o { Some(v) => v, None => def }\n"
+        "}\n"
+        "fn main() -> i64 {\n"
+        "    let a = unwrap_or(Some(42), 0);\n"
+        "    let b = unwrap_or(None, 99);\n"
+        "    a + b\n"
+        "}",
+        "main", "generic_option_unwrap_or");
+    expectEquals(v, 141, "generic_option_unwrap_or");
+}
+
+// Two-parameter generic enum: Result<T, E> — both Ok and Err carry payloads.
+void test_generic_result_with_match() {
+    auto v = compileAndRun(
+        "enum Result<T, E> { Ok(T), Err(E) }\n"
+        "fn try_thing(n: i64) -> Result<i64, i64> {\n"
+        "    if n < 0 { Err(0 - n) } else { Ok(n + 100) }\n"
+        "}\n"
+        "fn main() -> i64 {\n"
+        "    match try_thing(7) { Ok(v) => v, Err(e) => 0 - e }\n"
+        "}",
+        "main", "generic_result_with_match");
+    expectEquals(v, 107, "generic_result_with_match");
+}
+
+// --- Phase 3.3: traits, impl blocks, method calls, bounded generics ---
+
+// Simplest trait+impl: Point.show() returns x + y.
+void test_trait_basic_show() {
+    auto v = compileAndRun(
+        "trait Show { fn show(self) -> i64; }\n"
+        "struct Point { x: i64, y: i64 }\n"
+        "impl Show for Point { fn show(self) -> i64 { self.x + self.y } }\n"
+        "fn main() -> i64 { let p = Point { x: 3, y: 4 }; p.show() }",
+        "main", "trait_basic_show");
+    expectEquals(v, 7, "trait_basic_show");
+}
+
+// Bounded generic <T: Show> dispatched at two different impl types.
+void test_trait_bounded_generic() {
+    auto v = compileAndRun(
+        "trait Show { fn show(self) -> i64; }\n"
+        "struct Point { x: i64, y: i64 }\n"
+        "struct Line { len: i64 }\n"
+        "impl Show for Point { fn show(self) -> i64 { self.x + self.y } }\n"
+        "impl Show for Line { fn show(self) -> i64 { self.len } }\n"
+        "fn use_show<T: Show>(t: T) -> i64 { t.show() }\n"
+        "fn main() -> i64 {\n"
+        "    let p = Point { x: 3, y: 4 };\n"
+        "    let l = Line { len: 100 };\n"
+        "    use_show(p) + use_show(l)\n"
+        "}",
+        "main", "trait_bounded_generic");
+    expectEquals(v, 107, "trait_bounded_generic");
+}
+
+// Trait with multiple methods; impl supplies both.
+void test_trait_multi_method() {
+    auto v = compileAndRun(
+        "trait Math { fn double(self) -> i64; fn square(self) -> i64; }\n"
+        "struct N { v: i64 }\n"
+        "impl Math for N {\n"
+        "    fn double(self) -> i64 { self.v + self.v }\n"
+        "    fn square(self) -> i64 { self.v * self.v }\n"
+        "}\n"
+        "fn main() -> i64 { let n = N { v: 5 }; n.double() + n.square() }",
+        "main", "trait_multi_method");
+    expectEquals(v, 35, "trait_multi_method");
+}
+
+// Method takes a non-self argument; receiver carries state.
+void test_trait_method_with_args() {
+    auto v = compileAndRun(
+        "trait Adder { fn add_with(self, x: i64) -> i64; }\n"
+        "struct N { v: i64 }\n"
+        "impl Adder for N { fn add_with(self, x: i64) -> i64 { self.v + x } }\n"
+        "fn main() -> i64 { let n = N { v: 10 }; n.add_with(32) }",
+        "main", "trait_method_with_args");
+    expectEquals(v, 42, "trait_method_with_args");
+}
+
+// --- Phase 3.4: postfix `?` (try) operator end-to-end codegen ---
+
+// Ok-path: `parse(7)?` yields 7; main observes Ok(14) and unwraps via match.
+void test_try_ok_path() {
+    auto v = compileAndRun(
+        "enum Result<T, E> { Ok(T), Err(E) }\n"
+        "fn parse(n: i64) -> Result<i64, i64> {\n"
+        "    if n < 0 { Err(0 - n) } else { Ok(n) }\n"
+        "}\n"
+        "fn double(n: i64) -> Result<i64, i64> {\n"
+        "    let x = parse(n)?;\n"
+        "    Ok(x + x)\n"
+        "}\n"
+        "fn main() -> i64 {\n"
+        "    match double(7) { Ok(v) => v, Err(e) => 1000 + e }\n"
+        "}",
+        "main", "try_ok_path");
+    expectEquals(v, 14, "try_ok_path");
+}
+
+// Err-path: parse(-5) returns Err(5); the `?` early-returns Err(5) from
+// double, and main's Err arm yields 1000 + 5 == 1005.
+void test_try_err_path() {
+    auto v = compileAndRun(
+        "enum Result<T, E> { Ok(T), Err(E) }\n"
+        "fn parse(n: i64) -> Result<i64, i64> {\n"
+        "    if n < 0 { Err(0 - n) } else { Ok(n) }\n"
+        "}\n"
+        "fn double(n: i64) -> Result<i64, i64> {\n"
+        "    let x = parse(n)?;\n"
+        "    Ok(x + x)\n"
+        "}\n"
+        "fn main() -> i64 {\n"
+        "    match double(0 - 5) { Ok(v) => v, Err(e) => 1000 + e }\n"
+        "}",
+        "main", "try_err_path");
+    expectEquals(v, 1005, "try_err_path");
+}
+
+// Three chained `?`s in sequence: x=5, each `step` adds 10. The Ok-path
+// runs through all three calls, yielding 5 + 30 == 35.
+void test_try_chained() {
+    auto v = compileAndRun(
+        "enum Result<T, E> { Ok(T), Err(E) }\n"
+        "fn step(x: i64) -> Result<i64, i64> { Ok(x + 10) }\n"
+        "fn run(x: i64) -> Result<i64, i64> {\n"
+        "    let a = step(x)?;\n"
+        "    let b = step(a)?;\n"
+        "    let c = step(b)?;\n"
+        "    Ok(c)\n"
+        "}\n"
+        "fn main() -> i64 {\n"
+        "    match run(5) { Ok(v) => v, Err(e) => 0 - e }\n"
+        "}",
+        "main", "try_chained");
+    expectEquals(v, 35, "try_chained");
+}
+
 } // namespace
 
 int main() {
@@ -466,6 +702,25 @@ int main() {
     test_enum_with_struct_payload();
     test_dt_10_arm_literal_match();
     test_dt_shared_outer_ctor();
-    std::cout << "All codegen tests passed (31 cases) — Phase 2.3c decision-tree codegen\n";
+    test_generic_identity_i64();
+    test_generic_two_params_returns_first();
+    test_generic_calling_generic();
+    test_generic_multiple_instances();
+    // Phase 3.2 generic structs and enums
+    test_generic_struct_box();
+    test_generic_enum_maybe_match();
+    test_generic_fn_returns_generic_struct();
+    test_generic_option_unwrap_or();
+    test_generic_result_with_match();
+    // Phase 3.3 traits + impl + bounded generics
+    test_trait_basic_show();
+    test_trait_bounded_generic();
+    test_trait_multi_method();
+    test_trait_method_with_args();
+    // Phase 3.4 try operator
+    test_try_ok_path();
+    test_try_err_path();
+    test_try_chained();
+    std::cout << "All codegen tests passed (47 cases) — Phase 3.3 traits + Phase 3.4 try\n";
     return 0;
 }

@@ -23,8 +23,13 @@ public:
                 prog.structs.push_back(parseStructDecl());
             } else if (check(TokenKind::KwEnum)) {
                 prog.enums.push_back(parseEnumDecl());
+            } else if (check(TokenKind::KwTrait)) {
+                prog.traits.push_back(parseTraitDecl());
+            } else if (check(TokenKind::KwImpl)) {
+                prog.impls.push_back(parseImplDecl());
             } else {
-                errorHere(std::string("expected 'fn', 'struct' or 'enum' at top level, got ") +
+                errorHere(std::string("expected 'fn', 'struct', 'enum', "
+                                      "'trait' or 'impl' at top level, got ") +
                           std::string(tokenKindName(peek().kind)));
                 advance();
             }
@@ -87,6 +92,11 @@ private:
         Token nameTok = expect(TokenKind::Identifier, "function name");
         decl.name = nameTok.lexeme;
 
+        // Generic params: `<T1, T2>`. The `<` here is unambiguous because it
+        // sits between an identifier and `(` in fn-decl position — there's no
+        // expression context to confuse with comparison.
+        decl.genericParams = parseOptionalGenericParams();
+
         expect(TokenKind::LParen, "(");
         if (!check(TokenKind::RParen)) {
             while (true) {
@@ -115,6 +125,7 @@ private:
 
         Token nameTok = expect(TokenKind::Identifier, "struct name");
         decl.name = nameTok.lexeme;
+        decl.genericParams = parseOptionalGenericParams();
 
         expect(TokenKind::LBrace, "{");
         if (!check(TokenKind::RBrace)) {
@@ -136,6 +147,7 @@ private:
 
         Token nameTok = expect(TokenKind::Identifier, "enum name");
         decl.name = nameTok.lexeme;
+        decl.genericParams = parseOptionalGenericParams();
 
         expect(TokenKind::LBrace, "{");
         if (!check(TokenKind::RBrace)) {
@@ -170,7 +182,151 @@ private:
 
     ast::TypeRef parseTypeRef() {
         Token t = expect(TokenKind::Identifier, "type name");
-        return {t.lexeme, t.line, t.column};
+        ast::TypeRef tr;
+        tr.name = t.lexeme;
+        tr.line = t.line;
+        tr.column = t.column;
+        // Optional type-args: `Name<T1, T2>`. Position is unambiguous because
+        // `<` immediately after an Ident in a type-ref slot can only be the
+        // start of a type-arg list (the alternative — comparison — never
+        // appears in a type-annotation slot, which is always preceded by
+        // `:` / `->` / `(` / `,`).
+        if (accept(TokenKind::Lt)) {
+            if (!check(TokenKind::Gt)) {
+                while (true) {
+                    tr.typeArgs.push_back(parseTypeRef());
+                    if (!accept(TokenKind::Comma)) break;
+                    if (check(TokenKind::Gt)) break; // trailing comma
+                }
+            }
+            expect(TokenKind::Gt, ">");
+        }
+        return tr;
+    }
+
+    // Helper for fn/struct/enum decls: parse optional `<T1, T2: Bound>`
+    // generic params after the type name. The optional `: TraitName`
+    // single-trait bound lands in TypeParam.bound; multiple bounds (`T:
+    // A + B`) aren't yet in the grammar.
+    std::vector<ast::TypeParam> parseOptionalGenericParams() {
+        std::vector<ast::TypeParam> result;
+        if (!accept(TokenKind::Lt)) return result;
+        if (!check(TokenKind::Gt)) {
+            while (true) {
+                Token tpTok = expect(TokenKind::Identifier,
+                                     "generic type parameter name");
+                ast::TypeParam tp;
+                tp.name = tpTok.lexeme;
+                tp.line = tpTok.line;
+                tp.column = tpTok.column;
+                if (accept(TokenKind::Colon)) {
+                    Token boundTok = expect(TokenKind::Identifier,
+                                             "trait name after ':'");
+                    tp.bound = boundTok.lexeme;
+                }
+                result.push_back(std::move(tp));
+                if (!accept(TokenKind::Comma)) break;
+                if (check(TokenKind::Gt)) break; // trailing comma
+            }
+        }
+        expect(TokenKind::Gt, ">");
+        return result;
+    }
+
+    ast::TraitDecl parseTraitDecl() {
+        Token traitTok = expect(TokenKind::KwTrait, "trait");
+        ast::TraitDecl decl;
+        decl.line = traitTok.line;
+        decl.column = traitTok.column;
+        Token nameTok = expect(TokenKind::Identifier, "trait name");
+        decl.name = nameTok.lexeme;
+        expect(TokenKind::LBrace, "{");
+        while (!check(TokenKind::RBrace) && !check(TokenKind::EndOfInput)) {
+            if (errors_.size() > 20) break;
+            decl.methods.push_back(parseMethodSig());
+        }
+        expect(TokenKind::RBrace, "}");
+        return decl;
+    }
+
+    ast::MethodSig parseMethodSig() {
+        Token fnTok = expect(TokenKind::KwFn, "fn");
+        ast::MethodSig sig;
+        sig.line = fnTok.line;
+        sig.column = fnTok.column;
+        Token nameTok = expect(TokenKind::Identifier, "method name");
+        sig.name = nameTok.lexeme;
+        expect(TokenKind::LParen, "(");
+        if (!check(TokenKind::RParen)) {
+            while (true) {
+                sig.params.push_back(parseSelfOrParam());
+                if (!accept(TokenKind::Comma)) break;
+            }
+        }
+        expect(TokenKind::RParen, ")");
+        expect(TokenKind::Arrow, "->");
+        sig.returnType = parseTypeRef();
+        expect(TokenKind::Semi, ";");
+        return sig;
+    }
+
+    // Trait/impl method first param is conventionally `self` (lowercase).
+    // We accept either `self` (without an explicit type — it implicitly
+    // becomes `Self`) or `name: Type` for additional params.
+    ast::Param parseSelfOrParam() {
+        const Token& t = peek();
+        if (t.kind == TokenKind::Identifier && t.lexeme == "self") {
+            Token selfTok = consume();
+            ast::Param p;
+            p.name = "self";
+            p.type.name = "Self";
+            p.type.line = selfTok.line;
+            p.type.column = selfTok.column;
+            return p;
+        }
+        return parseParam();
+    }
+
+    ast::ImplDecl parseImplDecl() {
+        Token implTok = expect(TokenKind::KwImpl, "impl");
+        ast::ImplDecl decl;
+        decl.line = implTok.line;
+        decl.column = implTok.column;
+        Token traitTok = expect(TokenKind::Identifier, "trait name");
+        decl.traitName = traitTok.lexeme;
+        expect(TokenKind::KwFor, "for");
+        decl.forType = parseTypeRef();
+        expect(TokenKind::LBrace, "{");
+        while (!check(TokenKind::RBrace) && !check(TokenKind::EndOfInput)) {
+            if (errors_.size() > 20) break;
+            decl.methods.push_back(parseImplFnDecl());
+        }
+        expect(TokenKind::RBrace, "}");
+        return decl;
+    }
+
+    // Like parseFnDecl but with parseSelfOrParam for the first param so
+    // the `self` shorthand works.
+    ast::FnDecl parseImplFnDecl() {
+        Token fnTok = expect(TokenKind::KwFn, "fn");
+        ast::FnDecl decl;
+        decl.line = fnTok.line;
+        decl.column = fnTok.column;
+        Token nameTok = expect(TokenKind::Identifier, "function name");
+        decl.name = nameTok.lexeme;
+        decl.genericParams = parseOptionalGenericParams();
+        expect(TokenKind::LParen, "(");
+        if (!check(TokenKind::RParen)) {
+            while (true) {
+                decl.params.push_back(parseSelfOrParam());
+                if (!accept(TokenKind::Comma)) break;
+            }
+        }
+        expect(TokenKind::RParen, ")");
+        expect(TokenKind::Arrow, "->");
+        decl.returnType = parseTypeRef();
+        decl.body = parseBlockExpr();
+        return decl;
     }
 
     // --- Block & statements ---
@@ -301,15 +457,51 @@ private:
 
     ast::ExprPtr parsePostfix() {
         auto expr = parsePrimary();
-        while (check(TokenKind::Dot)) {
-            Token dotTok = consume();
-            Token nameTok = expect(TokenKind::Identifier, "field name after '.'");
-            auto fe = std::make_unique<ast::FieldExpr>();
-            fe->line = dotTok.line;
-            fe->column = dotTok.column;
-            fe->object = std::move(expr);
-            fe->fieldName = nameTok.lexeme;
-            expr = std::move(fe);
+        while (true) {
+            if (check(TokenKind::Dot)) {
+                Token dotTok = consume();
+                Token nameTok = expect(TokenKind::Identifier, "field name after '.'");
+                // `.name(args)` is a method call; `.name` alone is field
+                // access. The distinction matters: method calls route
+                // through trait/impl resolution at typecheck time.
+                if (check(TokenKind::LParen)) {
+                    advance(); // consume '('
+                    auto mc = std::make_unique<ast::MethodCallExpr>();
+                    mc->line = dotTok.line;
+                    mc->column = dotTok.column;
+                    mc->receiver = std::move(expr);
+                    mc->methodName = nameTok.lexeme;
+                    bool prevCallRestrict = restrictStructLit_;
+                    restrictStructLit_ = false;
+                    if (!check(TokenKind::RParen)) {
+                        while (true) {
+                            mc->args.push_back(parseExpr());
+                            if (!accept(TokenKind::Comma)) break;
+                        }
+                    }
+                    restrictStructLit_ = prevCallRestrict;
+                    expect(TokenKind::RParen, ")");
+                    expr = std::move(mc);
+                    continue;
+                }
+                auto fe = std::make_unique<ast::FieldExpr>();
+                fe->line = dotTok.line;
+                fe->column = dotTok.column;
+                fe->object = std::move(expr);
+                fe->fieldName = nameTok.lexeme;
+                expr = std::move(fe);
+                continue;
+            }
+            if (check(TokenKind::Question)) {
+                Token qTok = consume();
+                auto te = std::make_unique<ast::TryExpr>();
+                te->line = qTok.line;
+                te->column = qTok.column;
+                te->operand = std::move(expr);
+                expr = std::move(te);
+                continue;
+            }
+            break;
         }
         return expr;
     }

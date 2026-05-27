@@ -4,6 +4,8 @@ bazel-*
 
 # Build artifacts
 build/
+build.local/
+Makefile.local
 *.o
 *.a
 *.so

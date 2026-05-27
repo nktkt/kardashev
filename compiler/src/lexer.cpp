@@ -23,6 +23,9 @@ TokenKind keywordOrIdent(std::string_view s) {
     if (s == "struct") return TokenKind::KwStruct;
     if (s == "enum") return TokenKind::KwEnum;
     if (s == "match") return TokenKind::KwMatch;
+    if (s == "trait") return TokenKind::KwTrait;
+    if (s == "impl") return TokenKind::KwImpl;
+    if (s == "for") return TokenKind::KwFor;
     // A bare `_` is the wildcard pattern; `_foo` stays an Identifier.
     if (s == "_") return TokenKind::Underscore;
     return TokenKind::Identifier;
@@ -146,6 +149,7 @@ std::vector<Token> lex(std::string_view source) {
         case ';': push1(TokenKind::Semi, startCol); continue;
         case ':': push1(TokenKind::Colon, startCol); continue;
         case '.': push1(TokenKind::Dot, startCol); continue;
+        case '?': push1(TokenKind::Question, startCol); continue;
         default: break;
         }
 
@@ -171,6 +175,9 @@ std::string_view tokenKindName(TokenKind kind) {
     case TokenKind::KwStruct: return "KwStruct";
     case TokenKind::KwEnum: return "KwEnum";
     case TokenKind::KwMatch: return "KwMatch";
+    case TokenKind::KwTrait: return "KwTrait";
+    case TokenKind::KwImpl: return "KwImpl";
+    case TokenKind::KwFor: return "KwFor";
     case TokenKind::Plus: return "Plus";
     case TokenKind::Minus: return "Minus";
     case TokenKind::Star: return "Star";
@@ -192,6 +199,7 @@ std::string_view tokenKindName(TokenKind kind) {
     case TokenKind::Semi: return "Semi";
     case TokenKind::Colon: return "Colon";
     case TokenKind::Dot: return "Dot";
+    case TokenKind::Question: return "Question";
     case TokenKind::Underscore: return "Underscore";
     case TokenKind::EndOfInput: return "EndOfInput";
     case TokenKind::Invalid: return "Invalid";

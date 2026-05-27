@@ -163,8 +163,8 @@ void test_struct_decl_exposed_in_result() {
         std::abort();
     }
     assert(r.structs.count("Point") == 1);
-    assert(r.structs["Point"]->kind == kardashev::TypeKind::Struct);
-    assert(r.structs["Point"]->structFields.size() == 2);
+    assert(r.structs["Point"].type->kind == kardashev::TypeKind::Struct);
+    assert(r.structs["Point"].type->structFields.size() == 2);
 }
 
 void test_duplicate_struct_decl() {
@@ -295,8 +295,8 @@ void test_enum_exposed_in_result() {
         std::abort();
     }
     assert(r.enums.count("Maybe") == 1);
-    assert(r.enums["Maybe"]->kind == kardashev::TypeKind::Enum);
-    assert(r.enums["Maybe"]->enumVariants.size() == 2);
+    assert(r.enums["Maybe"].type->kind == kardashev::TypeKind::Enum);
+    assert(r.enums["Maybe"].type->enumVariants.size() == 2);
     assert(r.variantIndex.count("Some") == 1);
     assert(r.variantIndex.count("None") == 1);
     assert(r.variantIndex["Some"].first == "Maybe");
@@ -780,6 +780,226 @@ void test_decision_tree_count_matches_match_count() {
     assert(r.matchTrees.size() == 2);
 }
 
+// ---- Phase 3.1: generic functions ----
+
+void test_generic_identity_ok() {
+    // Calling id<T> with an i64 arg should infer T = i64.
+    expectOk(
+        "fn id<T>(x: T) -> T { x }\n"
+        "fn main() -> i64 { id(42) }",
+        "generic_identity_ok");
+}
+
+void test_generic_two_params_ok() {
+    // Two independent generic params; return picks A.
+    expectOk(
+        "fn pair<A, B>(a: A, b: B) -> A { a }\n"
+        "fn run() -> i64 { pair(7, 8) }",
+        "generic_two_params_ok");
+}
+
+void test_generic_calls_generic_ok() {
+    // A generic fn calling another generic fn: U flows through to T via id.
+    expectOk(
+        "fn id<T>(x: T) -> T { x }\n"
+        "fn wrap<U>(u: U) -> U { id(u) }\n"
+        "fn run() -> i64 { wrap(9) }",
+        "generic_calls_generic_ok");
+}
+
+void test_generic_with_struct_arg_ok() {
+    // Instantiating T with a struct type and then accessing a field on the
+    // result of id(p) exercises Var-resolution through the call site.
+    expectOk(
+        "struct P { x: i64 }\n"
+        "fn id<T>(x: T) -> T { x }\n"
+        "fn run() -> i64 { let p = P { x: 7 }; id(p).x }",
+        "generic_with_struct_arg_ok");
+}
+
+void test_generic_dup_param_error() {
+    // Duplicate generic parameter name within the same fn is rejected at
+    // schema-registration time (Pass 1b).
+    expectErr(
+        "fn bad<T, T>(x: T) -> T { x }",
+        "generic_dup_param_error");
+}
+
+void test_generic_schema_recorded() {
+    // The result's fnSchemas map should record id with one generic Var.
+    auto pr = kardashev::parse("fn id<T>(x: T) -> T { x }");
+    assert(pr.ok());
+    auto r = kardashev::typecheck(pr.program);
+    if (!r.ok()) {
+        std::cerr << "[generic_schema_recorded] expected ok, got errors:\n";
+        dump(r);
+        std::abort();
+    }
+    auto it = r.fnSchemas.find("id");
+    assert(it != r.fnSchemas.end());
+    assert(it->second.genericVars.size() == 1);
+}
+
+// ---- Phase 3.2: generic structs and enums ----
+
+void test_generic_struct_decl_ok() {
+    auto pr = kardashev::parse("struct Box<T> { v: T }");
+    assert(pr.ok());
+    auto r = kardashev::typecheck(pr.program);
+    if (!r.ok()) {
+        std::cerr << "[generic_struct_decl_ok] expected ok, got errors:\n";
+        dump(r);
+        std::abort();
+    }
+    auto it = r.structs.find("Box");
+    assert(it != r.structs.end());
+    assert(it->second.genericVars.size() == 1);
+}
+
+void test_generic_struct_use_ok() {
+    expectOk(
+        "struct Box<T> { v: T }\n"
+        "fn main() -> i64 { let b = Box { v: 42 }; b.v }",
+        "generic_struct_use_ok");
+}
+
+void test_generic_enum_decl_ok() {
+    auto pr = kardashev::parse("enum Option<T> { Some(T), None }");
+    assert(pr.ok());
+    auto r = kardashev::typecheck(pr.program);
+    if (!r.ok()) {
+        std::cerr << "[generic_enum_decl_ok] expected ok, got errors:\n";
+        dump(r);
+        std::abort();
+    }
+    auto it = r.enums.find("Option");
+    assert(it != r.enums.end());
+    assert(it->second.genericVars.size() == 1);
+}
+
+void test_generic_enum_match_ok() {
+    expectOk(
+        "enum Option<T> { Some(T), None }\n"
+        "fn unwrap_or(o: Option<i64>, def: i64) -> i64 {\n"
+        "    match o { Some(v) => v, None => def }\n"
+        "}",
+        "generic_enum_match_ok");
+}
+
+void test_generic_type_arity_mismatch() {
+    expectErr(
+        "struct Box<T> { v: T }\n"
+        "fn f(b: Box<i64, bool>) -> i64 { 0 }",
+        "generic_type_arity_mismatch");
+}
+
+void test_generic_type_unknown_param() {
+    expectErr(
+        "struct Box<T> { v: T }\n"
+        "fn f(b: Box) -> i64 { 0 }",
+        "generic_type_unknown_param");
+}
+
+// ---- Phase 3.3: traits, impls, method calls, bounded generics ----
+
+void test_trait_basic_ok() {
+    expectOk(
+        "trait Show { fn show(self) -> i64; }\n"
+        "struct Point { x: i64, y: i64 }\n"
+        "impl Show for Point { fn show(self) -> i64 { self.x + self.y } }\n"
+        "fn main() -> i64 { let p = Point { x: 3, y: 4 }; p.show() }",
+        "trait_basic_ok");
+}
+
+void test_bounded_generic_fn_ok() {
+    expectOk(
+        "trait Show { fn show(self) -> i64; }\n"
+        "struct Point { x: i64, y: i64 }\n"
+        "impl Show for Point { fn show(self) -> i64 { self.x + self.y } }\n"
+        "fn use_show<T: Show>(t: T) -> i64 { t.show() }\n"
+        "fn main() -> i64 {\n"
+        "    let p = Point { x: 3, y: 4 };\n"
+        "    use_show(p)\n"
+        "}",
+        "bounded_generic_fn_ok");
+}
+
+void test_method_on_unbounded_generic_errors() {
+    // No bound on T, so `t.show()` cannot be resolved.
+    expectErr(
+        "trait Show { fn show(self) -> i64; }\n"
+        "fn f<T>(t: T) -> i64 { t.show() }",
+        "method_on_unbounded_generic_errors");
+}
+
+void test_method_not_in_trait_errors() {
+    // T is bounded by Show, but `nope` is not a method of Show.
+    expectErr(
+        "trait Show { fn show(self) -> i64; }\n"
+        "fn f<T: Show>(t: T) -> i64 { t.nope() }",
+        "method_not_in_trait_errors");
+}
+
+void test_impl_missing_method_errors() {
+    expectErr(
+        "trait Show { fn show(self) -> i64; }\n"
+        "struct P { x: i64 }\n"
+        "impl Show for P { }",
+        "impl_missing_method_errors");
+}
+
+// ---- Phase 3.4: postfix `?` (try) operator ----
+
+void test_try_basic_ok() {
+    // Enclosing fn returns a Result-shape enum; `parse(n)?` extracts the Ok
+    // payload (i64) and propagates Err.
+    expectOk(
+        "enum Result<T, E> { Ok(T), Err(E) }\n"
+        "fn parse(n: i64) -> Result<i64, i64> { Ok(n) }\n"
+        "fn use_it(n: i64) -> Result<i64, i64> {\n"
+        "    let x = parse(n)?;\n"
+        "    Ok(x)\n"
+        "}",
+        "try_basic_ok");
+}
+
+void test_try_outside_fn_with_result_errors() {
+    // Enclosing fn returns i64, not a Result-shape enum → `?` is illegal here.
+    expectErr(
+        "enum Result<T, E> { Ok(T), Err(E) }\n"
+        "fn parse(n: i64) -> Result<i64, i64> { Ok(n) }\n"
+        "fn caller(n: i64) -> i64 {\n"
+        "    let x = parse(n)?;\n"
+        "    x\n"
+        "}",
+        "try_outside_fn_with_result_errors");
+}
+
+void test_try_on_non_result_enum_errors() {
+    // Operand is an enum without an Err variant.
+    expectErr(
+        "enum Result<T, E> { Ok(T), Err(E) }\n"
+        "enum Foo { A(i64), B }\n"
+        "fn f() -> Result<i64, i64> {\n"
+        "    let x = A(7)?;\n"
+        "    Ok(x)\n"
+        "}",
+        "try_on_non_result_enum_errors");
+}
+
+void test_try_err_payload_mismatch_errors() {
+    // Operand's Err carries i64; enclosing fn's Err carries bool — mismatch.
+    expectErr(
+        "enum ResI { Ok(i64), Err(i64) }\n"
+        "enum ResB { Ok(i64), Err(bool) }\n"
+        "fn produce(n: i64) -> ResI { Ok(n) }\n"
+        "fn consume(n: i64) -> ResB {\n"
+        "    let x = produce(n)?;\n"
+        "    Ok(x)\n"
+        "}",
+        "try_err_payload_mismatch_errors");
+}
+
 } // namespace
 
 int main() {
@@ -861,6 +1081,31 @@ int main() {
     test_redundant_wildcard_before_color();
     test_decision_tree_stored_for_match();
     test_decision_tree_count_matches_match_count();
-    std::cout << "All typecheck tests passed (74 cases)\n";
+    // Phase 3.1 generic functions
+    test_generic_identity_ok();
+    test_generic_two_params_ok();
+    test_generic_calls_generic_ok();
+    test_generic_with_struct_arg_ok();
+    test_generic_dup_param_error();
+    test_generic_schema_recorded();
+    // Phase 3.2 generic structs and enums
+    test_generic_struct_decl_ok();
+    test_generic_struct_use_ok();
+    test_generic_enum_decl_ok();
+    test_generic_enum_match_ok();
+    test_generic_type_arity_mismatch();
+    test_generic_type_unknown_param();
+    // Phase 3.3 traits + impl + bounded generics
+    test_trait_basic_ok();
+    test_bounded_generic_fn_ok();
+    test_method_on_unbounded_generic_errors();
+    test_method_not_in_trait_errors();
+    test_impl_missing_method_errors();
+    // Phase 3.4 try operator
+    test_try_basic_ok();
+    test_try_outside_fn_with_result_errors();
+    test_try_on_non_result_enum_errors();
+    test_try_err_payload_mismatch_errors();
+    std::cout << "All typecheck tests passed (95 cases)\n";
     return 0;
 }

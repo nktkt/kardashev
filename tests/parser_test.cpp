@@ -534,6 +534,313 @@ void test_mixed_program_enum_and_fn() {
     assert(me->arms.size() == 2);
 }
 
+void test_fn_decl_single_generic() {
+    auto r = parse("fn id<T>(x: T) -> T { x }");
+    if (!r.ok()) {
+        std::cerr << "parse failed:\n";
+        for (const auto& e : r.errors) {
+            std::cerr << "  " << e.line << ":" << e.column << ": " << e.message
+                      << '\n';
+        }
+        std::abort();
+    }
+    assert(r.program.functions.size() == 1);
+    const auto& fn = r.program.functions[0];
+    assert(fn.name == "id");
+    assert(fn.genericParams.size() == 1);
+    assert(fn.genericParams[0].name == "T");
+    assert(fn.params.size() == 1);
+    assert(fn.params[0].name == "x");
+    assert(fn.params[0].type.name == "T");
+    assert(fn.returnType.name == "T");
+}
+
+void test_fn_decl_multi_generic() {
+    auto r = parse("fn pair<A, B>(a: A, b: B) -> A { a }");
+    if (!r.ok()) {
+        std::cerr << "parse failed:\n";
+        for (const auto& e : r.errors) {
+            std::cerr << "  " << e.line << ":" << e.column << ": " << e.message
+                      << '\n';
+        }
+        std::abort();
+    }
+    assert(r.program.functions.size() == 1);
+    const auto& fn = r.program.functions[0];
+    assert(fn.name == "pair");
+    assert(fn.genericParams.size() == 2);
+    assert(fn.genericParams[0].name == "A");
+    assert(fn.genericParams[1].name == "B");
+    assert(fn.params.size() == 2);
+    assert(fn.params[0].name == "a" && fn.params[0].type.name == "A");
+    assert(fn.params[1].name == "b" && fn.params[1].type.name == "B");
+    assert(fn.returnType.name == "A");
+}
+
+void test_fn_decl_no_generic_still_works() {
+    auto r = parse("fn add(a: i64, b: i64) -> i64 { a + b }");
+    if (!r.ok()) {
+        std::cerr << "parse failed:\n";
+        for (const auto& e : r.errors) {
+            std::cerr << "  " << e.line << ":" << e.column << ": " << e.message
+                      << '\n';
+        }
+        std::abort();
+    }
+    assert(r.program.functions.size() == 1);
+    const auto& fn = r.program.functions[0];
+    assert(fn.name == "add");
+    assert(fn.genericParams.empty());
+    assert(fn.params.size() == 2);
+    assert(fn.returnType.name == "i64");
+}
+
+void test_fn_decl_generic_trailing_comma() {
+    auto r = parse("fn id<T,>(x: T) -> T { x }");
+    if (!r.ok()) {
+        std::cerr << "parse failed:\n";
+        for (const auto& e : r.errors) {
+            std::cerr << "  " << e.line << ":" << e.column << ": " << e.message
+                      << '\n';
+        }
+        std::abort();
+    }
+    assert(r.program.functions.size() == 1);
+    const auto& fn = r.program.functions[0];
+    assert(fn.name == "id");
+    assert(fn.genericParams.size() == 1);
+    assert(fn.genericParams[0].name == "T");
+}
+
+void test_struct_decl_with_generic_param() {
+    auto r = parse("struct Box<T> { v: T }");
+    if (!r.ok()) {
+        std::cerr << "parse failed:\n";
+        for (const auto& e : r.errors) {
+            std::cerr << "  " << e.line << ":" << e.column << ": " << e.message
+                      << '\n';
+        }
+        std::abort();
+    }
+    assert(r.program.structs.size() == 1);
+    const auto& s = r.program.structs[0];
+    assert(s.name == "Box");
+    assert(s.genericParams.size() == 1);
+    assert(s.genericParams[0].name == "T");
+    assert(s.fields.size() == 1);
+    assert(s.fields[0].name == "v");
+    assert(s.fields[0].type.name == "T");
+    assert(s.fields[0].type.typeArgs.empty());
+}
+
+void test_enum_decl_with_generic_params() {
+    auto r = parse("enum Result<T, E> { Ok(T), Err(E) }");
+    if (!r.ok()) {
+        std::cerr << "parse failed:\n";
+        for (const auto& e : r.errors) {
+            std::cerr << "  " << e.line << ":" << e.column << ": " << e.message
+                      << '\n';
+        }
+        std::abort();
+    }
+    assert(r.program.enums.size() == 1);
+    const auto& e = r.program.enums[0];
+    assert(e.name == "Result");
+    assert(e.genericParams.size() == 2);
+    assert(e.genericParams[0].name == "T");
+    assert(e.genericParams[1].name == "E");
+    assert(e.variants.size() == 2);
+    assert(e.variants[0].name == "Ok");
+    assert(e.variants[0].payloadTypes.size() == 1);
+    assert(e.variants[0].payloadTypes[0].name == "T");
+    assert(e.variants[1].name == "Err");
+    assert(e.variants[1].payloadTypes.size() == 1);
+    assert(e.variants[1].payloadTypes[0].name == "E");
+}
+
+void test_typeref_with_typeargs() {
+    auto r = parse("fn f(x: Box<i64>) -> Box<i64> { x }");
+    if (!r.ok()) {
+        std::cerr << "parse failed:\n";
+        for (const auto& e : r.errors) {
+            std::cerr << "  " << e.line << ":" << e.column << ": " << e.message
+                      << '\n';
+        }
+        std::abort();
+    }
+    assert(r.program.functions.size() == 1);
+    const auto& fn = r.program.functions[0];
+    assert(fn.params.size() == 1);
+    const auto& pt = fn.params[0].type;
+    assert(pt.name == "Box");
+    assert(pt.typeArgs.size() == 1);
+    assert(pt.typeArgs[0].name == "i64");
+    assert(pt.typeArgs[0].typeArgs.empty());
+    const auto& rt = fn.returnType;
+    assert(rt.name == "Box");
+    assert(rt.typeArgs.size() == 1);
+    assert(rt.typeArgs[0].name == "i64");
+}
+
+void test_nested_typeref_typeargs() {
+    auto r = parse("fn f(x: Pair<Box<i64>, bool>) -> i64 { 0 }");
+    if (!r.ok()) {
+        std::cerr << "parse failed:\n";
+        for (const auto& e : r.errors) {
+            std::cerr << "  " << e.line << ":" << e.column << ": " << e.message
+                      << '\n';
+        }
+        std::abort();
+    }
+    assert(r.program.functions.size() == 1);
+    const auto& fn = r.program.functions[0];
+    assert(fn.params.size() == 1);
+    const auto& pt = fn.params[0].type;
+    assert(pt.name == "Pair");
+    assert(pt.typeArgs.size() == 2);
+    // typeArgs[0] is Box<i64>
+    const auto& a0 = pt.typeArgs[0];
+    assert(a0.name == "Box");
+    assert(a0.typeArgs.size() == 1);
+    assert(a0.typeArgs[0].name == "i64");
+    assert(a0.typeArgs[0].typeArgs.empty());
+    // typeArgs[1] is bool
+    const auto& a1 = pt.typeArgs[1];
+    assert(a1.name == "bool");
+    assert(a1.typeArgs.empty());
+}
+
+// ---- Phase 3.3: traits, impl blocks, method calls, bounded generics ----
+
+void test_trait_decl_one_method() {
+    auto r = parse("trait Show { fn show(self) -> i64; }");
+    if (!r.ok()) {
+        std::cerr << "parse failed:\n";
+        for (const auto& e : r.errors) {
+            std::cerr << "  " << e.line << ":" << e.column << ": " << e.message
+                      << '\n';
+        }
+        std::abort();
+    }
+    assert(r.program.traits.size() == 1);
+    const auto& tr = r.program.traits[0];
+    assert(tr.name == "Show");
+    assert(tr.methods.size() == 1);
+    const auto& m = tr.methods[0];
+    assert(m.name == "show");
+    assert(m.params.size() == 1);
+    assert(m.params[0].name == "self");
+    assert(m.params[0].type.name == "Self");
+    assert(m.returnType.name == "i64");
+}
+
+void test_impl_decl_basic() {
+    auto r = parse(
+        "struct P{x:i64} trait Show{fn show(self)->i64;} "
+        "impl Show for P{fn show(self)->i64{self.x}}");
+    if (!r.ok()) {
+        std::cerr << "parse failed:\n";
+        for (const auto& e : r.errors) {
+            std::cerr << "  " << e.line << ":" << e.column << ": " << e.message
+                      << '\n';
+        }
+        std::abort();
+    }
+    assert(r.program.impls.size() == 1);
+    const auto& im = r.program.impls[0];
+    assert(im.traitName == "Show");
+    assert(im.forType.name == "P");
+    assert(im.methods.size() == 1);
+    assert(im.methods[0].name == "show");
+}
+
+void test_typeparam_with_bound() {
+    auto r = parse(
+        "trait T{fn x(self)->i64;} "
+        "fn use_t<T: T>(t: T) -> i64 { 0 }");
+    if (!r.ok()) {
+        std::cerr << "parse failed:\n";
+        for (const auto& e : r.errors) {
+            std::cerr << "  " << e.line << ":" << e.column << ": " << e.message
+                      << '\n';
+        }
+        std::abort();
+    }
+    assert(r.program.functions.size() == 1);
+    const auto& fn = r.program.functions[0];
+    assert(fn.name == "use_t");
+    assert(fn.genericParams.size() == 1);
+    assert(fn.genericParams[0].name == "T");
+    assert(fn.genericParams[0].bound == "T");
+}
+
+void test_method_call_distinguishes_field() {
+    // `p.x.foo() + p.y` — assert the tail expression's structure exactly:
+    //   BinaryExpr(Add,
+    //              MethodCallExpr(FieldExpr(p,"x"), "foo"),
+    //              FieldExpr(p, "y"))
+    auto r = parse("fn f(p: P) -> i64 { p.x.foo() + p.y }");
+    if (!r.ok()) {
+        std::cerr << "parse failed:\n";
+        for (const auto& e : r.errors) {
+            std::cerr << "  " << e.line << ":" << e.column << ": " << e.message
+                      << '\n';
+        }
+        std::abort();
+    }
+    assert(r.program.functions.size() == 1);
+    const auto& fn = r.program.functions[0];
+    assert(fn.body && fn.body->tail);
+    const auto* bin = dynamic_cast<const ast::BinaryExpr*>(fn.body->tail.get());
+    assert(bin != nullptr);
+    assert(bin->op == ast::BinOp::Add);
+    // LHS: p.x.foo()  -> MethodCallExpr(FieldExpr(p,"x"), "foo")
+    const auto* mcall = dynamic_cast<const ast::MethodCallExpr*>(bin->lhs.get());
+    assert(mcall != nullptr);
+    assert(mcall->methodName == "foo");
+    assert(mcall->args.empty());
+    const auto* recv = dynamic_cast<const ast::FieldExpr*>(mcall->receiver.get());
+    assert(recv != nullptr);
+    assert(recv->fieldName == "x");
+    const auto* recvObj = dynamic_cast<const ast::IdentExpr*>(recv->object.get());
+    assert(recvObj && recvObj->name == "p");
+    // RHS: p.y  -> FieldExpr(p, "y") (NOT a MethodCallExpr)
+    const auto* rfe = dynamic_cast<const ast::FieldExpr*>(bin->rhs.get());
+    assert(rfe != nullptr);
+    assert(rfe->fieldName == "y");
+    const auto* rfeObj = dynamic_cast<const ast::IdentExpr*>(rfe->object.get());
+    assert(rfeObj && rfeObj->name == "p");
+    // Confirm it isn't accidentally a MethodCallExpr.
+    assert(dynamic_cast<const ast::MethodCallExpr*>(bin->rhs.get()) == nullptr);
+}
+
+// ---- Phase 3.4: postfix `?` (try) operator ----
+
+void test_try_postfix() {
+    // `foo()?` parses as TryExpr(CallExpr(foo)).
+    auto r = parseWrapped("foo()?");
+    const auto* tryE = dynamic_cast<const ast::TryExpr*>(tailExprOf(r));
+    assert(tryE != nullptr);
+    const auto* call = dynamic_cast<const ast::CallExpr*>(tryE->operand.get());
+    assert(call != nullptr);
+    assert(call->callee == "foo");
+    assert(call->args.empty());
+}
+
+void test_try_chained_after_dot() {
+    // `foo().bar?` parses as TryExpr(FieldExpr(CallExpr(foo), "bar")).
+    auto r = parseWrapped("foo().bar?");
+    const auto* tryE = dynamic_cast<const ast::TryExpr*>(tailExprOf(r));
+    assert(tryE != nullptr);
+    const auto* field = dynamic_cast<const ast::FieldExpr*>(tryE->operand.get());
+    assert(field != nullptr);
+    assert(field->fieldName == "bar");
+    const auto* call = dynamic_cast<const ast::CallExpr*>(field->object.get());
+    assert(call != nullptr);
+    assert(call->callee == "foo");
+    assert(call->args.empty());
+}
+
 } // namespace
 
 int main() {
@@ -576,6 +883,22 @@ int main() {
     test_match_scrutinee_struct_lit_parenthesized();
     test_match_trailing_comma();
     test_mixed_program_enum_and_fn();
-    std::cout << "All parser tests passed (37 cases)\n";
+    test_fn_decl_single_generic();
+    test_fn_decl_multi_generic();
+    test_fn_decl_no_generic_still_works();
+    test_fn_decl_generic_trailing_comma();
+    test_struct_decl_with_generic_param();
+    test_enum_decl_with_generic_params();
+    test_typeref_with_typeargs();
+    test_nested_typeref_typeargs();
+    // Phase 3.3 traits + impl + bounded generics
+    test_trait_decl_one_method();
+    test_impl_decl_basic();
+    test_typeparam_with_bound();
+    test_method_call_distinguishes_field();
+    // Phase 3.4 try operator
+    test_try_postfix();
+    test_try_chained_after_dot();
+    std::cout << "All parser tests passed (51 cases)\n";
     return 0;
 }

@@ -1,8 +1,17 @@
 // Untyped AST for the kardashev V1 surface syntax.
 //
 // Grammar (informal):
-//   program       := (fn_decl | struct_decl | enum_decl)*
-//   fn_decl       := 'fn' Ident '(' params? ')' '->' type_ref block_expr
+//   program       := (fn_decl | struct_decl | enum_decl | trait_decl | impl_decl)*
+//   fn_decl       := 'fn' Ident generic_params? '(' params? ')' '->' type_ref block_expr
+//   generic_params:= '<' generic_param (',' generic_param)* ','? '>'
+//   generic_param := Ident (':' Ident)?           -- optional single-trait bound
+//   trait_decl    := 'trait' Ident '{' method_sig* '}'
+//   method_sig    := 'fn' Ident '(' params? ')' '->' type_ref ';'
+//   impl_decl     := 'impl' Ident 'for' type_ref '{' fn_decl* '}'
+//   type_ref      := Ident type_args?
+//   type_args     := '<' type_ref (',' type_ref)* ','? '>'
+//   postfix       := primary ( '.' Ident method_call_args? | '?' )*
+//   method_call_args := '(' arglist? ')'
 //   struct_decl   := 'struct' Ident '{' field_decl (',' field_decl)* ','? '}'
 //   field_decl    := Ident ':' type_ref
 //   enum_decl     := 'enum' Ident '{' (variant (',' variant)* ','?)? '}'
@@ -152,6 +161,15 @@ struct MatchArm {
     std::size_t column = 1;
 };
 
+// Phase 3.4: `expr?` postfix. Desugars (in codegen) to `match expr { Ok(v)
+// => v, Err(e) => return Err(e) }`. The typechecker enforces that `expr`
+// is an enum with `Ok(T)` and `Err(E)` variants and that the enclosing
+// function returns an enum with an `Err(E)`-compatible variant. The
+// TryExpr's own type is the operand's `Ok` payload type.
+struct TryExpr : Expr {
+    ExprPtr operand;
+};
+
 struct MatchExpr : Expr {
     ExprPtr scrutinee;
     std::vector<MatchArm> arms;
@@ -174,8 +192,15 @@ struct ExprStmt : Stmt {
 
 // --- Top-level ---
 
+// `Option<i64>` parses as TypeRef{name="Option", typeArgs=[{name="i64"}]}.
+// Empty `typeArgs` means a bare type reference; the typechecker rejects
+// type-args on names that don't denote a generic type and rejects missing
+// type-args on names that do. Type parameter names (e.g. `T` inside
+// `fn id<T>(x: T)`) are written as bare `Ident` references and resolved
+// against the enclosing fn/struct/enum's generic-param env first.
 struct TypeRef {
     std::string name;
+    std::vector<TypeRef> typeArgs;
     std::size_t line = 1;
     std::size_t column = 1;
 };
@@ -185,8 +210,20 @@ struct Param {
     TypeRef type;
 };
 
+// A generic type parameter binding, e.g. `T` in `fn id<T>(x: T) -> T` or
+// `T: Show` in `fn use_show<T: Show>(t: T) -> i64`. Phase 3.3 adds a
+// single optional trait bound per param; multiple bounds (`T: A + B`)
+// can wait for a later phase.
+struct TypeParam {
+    std::string name;
+    std::string bound; // empty = unbounded
+    std::size_t line = 1;
+    std::size_t column = 1;
+};
+
 struct FnDecl {
     std::string name;
+    std::vector<TypeParam> genericParams; // empty = monomorphic fn
     std::vector<Param> params;
     TypeRef returnType;
     std::unique_ptr<BlockExpr> body;
@@ -196,6 +233,7 @@ struct FnDecl {
 
 struct StructDecl {
     std::string name;
+    std::vector<TypeParam> genericParams; // empty = monomorphic struct
     std::vector<Param> fields;
     std::size_t line = 1;
     std::size_t column = 1;
@@ -210,15 +248,58 @@ struct EnumVariant {
 
 struct EnumDecl {
     std::string name;
+    std::vector<TypeParam> genericParams; // empty = monomorphic enum
     std::vector<EnumVariant> variants;
     std::size_t line = 1;
     std::size_t column = 1;
+};
+
+// Trait method signature (declaration without a body). The first param
+// is conventionally named `self` and has type `Self`; the parser stores
+// it as a regular Param with TypeRef name "Self" so downstream code can
+// rebind the name to the implementing type at use sites.
+struct MethodSig {
+    std::string name;
+    std::vector<Param> params;
+    TypeRef returnType;
+    std::size_t line = 1;
+    std::size_t column = 1;
+};
+
+struct TraitDecl {
+    std::string name;
+    std::vector<MethodSig> methods;
+    std::size_t line = 1;
+    std::size_t column = 1;
+};
+
+// `impl TraitName for TypeRef { fn ... ... }`. The `forType` is a full
+// TypeRef so it can be a generic instantiation (e.g. `Box<i64>`); the
+// typechecker validates that each method's signature matches the trait's
+// after substituting Self -> forType.
+struct ImplDecl {
+    std::string traitName;
+    TypeRef forType;
+    std::vector<FnDecl> methods;
+    std::size_t line = 1;
+    std::size_t column = 1;
+};
+
+// Phase 3.3: postfix method call `receiver.methodName(args)`. Parsed as
+// a distinct AST node so the typechecker can route through trait /
+// impl resolution rather than the regular `Ident -> CallExpr` path.
+struct MethodCallExpr : Expr {
+    ExprPtr receiver;
+    std::string methodName;
+    std::vector<ExprPtr> args;
 };
 
 struct Program {
     std::vector<FnDecl> functions;
     std::vector<StructDecl> structs;
     std::vector<EnumDecl> enums;
+    std::vector<TraitDecl> traits;
+    std::vector<ImplDecl> impls;
 };
 
 } // namespace kardashev::ast

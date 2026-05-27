@@ -20,29 +20,42 @@ public:
         //   (ii) resolve the field types / variant payload types now that
         //        every name is bound. Mutate the entries in-place.
         //
-        // Phase (i): opaque registration.
+        // Phase (i): opaque registration. Each struct/enum reserves an
+        // entry with empty body and (for generics) a fresh schema Var per
+        // declared type parameter; the schema's `typeArgs` stays empty
+        // (typeArgs are filled only at *use* sites, never on the schema).
         for (const auto& sd : program.structs) {
-            if (structs_.count(sd.name) || enums_.count(sd.name)) {
+            if (structSchemas_.count(sd.name) ||
+                enumSchemas_.count(sd.name)) {
                 error("struct redefined: " + sd.name, sd.line, sd.column);
                 continue;
             }
-            structs_[sd.name] = makeStruct(sd.name, {});
+            structSchemas_[sd.name] =
+                buildSchemaShell<StructSchema>(sd.name, sd.genericParams,
+                                                 /*isStruct=*/true);
         }
         for (const auto& ed : program.enums) {
-            if (structs_.count(ed.name) || enums_.count(ed.name)) {
+            if (structSchemas_.count(ed.name) ||
+                enumSchemas_.count(ed.name)) {
                 error("enum redefined: " + ed.name, ed.line, ed.column);
                 continue;
             }
-            enums_[ed.name] = makeEnum(ed.name, {});
+            enumSchemas_[ed.name] =
+                buildSchemaShell<EnumSchema>(ed.name, ed.genericParams,
+                                              /*isStruct=*/false);
         }
 
         // Phase (ii): resolve struct field types and enum variant payloads.
+        // For generic types the schema's per-decl generic env is active
+        // while resolving the field / payload TypeRefs, so a `T` in
+        // `struct Box<T> { value: T }` resolves to the schema Var.
         for (const auto& sd : program.structs) {
-            auto it = structs_.find(sd.name);
-            if (it == structs_.end()) continue; // duplicate
-            // Only resolve fields once: if the registered entry was already
-            // populated by a previous decl with the same name, skip.
-            if (!it->second->structFields.empty()) continue;
+            auto it = structSchemas_.find(sd.name);
+            if (it == structSchemas_.end()) continue; // duplicate
+            if (!it->second.type->structFields.empty()) continue;
+            GenericEnv genEnv = buildGenericEnv(sd.genericParams,
+                                                  it->second.genericVars);
+            currentGenericEnv_ = &genEnv;
             std::vector<std::pair<std::string, TypePtr>> resolvedFields;
             resolvedFields.reserve(sd.fields.size());
             std::unordered_set<std::string> seen;
@@ -55,13 +68,17 @@ public:
                 }
                 resolvedFields.emplace_back(f.name, resolveTypeRef(f.type));
             }
-            it->second->structFields = std::move(resolvedFields);
+            it->second.type->structFields = std::move(resolvedFields);
+            currentGenericEnv_ = nullptr;
         }
 
         for (const auto& ed : program.enums) {
-            auto it = enums_.find(ed.name);
-            if (it == enums_.end()) continue; // duplicate
-            if (!it->second->enumVariants.empty()) continue;
+            auto it = enumSchemas_.find(ed.name);
+            if (it == enumSchemas_.end()) continue; // duplicate
+            if (!it->second.type->enumVariants.empty()) continue;
+            GenericEnv genEnv = buildGenericEnv(ed.genericParams,
+                                                  it->second.genericVars);
+            currentGenericEnv_ = &genEnv;
             std::vector<EnumVariantType> resolvedVariants;
             resolvedVariants.reserve(ed.variants.size());
             std::unordered_set<std::string> seenVariant;
@@ -98,65 +115,515 @@ public:
                                          static_cast<unsigned>(
                                              resolvedVariants.size() - 1)};
             }
-            it->second->enumVariants = std::move(resolvedVariants);
+            it->second.type->enumVariants = std::move(resolvedVariants);
+            currentGenericEnv_ = nullptr;
+        }
+
+        // Pass 1c: register trait declarations. Each trait gets a global
+        // entry with its method signatures, used later to validate impl
+        // blocks and to type-check method calls through bounded generic
+        // params.
+        for (const auto& td : program.traits) {
+            if (traits_.count(td.name)) {
+                error("trait redefined: " + td.name, td.line, td.column);
+                continue;
+            }
+            std::unordered_set<std::string> seenMethod;
+            std::vector<ast::MethodSig> uniqueMethods;
+            uniqueMethods.reserve(td.methods.size());
+            for (const auto& m : td.methods) {
+                if (!seenMethod.insert(m.name).second) {
+                    error("duplicate method '" + m.name + "' in trait '" +
+                              td.name + "'",
+                          m.line, m.column);
+                    continue;
+                }
+                if (m.params.empty() || m.params[0].name != "self" ||
+                    m.params[0].type.name != "Self") {
+                    error("trait method '" + m.name + "' must take `self` "
+                          "as its first parameter",
+                          m.line, m.column);
+                }
+                uniqueMethods.push_back(m);
+            }
+            traits_[td.name] = std::move(uniqueMethods);
+        }
+
+        // Pass 1d: register impl blocks. We resolve the implementing type
+        // and validate that each impl method's signature matches the
+        // trait's after substituting Self -> implementing type.
+        // monomorphic-only in Phase 3.3 MVP: forType must resolve to a
+        // concrete (no Vars) Struct or Enum.
+        for (std::size_t implIdx = 0; implIdx < program.impls.size();
+             ++implIdx) {
+            const auto& impl = program.impls[implIdx];
+            auto traitIt = traits_.find(impl.traitName);
+            if (traitIt == traits_.end()) {
+                error("impl references unknown trait '" + impl.traitName + "'",
+                      impl.line, impl.column);
+                continue;
+            }
+            TypePtr forTy = resolveTypeRef(impl.forType);
+            TypePtr rfor = resolve(forTy);
+            std::string typeName;
+            if (rfor->kind == TypeKind::Struct) typeName = rfor->structName;
+            else if (rfor->kind == TypeKind::Enum) typeName = rfor->enumName;
+            else if (rfor->kind == TypeKind::Int) typeName = "i64";
+            else if (rfor->kind == TypeKind::Bool) typeName = "bool";
+            else {
+                error("impl for unsupported type " + typeToString(forTy),
+                      impl.forType.line, impl.forType.column);
+                continue;
+            }
+            ImplRegistration reg;
+            reg.traitName = impl.traitName;
+            reg.typeName = typeName;
+            // Validate methods + collect.
+            std::unordered_set<std::string> seenMethod;
+            for (const auto& fn : impl.methods) {
+                if (!seenMethod.insert(fn.name).second) {
+                    error("duplicate method '" + fn.name + "' in impl",
+                          fn.line, fn.column);
+                    continue;
+                }
+                const ast::MethodSig* traitMethod = nullptr;
+                for (const auto& m : traitIt->second) {
+                    if (m.name == fn.name) { traitMethod = &m; break; }
+                }
+                if (!traitMethod) {
+                    error("method '" + fn.name +
+                              "' is not declared in trait '" + impl.traitName +
+                              "'",
+                          fn.line, fn.column);
+                    continue;
+                }
+                reg.methods[fn.name] = &fn;
+            }
+            // Verify the impl covers every trait method (no missing impls).
+            for (const auto& m : traitIt->second) {
+                if (!reg.methods.count(m.name)) {
+                    error("impl of '" + impl.traitName + "' for '" +
+                              typeName +
+                              "' is missing method '" + m.name + "'",
+                          impl.line, impl.column);
+                }
+            }
+            implMethodByType_[typeName][impl.traitName] = std::move(reg);
+            // Also build a quick (typeName, methodName) -> impl-method lookup
+            // for the method-call resolver.
+            for (const auto& [mname, mfn] :
+                 implMethodByType_[typeName][impl.traitName].methods) {
+                methodImplLookup_[typeName][mname] =
+                    {impl.traitName, mfn};
+            }
         }
 
         // Pass 1b: register every fn signature so calls can see siblings
-        // (and the function can recurse into itself).
+        // (and the function can recurse into itself). For each fn, allocate
+        // a fresh Var per generic parameter and resolve param / return type
+        // refs with those Vars in scope, so the schema's Function type
+        // references them wherever the source mentions the name. Also
+        // register the schema's per-genericVar bound so method calls on a
+        // bounded param type-check against the bound trait's methods.
         for (const auto& fn : program.functions) {
+            if (fnSchemas_.count(fn.name)) {
+                error("function redefined: " + fn.name, fn.line, fn.column);
+                // Skip the second decl entirely — keep the first schema.
+                continue;
+            }
+            std::unordered_map<std::string, TypePtr> genEnv;
+            std::vector<TypePtr> genVars;
+            std::vector<std::string> genBounds;
+            genVars.reserve(fn.genericParams.size());
+            genBounds.reserve(fn.genericParams.size());
+            std::unordered_set<std::string> seenGp;
+            for (const auto& gp : fn.genericParams) {
+                if (!seenGp.insert(gp.name).second) {
+                    error("duplicate generic parameter '" + gp.name +
+                              "' on fn '" + fn.name + "'",
+                          gp.line, gp.column);
+                    continue;
+                }
+                if (gp.name == "i64" || gp.name == "bool" ||
+                    structSchemas_.count(gp.name) ||
+                    enumSchemas_.count(gp.name)) {
+                    error("generic parameter '" + gp.name +
+                              "' shadows an existing type",
+                          gp.line, gp.column);
+                }
+                if (!gp.bound.empty() && !traits_.count(gp.bound)) {
+                    error("unknown trait bound '" + gp.bound + "' on '" +
+                              gp.name + "'",
+                          gp.line, gp.column);
+                }
+                TypePtr v = makeFreshVar();
+                genEnv[gp.name] = v;
+                genVars.push_back(v);
+                genBounds.push_back(gp.bound);
+            }
+            currentGenericEnv_ = &genEnv;
+
             std::vector<TypePtr> argTypes;
             argTypes.reserve(fn.params.size());
             for (const auto& p : fn.params) {
                 argTypes.push_back(resolveTypeRef(p.type));
             }
             TypePtr ret = resolveTypeRef(fn.returnType);
-            if (functions_.count(fn.name)) {
-                error("function redefined: " + fn.name, fn.line, fn.column);
-            }
-            functions_[fn.name] = makeFunction(std::move(argTypes), ret);
+
+            currentGenericEnv_ = nullptr;
+
+            FnSchema schema;
+            schema.signature = makeFunction(std::move(argTypes), ret);
+            schema.genericVars = std::move(genVars);
+            schema.genericBounds = std::move(genBounds);
+            fnSchemas_[fn.name] = std::move(schema);
         }
+        // Pass 1e: register each impl method as a regular fn schema under
+        // its mangled name so call routing through MethodCallExpr can
+        // re-use the existing fn-call machinery. The mangled name encodes
+        // (trait, implementing-type, method) so it never clashes with a
+        // user-declared free fn. Self gets rewritten to the implementing
+        // type during signature resolution.
+        for (const auto& impl : program.impls) {
+            for (const auto& fn : impl.methods) {
+                std::string mangled =
+                    implMethodMangledName(impl.traitName, impl.forType,
+                                            fn.name);
+                if (fnSchemas_.count(mangled)) continue; // duplicate-impl
+                std::unordered_map<std::string, TypePtr> genEnv;
+                std::vector<TypePtr> genVars;
+                std::vector<std::string> genBounds;
+                for (const auto& gp : fn.genericParams) {
+                    TypePtr v = makeFreshVar();
+                    genEnv[gp.name] = v;
+                    genVars.push_back(v);
+                    genBounds.push_back(gp.bound);
+                }
+                // Bind Self to the impl's forType while resolving params /
+                // return. This lets the impl write `self: Self -> i64`
+                // and have it land as `self: ConcreteType -> i64`.
+                TypePtr selfTy = resolveTypeRef(impl.forType);
+                genEnv["Self"] = selfTy;
+                currentGenericEnv_ = &genEnv;
+                std::vector<TypePtr> argTypes;
+                for (const auto& p : fn.params) {
+                    argTypes.push_back(resolveTypeRef(p.type));
+                }
+                TypePtr ret = resolveTypeRef(fn.returnType);
+                currentGenericEnv_ = nullptr;
+                FnSchema sch;
+                sch.signature = makeFunction(std::move(argTypes), ret);
+                sch.genericVars = std::move(genVars);
+                sch.genericBounds = std::move(genBounds);
+                fnSchemas_[mangled] = std::move(sch);
+                implMethodMangled_[&fn] = mangled;
+            }
+        }
+
         // Pass 2: type-check each fn body.
         for (const auto& fn : program.functions) {
             checkFunction(fn);
         }
+        // Pass 2 (impl methods): same, with Self bound to the impl's
+        // forType.
+        for (const auto& impl : program.impls) {
+            TypePtr selfTy = resolveTypeRef(impl.forType);
+            for (const auto& fn : impl.methods) {
+                checkImplMethod(fn, impl.traitName, impl.forType, selfTy);
+            }
+        }
         TypeCheckResult result;
         result.errors = std::move(errors_);
         result.exprTypes = std::move(exprTypes_);
-        result.structs = std::move(structs_);
-        result.enums = std::move(enums_);
+        result.structs = std::move(structSchemas_);
+        result.enums = std::move(enumSchemas_);
         result.variantIndex = std::move(variantIndex_);
         result.matchTrees = std::move(matchTrees_);
+        result.fnSchemas = std::move(fnSchemas_);
+        result.callInstantiations = std::move(callInstantiations_);
+        result.methodResolutions = std::move(methodResolutions_);
         return result;
     }
 
 private:
     using Scope = std::unordered_map<std::string, TypePtr>;
+    using GenericEnv = std::unordered_map<std::string, TypePtr>;
 
-    std::unordered_map<std::string, TypePtr> functions_;
-    std::unordered_map<std::string, TypePtr> structs_;
-    std::unordered_map<std::string, TypePtr> enums_;
+    std::unordered_map<std::string, FnSchema> fnSchemas_;
+    std::unordered_map<std::string, StructSchema> structSchemas_;
+    std::unordered_map<std::string, EnumSchema> enumSchemas_;
+
+    // Trait declarations: traitName -> ordered list of method signatures.
+    std::unordered_map<std::string, std::vector<ast::MethodSig>> traits_;
+    // Impl registration: per implementing-type-name, per-trait-name, the
+    // method-AST table. Indexed twice so method-call resolution can hop
+    // typeName -> impl in O(1) and a missing method tells us the impl
+    // doesn't claim that method even if the trait declares it.
+    struct ImplRegistration {
+        std::string traitName;
+        std::string typeName;
+        std::unordered_map<std::string, const ast::FnDecl*> methods;
+    };
+    std::unordered_map<std::string,
+                       std::unordered_map<std::string, ImplRegistration>>
+        implMethodByType_;
+    // Flat lookup: typeName -> methodName -> (traitName, impl FnDecl*).
+    // Lets `x.foo()` find foo by name without scanning every impl block.
+    std::unordered_map<std::string,
+                       std::unordered_map<
+                           std::string,
+                           std::pair<std::string, const ast::FnDecl*>>>
+        methodImplLookup_;
+    // Per-MethodCallExpr resolution (Concrete or BoundedGeneric).
+    std::unordered_map<const ast::MethodCallExpr*, ResolvedMethod>
+        methodResolutions_;
+    // FnDecl* of an impl method -> its mangled FnSchema key.
+    std::unordered_map<const ast::FnDecl*, std::string> implMethodMangled_;
+    // Active during Pass-2 body-checking of an impl method: maps the
+    // generic-param names of the enclosing fn to schema Vars, with `Self`
+    // included so the body can mention `Self` in type positions.
+    // Reused by `currentGenericEnv_` mechanics — no separate member.
     // Variant name -> {enumName, index within that enum}.
     std::unordered_map<std::string, std::pair<std::string, unsigned>>
         variantIndex_;
     std::unordered_map<const ast::Expr*, TypePtr> exprTypes_;
+    std::unordered_map<const ast::CallExpr*, std::vector<TypePtr>>
+        callInstantiations_;
     std::unordered_map<const ast::MatchExpr*,
                        std::unique_ptr<pattern_match::DecisionTree>>
         matchTrees_;
     std::vector<TypeError> errors_;
     std::vector<Scope> scopes_;
     TypePtr currentReturnType_;
+    // Generic-param-name -> Type Var, scoped to the current fn declaration.
+    // Set during Pass 1b sig resolution and during Pass 2 body checking
+    // (with a fresh-instantiation copy for body checking, so accidental
+    // specialization in a body — e.g. `x + 1` in `fn id<T>(x: T) -> T` —
+    // doesn't taint the stored schema).
+    const GenericEnv* currentGenericEnv_ = nullptr;
 
     void error(std::string msg, std::size_t line, std::size_t col) {
         errors_.push_back({std::move(msg), line, col});
     }
 
+    // Mangle an impl method into a globally-unique fn name. Format:
+    // `__impl_<Trait>_for_<Type>__<method>`. Phase 3.3 MVP keys impls
+    // by the implementing type's *base* name only, so `impl X for
+    // Option<i64>` and `impl X for Option<bool>` are not both
+    // expressible — duplicate-impl detection rejects the second. A
+    // later phase that wants per-typeArgs impls will extend this
+    // mangling and the (typeName, trait) lookup to include typeArgs.
+    std::string implMethodMangledName(const std::string& trait,
+                                       const ast::TypeRef& forType,
+                                       const std::string& method) {
+        return "__impl_" + trait + "_for_" + forType.name + "__" + method;
+    }
+
+    void checkImplMethod(const ast::FnDecl& fn, const std::string& traitName,
+                         const ast::TypeRef& forType, const TypePtr& selfTy) {
+        (void)traitName;
+        (void)forType;
+        auto it = implMethodMangled_.find(&fn);
+        if (it == implMethodMangled_.end()) return;
+        auto sit = fnSchemas_.find(it->second);
+        if (sit == fnSchemas_.end()) return;
+        const FnSchema& schema = sit->second;
+        GenericEnv genEnv;
+        for (std::size_t i = 0;
+             i < fn.genericParams.size() && i < schema.genericVars.size();
+             ++i) {
+            genEnv[fn.genericParams[i].name] = schema.genericVars[i];
+        }
+        genEnv["Self"] = selfTy;
+        currentGenericEnv_ = &genEnv;
+        scopes_.push_back({});
+        for (const auto& p : fn.params) {
+            scopes_.back()[p.name] = resolveTypeRef(p.type);
+        }
+        currentReturnType_ = resolveTypeRef(fn.returnType);
+        TypePtr bodyType = checkBlock(*fn.body);
+        if (fn.body->tail) {
+            if (!unify(bodyType, currentReturnType_)) {
+                error("impl method '" + fn.name + "' body type " +
+                          typeToString(bodyType) +
+                          " does not match declared return type " +
+                          typeToString(currentReturnType_),
+                      fn.body->tail->line, fn.body->tail->column);
+            }
+        }
+        scopes_.pop_back();
+        currentReturnType_.reset();
+        currentGenericEnv_ = nullptr;
+    }
+
+    // Allocate a schema shell: an opaque Type (Struct or Enum kind, empty
+    // body) plus one fresh schema Var per declared generic parameter.
+    // Used in Pass 1a so cross-references can resolve names without
+    // tripping on missing entries; bodies fill in fields/variants in Pass
+    // 1b under the schema's generic env.
+    template <typename Schema>
+    Schema buildSchemaShell(const std::string& name,
+                              const std::vector<ast::TypeParam>& genericParams,
+                              bool isStruct) {
+        Schema s;
+        s.type = isStruct ? makeStruct(name, {}) : makeEnum(name, {});
+        s.genericVars.reserve(genericParams.size());
+        // One fresh Var per declared generic param, positionally; duplicate
+        // names get one Var each (and we report the duplicate below) so the
+        // genericVars vector stays index-aligned with `genericParams`.
+        for (std::size_t i = 0; i < genericParams.size(); ++i) {
+            s.genericVars.push_back(makeFreshVar());
+        }
+        // Reject obvious shadowing here (i64/bool plus already-bound types
+        // are reported once for each generic param in the order they
+        // appear).
+        std::unordered_set<std::string> seenGp;
+        for (const auto& gp : genericParams) {
+            if (!seenGp.insert(gp.name).second) {
+                error("duplicate generic parameter '" + gp.name +
+                          "' on type '" + name + "'",
+                      gp.line, gp.column);
+            }
+            if (gp.name == "i64" || gp.name == "bool") {
+                error("generic parameter '" + gp.name +
+                          "' shadows a built-in type",
+                      gp.line, gp.column);
+            }
+        }
+        return s;
+    }
+
+    GenericEnv buildGenericEnv(
+        const std::vector<ast::TypeParam>& genericParams,
+        const std::vector<TypePtr>& genericVars) {
+        GenericEnv env;
+        std::size_t n = std::min(genericParams.size(), genericVars.size());
+        for (std::size_t i = 0; i < n; ++i) {
+            env[genericParams[i].name] = genericVars[i];
+        }
+        return env;
+    }
+
+    // Build a fresh instantiation of a struct/enum schema. Each schema
+    // genericVar is replaced by a fresh Var; the resulting Type has
+    // typeArgs filled with those fresh Vars and field/variant payload
+    // types substituted accordingly. Callers (struct lit, ctor, pattern)
+    // unify the typeArgs / payloads of the freshly-instantiated Type with
+    // their concrete expectations, so the fresh Vars resolve to the
+    // intended concretes after unification.
+    TypePtr freshInstantiateStruct(const StructSchema& schema) {
+        if (schema.genericVars.empty()) return schema.type;
+        std::unordered_map<int, TypePtr> subst;
+        std::vector<TypePtr> args;
+        args.reserve(schema.genericVars.size());
+        for (const auto& gv : schema.genericVars) {
+            TypePtr fresh = makeFreshVar();
+            subst[gv->varId] = fresh;
+            args.push_back(fresh);
+        }
+        TypePtr inst = instantiate(schema.type, subst);
+        // `instantiate` already preserves typeArgs when struct field types
+        // changed, but a schema's typeArgs are always empty. Set them now
+        // so unification sees the fresh-instance identity.
+        inst->typeArgs = std::move(args);
+        return inst;
+    }
+
+    TypePtr freshInstantiateEnum(const EnumSchema& schema) {
+        if (schema.genericVars.empty()) return schema.type;
+        std::unordered_map<int, TypePtr> subst;
+        std::vector<TypePtr> args;
+        args.reserve(schema.genericVars.size());
+        for (const auto& gv : schema.genericVars) {
+            TypePtr fresh = makeFreshVar();
+            subst[gv->varId] = fresh;
+            args.push_back(fresh);
+        }
+        TypePtr inst = instantiate(schema.type, subst);
+        inst->typeArgs = std::move(args);
+        return inst;
+    }
+
+    // Instantiate a struct/enum schema with explicit concrete typeArgs
+    // already in hand (e.g. from a `Vec<i64>` annotation). Returns a fresh
+    // Type whose typeArgs are exactly the caller-supplied types and whose
+    // fields/payloads have been substituted accordingly.
+    TypePtr instantiateStructWithArgs(const StructSchema& schema,
+                                       std::vector<TypePtr> typeArgs) {
+        if (schema.genericVars.empty()) return schema.type;
+        std::unordered_map<int, TypePtr> subst;
+        for (std::size_t i = 0;
+             i < schema.genericVars.size() && i < typeArgs.size(); ++i) {
+            subst[schema.genericVars[i]->varId] = typeArgs[i];
+        }
+        TypePtr inst = instantiate(schema.type, subst);
+        inst->typeArgs = std::move(typeArgs);
+        return inst;
+    }
+
+    TypePtr instantiateEnumWithArgs(const EnumSchema& schema,
+                                     std::vector<TypePtr> typeArgs) {
+        if (schema.genericVars.empty()) return schema.type;
+        std::unordered_map<int, TypePtr> subst;
+        for (std::size_t i = 0;
+             i < schema.genericVars.size() && i < typeArgs.size(); ++i) {
+            subst[schema.genericVars[i]->varId] = typeArgs[i];
+        }
+        TypePtr inst = instantiate(schema.type, subst);
+        inst->typeArgs = std::move(typeArgs);
+        return inst;
+    }
+
     TypePtr resolveTypeRef(const ast::TypeRef& tr) {
-        if (tr.name == "i64") return makeInt();
-        if (tr.name == "bool") return makeBool();
-        auto sit = structs_.find(tr.name);
-        if (sit != structs_.end()) return sit->second;
-        auto eit = enums_.find(tr.name);
-        if (eit != enums_.end()) return eit->second;
+        // Generic params from the enclosing fn/struct/enum decl.
+        if (currentGenericEnv_) {
+            auto git = currentGenericEnv_->find(tr.name);
+            if (git != currentGenericEnv_->end()) {
+                if (!tr.typeArgs.empty()) {
+                    error("type parameter '" + tr.name +
+                              "' cannot take type arguments",
+                          tr.line, tr.column);
+                }
+                return git->second;
+            }
+        }
+        if (tr.name == "i64") {
+            if (!tr.typeArgs.empty())
+                error("i64 takes no type arguments", tr.line, tr.column);
+            return makeInt();
+        }
+        if (tr.name == "bool") {
+            if (!tr.typeArgs.empty())
+                error("bool takes no type arguments", tr.line, tr.column);
+            return makeBool();
+        }
+        std::vector<TypePtr> argTypes;
+        argTypes.reserve(tr.typeArgs.size());
+        for (const auto& a : tr.typeArgs) argTypes.push_back(resolveTypeRef(a));
+        if (auto sit = structSchemas_.find(tr.name);
+            sit != structSchemas_.end()) {
+            if (sit->second.genericVars.size() != argTypes.size()) {
+                error("struct '" + tr.name + "' expects " +
+                          std::to_string(sit->second.genericVars.size()) +
+                          " type arg(s), got " +
+                          std::to_string(argTypes.size()),
+                      tr.line, tr.column);
+                return sit->second.type;
+            }
+            return instantiateStructWithArgs(sit->second, std::move(argTypes));
+        }
+        if (auto eit = enumSchemas_.find(tr.name);
+            eit != enumSchemas_.end()) {
+            if (eit->second.genericVars.size() != argTypes.size()) {
+                error("enum '" + tr.name + "' expects " +
+                          std::to_string(eit->second.genericVars.size()) +
+                          " type arg(s), got " +
+                          std::to_string(argTypes.size()),
+                      tr.line, tr.column);
+                return eit->second.type;
+            }
+            return instantiateEnumWithArgs(eit->second, std::move(argTypes));
+        }
         error("unknown type: " + tr.name, tr.line, tr.column);
         return makeInt(); // fallback so downstream code keeps running
     }
@@ -169,21 +636,56 @@ private:
         return nullptr;
     }
 
-    // Look up a variant by name in the global variant table. Returns the
-    // (enumType, variant) pair, or {nullptr, nullptr} if unknown.
-    std::pair<TypePtr, const EnumVariantType*> lookupVariant(
-        const std::string& name) {
+    // Look up a variant by name. Returns a fresh enum-instance Type
+    // (typeArgs filled with fresh Vars) plus an index into that instance's
+    // variants list. Callers unify the returned Type's typeArgs / payload
+    // types with their concrete inputs; the fresh Vars then resolve to
+    // the right concretes via the union-find chain. Returns
+    // {nullptr, npos} on unknown name.
+    struct VariantLookup {
+        TypePtr enumInstance;
+        unsigned variantIdx = static_cast<unsigned>(-1);
+    };
+    VariantLookup lookupVariant(const std::string& name) {
         auto it = variantIndex_.find(name);
-        if (it == variantIndex_.end()) return {nullptr, nullptr};
-        auto enumIt = enums_.find(it->second.first);
-        if (enumIt == enums_.end()) return {nullptr, nullptr};
-        const auto& variants = enumIt->second->enumVariants;
-        unsigned idx = it->second.second;
-        if (idx >= variants.size()) return {nullptr, nullptr};
-        return {enumIt->second, &variants[idx]};
+        if (it == variantIndex_.end()) return {};
+        auto schemaIt = enumSchemas_.find(it->second.first);
+        if (schemaIt == enumSchemas_.end()) return {};
+        const EnumSchema& schema = schemaIt->second;
+        if (it->second.second >= schema.type->enumVariants.size()) return {};
+        VariantLookup vl;
+        vl.enumInstance = freshInstantiateEnum(schema);
+        vl.variantIdx = it->second.second;
+        return vl;
     }
 
     void checkFunction(const ast::FnDecl& fn) {
+        auto sit = fnSchemas_.find(fn.name);
+        if (sit == fnSchemas_.end()) return; // duplicate decl, schema absent
+        const FnSchema& schema = sit->second;
+
+        // Body-checking uses the SCHEMA Vars directly (not fresh
+        // instantiation copies). This makes codegen's job tractable: every
+        // Var the typechecker records in `exprTypes` and `callInstantiations`
+        // either resolves to a concrete type or to a schema Var of the
+        // enclosing fn — codegen can substitute the latter through the
+        // instance's typeArgs.
+        //
+        // Trade-off: if a generic body inadvertently constrains a type
+        // parameter (e.g. `fn id<T>(x: T) -> T { x + 1 }` unifies T with
+        // i64), the schema is mutated and the fn silently becomes
+        // monomorphic. That's caught at the next call site whose arg
+        // doesn't unify with the now-concrete type. A dedicated check that
+        // genericVars stay free after body-checking lands in Phase 3.3
+        // alongside trait bounds.
+        GenericEnv genEnv;
+        for (std::size_t i = 0;
+             i < fn.genericParams.size() && i < schema.genericVars.size();
+             ++i) {
+            genEnv[fn.genericParams[i].name] = schema.genericVars[i];
+        }
+        currentGenericEnv_ = &genEnv;
+
         scopes_.push_back({});
         for (const auto& p : fn.params) {
             scopes_.back()[p.name] = resolveTypeRef(p.type);
@@ -205,6 +707,7 @@ private:
         }
         scopes_.pop_back();
         currentReturnType_.reset();
+        currentGenericEnv_ = nullptr;
     }
 
     TypePtr checkExpr(const ast::Expr& e) {
@@ -219,20 +722,33 @@ private:
         }
         if (auto* id = dynamic_cast<const ast::IdentExpr*>(&e)) {
             if (auto t = lookupLocal(id->name)) return t;
-            auto fnIt = functions_.find(id->name);
-            if (fnIt != functions_.end()) return fnIt->second;
+            auto fnIt = fnSchemas_.find(id->name);
+            if (fnIt != fnSchemas_.end()) {
+                // Bare Ident referring to a fn name: instantiate so callers
+                // never see the raw schema Vars escape. Phase 3.1 has no
+                // first-class fn values, so this branch is effectively
+                // unused; we instantiate defensively in case future code
+                // (e.g. let-bind a fn name) reaches it.
+                std::unordered_map<int, TypePtr> subst;
+                for (const auto& gv : fnIt->second.genericVars) {
+                    subst[gv->varId] = makeFreshVar();
+                }
+                return instantiate(fnIt->second.signature, subst);
+            }
             // Fall through to variant table: a bare Ident resolving to a
             // unit constructor is the value of that constructor.
-            auto [enumType, variant] = lookupVariant(id->name);
-            if (variant) {
-                if (!variant->payloadTypes.empty()) {
+            auto vl = lookupVariant(id->name);
+            if (vl.enumInstance) {
+                const auto& variant =
+                    vl.enumInstance->enumVariants[vl.variantIdx];
+                if (!variant.payloadTypes.empty()) {
                     error("constructor " + id->name + " requires " +
-                              std::to_string(variant->payloadTypes.size()) +
+                              std::to_string(variant.payloadTypes.size()) +
                               " argument(s)",
                           e.line, e.column);
                     return makeInt();
                 }
-                return enumType;
+                return vl.enumInstance;
             }
             error("unknown identifier: " + id->name, e.line, e.column);
             return makeInt();
@@ -258,21 +774,295 @@ private:
         if (auto* me = dynamic_cast<const ast::MatchExpr*>(&e)) {
             return checkMatch(*me);
         }
+        if (auto* te = dynamic_cast<const ast::TryExpr*>(&e)) {
+            return checkTry(*te);
+        }
+        if (auto* mc = dynamic_cast<const ast::MethodCallExpr*>(&e)) {
+            return checkMethodCall(*mc);
+        }
         error("unknown expression kind", e.line, e.column);
         return makeInt();
     }
 
+    // Phase 3.3: resolve `recv.method(args)` against trait impls.
+    TypePtr checkMethodCall(const ast::MethodCallExpr& mc) {
+        TypePtr recvT = checkExpr(*mc.receiver);
+        TypePtr r = resolve(recvT);
+
+        // Case A: receiver is a generic-param Var. The fn must have a
+        // trait bound for this Var, the bound trait must declare the
+        // method, and codegen will route to the correct impl per
+        // monomorphic instance.
+        if (r->kind == TypeKind::Var) {
+            int rId = r->varId;
+            std::string bound;
+            // Find the bound by scanning the enclosing fn's schema.
+            // `currentGenericEnv_` holds name -> Var; we need the parallel
+            // bound list. Look up via fnSchemas_.
+            for (const auto& [_n, schema] : fnSchemas_) {
+                for (std::size_t i = 0; i < schema.genericVars.size(); ++i) {
+                    if (schema.genericVars[i]->varId == rId &&
+                        i < schema.genericBounds.size() &&
+                        !schema.genericBounds[i].empty()) {
+                        bound = schema.genericBounds[i];
+                        break;
+                    }
+                }
+                if (!bound.empty()) break;
+            }
+            if (bound.empty()) {
+                error("method call on unbounded generic parameter; add a "
+                      "trait bound like `<T: Trait>`",
+                      mc.line, mc.column);
+                for (const auto& a : mc.args) checkExpr(*a);
+                return makeFreshVar();
+            }
+            auto traitIt = traits_.find(bound);
+            if (traitIt == traits_.end()) {
+                error("unknown trait bound '" + bound + "'",
+                      mc.line, mc.column);
+                return makeFreshVar();
+            }
+            const ast::MethodSig* sig = nullptr;
+            for (const auto& m : traitIt->second) {
+                if (m.name == mc.methodName) { sig = &m; break; }
+            }
+            if (!sig) {
+                error("trait '" + bound + "' has no method '" +
+                          mc.methodName + "'",
+                      mc.line, mc.column);
+                return makeFreshVar();
+            }
+            // Type-check arg count + arg types against the trait's
+            // signature, substituting Self -> r (the schema Var).
+            return checkMethodCallAgainstSig(mc, *sig, r,
+                                              /*concrete=*/false, bound,
+                                              /*concreteTypeName=*/{}, rId);
+        }
+
+        // Case B: receiver has a concrete type (struct/enum/i64/bool).
+        std::string typeName;
+        if (r->kind == TypeKind::Struct) typeName = r->structName;
+        else if (r->kind == TypeKind::Enum) typeName = r->enumName;
+        else if (r->kind == TypeKind::Int) typeName = "i64";
+        else if (r->kind == TypeKind::Bool) typeName = "bool";
+        else {
+            error("method call on unsupported receiver type " +
+                      typeToString(recvT),
+                  mc.line, mc.column);
+            return makeFreshVar();
+        }
+        auto typeIt = methodImplLookup_.find(typeName);
+        if (typeIt == methodImplLookup_.end()) {
+            error("no impl for type '" + typeName + "' (method '" +
+                      mc.methodName + "')",
+                  mc.line, mc.column);
+            return makeFreshVar();
+        }
+        auto methodIt = typeIt->second.find(mc.methodName);
+        if (methodIt == typeIt->second.end()) {
+            error("no impl provides method '" + mc.methodName +
+                      "' for type '" + typeName + "'",
+                  mc.line, mc.column);
+            return makeFreshVar();
+        }
+        // The trait that supplies this method.
+        const std::string& trait = methodIt->second.first;
+        // Get the impl method's signature via its FnSchema (mangled name).
+        std::string mangled = implMethodMangledName(
+            trait, ast::TypeRef{typeName, {}, 0, 0}, mc.methodName);
+        auto schemaIt = fnSchemas_.find(mangled);
+        if (schemaIt == fnSchemas_.end()) {
+            error("internal: missing impl method schema for " + mangled,
+                  mc.line, mc.column);
+            return makeFreshVar();
+        }
+        // Re-use the fn-call instantiation path so generic impl methods
+        // (Phase 3.3 doesn't have them yet) would route through the same
+        // schema mechanics.
+        const FnSchema& schema = schemaIt->second;
+        std::unordered_map<int, TypePtr> subst;
+        for (const auto& gv : schema.genericVars) {
+            subst[gv->varId] = makeFreshVar();
+        }
+        TypePtr instSig = instantiate(schema.signature, subst);
+        // Unify receiver against the impl's `self` slot (first arg).
+        if (!instSig->args.empty()) {
+            if (!unify(recvT, instSig->args[0])) {
+                error("receiver type " + typeToString(recvT) +
+                          " doesn't unify with impl `self` type " +
+                          typeToString(instSig->args[0]),
+                      mc.line, mc.column);
+            }
+        }
+        const std::size_t expectedExtra =
+            instSig->args.empty() ? 0 : instSig->args.size() - 1;
+        if (expectedExtra != mc.args.size()) {
+            error("method '" + mc.methodName + "' expects " +
+                      std::to_string(expectedExtra) + " arg(s), got " +
+                      std::to_string(mc.args.size()),
+                  mc.line, mc.column);
+        }
+        const std::size_t n =
+            std::min(expectedExtra, mc.args.size());
+        for (std::size_t i = 0; i < n; ++i) {
+            TypePtr argT = checkExpr(*mc.args[i]);
+            if (!unify(argT, instSig->args[i + 1])) {
+                error("argument " + std::to_string(i + 1) + " to method '" +
+                          mc.methodName + "' has type " +
+                          typeToString(argT) + ", expected " +
+                          typeToString(instSig->args[i + 1]),
+                      mc.args[i]->line, mc.args[i]->column);
+            }
+        }
+        for (std::size_t i = n; i < mc.args.size(); ++i) {
+            checkExpr(*mc.args[i]);
+        }
+        ResolvedMethod res;
+        res.kind = ResolvedMethod::Concrete;
+        res.traitName = trait;
+        res.methodName = mc.methodName;
+        res.concreteTypeName = typeName;
+        res.receiverTypeArgs = r->typeArgs;
+        methodResolutions_[&mc] = std::move(res);
+        return instSig->ret;
+    }
+
+    TypePtr checkMethodCallAgainstSig(const ast::MethodCallExpr& mc,
+                                       const ast::MethodSig& sig,
+                                       const TypePtr& receiverTy,
+                                       bool concrete,
+                                       const std::string& traitName,
+                                       const std::string& concreteTypeName,
+                                       int boundedVarId) {
+        // Resolve sig's param/return types with Self -> receiverTy.
+        GenericEnv selfEnv;
+        selfEnv["Self"] = receiverTy;
+        currentGenericEnv_ = &selfEnv;
+        std::vector<TypePtr> paramTypes;
+        for (const auto& p : sig.params) {
+            paramTypes.push_back(resolveTypeRef(p.type));
+        }
+        TypePtr retTy = resolveTypeRef(sig.returnType);
+        currentGenericEnv_ = nullptr;
+
+        // paramTypes[0] is self (already a Self type). Skip and unify args.
+        const std::size_t expectedExtra =
+            paramTypes.empty() ? 0 : paramTypes.size() - 1;
+        if (expectedExtra != mc.args.size()) {
+            error("method '" + mc.methodName + "' expects " +
+                      std::to_string(expectedExtra) + " arg(s), got " +
+                      std::to_string(mc.args.size()),
+                  mc.line, mc.column);
+        }
+        const std::size_t n =
+            std::min(expectedExtra, mc.args.size());
+        for (std::size_t i = 0; i < n; ++i) {
+            TypePtr argT = checkExpr(*mc.args[i]);
+            if (!unify(argT, paramTypes[i + 1])) {
+                error("argument " + std::to_string(i + 1) + " to method '" +
+                          mc.methodName + "' has type " +
+                          typeToString(argT) + ", expected " +
+                          typeToString(paramTypes[i + 1]),
+                      mc.args[i]->line, mc.args[i]->column);
+            }
+        }
+        for (std::size_t i = n; i < mc.args.size(); ++i) {
+            checkExpr(*mc.args[i]);
+        }
+        ResolvedMethod res;
+        res.kind = concrete ? ResolvedMethod::Concrete
+                            : ResolvedMethod::BoundedGeneric;
+        res.traitName = traitName;
+        res.methodName = mc.methodName;
+        res.concreteTypeName = concreteTypeName;
+        res.boundedVarId = boundedVarId;
+        methodResolutions_[&mc] = std::move(res);
+        return retTy;
+    }
+
+    // Helper: find a variant by name in an enum's variant list. Returns
+    // nullptr if not present.
+    const EnumVariantType* findVariant(const TypePtr& enumType,
+                                        const std::string& name) {
+        for (const auto& v : enumType->enumVariants) {
+            if (v.name == name) return &v;
+        }
+        return nullptr;
+    }
+
+    // Phase 3.4: `expr?` requires the operand to be a Result-shape enum
+    // (variants `Ok(T)` and `Err(E)`, each with a single payload) and the
+    // enclosing fn to return a Result-shape enum whose `Err` payload type
+    // unifies with the operand's. The TryExpr evaluates to the operand's
+    // `Ok` payload type when it doesn't early-return.
+    TypePtr checkTry(const ast::TryExpr& te) {
+        TypePtr operandT = checkExpr(*te.operand);
+        TypePtr ro = resolve(operandT);
+        if (ro->kind != TypeKind::Enum) {
+            error("`?` requires a Result-shaped enum, got " +
+                      typeToString(operandT),
+                  te.line, te.column);
+            return makeInt();
+        }
+        const EnumVariantType* okV = findVariant(ro, "Ok");
+        const EnumVariantType* errV = findVariant(ro, "Err");
+        if (!okV || !errV) {
+            error("`?` operand enum '" + ro->enumName +
+                      "' must have `Ok(T)` and `Err(E)` variants",
+                  te.line, te.column);
+            return makeInt();
+        }
+        if (okV->payloadTypes.size() != 1 || errV->payloadTypes.size() != 1) {
+            error("`?` operand variants `Ok` / `Err` must each carry exactly "
+                  "one payload",
+                  te.line, te.column);
+            return makeInt();
+        }
+        if (!currentReturnType_) {
+            error("`?` used outside any function body", te.line, te.column);
+            return okV->payloadTypes[0];
+        }
+        TypePtr rRet = resolve(currentReturnType_);
+        if (rRet->kind != TypeKind::Enum) {
+            error("`?` in fn whose return type is " +
+                      typeToString(currentReturnType_) +
+                      "; expected a Result-shaped enum",
+                  te.line, te.column);
+            return okV->payloadTypes[0];
+        }
+        const EnumVariantType* retErr = findVariant(rRet, "Err");
+        if (!retErr || retErr->payloadTypes.size() != 1) {
+            error("`?` requires the enclosing fn's return type '" +
+                      rRet->enumName +
+                      "' to have an `Err(E)` variant",
+                  te.line, te.column);
+            return okV->payloadTypes[0];
+        }
+        if (!unify(errV->payloadTypes[0], retErr->payloadTypes[0])) {
+            error("`?` Err payload type " +
+                      typeToString(errV->payloadTypes[0]) +
+                      " does not match enclosing fn's Err payload type " +
+                      typeToString(retErr->payloadTypes[0]),
+                  te.line, te.column);
+        }
+        return okV->payloadTypes[0];
+    }
+
     TypePtr checkStructLit(const ast::StructLitExpr& sl) {
-        auto it = structs_.find(sl.structName);
-        if (it == structs_.end()) {
+        auto it = structSchemas_.find(sl.structName);
+        if (it == structSchemas_.end()) {
             error("unknown struct: " + sl.structName, sl.line, sl.column);
             for (const auto& f : sl.fields) checkExpr(*f.second);
             return makeInt();
         }
-        const TypePtr& structType = it->second;
+        // For generic structs, build a fresh instantiation so field-type
+        // unification with each literal expr leaves the instance's
+        // typeArgs in a fully-solved state.
+        TypePtr instType = freshInstantiateStruct(it->second);
         std::unordered_map<std::string, TypePtr> declared;
-        declared.reserve(structType->structFields.size());
-        for (const auto& df : structType->structFields) {
+        declared.reserve(instType->structFields.size());
+        for (const auto& df : instType->structFields) {
             declared.emplace(df.first, df.second);
         }
         std::unordered_set<std::string> initialised;
@@ -297,14 +1087,14 @@ private:
                       f.second->line, f.second->column);
             }
         }
-        for (const auto& df : structType->structFields) {
+        for (const auto& df : instType->structFields) {
             if (!initialised.count(df.first)) {
                 error("missing field '" + df.first + "' in struct '" +
                           sl.structName + "' literal",
                       sl.line, sl.column);
             }
         }
-        return structType;
+        return instType;
     }
 
     TypePtr checkField(const ast::FieldExpr& fe) {
@@ -348,59 +1138,76 @@ private:
     }
 
     TypePtr checkCall(const ast::CallExpr& call) {
-        auto fnIt = functions_.find(call.callee);
-        if (fnIt != functions_.end()) {
-            const TypePtr& fnType = fnIt->second;
-            if (fnType->args.size() != call.args.size()) {
+        auto fnIt = fnSchemas_.find(call.callee);
+        if (fnIt != fnSchemas_.end()) {
+            const FnSchema& schema = fnIt->second;
+            // Instantiate the schema with a fresh Var per generic param.
+            // Substitution is empty for monomorphic fns (instantiate is a
+            // no-op in that case), keeping the hot path zero-cost.
+            std::unordered_map<int, TypePtr> subst;
+            std::vector<TypePtr> typeArgs;
+            typeArgs.reserve(schema.genericVars.size());
+            for (const auto& gv : schema.genericVars) {
+                TypePtr fresh = makeFreshVar();
+                subst[gv->varId] = fresh;
+                typeArgs.push_back(fresh);
+            }
+            TypePtr instSig = instantiate(schema.signature, subst);
+            if (instSig->args.size() != call.args.size()) {
                 error("function '" + call.callee + "' expects " +
-                          std::to_string(fnType->args.size()) +
+                          std::to_string(instSig->args.size()) +
                           " arg(s), got " + std::to_string(call.args.size()),
                       call.line, call.column);
             }
             const std::size_t n =
-                std::min(fnType->args.size(), call.args.size());
+                std::min(instSig->args.size(), call.args.size());
             for (std::size_t i = 0; i < n; ++i) {
                 TypePtr argType = checkExpr(*call.args[i]);
-                if (!unify(argType, fnType->args[i])) {
+                if (!unify(argType, instSig->args[i])) {
                     error("argument " + std::to_string(i + 1) + " to '" +
                               call.callee + "' has type " +
                               typeToString(argType) + ", expected " +
-                              typeToString(fnType->args[i]),
+                              typeToString(instSig->args[i]),
                           call.args[i]->line, call.args[i]->column);
                 }
             }
             for (std::size_t i = n; i < call.args.size(); ++i) {
                 checkExpr(*call.args[i]);
             }
-            return fnType->ret;
+            if (!schema.genericVars.empty()) {
+                callInstantiations_[&call] = std::move(typeArgs);
+            }
+            return instSig->ret;
         }
         // Not a fn — fall back to variant constructor.
-        auto [enumType, variant] = lookupVariant(call.callee);
-        if (variant) {
-            if (variant->payloadTypes.size() != call.args.size()) {
+        auto vl = lookupVariant(call.callee);
+        if (vl.enumInstance) {
+            const auto& variant =
+                vl.enumInstance->enumVariants[vl.variantIdx];
+            if (variant.payloadTypes.size() != call.args.size()) {
                 error("constructor " + call.callee + " expects " +
-                          std::to_string(variant->payloadTypes.size()) +
+                          std::to_string(variant.payloadTypes.size()) +
                           " arg(s), got " +
                           std::to_string(call.args.size()),
                       call.line, call.column);
             }
             const std::size_t n =
-                std::min(variant->payloadTypes.size(), call.args.size());
+                std::min(variant.payloadTypes.size(), call.args.size());
             for (std::size_t i = 0; i < n; ++i) {
                 TypePtr argType = checkExpr(*call.args[i]);
-                if (!unify(argType, variant->payloadTypes[i])) {
+                if (!unify(argType, variant.payloadTypes[i])) {
                     error("argument " + std::to_string(i + 1) +
                               " to constructor " + call.callee +
                               " has type " + typeToString(argType) +
                               ", expected " +
-                              typeToString(variant->payloadTypes[i]),
+                              typeToString(variant.payloadTypes[i]),
                           call.args[i]->line, call.args[i]->column);
                 }
             }
             for (std::size_t i = n; i < call.args.size(); ++i) {
                 checkExpr(*call.args[i]);
             }
-            return enumType;
+            return vl.enumInstance;
         }
 
         error("unknown function: " + call.callee, call.line, call.column);
@@ -488,8 +1295,14 @@ private:
             }
         }
         if (!unified) unified = makeFreshVar();
+        // pattern_match operates on schema variant lists, not on instance
+        // typeArgs. Repackage enumSchemas_'s schema TypePtrs into the
+        // legacy map<string, TypePtr> shape its API expects.
+        std::unordered_map<std::string, TypePtr> enumsForPm;
+        enumsForPm.reserve(enumSchemas_.size());
+        for (const auto& [n, s] : enumSchemas_) enumsForPm[n] = s.type;
         if (auto w = pattern_match::checkExhaustiveness(
-                scrutT, me.arms, enums_, variantIndex_)) {
+                scrutT, me.arms, enumsForPm, variantIndex_)) {
             error("non-exhaustive match: missing pattern `" + w->text + "`",
                   me.line, me.column);
         }
@@ -497,7 +1310,7 @@ private:
         if (armsClean) {
             // Redundancy: report each arm unreachable given the arms before it.
             auto redundant = pattern_match::findRedundantArms(
-                scrutT, me.arms, enums_, variantIndex_);
+                scrutT, me.arms, enumsForPm, variantIndex_);
             for (unsigned idx : redundant) {
                 if (idx >= me.arms.size()) continue;
                 const auto& arm = me.arms[idx];
@@ -509,7 +1322,7 @@ private:
             // (even when non-exhaustive — the tree bottoms out at Fail
             // nodes), as long as arm patterns were well-typed.
             matchTrees_[&me] = pattern_match::compileDecisionTree(
-                scrutT, me.arms, enums_, variantIndex_);
+                scrutT, me.arms, enumsForPm, variantIndex_);
         }
         return unified;
     }
@@ -536,17 +1349,20 @@ private:
             return;
         }
         if (auto* vp = dynamic_cast<const ast::VarPat*>(&pat)) {
-            auto [enumType, variant] = lookupVariant(vp->name);
-            if (variant) {
-                if (!variant->payloadTypes.empty()) {
+            auto vl = lookupVariant(vp->name);
+            if (vl.enumInstance) {
+                const auto& variant =
+                    vl.enumInstance->enumVariants[vl.variantIdx];
+                if (!variant.payloadTypes.empty()) {
                     error("constructor " + vp->name + " requires " +
-                              std::to_string(variant->payloadTypes.size()) +
+                              std::to_string(variant.payloadTypes.size()) +
                               " argument(s) in pattern",
                           pat.line, pat.column);
                     return;
                 }
-                if (!unify(expected, enumType)) {
-                    error("pattern matches enum " + enumType->enumName +
+                if (!unify(expected, vl.enumInstance)) {
+                    error("pattern matches enum " +
+                              vl.enumInstance->enumName +
                               ", scrutinee is " + typeToString(expected),
                           pat.line, pat.column);
                 }
@@ -561,8 +1377,8 @@ private:
             return;
         }
         if (auto* cp = dynamic_cast<const ast::CtorPat*>(&pat)) {
-            auto [enumType, variant] = lookupVariant(cp->ctorName);
-            if (!variant) {
+            auto vl = lookupVariant(cp->ctorName);
+            if (!vl.enumInstance) {
                 error("unknown constructor " + cp->ctorName,
                       pat.line, pat.column);
                 // Still walk subpatterns so nested errors / bindings surface
@@ -572,22 +1388,24 @@ private:
                 }
                 return;
             }
-            if (!unify(expected, enumType)) {
-                error("pattern matches enum " + enumType->enumName +
+            if (!unify(expected, vl.enumInstance)) {
+                error("pattern matches enum " + vl.enumInstance->enumName +
                           ", scrutinee is " + typeToString(expected),
                       pat.line, pat.column);
             }
-            if (cp->subpatterns.size() != variant->payloadTypes.size()) {
+            const auto& variant =
+                vl.enumInstance->enumVariants[vl.variantIdx];
+            if (cp->subpatterns.size() != variant.payloadTypes.size()) {
                 error("constructor " + cp->ctorName + " expects " +
-                          std::to_string(variant->payloadTypes.size()) +
+                          std::to_string(variant.payloadTypes.size()) +
                           " arg(s), got " +
                           std::to_string(cp->subpatterns.size()),
                       pat.line, pat.column);
             }
             const std::size_t n =
-                std::min(cp->subpatterns.size(), variant->payloadTypes.size());
+                std::min(cp->subpatterns.size(), variant.payloadTypes.size());
             for (std::size_t i = 0; i < n; ++i) {
-                checkPattern(*cp->subpatterns[i], variant->payloadTypes[i],
+                checkPattern(*cp->subpatterns[i], variant.payloadTypes[i],
                              bindings);
             }
             // Walk any extras against fresh vars to surface their bindings/errors.

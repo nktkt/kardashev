@@ -3,8 +3,8 @@
 // Recognized tokens:
 //   - Integer literals: [0-9]+
 //   - Identifiers:      [A-Za-z_][A-Za-z0-9_]*
-//   - Keywords:         fn let if else return struct enum match
-//   - Operators:        +  -  *  /  <  <=  >  >=  ==  !=  =  ->  =>
+//   - Keywords:         fn let if else return struct enum match trait impl for
+//   - Operators:        +  -  *  /  <  <=  >  >=  ==  !=  =  ->  =>  ?
 //   - Punctuation:      (  )  {  }  ,  ;  :  .  _
 //   - Skipped:          whitespace, `// ... \n` line comments
 //
@@ -33,6 +33,12 @@ enum class TokenKind {
     KwStruct,
     KwEnum,
     KwMatch,
+    KwTrait,
+    KwImpl,
+    KwFor,
+    // `Self` and `self` stay as Identifiers — the typechecker rewrites
+    // `Self` to the implementing type inside trait method sigs / impl
+    // bodies, and `self` is just a parameter name.
 
     // Operators
     Plus,
@@ -48,6 +54,7 @@ enum class TokenKind {
     Eq,
     Arrow, // ->
     FatArrow, // =>
+    Question, // ? — Phase 3.4 try operator
 
     // Punctuation
     LParen,

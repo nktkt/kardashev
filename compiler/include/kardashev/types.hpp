@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -61,6 +62,15 @@ struct Type {
     // Enum:
     std::string enumName;
     std::vector<EnumVariantType> enumVariants;
+
+    // Concrete type arguments at this Struct/Enum instantiation, in the
+    // declaration order of the corresponding genericParams. Empty for
+    // monomorphic structs/enums AND for "schema" types stored in the
+    // typechecker's structs_ / enums_ tables (where field / payload
+    // TypePtrs still mention the schema's generic Vars). Populated when
+    // `resolveTypeRef` materializes a generic type at a use site
+    // (e.g. `Box<i64>` -> typeArgs=[i64]).
+    std::vector<TypePtr> typeArgs;
 };
 
 TypePtr makeInt();
@@ -82,5 +92,23 @@ bool unify(const TypePtr& a, const TypePtr& b);
 
 // Pretty-print a type (after `resolve()`).
 std::string typeToString(const TypePtr& t);
+
+// Deep-copy `t`, substituting any Var whose `varId` is a key in `subst` with
+// the substitution target. Vars not in `subst` are returned unchanged (sharing
+// the original TypePtr — caller must not mutate it). Function types are
+// reconstructed; primitive / struct / enum types are returned as-is when no
+// substitution applies to them.
+//
+// Use cases:
+//   - Type-checker: instantiate a generic fn's schema at a call site with
+//     a fresh Var per generic parameter, then unify with arg types.
+//   - Codegen: produce a fully-concrete signature for a monomorphized
+//     instance by mapping schema Vars to concrete TypePtrs (Int/Bool/...).
+//
+// Substitution is non-recursive in the target: if subst[A] = B (a Var) and
+// subst[B] = i64, the result still mentions B (we substitute once per Var).
+// Callers requiring fixed-point substitution should compose two passes.
+TypePtr instantiate(const TypePtr& t,
+                    const std::unordered_map<int, TypePtr>& subst);
 
 } // namespace kardashev

@@ -39,14 +39,85 @@ struct TypeError {
     std::size_t column = 1;
 };
 
+// Schema of a function as the typechecker resolved it. For monomorphic
+// functions, `genericVars` is empty and `signature` is the concrete
+// `fn(args...) -> ret` Type. For generic functions, `genericVars` holds the
+// stable Type variables introduced for each generic parameter (one per
+// `fn.genericParams`); `signature` mentions those Vars wherever the source
+// referenced the parameter by name. Codegen instantiates this schema by
+// substituting concrete types for the genericVars to drive monomorphization.
+struct FnSchema {
+    TypePtr signature;
+    std::vector<TypePtr> genericVars;
+    // One entry per genericVars[i]: the trait-name bound (empty for an
+    // unbounded param). Phase 3.3 only supports a single trait bound per
+    // param; multi-bounds (`T: A + B`) can append entries here later.
+    std::vector<std::string> genericBounds;
+};
+
+// Schema of a generic struct. For monomorphic structs, `genericVars` is
+// empty. For generic structs, `type` is a Struct-kind Type whose
+// `structFields` may reference the genericVars in their TypePtrs. Codegen
+// monomorphizes each (structName, [concrete typeArgs]) combination
+// encountered through resolved expression types.
+struct StructSchema {
+    TypePtr type;
+    std::vector<TypePtr> genericVars;
+};
+
+// Schema of a generic enum. Same shape as StructSchema, but `type`'s
+// `enumVariants` reference the genericVars in payload TypePtrs.
+struct EnumSchema {
+    TypePtr type;
+    std::vector<TypePtr> genericVars;
+};
+
+// Per-call-site result of resolving a `receiver.method(args)` expression
+// to a concrete impl. The `mangledName` directly names the LLVM function
+// codegen emits for the impl method; for trait-bounded generic receivers
+// it gets re-computed at codegen time once the bound's concrete type is
+// known via the enclosing instance's substitution.
+struct ResolvedMethod {
+    enum Kind { Concrete, BoundedGeneric };
+    Kind kind = Concrete;
+    // Common to both kinds:
+    std::string traitName;
+    std::string methodName;
+    // Concrete: the implementing-type's name (e.g. "Point", "Box");
+    // BoundedGeneric: the schema Var ID of the receiver's generic param.
+    std::string concreteTypeName; // Concrete only
+    int boundedVarId = -1;        // BoundedGeneric only
+    // typeArgs on the receiver type at the resolution site (so generic
+    // impls — Phase 3.3 doesn't have them yet — can route correctly).
+    std::vector<TypePtr> receiverTypeArgs;
+};
+
 struct TypeCheckResult {
     std::vector<TypeError> errors;
     // Per-expression resolved type, for codegen.
     std::unordered_map<const ast::Expr*, TypePtr> exprTypes;
-    // Resolved struct types keyed by struct name, for codegen layout lookup.
-    std::unordered_map<std::string, TypePtr> structs;
-    // Resolved enum types keyed by enum name, for codegen tagged-union layout.
-    std::unordered_map<std::string, TypePtr> enums;
+    // Resolved struct schemas keyed by struct name. For monomorphic
+    // structs the schema's `type` is the concrete struct Type and codegen
+    // uses it directly; for generic structs codegen instantiates per
+    // unique typeArgs combination encountered through `exprTypes`.
+    std::unordered_map<std::string, StructSchema> structs;
+    // Resolved enum schemas keyed by enum name.
+    std::unordered_map<std::string, EnumSchema> enums;
+    // Per-fn schema, for codegen monomorphization.
+    std::unordered_map<std::string, FnSchema> fnSchemas;
+    // Type arguments inferred at each call site to a generic function, in
+    // the same order as the callee's `genericParams`. Each TypePtr is the
+    // fresh Var created at the call site, possibly linked (via unification)
+    // to a concrete type or to a generic Var of the enclosing fn. Codegen
+    // walks these to build the monomorphization worklist. Calls to
+    // monomorphic functions are NOT recorded here.
+    std::unordered_map<const ast::CallExpr*, std::vector<TypePtr>>
+        callInstantiations;
+    // Per-MethodCallExpr resolution: which (trait, type) impl provides
+    // the called method, plus the receiver-typeArgs context. Codegen
+    // uses this to mangle the LLVM function name.
+    std::unordered_map<const ast::MethodCallExpr*, ResolvedMethod>
+        methodResolutions;
     // Global variant table: variant name -> (enumName, discriminant index).
     // Codegen reads this to map a constructor name to its enum and tag.
     // Phase 2.2 keeps variant names globally unique across all enums to
