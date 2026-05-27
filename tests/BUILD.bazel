@@ -37,6 +37,12 @@ sh_test(
     data = ["//compiler:kard-lsp"],
 )
 
+sh_test(
+    name = "smoke_test_async",
+    srcs = ["smoke_test_async.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

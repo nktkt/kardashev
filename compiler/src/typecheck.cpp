@@ -48,6 +48,17 @@ public:
         }
         TypePtr stringTy = structSchemas_["String"].type;
 
+        // Phase 6.1 built-in: `Future` — opaque handle returned by every
+        // async fn. Codegen lays it out as { i64 state, i64 result }
+        // (MVP only handles `async fn () -> i64`; richer wrapped types
+        // wait for generic Future<T>). The struct stays nameable but
+        // opaque to user dot-access.
+        {
+            StructSchema sch;
+            sch.type = makeStruct("Future", {});
+            structSchemas_["Future"] = std::move(sch);
+        }
+
         // print_str(s: &String) -> i64 ! { io }
         {
             FnSchema sch;
@@ -361,11 +372,19 @@ public:
             schema.declaredEffects = buildEffectSet(fn.effects,
                                                        fn.genericParams,
                                                        fn.name);
-            // Phase 6 (stub): `async fn` implicitly carries the
-            // `async` effect, so a caller still has to opt in via
-            // its own effect row. Adding it here piggybacks on the
-            // existing Phase 4 inference / propagation machinery.
-            if (fn.isAsync) schema.declaredEffects.add("async");
+            // Phase 6.1: `async fn` wraps the declared return type in
+            // the built-in `Future` struct. The body still emits the
+            // inner type (which we stash on the schema for codegen);
+            // callers see Future and must `.await` to unwrap.
+            if (fn.isAsync) {
+                schema.declaredEffects.add("async");
+                schema.isAsync = true;
+                schema.asyncInnerType = schema.signature->ret;
+                auto futIt = structSchemas_.find("Future");
+                if (futIt != structSchemas_.end()) {
+                    schema.signature->ret = futIt->second.type;
+                }
+            }
             schema.isPub = fn.isPub;
             fnSchemas_[fn.name] = std::move(schema);
         }
@@ -1064,11 +1083,20 @@ private:
             return makeRef(inner, re->isMut);
         }
         if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e)) {
-            // Phase 6 (stub): `expr.await` passes its operand's type
-            // through. When a state-machine transform lands this will
-            // strip a `Future<T>` wrapper and yield `T`; today the
-            // operand IS the value.
-            return checkExpr(*ae->operand);
+            // Phase 6.1: `expr.await` requires its operand to be a
+            // `Future`, which the type system uses as the opaque
+            // wrapper async fns return. Phase 6.1 MVP only supports
+            // `async fn () -> i64`, so await is hard-coded to yield
+            // i64; generic Future<T> arrives alongside generic Vec<T>.
+            TypePtr opTy = checkExpr(*ae->operand);
+            TypePtr r = resolve(opTy);
+            if (r->kind != TypeKind::Struct || r->structName != "Future") {
+                error("`.await` requires a Future value, got " +
+                          typeToString(opTy),
+                      ae->line, ae->column);
+                return makeInt();
+            }
+            return makeInt();
         }
         error("unknown expression kind", e.line, e.column);
         return makeInt();

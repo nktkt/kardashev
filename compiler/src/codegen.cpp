@@ -251,6 +251,16 @@ private:
             ctx, {i8PtrTy, i64Ty}, "String");
         structTypes_["String"] = strTy;
 
+        // --- Future struct layout: { i64 state, i64 result }.
+        // Phase 6.1 MVP only supports `async fn () -> i64`, so the
+        // result slot is hard-coded i64. Async fns return Future at the
+        // user-visible LLVM signature; their actual body lives in a
+        // sibling `__async_body_<name>` fn whose wrapper builds the
+        // Future at every return point.
+        auto* futureTy = llvm::StructType::create(
+            ctx, {i64Ty, i64Ty}, "Future");
+        structTypes_["Future"] = futureTy;
+
         // --- print(i64) -> i64 ---
         {
             auto* printTy = llvm::FunctionType::get(
@@ -772,6 +782,42 @@ private:
         if (selfIt != implMethodSelf_.end()) {
             currentInstanceTypeMap_["Self"] = selfIt->second;
         }
+        if (fn.isAsync) {
+            // Phase 6.1: async fn — declare two LLVM functions. The
+            // user-visible `name` returns Future and is a wrapper; the
+            // sibling `__async_body_<name>` carries the actual body
+            // and returns the declared inner type. fnTypeFromDecl uses
+            // fn.returnType which is the declared T, so the body
+            // signature falls out naturally.
+            auto* futureTy = structTypes_["Future"];
+            std::vector<llvm::Type*> argTs;
+            argTs.reserve(fn.params.size());
+            for (const auto& p : fn.params) argTs.push_back(mapTypeRef(p.type));
+            auto* wrapperFty = llvm::FunctionType::get(
+                futureTy, argTs, /*isVarArg=*/false);
+            auto* wrapper = llvm::Function::Create(
+                wrapperFty, llvm::Function::ExternalLinkage, name,
+                module_.get());
+            unsigned i = 0;
+            for (auto& arg : wrapper->args()) {
+                if (i < fn.params.size()) arg.setName(fn.params[i].name);
+                ++i;
+            }
+            declaredFns_[name] = wrapper;
+
+            llvm::FunctionType* bodyFty = fnTypeFromDecl(fn);
+            auto* bodyFn = llvm::Function::Create(
+                bodyFty, llvm::Function::InternalLinkage,
+                "__async_body_" + name, module_.get());
+            i = 0;
+            for (auto& arg : bodyFn->args()) {
+                if (i < fn.params.size()) arg.setName(fn.params[i].name);
+                ++i;
+            }
+            declaredFns_["__async_body_" + name] = bodyFn;
+            currentInstanceTypeMap_ = std::move(savedMap);
+            return;
+        }
         llvm::FunctionType* fty = fnTypeFromDecl(fn);
         auto* f = llvm::Function::Create(
             fty, llvm::Function::ExternalLinkage, name, module_.get());
@@ -828,7 +874,15 @@ private:
         if (selfIt != implMethodSelf_.end()) {
             currentInstanceTypeMap_["Self"] = selfIt->second;
         }
-        const std::string mangled = mangleInstance(baseName, typeArgs);
+        // Phase 6.1: async fns emit the body INTO the
+        // `__async_body_<name>` sibling we declared. Then we generate
+        // the Future-wrapping body of the user-visible name.
+        std::string mangled;
+        if (fn.isAsync) {
+            mangled = "__async_body_" + baseName;
+        } else {
+            mangled = mangleInstance(baseName, typeArgs);
+        }
         auto fnIt = declaredFns_.find(mangled);
         if (fnIt == declaredFns_.end()) {
             // Generic instance not yet declared: declare it now so
@@ -867,6 +921,38 @@ private:
                 // ill-typed; either way emit ret void as a safe default.
                 builder_->CreateRetVoid();
             }
+        }
+
+        // Phase 6.1: for async fns, also emit the Future-wrapping
+        // wrapper that the user-visible name points at. The body we
+        // just emitted lives in `__async_body_<name>`; the wrapper
+        // calls it and packages the result into Future { 1, result }.
+        if (fn.isAsync) {
+            auto wrapperIt = declaredFns_.find(baseName);
+            if (wrapperIt == declaredFns_.end()) {
+                errors_.push_back(
+                    "codegen: async wrapper not declared for " + baseName);
+                return;
+            }
+            auto* wrapper = wrapperIt->second;
+            auto* bodyFn = currentFn_; // the __async_body_<name> we just filled
+            auto& ctx = *ctx_;
+            auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+            auto* futureTy = structTypes_["Future"];
+            auto* wEntry =
+                llvm::BasicBlock::Create(ctx, "entry", wrapper);
+            llvm::IRBuilder<> b(wEntry);
+            std::vector<llvm::Value*> args;
+            args.reserve(wrapper->arg_size());
+            for (auto& arg : wrapper->args()) args.push_back(&arg);
+            auto* result =
+                b.CreateCall(bodyFn, args, "async_inner_result");
+            llvm::Value* fut = llvm::UndefValue::get(futureTy);
+            fut = b.CreateInsertValue(
+                fut, llvm::ConstantInt::get(i64Ty, 1), {0},
+                "future_state");
+            fut = b.CreateInsertValue(fut, result, {1}, "future_result");
+            b.CreateRet(fut);
         }
     }
 
@@ -961,11 +1047,15 @@ private:
             return emitRef(*re);
         }
         if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e)) {
-            // Phase 6 (stub): `.await` is currently a value-pass-
-            // through. Once the state-machine transform lands this will
-            // become the suspend point that yields control to the
-            // executor; today it's just emitExpr(operand).
-            return emitExpr(*ae->operand);
+            // Phase 6.1: `.await` extracts the inner result field of
+            // the Future the operand evaluates to. With no real
+            // suspension primitives in kardashev today, the executor
+            // is the calling code itself — every Future is already
+            // Ready when produced, so the unwrap is a single
+            // ExtractValue. The state slot stays in the IR for future
+            // expansion (suspension points, drop ordering, etc).
+            llvm::Value* fut = emitExpr(*ae->operand);
+            return builder_->CreateExtractValue(fut, {1}, "await_result");
         }
         errors_.push_back("codegen: unknown expression kind");
         return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);

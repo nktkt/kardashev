@@ -79,6 +79,12 @@ struct FnSchema {
     // (`foo::fn_name(args)`). Bare-name calls bypass this check
     // because Phase 7.1 still flat-merges modules.
     bool isPub = false;
+    // Phase 6.1: async fn — `signature.ret` is `Future`, the wrapped
+    // type that callers see. `asyncInnerType` is the declared T (the
+    // type the body actually returns). Codegen emits a pair: the body
+    // returning T and a wrapper that constructs Future{state, T}.
+    bool isAsync = false;
+    TypePtr asyncInnerType;
 };
 
 // Schema of a generic struct. For monomorphic structs, `genericVars` is
