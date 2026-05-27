@@ -50,8 +50,9 @@ Effect sets are unioned across the call graph and checked at definition sites; n
 
 ## Status
 
-Phases 0–4 (concrete effects) land; row-polymorphic effects (`! {e}`) wait
-for first-class function values in Phase 6. Built locally with `bazel
+Phases 0–5a + 5b (prelude) land; row-polymorphic effects (`! {e}`) and
+stdlib types that need a heap (`Vec`, `String`) wait for first-class
+function values + a small runtime in Phase 6. Built locally with `bazel
 build //... && bazel test //...` or, when Bazel isn't available, the
 `Makefile.local` shim (LLVM + clang). The CI matrix runs both
 ubuntu-latest and macos-latest via Bazel on every push.
@@ -87,11 +88,24 @@ fn raw_read() -> i64 ! { io } { 42 }
 fn main() -> i64 ! { io, alloc } { raw_read() }    // pure-caller would error
 ```
 
-Run the REPL with `bazel run //compiler:kardc` (or `./build.local/kardc`
-after `make -f Makefile.local kardc`); type a `fn` to define it, type
-any expression to evaluate. Programs compile through lexer → parser →
-HM typechecker → NLL borrow-checker → effect inference → LLVM IR →
-ORC v2 JIT.
+`Option<T>` and `Result<T, E>` are auto-included via a built-in prelude
+so user programs can use `Some` / `None` / `Ok` / `Err` without
+redeclaring them.
+
+Three driver modes:
+
+```
+kardc                      # interactive REPL (JIT each expression)
+kardc <file.kd>            # JIT-run main() and print result
+kardc -o <out> <file.kd>   # AOT-compile to a native executable
+```
+
+The AOT path emits a native object via LLVM's `TargetMachine`, generates
+a C-compatible `int main()` wrapper that returns the kardashev
+`fn main() -> i64` result truncated to an exit code, and shells out to
+`clang` for linking. Programs compile through lexer → parser → HM
+typechecker → NLL borrow-checker → effect inference → LLVM IR → ORC v2
+JIT (or AOT).
 
 ## Roadmap
 
@@ -102,7 +116,7 @@ ORC v2 JIT.
 | 2 | Ownership + NLL borrow check + structs + enums + pattern matching | ✅ |
 | 3 | Traits + generics + `Result` + `?` operator + monomorphization | ✅ |
 | 4 | Effect labels in signatures (the signature feature lands here) | ✅ (concrete labels; row-polymorphic `! {e}` waits for fn-pointer values in Phase 6) |
-| 5 | AOT pipeline + minimal stdlib (`Option`, `Result`, `Vec`, `String`) | — |
+| 5 | AOT pipeline + minimal stdlib (`Option`, `Result`, `Vec`, `String`) | ✅ AOT + Option/Result prelude; Vec/String wait for the Phase 6 runtime |
 | 6 | `async` / `await` + state-machine transform + basic executor | — |
 | 7 | Module system + complete `rules_kardashev` + `kard` CLI | — |
 | 8 | Optimization passes + LSP + docs site | — |
