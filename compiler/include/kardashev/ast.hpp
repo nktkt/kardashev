@@ -120,6 +120,12 @@ struct IntLitExpr : Expr {
     std::int64_t value = 0;
 };
 
+// Phase 5.y: `"..."` string literal. Codegen lowers to a heap-immutable
+// global byte buffer wrapped in the built-in `String` struct.
+struct StringLitExpr : Expr {
+    std::string value;
+};
+
 struct IdentExpr : Expr {
     std::string name;
 };

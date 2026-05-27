@@ -683,6 +683,15 @@ private:
             return e;
         }
 
+        if (t.kind == TokenKind::StringLit) {
+            Token tok = consume();
+            auto e = std::make_unique<ast::StringLitExpr>();
+            e->line = tok.line;
+            e->column = tok.column;
+            e->value = tok.lexeme;
+            return e;
+        }
+
         if (t.kind == TokenKind::Identifier) {
             // Phase 7.2: paths (`foo::bar`) collapse to their last
             // segment because modules currently flat-merge into one

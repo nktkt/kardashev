@@ -22,6 +22,7 @@ namespace kardashev {
 enum class TokenKind {
     // Literals & identifiers
     Integer,
+    StringLit, // Phase 5.y: "..." string literal
     Identifier,
 
     // Keywords

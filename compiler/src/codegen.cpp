@@ -244,6 +244,13 @@ private:
             ctx, {i8PtrTy, i64Ty, i64Ty}, "Vec");
         structTypes_["Vec"] = vecTy;
 
+        // --- String struct layout: { i8* data, i64 len }. Immutable;
+        // string literals are emitted as LLVM private global constants
+        // and aliased through this view.
+        auto* strTy = llvm::StructType::create(
+            ctx, {i8PtrTy, i64Ty}, "String");
+        structTypes_["String"] = strTy;
+
         // --- print(i64) -> i64 ---
         {
             auto* printTy = llvm::FunctionType::get(
@@ -377,6 +384,49 @@ private:
             auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
             b.CreateRet(len);
             declaredFns_["vec_len"] = fn;
+        }
+
+        auto* strPtrTy = llvm::PointerType::get(ctx, 0);
+
+        // --- print_str(s: &String) -> i64 ---
+        // Writes len bytes of s->data to stdout via printf("%.*s\n", ...).
+        {
+            auto* fnTy = llvm::FunctionType::get(i64Ty, {strPtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "print_str",
+                module_.get());
+            fn->getArg(0)->setName("s");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* dataPtr =
+                b.CreateStructGEP(strTy, fn->getArg(0), 0, "data_ptr");
+            auto* data = b.CreateLoad(i8PtrTy, dataPtr, "data");
+            auto* lenPtr =
+                b.CreateStructGEP(strTy, fn->getArg(0), 1, "len_ptr");
+            auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
+            // printf takes int, not int64, for `%.*s` precision arg.
+            auto* lenI32 = b.CreateTrunc(len, i32Ty, "len_i32");
+            auto* fmt = b.CreateGlobalString("%.*s\n", "kd_print_str_fmt",
+                                                0, module_.get());
+            b.CreateCall(printfFn, {fmt, lenI32, data});
+            b.CreateRet(zero);
+            declaredFns_["print_str"] = fn;
+        }
+
+        // --- str_len(s: &String) -> i64 ---
+        {
+            auto* fnTy = llvm::FunctionType::get(i64Ty, {strPtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "str_len",
+                module_.get());
+            fn->getArg(0)->setName("s");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* lenPtr =
+                b.CreateStructGEP(strTy, fn->getArg(0), 1, "len_ptr");
+            auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
+            b.CreateRet(len);
+            declaredFns_["str_len"] = fn;
         }
     }
 
@@ -861,6 +911,9 @@ private:
                 llvm::Type::getInt64Ty(*ctx_),
                 static_cast<uint64_t>(lit->value), /*isSigned=*/true);
         }
+        if (auto* sl = dynamic_cast<const ast::StringLitExpr*>(&e)) {
+            return emitStringLit(*sl);
+        }
         if (auto* id = dynamic_cast<const ast::IdentExpr*>(&e)) {
             auto it = locals_.find(id->name);
             if (it != locals_.end()) {
@@ -916,6 +969,28 @@ private:
         }
         errors_.push_back("codegen: unknown expression kind");
         return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
+    }
+
+    // Phase 5.y: lower `"..."` to a private global byte constant and
+    // return a String struct view over it. The global is unnamed +
+    // unique per source occurrence, so duplicates aren't deduplicated
+    // today (LLVM's `GlobalString` mergeable constants would dedupe,
+    // but the simple form here is enough for `print_str("hi")` use).
+    llvm::Value* emitStringLit(const ast::StringLitExpr& sl) {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* strTy = structTypes_["String"];
+        llvm::IRBuilder<> tmp(*ctx_);
+        // CreateGlobalString needs an IRBuilder with an insertion
+        // point; reuse builder_ for that and then restore.
+        llvm::Value* ptr = builder_->CreateGlobalString(
+            sl.value, "kd_strlit", 0, module_.get());
+        auto* len = llvm::ConstantInt::get(
+            i64Ty, static_cast<uint64_t>(sl.value.size()));
+        llvm::Value* v = llvm::UndefValue::get(strTy);
+        v = builder_->CreateInsertValue(v, ptr, {0}, "str_data");
+        v = builder_->CreateInsertValue(v, len, {1}, "str_len");
+        return v;
     }
 
     llvm::Value* emitStructLit(const ast::StructLitExpr& sl) {

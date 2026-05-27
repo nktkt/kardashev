@@ -38,6 +38,32 @@ public:
         }
         TypePtr vecTy = structSchemas_["Vec"].type;
 
+        // Phase 5.y built-in: `String` — immutable utf-8-ish byte buffer
+        // backing string literals (`"..."`). Codegen emits each literal
+        // as an LLVM global constant + a struct view { i8* data, i64 len }.
+        {
+            StructSchema sch;
+            sch.type = makeStruct("String", {});
+            structSchemas_["String"] = std::move(sch);
+        }
+        TypePtr stringTy = structSchemas_["String"].type;
+
+        // print_str(s: &String) -> i64 ! { io }
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(stringTy, /*isMut=*/false)}, makeInt());
+            sch.declaredEffects.add("io");
+            fnSchemas_["print_str"] = std::move(sch);
+        }
+        // str_len(s: &String) -> i64
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(stringTy, /*isMut=*/false)}, makeInt());
+            fnSchemas_["str_len"] = std::move(sch);
+        }
+
         // vec_new() -> Vec ! { alloc }
         {
             FnSchema sch;
@@ -510,6 +536,7 @@ private:
     // unknown callees (the typechecker already errored on them) we skip.
     void collectEffects(const ast::Expr& e, EffectSet& out) {
         if (dynamic_cast<const ast::IntLitExpr*>(&e)) return;
+        if (dynamic_cast<const ast::StringLitExpr*>(&e)) return;
         if (dynamic_cast<const ast::IdentExpr*>(&e)) return;
         if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(&e)) {
             collectEffects(*bin->lhs, out);
@@ -963,6 +990,11 @@ private:
     TypePtr computeExprType(const ast::Expr& e) {
         if (dynamic_cast<const ast::IntLitExpr*>(&e)) {
             return makeInt();
+        }
+        if (dynamic_cast<const ast::StringLitExpr*>(&e)) {
+            auto it = structSchemas_.find("String");
+            return it != structSchemas_.end() ? it->second.type
+                                              : makeStruct("String", {});
         }
         if (auto* id = dynamic_cast<const ast::IdentExpr*>(&e)) {
             if (auto t = lookupLocal(id->name)) return t;

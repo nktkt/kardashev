@@ -158,6 +158,7 @@ private:
             return;
         }
         if (dynamic_cast<const ast::IntLitExpr*>(&e)) return;
+        if (dynamic_cast<const ast::StringLitExpr*>(&e)) return;
         if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(&e)) {
             prePass(*bin->lhs);
             prePass(*bin->rhs);
@@ -295,6 +296,9 @@ private:
             return startPos;
         }
         if (dynamic_cast<const ast::IntLitExpr*>(&e)) {
+            return startPos;
+        }
+        if (dynamic_cast<const ast::StringLitExpr*>(&e)) {
             return startPos;
         }
         if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(&e)) {

@@ -80,6 +80,33 @@ std::vector<Token> lex(std::string_view source) {
 
         std::size_t startCol = col;
 
+        // Phase 5.y: string literal. Supports \n, \\, \" escapes; any
+        // other backslash sequence is taken literally so a stray `\` in
+        // source survives lexing.
+        if (c == '"') {
+            ++i;
+            ++col;
+            std::string val;
+            while (i < source.size() && source[i] != '"') {
+                char ch = source[i];
+                if (ch == '\\' && i + 1 < source.size()) {
+                    char e = source[i + 1];
+                    if (e == 'n') { val.push_back('\n'); i += 2; col += 2; continue; }
+                    if (e == '\\') { val.push_back('\\'); i += 2; col += 2; continue; }
+                    if (e == '"') { val.push_back('"'); i += 2; col += 2; continue; }
+                    if (e == 't') { val.push_back('\t'); i += 2; col += 2; continue; }
+                }
+                if (ch == '\n') { ++line; col = 1; ++i; }
+                else            { ++col; ++i; }
+                val.push_back(ch);
+            }
+            if (i < source.size() && source[i] == '"') {
+                ++i; ++col;
+            }
+            tokens.push_back({TokenKind::StringLit, std::move(val), line, startCol});
+            continue;
+        }
+
         // Integer literal.
         if (std::isdigit(static_cast<unsigned char>(c))) {
             std::size_t start = i;
@@ -174,6 +201,7 @@ std::vector<Token> lex(std::string_view source) {
 std::string_view tokenKindName(TokenKind kind) {
     switch (kind) {
     case TokenKind::Integer: return "Integer";
+    case TokenKind::StringLit: return "StringLit";
     case TokenKind::Identifier: return "Identifier";
     case TokenKind::KwFn: return "KwFn";
     case TokenKind::KwLet: return "KwLet";
