@@ -207,37 +207,177 @@ private:
     // here so both JIT and AOT resolve it without external runtime
     // files. libc's `printf` is always linked into the host process
     // (kardc) for JIT, and clang links libc into AOT outputs by default.
+    //
+    // Also emits the Vec growable-buffer runtime (Phase 5.x): the LLVM
+    // struct layout for Vec + the four operations (vec_new / vec_push /
+    // vec_get / vec_len). The implementation depends on libc's malloc +
+    // realloc; same linkage logic as printf above.
     void declareBuiltins() {
         auto& ctx = *ctx_;
         auto* i64Ty = llvm::Type::getInt64Ty(ctx);
         auto* i32Ty = llvm::Type::getInt32Ty(ctx);
         auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
 
-        // Declare `int printf(const char*, ...)`.
+        // --- libc externals ---
         auto* printfTy =
             llvm::FunctionType::get(i32Ty, {i8PtrTy}, /*isVarArg=*/true);
         auto* printfFn = llvm::Function::Create(
-            printfTy, llvm::Function::ExternalLinkage, "printf", module_.get());
+            printfTy, llvm::Function::ExternalLinkage, "printf",
+            module_.get());
 
-        // Define `int64_t print(int64_t)` that calls printf("%lld\n", n)
-        // and returns 0. Naming it `print` directly is fine because no
-        // C runtime symbol conflicts with it.
-        auto* printTy =
-            llvm::FunctionType::get(i64Ty, {i64Ty}, /*isVarArg=*/false);
-        auto* printFn = llvm::Function::Create(
-            printTy, llvm::Function::ExternalLinkage, "print", module_.get());
-        printFn->getArg(0)->setName("n");
-        auto* entry = llvm::BasicBlock::Create(ctx, "entry", printFn);
-        llvm::IRBuilder<> b(entry);
-        // %lld matches Linux's int64_t; PRId64 from <inttypes.h> would
-        // be more portable but `%lld` is universally accepted on the
-        // 64-bit platforms our CI matrix targets (Ubuntu + macOS).
-        auto* fmt = b.CreateGlobalString("%lld\n", "kd_print_fmt", 0,
-                                           module_.get());
-        b.CreateCall(printfFn, {fmt, printFn->getArg(0)});
-        b.CreateRet(llvm::ConstantInt::get(i64Ty, 0));
+        auto* mallocTy =
+            llvm::FunctionType::get(i8PtrTy, {i64Ty}, /*isVarArg=*/false);
+        auto* mallocFn = llvm::Function::Create(
+            mallocTy, llvm::Function::ExternalLinkage, "malloc",
+            module_.get());
 
-        declaredFns_["print"] = printFn;
+        auto* reallocTy = llvm::FunctionType::get(
+            i8PtrTy, {i8PtrTy, i64Ty}, /*isVarArg=*/false);
+        auto* reallocFn = llvm::Function::Create(
+            reallocTy, llvm::Function::ExternalLinkage, "realloc",
+            module_.get());
+        (void)mallocFn; // realloc(NULL, n) == malloc(n), so we drive
+                         // growth through realloc alone
+
+        // --- Vec struct layout: { i8* data, i64 len, i64 cap } ---
+        auto* vecTy = llvm::StructType::create(
+            ctx, {i8PtrTy, i64Ty, i64Ty}, "Vec");
+        structTypes_["Vec"] = vecTy;
+
+        // --- print(i64) -> i64 ---
+        {
+            auto* printTy = llvm::FunctionType::get(
+                i64Ty, {i64Ty}, /*isVarArg=*/false);
+            auto* printFn = llvm::Function::Create(
+                printTy, llvm::Function::ExternalLinkage, "print",
+                module_.get());
+            printFn->getArg(0)->setName("n");
+            auto* entry =
+                llvm::BasicBlock::Create(ctx, "entry", printFn);
+            llvm::IRBuilder<> b(entry);
+            auto* fmt = b.CreateGlobalString("%lld\n", "kd_print_fmt", 0,
+                                               module_.get());
+            b.CreateCall(printfFn, {fmt, printFn->getArg(0)});
+            b.CreateRet(llvm::ConstantInt::get(i64Ty, 0));
+            declaredFns_["print"] = printFn;
+        }
+
+        auto* vecPtrTy = llvm::PointerType::get(ctx, 0);
+        auto* zero = llvm::ConstantInt::get(i64Ty, 0);
+
+        // --- vec_new() -> Vec ---
+        {
+            auto* fnTy = llvm::FunctionType::get(vecTy, {}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "vec_new",
+                module_.get());
+            auto* entry =
+                llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            llvm::Value* v = llvm::UndefValue::get(vecTy);
+            v = b.CreateInsertValue(
+                v, llvm::ConstantPointerNull::get(i8PtrTy), {0}, "vec_data");
+            v = b.CreateInsertValue(v, zero, {1}, "vec_len");
+            v = b.CreateInsertValue(v, zero, {2}, "vec_cap");
+            b.CreateRet(v);
+            declaredFns_["vec_new"] = fn;
+        }
+
+        // --- vec_push(v: Vec*, x: i64) -> i64 ---
+        //
+        // C-equivalent:
+        //   if (v->len == v->cap) {
+        //       v->cap = v->cap == 0 ? 4 : v->cap * 2;
+        //       v->data = realloc(v->data, v->cap * 8);
+        //   }
+        //   ((int64_t*)v->data)[v->len++] = x;
+        //   return 0;
+        {
+            auto* fnTy = llvm::FunctionType::get(
+                i64Ty, {vecPtrTy, i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "vec_push",
+                module_.get());
+            fn->getArg(0)->setName("v");
+            fn->getArg(1)->setName("x");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* growBB = llvm::BasicBlock::Create(ctx, "grow", fn);
+            auto* storeBB = llvm::BasicBlock::Create(ctx, "store", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* vPtr = fn->getArg(0);
+            auto* xVal = fn->getArg(1);
+            auto* dataPtr = b.CreateStructGEP(vecTy, vPtr, 0, "data_ptr");
+            auto* lenPtr = b.CreateStructGEP(vecTy, vPtr, 1, "len_ptr");
+            auto* capPtr = b.CreateStructGEP(vecTy, vPtr, 2, "cap_ptr");
+            auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
+            auto* cap = b.CreateLoad(i64Ty, capPtr, "cap");
+            auto* needGrow =
+                b.CreateICmpEQ(len, cap, "need_grow");
+            b.CreateCondBr(needGrow, growBB, storeBB);
+
+            b.SetInsertPoint(growBB);
+            auto* capIsZero = b.CreateICmpEQ(cap, zero, "cap_is_zero");
+            auto* four = llvm::ConstantInt::get(i64Ty, 4);
+            auto* doubled = b.CreateMul(
+                cap, llvm::ConstantInt::get(i64Ty, 2), "doubled");
+            auto* newCap =
+                b.CreateSelect(capIsZero, four, doubled, "new_cap");
+            auto* oldData = b.CreateLoad(i8PtrTy, dataPtr, "old_data");
+            auto* eight = llvm::ConstantInt::get(i64Ty, 8);
+            auto* newBytes = b.CreateMul(newCap, eight, "new_bytes");
+            auto* newData =
+                b.CreateCall(reallocFn, {oldData, newBytes}, "new_data");
+            b.CreateStore(newData, dataPtr);
+            b.CreateStore(newCap, capPtr);
+            b.CreateBr(storeBB);
+
+            b.SetInsertPoint(storeBB);
+            auto* curData = b.CreateLoad(i8PtrTy, dataPtr, "cur_data");
+            auto* elemPtr = b.CreateGEP(i64Ty, curData, len, "elem_ptr");
+            b.CreateStore(xVal, elemPtr);
+            auto* newLen = b.CreateAdd(
+                len, llvm::ConstantInt::get(i64Ty, 1), "new_len");
+            b.CreateStore(newLen, lenPtr);
+            b.CreateRet(zero);
+            declaredFns_["vec_push"] = fn;
+        }
+
+        // --- vec_get(v: Vec*, i: i64) -> i64 ---
+        {
+            auto* fnTy = llvm::FunctionType::get(
+                i64Ty, {vecPtrTy, i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "vec_get",
+                module_.get());
+            fn->getArg(0)->setName("v");
+            fn->getArg(1)->setName("i");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* dataPtr =
+                b.CreateStructGEP(vecTy, fn->getArg(0), 0, "data_ptr");
+            auto* data = b.CreateLoad(i8PtrTy, dataPtr, "data");
+            auto* elemPtr =
+                b.CreateGEP(i64Ty, data, fn->getArg(1), "elem_ptr");
+            auto* val = b.CreateLoad(i64Ty, elemPtr, "val");
+            b.CreateRet(val);
+            declaredFns_["vec_get"] = fn;
+        }
+
+        // --- vec_len(v: Vec*) -> i64 ---
+        {
+            auto* fnTy = llvm::FunctionType::get(i64Ty, {vecPtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "vec_len",
+                module_.get());
+            fn->getArg(0)->setName("v");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* lenPtr =
+                b.CreateStructGEP(vecTy, fn->getArg(0), 1, "len_ptr");
+            auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
+            b.CreateRet(len);
+            declaredFns_["vec_len"] = fn;
+        }
     }
 
     void declareAllStructs() {

@@ -13,15 +13,59 @@ class TypeChecker {
 public:
     TypeCheckResult check(const ast::Program& program) {
         // Phase 6.0 built-ins: register stdlib primitives the user can
-        // call without ever declaring them. Today: `print(i64) -> i64 ! { io }`.
-        // The implementation lives in codegen (a generated wrapper that
-        // calls libc's `printf`); we only commit a schema here so the
-        // typechecker accepts the calls + propagates effects.
+        // call without ever declaring them. The implementations live in
+        // codegen (generated wrappers that call libc's printf, malloc,
+        // realloc); we only commit schemas here so the typechecker
+        // accepts the calls + propagates effects.
+
+        // print(i64) -> i64 ! { io }
         {
             FnSchema sch;
             sch.signature = makeFunction({makeInt()}, makeInt());
             sch.declaredEffects.add("io");
             fnSchemas_["print"] = std::move(sch);
+        }
+
+        // Phase 5.x built-in: `Vec` — a growable buffer of i64. The
+        // type is registered as a single-field-less struct so user code
+        // can name it (`fn f(v: &Vec) -> i64 { vec_len(v) }`) but can't
+        // dot-access internals. Codegen knows the concrete LLVM layout
+        // ({ i8* data, i64 len, i64 cap }).
+        {
+            StructSchema sch;
+            sch.type = makeStruct("Vec", {});
+            structSchemas_["Vec"] = std::move(sch);
+        }
+        TypePtr vecTy = structSchemas_["Vec"].type;
+
+        // vec_new() -> Vec ! { alloc }
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({}, vecTy);
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["vec_new"] = std::move(sch);
+        }
+        // vec_push(v: &mut Vec, x: i64) -> i64 ! { alloc }
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(vecTy, /*isMut=*/true), makeInt()}, makeInt());
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["vec_push"] = std::move(sch);
+        }
+        // vec_get(v: &Vec, i: i64) -> i64
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(vecTy, /*isMut=*/false), makeInt()}, makeInt());
+            fnSchemas_["vec_get"] = std::move(sch);
+        }
+        // vec_len(v: &Vec) -> i64
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(vecTy, /*isMut=*/false)}, makeInt());
+            fnSchemas_["vec_len"] = std::move(sch);
         }
 
         // Pass 1a: register every struct and enum decl. To allow free
