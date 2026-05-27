@@ -340,6 +340,7 @@ public:
             // its own effect row. Adding it here piggybacks on the
             // existing Phase 4 inference / propagation machinery.
             if (fn.isAsync) schema.declaredEffects.add("async");
+            schema.isPub = fn.isPub;
             fnSchemas_[fn.name] = std::move(schema);
         }
         // Pass 1e: register each impl method as a regular fn schema under
@@ -1406,6 +1407,19 @@ private:
         auto fnIt = fnSchemas_.find(call.callee);
         if (fnIt != fnSchemas_.end()) {
             const FnSchema& schema = fnIt->second;
+            // Phase 7.3b: path-qualified call sites (`foo::bar()`) must
+            // resolve to a `pub` fn. Bare-name calls still work via
+            // Phase 7.1's flat-merge so existing intra-module code is
+            // unaffected. Built-in stdlib fns (`print`, `vec_*`) are
+            // declared via the typechecker's own registration and not
+            // marked pub, but they're addressed without paths so this
+            // check never fires on them.
+            if (call.wasPath && !schema.isPub) {
+                error("function '" + call.callee +
+                          "' is not declared `pub`; cannot reach it via "
+                          "path-qualified syntax",
+                      call.line, call.column);
+            }
             // Instantiate the schema with a fresh Var per generic param.
             // Substitution is empty for monomorphic fns (instantiate is a
             // no-op in that case), keeping the hot path zero-cost.

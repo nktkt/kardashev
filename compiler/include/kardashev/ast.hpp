@@ -135,6 +135,12 @@ struct CallExpr : Expr {
     // and method syntax arrive in later phases.
     std::string callee;
     std::vector<ExprPtr> args;
+    // Phase 7.3b: true when the source called the fn via a multi-segment
+    // path (`foo::bar(args)`). Combined with FnSchema.isPub the
+    // typechecker can enforce visibility on cross-module references
+    // without breaking bare-name calls that the Phase 7.1 flat-merge
+    // semantics still permits.
+    bool wasPath = false;
 };
 
 struct StructLitExpr : Expr {
@@ -270,6 +276,8 @@ struct FnDecl {
     EffectRow effects; // Phase 4: declared effect row; empty = pure
     bool isAsync = false; // Phase 6 (stub): `async fn` desugars to a fn
                             // that implicitly carries the `async` effect.
+    bool isPub = false;   // Phase 7.3b: visible across module boundaries
+                            // when referenced via path syntax.
     std::unique_ptr<BlockExpr> body;
     std::size_t line = 1;
     std::size_t column = 1;

@@ -75,6 +75,10 @@ struct FnSchema {
     std::vector<std::string> genericBounds;
     // Phase 4: effects declared in the fn's `! { ... }` row. Empty = pure.
     EffectSet declaredEffects;
+    // Phase 7.3b: `pub fn` makes a fn callable via path syntax
+    // (`foo::fn_name(args)`). Bare-name calls bypass this check
+    // because Phase 7.1 still flat-merges modules.
+    bool isPub = false;
 };
 
 // Schema of a generic struct. For monomorphic structs, `genericVars` is

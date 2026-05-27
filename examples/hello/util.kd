@@ -1,2 +1,2 @@
-fn double(n: i64) -> i64 { n + n }
-fn quadruple(n: i64) -> i64 { double(double(n)) }
+pub fn double(n: i64) -> i64 { n + n }
+pub fn quadruple(n: i64) -> i64 { double(double(n)) }

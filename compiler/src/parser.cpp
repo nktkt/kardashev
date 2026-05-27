@@ -33,15 +33,18 @@ public:
             } else if (check(TokenKind::KwMod)) {
                 prog.mods.push_back(parseModDecl());
             } else if (check(TokenKind::KwPub)) {
-                // Phase 7.2: `pub` accepted as a visibility marker but,
-                // because Phase 7.1 still flat-merges all modules into
-                // one namespace, treated as a no-op for routing. Drives
-                // the right surface syntax for libraries that want to
-                // declare public APIs explicitly today and pick up
-                // enforcement when path-qualified resolution lands.
+                // Phase 7.3b: `pub` now sticks to fn decls and is enforced
+                // on path-qualified call sites. Bare-name calls keep
+                // working under Phase 7.1's flat-merge — only
+                // `foo::bar()` form goes through the visibility check.
                 advance();
-                if (check(TokenKind::KwFn)) {
-                    prog.functions.push_back(parseFnDecl());
+                if (check(TokenKind::KwFn) ||
+                    (peek().kind == TokenKind::Identifier &&
+                     peek().lexeme == "async" &&
+                     peek(1).kind == TokenKind::KwFn)) {
+                    auto fn = parseFnDecl();
+                    fn.isPub = true;
+                    prog.functions.push_back(std::move(fn));
                 } else if (check(TokenKind::KwStruct)) {
                     prog.structs.push_back(parseStructDecl());
                 } else if (check(TokenKind::KwEnum)) {
@@ -683,14 +686,17 @@ private:
         if (t.kind == TokenKind::Identifier) {
             // Phase 7.2: paths (`foo::bar`) collapse to their last
             // segment because modules currently flat-merge into one
-            // namespace. We still consume the path so the grammar
-            // accepts canonical multi-segment names without complaint.
+            // namespace. Phase 7.3b additionally marks `wasPath` on
+            // CallExpr so the typechecker can enforce `pub` against
+            // path-qualified references.
             Token first = consume();
             Token tok = first;
+            bool wasPath = false;
             while (check(TokenKind::DoubleColon)) {
                 consume();
                 tok = expect(TokenKind::Identifier,
                               "identifier after `::`");
+                wasPath = true;
             }
             // Preserve the first-segment's position for diagnostics
             // since that's where the user's path begins.
@@ -702,6 +708,7 @@ private:
                 call->line = tok.line;
                 call->column = tok.column;
                 call->callee = tok.lexeme;
+                call->wasPath = wasPath;
                 bool prevCallRestrict = restrictStructLit_;
                 restrictStructLit_ = false;
                 if (!check(TokenKind::RParen)) {
