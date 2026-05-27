@@ -26,17 +26,24 @@ public:
             fnSchemas_["print"] = std::move(sch);
         }
 
-        // Phase 5.x built-in: `Vec` — a growable buffer of i64. The
-        // type is registered as a single-field-less struct so user code
-        // can name it (`fn f(v: &Vec) -> i64 { vec_len(v) }`) but can't
-        // dot-access internals. Codegen knows the concrete LLVM layout
-        // ({ i8* data, i64 len, i64 cap }).
+        // Phase 5.z built-in: `Vec<T>` — a growable buffer with one
+        // type parameter. typeArgs at use sites tell codegen which
+        // element type to specialize the runtime functions for. The
+        // LLVM struct layout stays uniform { i8* data, i64 len, i64 cap }
+        // regardless of T; what changes is the byte-stride used by
+        // push / get.
+        TypePtr vecGenericVar = makeFreshVar();
         {
             StructSchema sch;
             sch.type = makeStruct("Vec", {});
+            sch.genericVars.push_back(vecGenericVar);
             structSchemas_["Vec"] = std::move(sch);
         }
-        TypePtr vecTy = structSchemas_["Vec"].type;
+        TypePtr vecGenericInst = structSchemas_["Vec"].type;
+        // Vec's signature carries one typeArg (the generic Var) so
+        // call-site instantiation walks it the same way generic struct
+        // schemas do.
+        vecGenericInst->typeArgs = {vecGenericVar};
 
         // Phase 5.y built-in: `String` — immutable utf-8-ish byte buffer
         // backing string literals (`"..."`). Codegen emits each literal
@@ -75,33 +82,45 @@ public:
             fnSchemas_["str_len"] = std::move(sch);
         }
 
-        // vec_new() -> Vec ! { alloc }
+        // Phase 5.z: vec_* are generic over T. Each call site infers T
+        // from arg types; codegen lazily specializes the runtime per T.
+        TypePtr vecFnGenericVar = makeFreshVar();
+        TypePtr vecFnInst = makeStruct("Vec", {});
+        vecFnInst->typeArgs = {vecFnGenericVar};
+
+        // vec_new<T>() -> Vec<T> ! { alloc }
         {
             FnSchema sch;
-            sch.signature = makeFunction({}, vecTy);
+            sch.signature = makeFunction({}, vecFnInst);
+            sch.genericVars.push_back(vecFnGenericVar);
             sch.declaredEffects.add("alloc");
             fnSchemas_["vec_new"] = std::move(sch);
         }
-        // vec_push(v: &mut Vec, x: i64) -> i64 ! { alloc }
+        // vec_push<T>(v: &mut Vec<T>, x: T) -> i64 ! { alloc }
         {
             FnSchema sch;
             sch.signature = makeFunction(
-                {makeRef(vecTy, /*isMut=*/true), makeInt()}, makeInt());
+                {makeRef(vecFnInst, /*isMut=*/true), vecFnGenericVar},
+                makeInt());
+            sch.genericVars.push_back(vecFnGenericVar);
             sch.declaredEffects.add("alloc");
             fnSchemas_["vec_push"] = std::move(sch);
         }
-        // vec_get(v: &Vec, i: i64) -> i64
+        // vec_get<T>(v: &Vec<T>, i: i64) -> T
         {
             FnSchema sch;
             sch.signature = makeFunction(
-                {makeRef(vecTy, /*isMut=*/false), makeInt()}, makeInt());
+                {makeRef(vecFnInst, /*isMut=*/false), makeInt()},
+                vecFnGenericVar);
+            sch.genericVars.push_back(vecFnGenericVar);
             fnSchemas_["vec_get"] = std::move(sch);
         }
-        // vec_len(v: &Vec) -> i64
+        // vec_len<T>(v: &Vec<T>) -> i64
         {
             FnSchema sch;
             sch.signature = makeFunction(
-                {makeRef(vecTy, /*isMut=*/false)}, makeInt());
+                {makeRef(vecFnInst, /*isMut=*/false)}, makeInt());
+            sch.genericVars.push_back(vecFnGenericVar);
             fnSchemas_["vec_len"] = std::move(sch);
         }
 

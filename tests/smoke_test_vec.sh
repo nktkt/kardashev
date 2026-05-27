@@ -34,7 +34,7 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
 cat > "$TMP/vec.kd" <<'EOF'
-fn sum_from(v: &Vec, i: i64) -> i64 {
+fn sum_from(v: &Vec<i64>, i: i64) -> i64 {
     if i < vec_len(v) { vec_get(v, i) + sum_from(v, i + 1) }
     else              { 0 }
 }

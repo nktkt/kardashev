@@ -201,6 +201,11 @@ private:
     // existing pattern); GENERIC type instances are realized on demand by
     // `getOrDeclareStructInstance` / `getOrDeclareEnumInstance` when
     // mapKardashevType encounters a typeArgs-bearing Struct/Enum.
+    // Phase 5.z: libc externs cached as members so getOrEmitVecOp can
+    // reuse them when specializing vec_* per T.
+    llvm::Function* reallocFn_ = nullptr;
+    llvm::Function* printfFn_ = nullptr;
+
     // Phase 6.0 built-in: emit a `print` function that wraps libc's
     // `printf` to write one i64 + newline. The typechecker registered a
     // matching schema so user calls type-check; we materialize the body
@@ -238,6 +243,8 @@ private:
             module_.get());
         (void)mallocFn; // realloc(NULL, n) == malloc(n), so we drive
                          // growth through realloc alone
+        reallocFn_ = reallocFn;
+        printfFn_ = printfFn;
 
         // --- Vec struct layout: { i8* data, i64 len, i64 cap } ---
         auto* vecTy = llvm::StructType::create(
@@ -279,41 +286,103 @@ private:
             declaredFns_["print"] = printFn;
         }
 
-        auto* vecPtrTy = llvm::PointerType::get(ctx, 0);
-        auto* zero = llvm::ConstantInt::get(i64Ty, 0);
+        // Phase 5.z: vec_* are now generic over T; their bodies are
+        // emitted lazily per-T via `getOrEmitVecOp` when a call site
+        // demands them. Nothing eager to emit here for vec_*.
+        (void)reallocFn;
 
-        // --- vec_new() -> Vec ---
+        auto* zeroI64 = llvm::ConstantInt::get(i64Ty, 0);
+
+        // --- print_str(s: &String) -> i64 ---
+        // Writes len bytes of s->data to stdout via printf("%.*s\n", ...).
         {
+            auto* fnTy =
+                llvm::FunctionType::get(i64Ty, {i8PtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "print_str",
+                module_.get());
+            fn->getArg(0)->setName("s");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* dataPtr =
+                b.CreateStructGEP(strTy, fn->getArg(0), 0, "data_ptr");
+            auto* data = b.CreateLoad(i8PtrTy, dataPtr, "data");
+            auto* lenPtr =
+                b.CreateStructGEP(strTy, fn->getArg(0), 1, "len_ptr");
+            auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
+            auto* lenI32 = b.CreateTrunc(len, i32Ty, "len_i32");
+            auto* fmt = b.CreateGlobalString(
+                "%.*s\n", "kd_print_str_fmt", 0, module_.get());
+            b.CreateCall(printfFn, {fmt, lenI32, data});
+            b.CreateRet(zeroI64);
+            declaredFns_["print_str"] = fn;
+        }
+
+        // --- str_len(s: &String) -> i64 ---
+        {
+            auto* fnTy =
+                llvm::FunctionType::get(i64Ty, {i8PtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "str_len",
+                module_.get());
+            fn->getArg(0)->setName("s");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* lenPtr =
+                b.CreateStructGEP(strTy, fn->getArg(0), 1, "len_ptr");
+            auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
+            b.CreateRet(len);
+            declaredFns_["str_len"] = fn;
+        }
+    }
+
+    // Phase 5.z: lazily emit a per-element-type specialization of one of
+    // the four `vec_*` built-ins. Mangled name = `<op>__<T_mangle>`,
+    // matching the codegen generic-instance naming scheme so emitCall's
+    // existing generic-callee branch can find it in declaredFns_ after
+    // we register it here. Returns the LLVM Function.
+    llvm::Function* getOrEmitVecOp(const std::string& op, const TypePtr& T) {
+        std::string mangled = op + "__" + mangleType(T);
+        auto it = declaredFns_.find(mangled);
+        if (it != declaredFns_.end()) return it->second;
+
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* zero = llvm::ConstantInt::get(i64Ty, 0);
+        auto* vecTy = structTypes_["Vec"];
+        auto* vecPtrTy = i8PtrTy; // opaque pointer to Vec
+
+        llvm::Type* elemLlvmTy = mapKardashevType(T);
+        // Element byte size — sourced from LLVM's DataLayout. We grab
+        // the layout off the module to stay portable across platforms
+        // (i8=1 byte, i64=8 bytes, struct=natural size, etc).
+        auto dl = module_->getDataLayout();
+        uint64_t elemBytes = dl.getTypeAllocSize(elemLlvmTy);
+        auto* elemBytesK = llvm::ConstantInt::get(i64Ty, elemBytes);
+
+        if (op == "vec_new") {
             auto* fnTy = llvm::FunctionType::get(vecTy, {}, false);
             auto* fn = llvm::Function::Create(
-                fnTy, llvm::Function::ExternalLinkage, "vec_new",
+                fnTy, llvm::Function::ExternalLinkage, mangled,
                 module_.get());
             auto* entry =
                 llvm::BasicBlock::Create(ctx, "entry", fn);
             llvm::IRBuilder<> b(entry);
             llvm::Value* v = llvm::UndefValue::get(vecTy);
             v = b.CreateInsertValue(
-                v, llvm::ConstantPointerNull::get(i8PtrTy), {0}, "vec_data");
-            v = b.CreateInsertValue(v, zero, {1}, "vec_len");
-            v = b.CreateInsertValue(v, zero, {2}, "vec_cap");
+                v, llvm::ConstantPointerNull::get(i8PtrTy), {0}, "data");
+            v = b.CreateInsertValue(v, zero, {1}, "len");
+            v = b.CreateInsertValue(v, zero, {2}, "cap");
             b.CreateRet(v);
-            declaredFns_["vec_new"] = fn;
+            declaredFns_[mangled] = fn;
+            return fn;
         }
-
-        // --- vec_push(v: Vec*, x: i64) -> i64 ---
-        //
-        // C-equivalent:
-        //   if (v->len == v->cap) {
-        //       v->cap = v->cap == 0 ? 4 : v->cap * 2;
-        //       v->data = realloc(v->data, v->cap * 8);
-        //   }
-        //   ((int64_t*)v->data)[v->len++] = x;
-        //   return 0;
-        {
+        if (op == "vec_push") {
             auto* fnTy = llvm::FunctionType::get(
-                i64Ty, {vecPtrTy, i64Ty}, false);
+                i64Ty, {vecPtrTy, elemLlvmTy}, false);
             auto* fn = llvm::Function::Create(
-                fnTy, llvm::Function::ExternalLinkage, "vec_push",
+                fnTy, llvm::Function::ExternalLinkage, mangled,
                 module_.get());
             fn->getArg(0)->setName("v");
             fn->getArg(1)->setName("x");
@@ -328,8 +397,7 @@ private:
             auto* capPtr = b.CreateStructGEP(vecTy, vPtr, 2, "cap_ptr");
             auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
             auto* cap = b.CreateLoad(i64Ty, capPtr, "cap");
-            auto* needGrow =
-                b.CreateICmpEQ(len, cap, "need_grow");
+            auto* needGrow = b.CreateICmpEQ(len, cap, "need_grow");
             b.CreateCondBr(needGrow, growBB, storeBB);
 
             b.SetInsertPoint(growBB);
@@ -340,31 +408,30 @@ private:
             auto* newCap =
                 b.CreateSelect(capIsZero, four, doubled, "new_cap");
             auto* oldData = b.CreateLoad(i8PtrTy, dataPtr, "old_data");
-            auto* eight = llvm::ConstantInt::get(i64Ty, 8);
-            auto* newBytes = b.CreateMul(newCap, eight, "new_bytes");
+            auto* newBytes = b.CreateMul(newCap, elemBytesK, "new_bytes");
             auto* newData =
-                b.CreateCall(reallocFn, {oldData, newBytes}, "new_data");
+                b.CreateCall(reallocFn_, {oldData, newBytes}, "new_data");
             b.CreateStore(newData, dataPtr);
             b.CreateStore(newCap, capPtr);
             b.CreateBr(storeBB);
 
             b.SetInsertPoint(storeBB);
             auto* curData = b.CreateLoad(i8PtrTy, dataPtr, "cur_data");
-            auto* elemPtr = b.CreateGEP(i64Ty, curData, len, "elem_ptr");
+            auto* elemPtr =
+                b.CreateGEP(elemLlvmTy, curData, len, "elem_ptr");
             b.CreateStore(xVal, elemPtr);
             auto* newLen = b.CreateAdd(
                 len, llvm::ConstantInt::get(i64Ty, 1), "new_len");
             b.CreateStore(newLen, lenPtr);
             b.CreateRet(zero);
-            declaredFns_["vec_push"] = fn;
+            declaredFns_[mangled] = fn;
+            return fn;
         }
-
-        // --- vec_get(v: Vec*, i: i64) -> i64 ---
-        {
+        if (op == "vec_get") {
             auto* fnTy = llvm::FunctionType::get(
-                i64Ty, {vecPtrTy, i64Ty}, false);
+                elemLlvmTy, {vecPtrTy, i64Ty}, false);
             auto* fn = llvm::Function::Create(
-                fnTy, llvm::Function::ExternalLinkage, "vec_get",
+                fnTy, llvm::Function::ExternalLinkage, mangled,
                 module_.get());
             fn->getArg(0)->setName("v");
             fn->getArg(1)->setName("i");
@@ -374,17 +441,16 @@ private:
                 b.CreateStructGEP(vecTy, fn->getArg(0), 0, "data_ptr");
             auto* data = b.CreateLoad(i8PtrTy, dataPtr, "data");
             auto* elemPtr =
-                b.CreateGEP(i64Ty, data, fn->getArg(1), "elem_ptr");
-            auto* val = b.CreateLoad(i64Ty, elemPtr, "val");
+                b.CreateGEP(elemLlvmTy, data, fn->getArg(1), "elem_ptr");
+            auto* val = b.CreateLoad(elemLlvmTy, elemPtr, "val");
             b.CreateRet(val);
-            declaredFns_["vec_get"] = fn;
+            declaredFns_[mangled] = fn;
+            return fn;
         }
-
-        // --- vec_len(v: Vec*) -> i64 ---
-        {
+        if (op == "vec_len") {
             auto* fnTy = llvm::FunctionType::get(i64Ty, {vecPtrTy}, false);
             auto* fn = llvm::Function::Create(
-                fnTy, llvm::Function::ExternalLinkage, "vec_len",
+                fnTy, llvm::Function::ExternalLinkage, mangled,
                 module_.get());
             fn->getArg(0)->setName("v");
             auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
@@ -393,51 +459,10 @@ private:
                 b.CreateStructGEP(vecTy, fn->getArg(0), 1, "len_ptr");
             auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
             b.CreateRet(len);
-            declaredFns_["vec_len"] = fn;
+            declaredFns_[mangled] = fn;
+            return fn;
         }
-
-        auto* strPtrTy = llvm::PointerType::get(ctx, 0);
-
-        // --- print_str(s: &String) -> i64 ---
-        // Writes len bytes of s->data to stdout via printf("%.*s\n", ...).
-        {
-            auto* fnTy = llvm::FunctionType::get(i64Ty, {strPtrTy}, false);
-            auto* fn = llvm::Function::Create(
-                fnTy, llvm::Function::ExternalLinkage, "print_str",
-                module_.get());
-            fn->getArg(0)->setName("s");
-            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
-            llvm::IRBuilder<> b(entry);
-            auto* dataPtr =
-                b.CreateStructGEP(strTy, fn->getArg(0), 0, "data_ptr");
-            auto* data = b.CreateLoad(i8PtrTy, dataPtr, "data");
-            auto* lenPtr =
-                b.CreateStructGEP(strTy, fn->getArg(0), 1, "len_ptr");
-            auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
-            // printf takes int, not int64, for `%.*s` precision arg.
-            auto* lenI32 = b.CreateTrunc(len, i32Ty, "len_i32");
-            auto* fmt = b.CreateGlobalString("%.*s\n", "kd_print_str_fmt",
-                                                0, module_.get());
-            b.CreateCall(printfFn, {fmt, lenI32, data});
-            b.CreateRet(zero);
-            declaredFns_["print_str"] = fn;
-        }
-
-        // --- str_len(s: &String) -> i64 ---
-        {
-            auto* fnTy = llvm::FunctionType::get(i64Ty, {strPtrTy}, false);
-            auto* fn = llvm::Function::Create(
-                fnTy, llvm::Function::ExternalLinkage, "str_len",
-                module_.get());
-            fn->getArg(0)->setName("s");
-            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
-            llvm::IRBuilder<> b(entry);
-            auto* lenPtr =
-                b.CreateStructGEP(strTy, fn->getArg(0), 1, "len_ptr");
-            auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
-            b.CreateRet(len);
-            declaredFns_["str_len"] = fn;
-        }
+        return nullptr;
     }
 
     void declareAllStructs() {
@@ -1226,6 +1251,24 @@ private:
             concreteTypeArgs.reserve(cit->second.size());
             for (const auto& ta : cit->second) {
                 concreteTypeArgs.push_back(resolveInInstance(ta));
+            }
+            // Phase 5.z: vec_* built-ins are generic but have no AST
+            // body — synthesize their specialization directly.
+            if ((call.callee == "vec_new" || call.callee == "vec_push" ||
+                 call.callee == "vec_get" || call.callee == "vec_len") &&
+                !concreteTypeArgs.empty()) {
+                llvm::Function* fn =
+                    getOrEmitVecOp(call.callee, concreteTypeArgs[0]);
+                if (!fn) {
+                    errors_.push_back(
+                        "codegen: cannot specialize " + call.callee);
+                    return llvm::ConstantInt::get(
+                        llvm::Type::getInt64Ty(*ctx_), 0);
+                }
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitExpr(*a));
+                return builder_->CreateCall(fn, args, "call_" + call.callee);
             }
             const std::string mangled =
                 mangleInstance(call.callee, concreteTypeArgs);
