@@ -563,6 +563,8 @@ public:
         result.fnSchemas = std::move(fnSchemas_);
         result.callInstantiations = std::move(callInstantiations_);
         result.methodResolutions = std::move(methodResolutions_);
+        result.dynCoercions = std::move(dynCoercions_);
+        result.dynVtablesNeeded = std::move(dynVtablesNeeded_);
         return result;
     }
 
@@ -595,9 +597,15 @@ private:
                            std::string,
                            std::pair<std::string, const ast::FnDecl*>>>
         methodImplLookup_;
-    // Per-MethodCallExpr resolution (Concrete or BoundedGeneric).
+    // Per-MethodCallExpr resolution (Concrete, BoundedGeneric, or Dyn).
     std::unordered_map<const ast::MethodCallExpr*, ResolvedMethod>
         methodResolutions_;
+    // Phase 11: per-Expr `&T`->`&dyn`/`Box<T>`->`Box<dyn>` coercions and the
+    // set of (trait,type) vtables those coercions require.
+    std::unordered_map<const ast::Expr*, DynCoercion> dynCoercions_;
+    std::vector<std::pair<std::string, std::string>> dynVtablesNeeded_;
+    std::unordered_set<std::string> dynVtableSeen_; // dedupe key "Trait/Type"
+    std::unordered_set<std::string> dynSafetyReported_; // dedupe dyn-safety
     // FnDecl* of an impl method -> its mangled FnSchema key.
     std::unordered_map<const ast::FnDecl*, std::string> implMethodMangled_;
     // Active during Pass-2 body-checking of an impl method: maps the
@@ -860,6 +868,13 @@ private:
             collectEffects(*re->operand, out);
             return;
         }
+        if (auto* bn = dynamic_cast<const ast::BoxNewExpr*>(&e)) {
+            // Phase 11: the boxed value's effects flow through. (We don't
+            // synthesize `alloc` for the malloc itself — consistent with
+            // struct literals / closures, whose heap use is also implicit.)
+            collectEffects(*bn->value, out);
+            return;
+        }
         if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e)) {
             collectEffects(*ae->operand, out);
             return;
@@ -979,7 +994,7 @@ private:
         currentReturnType_ = resolveTypeRef(fn.returnType);
         TypePtr bodyType = checkBlock(*fn.body);
         if (fn.body->tail) {
-            if (!unify(bodyType, currentReturnType_)) {
+            if (!coerceOrUnify(*fn.body->tail, bodyType, currentReturnType_)) {
                 error("impl method '" + fn.name + "' body type " +
                           typeToString(bodyType) +
                           " does not match declared return type " +
@@ -1120,6 +1135,36 @@ private:
             inner.isRef = false;
             inner.refIsMut = false;
             return makeRef(resolveTypeRef(inner), tr.refIsMut);
+        }
+        // Phase 11: `dyn Trait` — validate the trait exists and is object-
+        // safe (dyn-safe), then build the unsized trait-object type. Only
+        // ever appears behind a `&`/`Box` (the Ref peel above / Box branch
+        // below handle the pointer); a bare `dyn Trait` value is rejected at
+        // its use site by codegen since it never maps to a sized LLVM type.
+        if (tr.isDyn) {
+            auto it = traits_.find(tr.name);
+            if (it == traits_.end()) {
+                error("`dyn` of unknown trait '" + tr.name + "'",
+                      tr.line, tr.column);
+                return makeInt();
+            }
+            checkObjectSafe(tr.name, tr.line, tr.column);
+            return makeDyn(tr.name);
+        }
+        // Phase 11: `Box<T>` — the built-in heap-owned pointer. Built-in,
+        // single type arg; the inner T may itself be `dyn Trait` (a heap
+        // trait object). This only applies when the user hasn't declared
+        // their own `Box` type (a user `struct Box<T>` shadows the built-in,
+        // preserving existing programs that define one).
+        if (tr.name == "Box" && !tr.isFn &&
+            !structSchemas_.count("Box") && !enumSchemas_.count("Box")) {
+            if (tr.typeArgs.size() != 1) {
+                error("Box expects exactly 1 type argument, got " +
+                          std::to_string(tr.typeArgs.size()),
+                      tr.line, tr.column);
+                return makeBox(makeInt());
+            }
+            return makeBox(resolveTypeRef(tr.typeArgs[0]));
         }
         // Phase 10a: a function type `fn(P...) -> R ! { effects }`. Build a
         // Function Type carrying the effect row. Concrete labels go in
@@ -1324,7 +1369,9 @@ private:
         // return type. If not (body ends with a stmt — typically a
         // `return`), we rely on the per-`return` check inside checkStmt.
         if (fn.body->tail) {
-            if (!unify(bodyType, currentReturnType_)) {
+            // Phase 11: coerce a thin-pointer tail into a `&dyn`/`Box<dyn>`
+            // return type (otherwise plain unification).
+            if (!coerceOrUnify(*fn.body->tail, bodyType, currentReturnType_)) {
                 error("function '" + fn.name + "' body type " +
                           typeToString(bodyType) +
                           " does not match declared return type " +
@@ -1436,6 +1483,11 @@ private:
         if (auto* mc = dynamic_cast<const ast::MethodCallExpr*>(&e)) {
             return checkMethodCall(*mc);
         }
+        if (auto* bn = dynamic_cast<const ast::BoxNewExpr*>(&e)) {
+            // Phase 11: `Box::new(v)` heap-allocates and produces `Box<T>`.
+            TypePtr inner = checkExpr(*bn->value);
+            return makeBox(inner);
+        }
         if (auto* re = dynamic_cast<const ast::RefExpr*>(&e)) {
             // Phase 2.4b: `&x` produces `&T` where T is x's type. The
             // operand is normally a bare Ident (we don't yet support
@@ -1463,15 +1515,159 @@ private:
         return makeInt();
     }
 
+    // Phase 11: dyn-safety (object-safety) check. A trait may be used as
+    // `dyn Trait` only if every method takes a `self` receiver (no static /
+    // associated fns) and no method is itself generic — otherwise a single
+    // vtable slot couldn't name one concrete fn. Reports one error per
+    // offending method; `traits_` already verified the `self`-first rule at
+    // registration, but generic methods and any future no-self methods are
+    // caught here so the diagnostic points at the `dyn` use site.
+    void checkObjectSafe(const std::string& traitName, std::size_t line,
+                         std::size_t col) {
+        auto it = traits_.find(traitName);
+        if (it == traits_.end()) return;
+        // Report once per trait — `resolveTypeRef` may revisit a `dyn Trait`
+        // annotation across passes (signature registration + body checking).
+        if (!dynSafetyReported_.insert(traitName).second) return;
+        for (const auto& m : it->second) {
+            bool hasSelf = !m.params.empty() && m.params[0].name == "self";
+            if (!hasSelf) {
+                error("trait '" + traitName + "' is not dyn-safe: method '" +
+                          m.name +
+                          "' has no `self` receiver (static methods can't be "
+                          "dispatched through a trait object)",
+                      line, col);
+            }
+            // MethodSig has no generic-param list in the grammar today, so a
+            // generic trait method isn't expressible; the rule is stated here
+            // so it's enforced the moment generic methods land. (Kept as a
+            // one-line note per the dyn-safety requirement.)
+        }
+    }
+
+    // Phase 11: the trait-object coercion site logic. If `expected` is a
+    // `&dyn Trait` / `Box<dyn Trait>` and `actual` is a matching thin pointer
+    // (`&Concrete` / `Box<Concrete>`) whose pointee impls the trait, record a
+    // DynCoercion on `srcExpr` and return true (no unification needed — the
+    // shapes deliberately differ). Otherwise fall back to plain `unify`.
+    bool coerceOrUnify(const ast::Expr& srcExpr, const TypePtr& actual,
+                       const TypePtr& expected) {
+        TypePtr e = resolve(expected);
+        TypePtr a = resolve(actual);
+        // Unwrap one pointer layer on each side, tracking whether it's a Box.
+        bool expIsBox = e->kind == TypeKind::Box;
+        bool expIsRef = e->kind == TypeKind::Ref;
+        if (expIsBox || expIsRef) {
+            TypePtr inner = resolve(e->refInner);
+            if (inner->kind == TypeKind::Dyn) {
+                bool actIsBox = a->kind == TypeKind::Box;
+                bool actIsRef = a->kind == TypeKind::Ref;
+                // Box<dyn> accepts Box<Concrete>; &dyn accepts &Concrete.
+                if ((expIsBox && actIsBox) || (expIsRef && actIsRef)) {
+                    TypePtr pointee = resolve(a->refInner);
+                    std::string typeName = concreteTypeName(pointee);
+                    if (!typeName.empty() &&
+                        typeImplsTrait(typeName, inner->dynTraitName)) {
+                        DynCoercion c;
+                        c.traitName = inner->dynTraitName;
+                        c.concreteTypeName = typeName;
+                        c.isBox = expIsBox;
+                        dynCoercions_[&srcExpr] = c;
+                        requireVtable(inner->dynTraitName, typeName);
+                        return true;
+                    }
+                }
+                // Already a trait object of the right trait: identity.
+                if (a->kind == e->kind) {
+                    TypePtr ai = resolve(a->refInner);
+                    if (ai->kind == TypeKind::Dyn &&
+                        ai->dynTraitName == inner->dynTraitName) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return unify(actual, expected);
+    }
+
+    // Phase 11: unify a receiver against an impl method's `self` slot,
+    // tolerating one level of ref difference (autoref / autoderef). A `&self`
+    // method's self slot is `&Concrete`; a by-value `self` method's is
+    // `Concrete`. We accept a value receiver for a `&self` method and a ref
+    // receiver for a by-value method by peeling the extra `&` on whichever
+    // side has it. (Existing Phase 2.4b auto-deref already let `&T` receivers
+    // call by-value methods at codegen; this keeps the type check in step.)
+    bool unifySelf(const TypePtr& recvT, const TypePtr& selfSlot) {
+        TypePtr r = resolve(recvT);
+        TypePtr s = resolve(selfSlot);
+        if (unify(r, s)) return true;
+        // Peel a single pointer layer (Ref or Box) on the receiver so a
+        // `Box<T>` / `&T` receiver matches a `T` (or `&T`) self slot.
+        if ((r->kind == TypeKind::Ref || r->kind == TypeKind::Box) &&
+            unifySelf(r->refInner, s)) {
+            return true;
+        }
+        if (s->kind == TypeKind::Ref && r->kind != TypeKind::Ref) {
+            return unify(r, s->refInner);
+        }
+        return false;
+    }
+
+    // The base type name for a concrete (sized) type, or "" if it isn't one
+    // we can impl a trait on.
+    std::string concreteTypeName(const TypePtr& t) {
+        TypePtr r = resolve(t);
+        if (r->kind == TypeKind::Struct) return r->structName;
+        if (r->kind == TypeKind::Enum) return r->enumName;
+        if (r->kind == TypeKind::Int) return "i64";
+        if (r->kind == TypeKind::Bool) return "bool";
+        return {};
+    }
+
+    bool typeImplsTrait(const std::string& typeName,
+                        const std::string& traitName) {
+        auto it = implMethodByType_.find(typeName);
+        if (it == implMethodByType_.end()) return false;
+        return it->second.count(traitName) > 0;
+    }
+
+    void requireVtable(const std::string& traitName,
+                       const std::string& typeName) {
+        std::string key = traitName + "/" + typeName;
+        if (dynVtableSeen_.insert(key).second) {
+            dynVtablesNeeded_.emplace_back(traitName, typeName);
+        }
+    }
+
     // Phase 3.3: resolve `recv.method(args)` against trait impls.
     TypePtr checkMethodCall(const ast::MethodCallExpr& mc) {
         TypePtr recvT = checkExpr(*mc.receiver);
         TypePtr r = resolve(recvT);
+
+        // Phase 11: dynamic dispatch. If the receiver is `&dyn Trait` or
+        // `Box<dyn Trait>` (one pointer layer over a Dyn), the call goes
+        // through the object's vtable at runtime instead of resolving to a
+        // single impl. We type-check args against the *trait's* method
+        // signature (Self = the receiver's trait-object type).
+        if (r->kind == TypeKind::Ref || r->kind == TypeKind::Box) {
+            TypePtr inner = resolve(r->refInner);
+            if (inner->kind == TypeKind::Dyn) {
+                return checkDynMethodCall(mc, inner->dynTraitName, recvT);
+            }
+        }
+        // A bare `dyn Trait` value can't reach here normally (it's unsized),
+        // but guard defensively.
+        if (r->kind == TypeKind::Dyn) {
+            return checkDynMethodCall(mc, r->dynTraitName, recvT);
+        }
+
         // Phase 2.4b auto-deref: if the receiver is `&T` (or `&mut T`),
         // dispatch as though the receiver were the underlying `T`. Phase
         // 2.4c will refine this so impls of `Trait for &T` (when written
-        // explicitly) take precedence over implicit deref.
-        while (r->kind == TypeKind::Ref) r = resolve(r->refInner);
+        // explicitly) take precedence over implicit deref. Phase 11: a
+        // `Box<Concrete>` derefs the same way (method call through the box).
+        while (r->kind == TypeKind::Ref || r->kind == TypeKind::Box)
+            r = resolve(r->refInner);
 
         // Case A: receiver is a generic-param Var. The fn must have a
         // trait bound for this Var, the bound trait must declare the
@@ -1572,9 +1768,12 @@ private:
             subst[gv->varId] = makeFreshVar();
         }
         TypePtr instSig = instantiate(schema.signature, subst);
-        // Unify receiver against the impl's `self` slot (first arg).
+        // Unify receiver against the impl's `self` slot (first arg). Phase 11:
+        // with `&self` methods the self slot is `&ConcreteType`; autoref/
+        // autoderef one pointer layer so `value.method()` and `(&value)
+        // .method()` both type-check against either receiver convention.
         if (!instSig->args.empty()) {
-            if (!unify(recvT, instSig->args[0])) {
+            if (!unifySelf(recvT, instSig->args[0])) {
                 error("receiver type " + typeToString(recvT) +
                           " doesn't unify with impl `self` type " +
                           typeToString(instSig->args[0]),
@@ -1663,6 +1862,81 @@ private:
         res.methodName = mc.methodName;
         res.concreteTypeName = concreteTypeName;
         res.boundedVarId = boundedVarId;
+        methodResolutions_[&mc] = std::move(res);
+        return retTy;
+    }
+
+    // Phase 11: type-check a call on a `&dyn Trait` / `Box<dyn Trait>`
+    // receiver. The method is looked up by name in the trait (declaration
+    // order gives the vtable slot); args are checked against the trait
+    // signature with `Self` bound to the trait-object type, and a `Dyn`
+    // ResolvedMethod records the slot for codegen's indexed vtable call. The
+    // method's declared return type (with Self -> dyn) is the call's type.
+    TypePtr checkDynMethodCall(const ast::MethodCallExpr& mc,
+                               const std::string& traitName,
+                               const TypePtr& dynRecvTy) {
+        auto traitIt = traits_.find(traitName);
+        if (traitIt == traits_.end()) {
+            error("internal: dyn dispatch on unknown trait '" + traitName + "'",
+                  mc.line, mc.column);
+            return makeFreshVar();
+        }
+        const ast::MethodSig* sig = nullptr;
+        int slot = -1;
+        for (std::size_t i = 0; i < traitIt->second.size(); ++i) {
+            if (traitIt->second[i].name == mc.methodName) {
+                sig = &traitIt->second[i];
+                slot = static_cast<int>(i);
+                break;
+            }
+        }
+        if (!sig) {
+            error("trait '" + traitName + "' has no method '" +
+                      mc.methodName + "' (called on a trait object)",
+                  mc.line, mc.column);
+            for (const auto& a : mc.args) checkExpr(*a);
+            return makeFreshVar();
+        }
+        // Resolve the signature's param/return types with Self -> the
+        // trait-object type, so a method returning Self stays a trait object
+        // and any `&self`/`self` receiver is irrelevant to the args.
+        GenericEnv selfEnv;
+        selfEnv["Self"] = dynRecvTy;
+        const GenericEnv* savedEnv = currentGenericEnv_;
+        currentGenericEnv_ = &selfEnv;
+        std::vector<TypePtr> paramTypes;
+        for (const auto& p : sig->params) {
+            paramTypes.push_back(resolveTypeRef(p.type));
+        }
+        TypePtr retTy = resolveTypeRef(sig->returnType);
+        currentGenericEnv_ = savedEnv;
+
+        const std::size_t expectedExtra =
+            paramTypes.empty() ? 0 : paramTypes.size() - 1;
+        if (expectedExtra != mc.args.size()) {
+            error("method '" + mc.methodName + "' expects " +
+                      std::to_string(expectedExtra) + " arg(s), got " +
+                      std::to_string(mc.args.size()),
+                  mc.line, mc.column);
+        }
+        const std::size_t n = std::min(expectedExtra, mc.args.size());
+        for (std::size_t i = 0; i < n; ++i) {
+            TypePtr argT = checkExpr(*mc.args[i]);
+            if (!unify(argT, paramTypes[i + 1])) {
+                error("argument " + std::to_string(i + 1) + " to method '" +
+                          mc.methodName + "' has type " +
+                          typeToString(argT) + ", expected " +
+                          typeToString(paramTypes[i + 1]),
+                      mc.args[i]->line, mc.args[i]->column);
+            }
+        }
+        for (std::size_t i = n; i < mc.args.size(); ++i) checkExpr(*mc.args[i]);
+
+        ResolvedMethod res;
+        res.kind = ResolvedMethod::Dyn;
+        res.traitName = traitName;
+        res.methodName = mc.methodName;
+        res.dynMethodSlot = slot;
         methodResolutions_[&mc] = std::move(res);
         return retTy;
     }
@@ -2283,7 +2557,9 @@ private:
                 std::min(instSig->args.size(), call.args.size());
             for (std::size_t i = 0; i < n; ++i) {
                 TypePtr argType = checkExpr(*call.args[i]);
-                if (!unify(argType, instSig->args[i])) {
+                // Phase 11: a `&Concrete`/`Box<Concrete>` arg coerces into a
+                // `&dyn Trait`/`Box<dyn Trait>` parameter.
+                if (!coerceOrUnify(*call.args[i], argType, instSig->args[i])) {
                     error("argument " + std::to_string(i + 1) + " to '" +
                               call.callee + "' has type " +
                               typeToString(argType) + ", expected " +
@@ -2745,7 +3021,21 @@ private:
     void checkStmt(const ast::Stmt& s) {
         if (auto* let = dynamic_cast<const ast::LetStmt*>(&s)) {
             TypePtr valT = checkExpr(*let->value);
-            scopes_.back()[let->name] = valT;
+            // Phase 11: an explicit annotation gives the binding's type and
+            // is a coercion target (e.g. `let b: Box<dyn Shape> = Box::new(
+            // Sq{..})` coerces `Box<Sq>` into `Box<dyn Shape>`).
+            if (let->annotation) {
+                TypePtr annotTy = resolveTypeRef(*let->annotation);
+                if (!coerceOrUnify(*let->value, valT, annotTy)) {
+                    error("let binding '" + let->name + "' has annotated type " +
+                              typeToString(annotTy) + " but value has type " +
+                              typeToString(valT),
+                          let->line, let->column);
+                }
+                scopes_.back()[let->name] = annotTy;
+            } else {
+                scopes_.back()[let->name] = valT;
+            }
             if (let->isMut) markMut(let->name);
             return;
         }
@@ -2756,8 +3046,10 @@ private:
         if (auto* ret = dynamic_cast<const ast::ReturnStmt*>(&s)) {
             if (ret->value) {
                 TypePtr valT = checkExpr(*ret->value);
+                // Phase 11: `return &concrete;` from a `-> &dyn Trait` fn
+                // coerces just like an argument / annotated let.
                 if (currentReturnType_ &&
-                    !unify(valT, currentReturnType_)) {
+                    !coerceOrUnify(*ret->value, valT, currentReturnType_)) {
                     error("return value type " + typeToString(valT) +
                               " does not match function return type " +
                               typeToString(currentReturnType_),

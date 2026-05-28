@@ -35,6 +35,17 @@ enum class TypeKind {
     Struct,
     Enum,
     Ref,
+    // Phase 11: `dyn Trait` — an unsized trait object, only ever used behind
+    // a pointer (`&dyn Trait` = Ref(Dyn), `Box<dyn Trait>` = Box(Dyn)). The
+    // trait name is stored in `dynTraitName`. Both pointer forms lower to a
+    // fat pointer `{ i8* data, i8* vtable }`.
+    Dyn,
+    // Phase 11: `Box<T>` — a heap-owned pointer to a T. For a concrete T this
+    // lowers to an opaque pointer (heap `T*`); for `Box<dyn Trait>` (inner is
+    // a Dyn) it lowers to the same fat pointer as `&dyn Trait`. The pointee
+    // type is stored in `refInner` (shared with Ref — they never coexist on
+    // one node).
+    Box,
 };
 
 struct Type;
@@ -95,9 +106,13 @@ struct Type {
     std::vector<TypePtr> typeArgs;
 
     // Ref (Phase 2.4b): inner type + mutability flag. `refIsMut` toggles
-    // between `&T` (false) and `&mut T` (true, Phase 2.4c).
+    // between `&T` (false) and `&mut T` (true, Phase 2.4c). Phase 11: also
+    // carries the pointee for a Box (Box and Ref never share one node).
     TypePtr refInner;
     bool refIsMut = false;
+
+    // Dyn (Phase 11): the trait name a `dyn Trait` object dispatches through.
+    std::string dynTraitName;
 };
 
 TypePtr makeInt();
@@ -115,6 +130,9 @@ TypePtr makeFreshVar();
 TypePtr makeStruct(std::string name, std::vector<std::pair<std::string, TypePtr>> fields);
 TypePtr makeEnum(std::string name, std::vector<EnumVariantType> variants);
 TypePtr makeRef(TypePtr inner, bool isMut);
+// Phase 11: `dyn Trait` object type and `Box<T>` heap pointer.
+TypePtr makeDyn(std::string traitName);
+TypePtr makeBox(TypePtr inner);
 
 // Follow the union-find link chain to the representative. Performs
 // path compression as a side effect.

@@ -880,6 +880,108 @@ void test_closure_block_body() {
     expectEquals(v, 13, "closure_block_body");
 }
 
+// --- Phase 11: dyn Trait + vtable dynamic dispatch ---
+
+// The headline acceptance test: ONE `describe` call site dispatches to two
+// different impls at runtime via the trait object's vtable. 25 + 12 == 37.
+void test_dyn_dispatch_two_impls() {
+    auto v = compileAndRun(
+        "trait Shape { fn area(&self) -> i64; }\n"
+        "struct Sq { side: i64 }\n"
+        "struct Rect { w: i64, h: i64 }\n"
+        "impl Shape for Sq   { fn area(&self) -> i64 { self.side * self.side } }\n"
+        "impl Shape for Rect { fn area(&self) -> i64 { self.w * self.h } }\n"
+        "fn describe(s: &dyn Shape) -> i64 { s.area() }\n"
+        "fn main() -> i64 {\n"
+        "    let sq = Sq { side: 5 };\n"
+        "    let r  = Rect { w: 3, h: 4 };\n"
+        "    let a = describe(&sq);\n"
+        "    let b = describe(&r);\n"
+        "    a + b\n"
+        "}",
+        "main", "dyn_dispatch_two_impls");
+    expectEquals(v, 37, "dyn_dispatch_two_impls");
+}
+
+// Box<dyn Trait>: a heap-owned trait object dispatched through its vtable.
+void test_dyn_box() {
+    auto v = compileAndRun(
+        "trait Shape { fn area(&self) -> i64; }\n"
+        "struct Sq { side: i64 }\n"
+        "impl Shape for Sq { fn area(&self) -> i64 { self.side * self.side } }\n"
+        "fn main() -> i64 {\n"
+        "    let b: Box<dyn Shape> = Box::new(Sq { side: 6 });\n"
+        "    b.area()\n"
+        "}",
+        "main", "dyn_box");
+    expectEquals(v, 36, "dyn_box");
+}
+
+// Multi-method trait through a trait object: calling the 2nd vtable slot must
+// land on the right method (proves slot indexing). 4+100 (Dog) +2+200 (Bird).
+void test_dyn_multi_method_slot() {
+    auto v = compileAndRun(
+        "trait Animal { fn legs(&self) -> i64; fn sound(&self) -> i64; }\n"
+        "struct Dog { x: i64 }\n"
+        "struct Bird { y: i64 }\n"
+        "impl Animal for Dog  { fn legs(&self) -> i64 { 4 } fn sound(&self) -> i64 { 100 } }\n"
+        "impl Animal for Bird { fn legs(&self) -> i64 { 2 } fn sound(&self) -> i64 { 200 } }\n"
+        "fn legs_of(a: &dyn Animal) -> i64 { a.legs() }\n"
+        "fn sound_of(a: &dyn Animal) -> i64 { a.sound() }\n"
+        "fn main() -> i64 {\n"
+        "    let d = Dog { x: 0 };\n"
+        "    let b = Bird { y: 0 };\n"
+        "    legs_of(&d) + sound_of(&d) + legs_of(&b) + sound_of(&b)\n"
+        "}",
+        "main", "dyn_multi_method_slot");
+    expectEquals(v, 306, "dyn_multi_method_slot");
+}
+
+// A trait method that takes a non-self argument, called through a dyn object.
+void test_dyn_method_with_arg() {
+    auto v = compileAndRun(
+        "trait Adder { fn add_with(&self, x: i64) -> i64; }\n"
+        "struct N { v: i64 }\n"
+        "impl Adder for N { fn add_with(&self, x: i64) -> i64 { self.v + x } }\n"
+        "fn run(a: &dyn Adder) -> i64 { a.add_with(32) }\n"
+        "fn main() -> i64 { let n = N { v: 10 }; run(&n) }",
+        "main", "dyn_method_with_arg");
+    expectEquals(v, 42, "dyn_method_with_arg");
+}
+
+// `&self` static dispatch (no dyn): autoref a value receiver to the method's
+// `&self` pointer slot. Confirms Phase 3 static dispatch still works with the
+// new receiver convention.
+void test_self_ref_static_dispatch() {
+    auto v = compileAndRun(
+        "trait Shape { fn area(&self) -> i64; }\n"
+        "struct Sq { side: i64 }\n"
+        "impl Shape for Sq { fn area(&self) -> i64 { self.side * self.side } }\n"
+        "fn main() -> i64 { let s = Sq { side: 7 }; s.area() }",
+        "main", "self_ref_static_dispatch");
+    expectEquals(v, 49, "self_ref_static_dispatch");
+}
+
+// Stretch: a heterogeneous pair stored as two `&dyn Shape` and summed through
+// the same vtable-dispatched call inside a helper.
+void test_dyn_heterogeneous_sum() {
+    auto v = compileAndRun(
+        "trait Shape { fn area(&self) -> i64; }\n"
+        "struct Sq { side: i64 }\n"
+        "struct Rect { w: i64, h: i64 }\n"
+        "impl Shape for Sq   { fn area(&self) -> i64 { self.side * self.side } }\n"
+        "impl Shape for Rect { fn area(&self) -> i64 { self.w * self.h } }\n"
+        "fn area_of(s: &dyn Shape) -> i64 { s.area() }\n"
+        "fn sum2(a: &dyn Shape, b: &dyn Shape) -> i64 { area_of(a) + area_of(b) }\n"
+        "fn main() -> i64 {\n"
+        "    let sq = Sq { side: 5 };\n"
+        "    let r  = Rect { w: 3, h: 4 };\n"
+        "    sum2(&sq, &r)\n"
+        "}",
+        "main", "dyn_heterogeneous_sum");
+    expectEquals(v, 37, "dyn_heterogeneous_sum");
+}
+
 } // namespace
 
 int main() {
@@ -953,6 +1055,13 @@ int main() {
     test_closure_no_capture();
     test_closure_selected_by_if();
     test_closure_block_body();
-    std::cout << "All codegen tests passed (64 cases) — Phase 10b closures\n";
+    // Phase 11 dyn Trait + vtable dynamic dispatch
+    test_dyn_dispatch_two_impls();
+    test_dyn_box();
+    test_dyn_multi_method_slot();
+    test_dyn_method_with_arg();
+    test_self_ref_static_dispatch();
+    test_dyn_heterogeneous_sum();
+    std::cout << "All codegen tests passed (70 cases) — Phase 11 dyn trait objects\n";
     return 0;
 }

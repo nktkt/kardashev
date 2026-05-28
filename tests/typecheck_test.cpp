@@ -948,6 +948,75 @@ void test_impl_missing_method_errors() {
         "impl_missing_method_errors");
 }
 
+// ---- Phase 11: dyn Trait + trait objects ----
+
+void test_dyn_ref_param_ok() {
+    expectOk(
+        "trait Shape { fn area(&self) -> i64; }\n"
+        "struct Sq { side: i64 }\n"
+        "impl Shape for Sq { fn area(&self) -> i64 { self.side * self.side } }\n"
+        "fn describe(s: &dyn Shape) -> i64 { s.area() }\n"
+        "fn main() -> i64 { let sq = Sq { side: 5 }; describe(&sq) }",
+        "dyn_ref_param_ok");
+}
+
+void test_dyn_box_ok() {
+    expectOk(
+        "trait Shape { fn area(&self) -> i64; }\n"
+        "struct Sq { side: i64 }\n"
+        "impl Shape for Sq { fn area(&self) -> i64 { self.side * self.side } }\n"
+        "fn main() -> i64 {\n"
+        "    let b: Box<dyn Shape> = Box::new(Sq { side: 6 });\n"
+        "    b.area()\n"
+        "}",
+        "dyn_box_ok");
+}
+
+void test_dyn_coercion_two_impls_ok() {
+    expectOk(
+        "trait Shape { fn area(&self) -> i64; }\n"
+        "struct Sq { side: i64 }\n"
+        "struct Rect { w: i64, h: i64 }\n"
+        "impl Shape for Sq   { fn area(&self) -> i64 { self.side * self.side } }\n"
+        "impl Shape for Rect { fn area(&self) -> i64 { self.w * self.h } }\n"
+        "fn describe(s: &dyn Shape) -> i64 { s.area() }\n"
+        "fn main() -> i64 {\n"
+        "    let sq = Sq { side: 5 };\n"
+        "    let r  = Rect { w: 3, h: 4 };\n"
+        "    describe(&sq) + describe(&r)\n"
+        "}",
+        "dyn_coercion_two_impls_ok");
+}
+
+void test_dyn_unknown_trait_errors() {
+    expectErr(
+        "struct S { x: i64 }\n"
+        "fn f(s: &dyn Nope) -> i64 { 0 }",
+        "dyn_unknown_trait_errors");
+}
+
+void test_dyn_unsafe_static_method_errors() {
+    // A trait with a method that has no `self` receiver is not dyn-safe and
+    // must be rejected when used as `dyn`.
+    expectErr(
+        "trait Maker { fn make() -> i64; }\n"
+        "fn use_it(m: &dyn Maker) -> i64 { 0 }\n"
+        "fn main() -> i64 { 0 }",
+        "dyn_unsafe_static_method_errors");
+}
+
+void test_dyn_coerce_unimpl_type_errors() {
+    // Passing a `&Concrete` whose type does NOT impl the trait must fail.
+    expectErr(
+        "trait Shape { fn area(&self) -> i64; }\n"
+        "struct Sq { side: i64 }\n"
+        "struct Other { z: i64 }\n"
+        "impl Shape for Sq { fn area(&self) -> i64 { self.side } }\n"
+        "fn describe(s: &dyn Shape) -> i64 { s.area() }\n"
+        "fn main() -> i64 { let o = Other { z: 1 }; describe(&o) }",
+        "dyn_coerce_unimpl_type_errors");
+}
+
 // ---- Phase 3.4: postfix `?` (try) operator ----
 
 void test_try_basic_ok() {
@@ -1484,6 +1553,13 @@ int main() {
     test_method_on_unbounded_generic_errors();
     test_method_not_in_trait_errors();
     test_impl_missing_method_errors();
+    // Phase 11 dyn Trait + trait objects
+    test_dyn_ref_param_ok();
+    test_dyn_box_ok();
+    test_dyn_coercion_two_impls_ok();
+    test_dyn_unknown_trait_errors();
+    test_dyn_unsafe_static_method_errors();
+    test_dyn_coerce_unimpl_type_errors();
     // Phase 3.4 try operator
     test_try_basic_ok();
     test_try_outside_fn_with_result_errors();
@@ -1539,6 +1615,6 @@ int main() {
     test_range_endpoints_must_be_int();
     test_loop_io_effect_propagates();
     test_nested_loops_ok();
-    std::cout << "All typecheck tests passed (142 cases)\n";
+    std::cout << "All typecheck tests passed (148 cases)\n";
     return 0;
 }

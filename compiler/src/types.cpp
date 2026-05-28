@@ -76,6 +76,20 @@ TypePtr makeRef(TypePtr inner, bool isMut) {
     return t;
 }
 
+TypePtr makeDyn(std::string traitName) {
+    auto t = std::make_shared<Type>();
+    t->kind = TypeKind::Dyn;
+    t->dynTraitName = std::move(traitName);
+    return t;
+}
+
+TypePtr makeBox(TypePtr inner) {
+    auto t = std::make_shared<Type>();
+    t->kind = TypeKind::Box;
+    t->refInner = std::move(inner);
+    return t;
+}
+
 TypePtr resolve(const TypePtr& t) {
     if (t->kind != TypeKind::Var || !t->link) return t;
     TypePtr rep = resolve(t->link);
@@ -97,6 +111,9 @@ bool occurs(int varId, const TypePtr& t) {
         if (r->effectRowVar && occurs(varId, r->effectRowVar)) return true;
         return false;
     }
+    // Phase 11: a Box<T> can hold a Var T, so descend (mirrors how the
+    // existing code descends into Function args).
+    if (r->kind == TypeKind::Box) return occurs(varId, r->refInner);
     return false;
 }
 } // namespace
@@ -261,6 +278,16 @@ bool unify(const TypePtr& a, const TypePtr& b) {
         return unify(ra->refInner, rb->refInner);
     }
 
+    if (ra->kind == TypeKind::Dyn) {
+        // Phase 11: two `dyn Trait` objects unify iff the trait matches.
+        return ra->dynTraitName == rb->dynTraitName;
+    }
+
+    if (ra->kind == TypeKind::Box) {
+        // Phase 11: `Box<T> ~ Box<U>` iff T ~ U.
+        return unify(ra->refInner, rb->refInner);
+    }
+
     if (ra->kind == TypeKind::Enum) {
         if (ra->enumName != rb->enumName) return false;
         if (ra->typeArgs.size() != rb->typeArgs.size()) return false;
@@ -369,6 +396,11 @@ TypePtr instantiate(const TypePtr& t,
         if (inner.get() == r->refInner.get()) return r;
         return makeRef(inner, r->refIsMut);
     }
+    case TypeKind::Box: {
+        TypePtr inner = instantiate(r->refInner, subst);
+        if (inner.get() == r->refInner.get()) return r;
+        return makeBox(inner);
+    }
     default:
         return r;
     }
@@ -440,6 +472,10 @@ std::string typeToString(const TypePtr& t) {
     case TypeKind::Ref:
         return std::string(r->refIsMut ? "&mut " : "&") +
                typeToString(r->refInner);
+    case TypeKind::Dyn:
+        return "dyn " + r->dynTraitName;
+    case TypeKind::Box:
+        return "Box<" + typeToString(r->refInner) + ">";
     }
     return "?";
 }

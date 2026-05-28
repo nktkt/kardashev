@@ -118,6 +118,10 @@ struct CtorPat : Pattern {
 
 // --- Expressions ---
 
+// Forward decl: TypeRef is defined in the "Top-level" section below, but
+// LetStmt (Phase 11 type annotation) references it via shared_ptr.
+struct TypeRef;
+
 struct IntLitExpr : Expr {
     std::int64_t value = 0;
 };
@@ -265,6 +269,12 @@ struct LetStmt : Stmt {
     // Phase 9: `let mut x = ...`. Marks the binding as reassignable; the
     // typechecker rejects assignment to a non-mut binding.
     bool isMut = false;
+    // Phase 11: optional type annotation `let x: T = ...`. When present, the
+    // typechecker resolves it as the binding's expected type and coerces the
+    // RHS into it (e.g. coercing `Box<Sq>` into `Box<dyn Shape>`). Null means
+    // the binding's type is inferred from the RHS as before. Held by
+    // shared_ptr because TypeRef is declared further down this header.
+    std::shared_ptr<TypeRef> annotation; // null = no annotation
 };
 
 struct ReturnStmt : Stmt {
@@ -308,6 +318,10 @@ struct TypeRef {
     std::vector<TypeRef> typeArgs;
     bool isRef = false;
     bool refIsMut = false;
+    // Phase 11: `dyn Trait` — an unsized trait-object type. When `isDyn` is
+    // true, `name` holds the trait name and `typeArgs` is empty. Combine with
+    // `isRef` for `&dyn Trait`, or nest in `Box<...>` for `Box<dyn Trait>`.
+    bool isDyn = false;
     // Function-type fields (valid only when isFn == true).
     bool isFn = false;
     std::vector<TypeRef> fnParams;
@@ -464,6 +478,14 @@ struct MethodCallExpr : Expr {
     ExprPtr receiver;
     std::string methodName;
     std::vector<ExprPtr> args;
+};
+
+// Phase 11: `Box::new(value)` — heap-allocates and moves `value` into the
+// box, producing a `Box<T>` where T is value's type. Parsed as a dedicated
+// node (rather than a CallExpr) because `Box` is a built-in heap pointer, not
+// a user fn, and `::`-paths otherwise collapse to their last segment.
+struct BoxNewExpr : Expr {
+    ExprPtr value;
 };
 
 // Phase 7: `mod foo;` references — the resolver loads `foo.kd` next to

@@ -1107,6 +1107,62 @@ void test_while_as_statement_then_tail() {
     assert(tail && tail->value == 7);
 }
 
+// --- Phase 11: dyn Trait, &self, Box ---
+
+void test_impl_ref_self_param() {
+    // `&self` parses into a `self` Param whose type is a reference to `Self`.
+    auto r = parse(
+        "trait Shape { fn area(&self) -> i64; }\n"
+        "struct Sq { side: i64 }\n"
+        "impl Shape for Sq { fn area(&self) -> i64 { self.side } }");
+    assert(r.ok());
+    assert(r.program.traits.size() == 1);
+    const auto& sig = r.program.traits[0].methods[0];
+    assert(sig.params.size() == 1);
+    assert(sig.params[0].name == "self");
+    assert(sig.params[0].type.name == "Self");
+    assert(sig.params[0].type.isRef);
+    const auto& m = r.program.impls[0].methods[0];
+    assert(m.params[0].name == "self");
+    assert(m.params[0].type.isRef);
+}
+
+void test_dyn_ref_param_type() {
+    // A `&dyn Trait` parameter type: isRef + isDyn, trait name in `name`.
+    auto r = parse("fn f(s: &dyn Shape) -> i64 { 0 }");
+    assert(r.ok());
+    const auto& p = r.program.functions[0].params[0];
+    assert(p.type.isRef);
+    assert(p.type.isDyn);
+    assert(p.type.name == "Shape");
+}
+
+void test_box_dyn_let_annotation() {
+    // `let b: Box<dyn Shape> = ...;` — the annotation is a Box with one
+    // dyn-Trait type arg.
+    auto r = parse(
+        "fn f() -> i64 { let b: Box<dyn Shape> = make(); 0 }");
+    assert(r.ok());
+    const auto& fn = r.program.functions[0];
+    const auto* let =
+        dynamic_cast<const ast::LetStmt*>(fn.body->stmts[0].get());
+    assert(let != nullptr);
+    assert(let->annotation != nullptr);
+    assert(let->annotation->name == "Box");
+    assert(let->annotation->typeArgs.size() == 1);
+    assert(let->annotation->typeArgs[0].isDyn);
+    assert(let->annotation->typeArgs[0].name == "Shape");
+}
+
+void test_box_new_expr() {
+    // `Box::new(v)` parses to a BoxNewExpr (not a CallExpr).
+    auto r = parseWrapped("Box::new(7)");
+    const auto* bn = dynamic_cast<const ast::BoxNewExpr*>(tailExprOf(r));
+    assert(bn != nullptr);
+    const auto* v = dynamic_cast<const ast::IntLitExpr*>(bn->value.get());
+    assert(v && v->value == 7);
+}
+
 } // namespace
 
 int main() {
@@ -1193,6 +1249,11 @@ int main() {
     test_assign_stmt();
     test_field_assign_stmt();
     test_while_as_statement_then_tail();
-    std::cout << "All parser tests passed (74 cases)\n";
+    // Phase 11 dyn Trait, &self, Box
+    test_impl_ref_self_param();
+    test_dyn_ref_param_type();
+    test_box_dyn_let_annotation();
+    test_box_new_expr();
+    std::cout << "All parser tests passed (78 cases)\n";
     return 0;
 }

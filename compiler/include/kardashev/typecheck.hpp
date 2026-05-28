@@ -119,18 +119,35 @@ struct EnumSchema {
 // it gets re-computed at codegen time once the bound's concrete type is
 // known via the enclosing instance's substitution.
 struct ResolvedMethod {
-    enum Kind { Concrete, BoundedGeneric };
+    // Phase 11 adds `Dyn`: a call on a `&dyn Trait` / `Box<dyn Trait>`
+    // receiver, dispatched at runtime through the object's vtable rather than
+    // resolved to a single impl at compile time.
+    enum Kind { Concrete, BoundedGeneric, Dyn };
     Kind kind = Concrete;
-    // Common to both kinds:
+    // Common to all kinds:
     std::string traitName;
     std::string methodName;
     // Concrete: the implementing-type's name (e.g. "Point", "Box");
     // BoundedGeneric: the schema Var ID of the receiver's generic param.
     std::string concreteTypeName; // Concrete only
     int boundedVarId = -1;        // BoundedGeneric only
+    // Dyn: the 0-based slot of `methodName` in the trait's declaration order
+    // (the vtable index codegen loads + calls through).
+    int dynMethodSlot = -1;       // Dyn only
     // typeArgs on the receiver type at the resolution site (so generic
     // impls — Phase 3.3 doesn't have them yet — can route correctly).
     std::vector<TypePtr> receiverTypeArgs;
+};
+
+// Phase 11: a point where a `&ConcreteType` / `Box<ConcreteType>` value is
+// coerced to a `&dyn Trait` / `Box<dyn Trait>`. The typechecker records one
+// per coercion site (keyed by the source Expr*); codegen turns the thin
+// pointer into the fat `{ data, vtable }` pair by pairing it with the
+// impl's vtable global.
+struct DynCoercion {
+    std::string traitName;
+    std::string concreteTypeName; // the impl's implementing type
+    bool isBox = false;           // false => &dyn, true => Box<dyn>
 };
 
 struct TypeCheckResult {
@@ -159,6 +176,14 @@ struct TypeCheckResult {
     // uses this to mangle the LLVM function name.
     std::unordered_map<const ast::MethodCallExpr*, ResolvedMethod>
         methodResolutions;
+    // Phase 11: per-Expr coercion of a thin `&T` / `Box<T>` into a fat
+    // `&dyn Trait` / `Box<dyn Trait>`. Codegen reads this at the coerced
+    // expression to emit the data+vtable fat pointer.
+    std::unordered_map<const ast::Expr*, DynCoercion> dynCoercions;
+    // Phase 11: every (trait, concreteType) impl pair that must get a vtable
+    // global emitted. Populated as coercions are discovered. Codegen walks
+    // this to emit one `__vtable_<Trait>_<Type>` constant + its thunks.
+    std::vector<std::pair<std::string, std::string>> dynVtablesNeeded;
     // Global variant table: variant name -> (enumName, discriminant index).
     // Codegen reads this to map a constructor name to its enum and tag.
     // Phase 2.2 keeps variant names globally unique across all enums to

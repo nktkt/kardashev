@@ -36,6 +36,14 @@ public:
         for (const auto& fn : program.functions) {
             fnAst_[fn.name] = &fn;
         }
+        // Phase 11: record each trait's method names in declaration order so
+        // vtable slot layout matches the typechecker's `dynMethodSlot`.
+        for (const auto& td : program.traits) {
+            std::vector<std::string> order;
+            order.reserve(td.methods.size());
+            for (const auto& m : td.methods) order.push_back(m.name);
+            traitMethodOrder_[td.name] = std::move(order);
+        }
         // Impl methods register under their mangled name so the codegen
         // tables stay 1-to-1 with fnSchemas. Phase 3.3 has only
         // non-generic impl methods. We also stash the impl's forType
@@ -65,6 +73,13 @@ public:
                     declareMonoFnAs(fn, implMethodMangle_[&fn]);
                 }
             }
+        }
+        // Phase 11: emit one vtable global (+ its method thunks) per
+        // (trait, type) pair that a `dyn` coercion needs. Done after impl
+        // methods are declared so the thunks can call them, and before bodies
+        // so coercion sites can reference the vtable global.
+        for (const auto& [traitName, typeName] : tc_.dynVtablesNeeded) {
+            getOrEmitVtable(traitName, typeName);
         }
         // Emit monomorphic bodies. Generic-fn calls discovered along the
         // way push monomorphization requests.
@@ -234,6 +249,15 @@ private:
     // Phase 4.3 bare-fn-pointer representation under one calling convention.
     llvm::StructType* fnValTy_ = nullptr;
 
+    // Phase 11: the trait-object fat-pointer LLVM type `{ i8* data, i8*
+    // vtable }`, shared by `&dyn Trait` and `Box<dyn Trait>`. Per-impl vtable
+    // globals are cached by "Trait/Type" key so repeated coercions reuse one.
+    llvm::StructType* dynPtrTy_ = nullptr;
+    std::unordered_map<std::string, llvm::GlobalVariable*> vtables_;
+    // Phase 11: traitName -> method names in declaration order (the vtable
+    // slot order, matching ResolvedMethod::dynMethodSlot).
+    std::unordered_map<std::string, std::vector<std::string>> traitMethodOrder_;
+
     // Phase 10b: monotonically-increasing id for generated closure / thunk
     // functions, so each gets a unique LLVM name.
     unsigned nextClosureId_ = 0;
@@ -283,6 +307,13 @@ private:
         // --- Phase 10b: fat-pointer type for fn VALUES: { i8* fn, i8* env }
         fnValTy_ = llvm::StructType::create(
             ctx, {i8PtrTy, i8PtrTy}, "kd.fnval");
+
+        // --- Phase 11: trait-object fat pointer: { i8* data, i8* vtable }.
+        // Both `&dyn Trait` and `Box<dyn Trait>` lower to this. `data` points
+        // at the concrete object; `vtable` points at the impl's vtable global
+        // (a struct of method fn-pointers), bitcast to i8* for a uniform type.
+        dynPtrTy_ = llvm::StructType::create(
+            ctx, {i8PtrTy, i8PtrTy}, "kd.dynptr");
 
         // --- Vec struct layout: { i8* data, i64 len, i64 cap } ---
         auto* vecTy = llvm::StructType::create(
@@ -603,7 +634,10 @@ private:
             case TypeKind::Int:  return llvm::Type::getInt64Ty(*ctx_);
             case TypeKind::Bool: return llvm::Type::getInt1Ty(*ctx_);
             case TypeKind::Unit: return llvm::Type::getVoidTy(*ctx_);
-            case TypeKind::Ref:
+            case TypeKind::Ref: {
+                // Phase 11: `&dyn Trait` is a fat pointer, not a thin one.
+                TypePtr inner = resolveInInstance(r->refInner);
+                if (inner->kind == TypeKind::Dyn) return dynPtrTy_;
                 // Phase 2.4b: `&T` lowers to an opaque pointer. LLVM 15+
                 // tracks pointee types only at load/GEP sites, not on the
                 // pointer type itself. We don't need the pointee here —
@@ -612,6 +646,20 @@ private:
                 (void)mapKardashevType(r->refInner); // ensure inner is
                                                        // declared
                 return llvm::PointerType::get(*ctx_, /*AS=*/0);
+            }
+            case TypeKind::Dyn:
+                // Phase 11: a trait object is unsized, but its single
+                // representation (used behind &/Box) is the fat pointer.
+                return dynPtrTy_;
+            case TypeKind::Box: {
+                // Phase 11: `Box<dyn Trait>` is the same fat pointer as
+                // `&dyn Trait` (it just owns the heap data). `Box<Concrete>`
+                // is a plain heap pointer `T*` (opaque).
+                TypePtr inner = resolveInInstance(r->refInner);
+                if (inner->kind == TypeKind::Dyn) return dynPtrTy_;
+                (void)mapKardashevType(inner); // ensure pointee declared
+                return llvm::PointerType::get(*ctx_, /*AS=*/0);
+            }
             case TypeKind::Struct: {
                 // Generic instance (typeArgs non-empty): lazily declare a
                 // dedicated LLVM struct per (name, typeArgs) tuple so
@@ -658,6 +706,15 @@ private:
             inner.isRef = false;
             inner.refIsMut = false;
             return makeRef(astTypeRefToConcrete(inner), tr.refIsMut);
+        }
+        // Phase 11: `dyn Trait` and the built-in `Box<T>` (a user-declared
+        // `Box` struct/enum shadows the built-in — mirror typecheck).
+        if (tr.isDyn) {
+            return makeDyn(tr.name);
+        }
+        if (tr.name == "Box" && !tr.isFn && tr.typeArgs.size() == 1 &&
+            !tc_.structs.count("Box") && !tc_.enums.count("Box")) {
+            return makeBox(astTypeRefToConcrete(tr.typeArgs[0]));
         }
         // Phase 10a: a function type lowers to a Function TypePtr; the
         // effect row is dropped (compile-time only). mapKardashevType then
@@ -751,6 +808,8 @@ private:
         case TypeKind::Ref:    return std::string(r->refIsMut ? "refmut_"
                                                               : "ref_") +
                                       mangleType(r->refInner);
+        case TypeKind::Dyn:    return "dyn_" + r->dynTraitName;
+        case TypeKind::Box:    return "box_" + mangleType(r->refInner);
         }
         return "_unknown";
     }
@@ -787,6 +846,13 @@ private:
             TypePtr inner = resolveInInstance(r->refInner);
             if (inner.get() == r->refInner.get()) return r;
             return makeRef(inner, r->refIsMut);
+        }
+        case TypeKind::Box: {
+            // Phase 11: descend into the boxed type so a `Box<T>` with a
+            // generic T pins to the instance's concrete type.
+            TypePtr inner = resolveInInstance(r->refInner);
+            if (inner.get() == r->refInner.get()) return r;
+            return makeBox(inner);
         }
         case TypeKind::Struct: {
             if (r->typeArgs.empty() && r->structFields.empty()) return r;
@@ -1175,6 +1241,20 @@ private:
     }
 
     llvm::Value* emitExpr(const ast::Expr& e) {
+        llvm::Value* v = emitExprRaw(e);
+        // Phase 11: apply a recorded `&T`->`&dyn` / `Box<T>`->`Box<dyn>`
+        // coercion at the producing expression, so it fires uniformly at
+        // every site (call arg, annotated let RHS, return tail). `v` is the
+        // thin data pointer; we pair it with the impl's vtable global.
+        auto cit = tc_.dynCoercions.find(&e);
+        if (cit != tc_.dynCoercions.end()) {
+            return makeDynPtr(v, cit->second.traitName,
+                              cit->second.concreteTypeName);
+        }
+        return v;
+    }
+
+    llvm::Value* emitExprRaw(const ast::Expr& e) {
         if (auto* lit = dynamic_cast<const ast::IntLitExpr*>(&e)) {
             return llvm::ConstantInt::get(
                 llvm::Type::getInt64Ty(*ctx_),
@@ -1267,6 +1347,9 @@ private:
         }
         if (auto* mc = dynamic_cast<const ast::MethodCallExpr*>(&e)) {
             return emitMethodCall(*mc);
+        }
+        if (auto* bn = dynamic_cast<const ast::BoxNewExpr*>(&e)) {
+            return emitBoxNew(*bn);
         }
         if (auto* re = dynamic_cast<const ast::RefExpr*>(&e)) {
             return emitRef(*re);
@@ -1455,6 +1538,23 @@ private:
         return it->second;
     }
 
+    // Phase 11: `Box::new(v)` — malloc sizeof(T), move v into the heap slot,
+    // return the (opaque) heap pointer. That pointer is the `Box<T>` value,
+    // and is exactly what a `&dyn`/`Box<dyn>` coercion uses as the data slot.
+    llvm::Value* emitBoxNew(const ast::BoxNewExpr& bn) {
+        llvm::Value* inner = emitExpr(*bn.value);
+        TypePtr innerTy = lookupExprType(*bn.value);
+        llvm::Type* llvmInner =
+            innerTy ? mapKardashevType(innerTy) : inner->getType();
+        auto dl = module_->getDataLayout();
+        uint64_t size = dl.getTypeAllocSize(llvmInner);
+        auto* i64Ty = llvm::Type::getInt64Ty(*ctx_);
+        llvm::Value* raw = builder_->CreateCall(
+            mallocFn_, {llvm::ConstantInt::get(i64Ty, size)}, "box.raw");
+        builder_->CreateStore(inner, raw);
+        return raw; // opaque pointer == Box<T>
+    }
+
     llvm::Value* emitBinary(const ast::BinaryExpr& bin) {
         llvm::Value* L = emitExpr(*bin.lhs);
         llvm::Value* R = emitExpr(*bin.rhs);
@@ -1534,6 +1634,106 @@ private:
         if (savedBB) builder_->SetInsertPoint(savedBB);
         fnvalThunks_[thunkName] = thunk;
         return thunk;
+    }
+
+    // Phase 11: get-or-create the vtable global for `impl Trait for Type`.
+    // Layout: a struct with one i8* (fn pointer) slot per trait method, in
+    // the trait's declaration order. Each slot points to a thunk
+    // `__vt_<Trait>_<Type>_<method>(i8* self, args...)` that forwards `self`
+    // (the object's data pointer) and the args to the real impl method. With
+    // LLVM opaque pointers the "bitcast self to ConcreteType*" is implicit
+    // (all pointers share one type), so the thunk is a thin forwarder; its
+    // existence keeps the vtable slot a uniform fn-pointer type and gives a
+    // single indirection point per (trait,type,method).
+    llvm::GlobalVariable* getOrEmitVtable(const std::string& traitName,
+                                          const std::string& typeName) {
+        std::string key = traitName + "/" + typeName;
+        auto cached = vtables_.find(key);
+        if (cached != vtables_.end()) return cached->second;
+
+        auto* i8PtrTy = llvm::PointerType::get(*ctx_, 0);
+        auto orderIt = traitMethodOrder_.find(traitName);
+        if (orderIt == traitMethodOrder_.end()) {
+            errors_.push_back("codegen: no method order for trait " + traitName);
+            return nullptr;
+        }
+        const std::vector<std::string>& order = orderIt->second;
+
+        // The vtable struct type: N fn-pointer slots (opaque pointers).
+        std::vector<llvm::Type*> slotTys(order.size(), i8PtrTy);
+        auto* vtTy = llvm::StructType::get(*ctx_, slotTys);
+
+        std::vector<llvm::Constant*> slots;
+        slots.reserve(order.size());
+        ast::TypeRef forTyRef;
+        forTyRef.name = typeName;
+        for (const auto& methodName : order) {
+            const std::string implMangled =
+                implMethodMangle(traitName, forTyRef, methodName);
+            auto implIt = declaredFns_.find(implMangled);
+            if (implIt == declaredFns_.end()) {
+                errors_.push_back("codegen: vtable references undeclared impl "
+                                  "method " + implMangled);
+                slots.push_back(llvm::ConstantPointerNull::get(i8PtrTy));
+                continue;
+            }
+            llvm::Function* thunk =
+                emitVtableThunk(traitName, typeName, methodName, implIt->second);
+            slots.push_back(thunk);
+        }
+
+        auto* init = llvm::ConstantStruct::get(vtTy, slots);
+        auto* gv = new llvm::GlobalVariable(
+            *module_, vtTy, /*isConstant=*/true,
+            llvm::GlobalValue::InternalLinkage, init,
+            "__vtable_" + traitName + "_" + typeName);
+        vtables_[key] = gv;
+        return gv;
+    }
+
+    // Emit (idempotently) the thunk that adapts a trait-object call to the
+    // concrete impl method. Signature mirrors the impl method exactly (the
+    // `self` slot is a pointer either way under opaque pointers), so the body
+    // is a straight forward-and-return.
+    llvm::Function* emitVtableThunk(const std::string& traitName,
+                                    const std::string& typeName,
+                                    const std::string& methodName,
+                                    llvm::Function* impl) {
+        std::string thunkName =
+            "__vt_" + traitName + "_" + typeName + "_" + methodName;
+        if (auto* existing = module_->getFunction(thunkName)) return existing;
+
+        auto* savedBB = builder_->GetInsertBlock();
+        llvm::FunctionType* implTy = impl->getFunctionType();
+        auto* thunk = llvm::Function::Create(
+            implTy, llvm::Function::InternalLinkage, thunkName, module_.get());
+        auto* entry = llvm::BasicBlock::Create(*ctx_, "entry", thunk);
+        llvm::IRBuilder<> b(entry);
+        std::vector<llvm::Value*> fwd;
+        fwd.reserve(thunk->arg_size());
+        for (auto& arg : thunk->args()) fwd.push_back(&arg);
+        llvm::Value* ret = b.CreateCall(implTy, impl, fwd);
+        if (impl->getReturnType()->isVoidTy()) b.CreateRetVoid();
+        else b.CreateRet(ret);
+
+        if (savedBB) builder_->SetInsertPoint(savedBB);
+        return thunk;
+    }
+
+    // Phase 11: build the trait-object fat pointer `{ i8* data, i8* vtable }`
+    // for coercing a thin pointer (`dataPtr`) of concrete `(trait,type)` into
+    // a `&dyn Trait` / `Box<dyn Trait>`.
+    llvm::Value* makeDynPtr(llvm::Value* dataPtr, const std::string& traitName,
+                            const std::string& typeName) {
+        llvm::GlobalVariable* vt = getOrEmitVtable(traitName, typeName);
+        llvm::Value* vtPtr =
+            vt ? static_cast<llvm::Value*>(vt)
+               : llvm::ConstantPointerNull::get(
+                     llvm::PointerType::get(*ctx_, 0));
+        llvm::Value* agg = llvm::UndefValue::get(dynPtrTy_);
+        agg = builder_->CreateInsertValue(agg, dataPtr, {0}, "dyn.data");
+        agg = builder_->CreateInsertValue(agg, vtPtr, {1}, "dyn.vtable");
+        return agg;
     }
 
     llvm::Value* emitCall(const ast::CallExpr& call) {
@@ -1938,6 +2138,16 @@ private:
             return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
         }
         const ResolvedMethod& res = it->second;
+
+        // Phase 11: dynamic dispatch. The receiver is a `&dyn Trait` /
+        // `Box<dyn Trait>` fat pointer `{ data, vtable }`. Load the vtable,
+        // index to this method's slot, load the fn pointer, and call it with
+        // the data pointer as `self`. The SAME call site reaches different
+        // impls at runtime depending on which vtable the object carries.
+        if (res.kind == ResolvedMethod::Dyn) {
+            return emitDynMethodCall(mc, res);
+        }
+
         std::string targetTypeName;
         if (res.kind == ResolvedMethod::Concrete) {
             targetTypeName = res.concreteTypeName;
@@ -1985,27 +2195,112 @@ private:
         llvm::Function* fn = fnIt->second;
         std::vector<llvm::Value*> args;
         args.reserve(mc.args.size() + 1);
-        // Phase 2.4b: auto-deref the receiver. If the receiver expression
-        // has type `&T` (possibly nested) but the impl takes self by
-        // value (`fn show(self)`), we need to load through the pointer so
-        // the call site provides a `T` value. If the impl was written for
-        // `&T` itself, the type-checker would route directly to that impl
-        // and no extra deref is needed.
-        llvm::Value* recv = emitExpr(*mc.receiver);
-        TypePtr recvTy = lookupExprType(*mc.receiver);
-        unsigned refDepth = 0;
-        while (recvTy && recvTy->kind == TypeKind::Ref) {
-            recvTy = resolveInInstance(recvTy->refInner);
-            ++refDepth;
+        // Determine whether the impl method takes `self` by reference
+        // (`&self`, Phase 11) or by value (`self`), so we pass the receiver
+        // accordingly. The FnSchema's first arg type is the source of truth.
+        bool selfByRef = false;
+        if (auto sIt = tc_.fnSchemas.find(mangled); sIt != tc_.fnSchemas.end()) {
+            const TypePtr& sig = sIt->second.signature;
+            if (!sig->args.empty() &&
+                resolve(sig->args[0])->kind == TypeKind::Ref) {
+                selfByRef = true;
+            }
         }
-        for (unsigned d = 0; d < refDepth; ++d) {
-            llvm::Type* underlying = mapKardashevType(recvTy);
-            recv = builder_->CreateLoad(underlying, recv,
-                                         "deref" + std::to_string(d));
+        // Receiver value vs address. The receiver's own type may be a pointer
+        // to the object (`&T` borrow or `Box<T>` heap pointer) or a `T` value
+        // place. A loaded `&T`/`Box<T>` value is already a pointer to the
+        // object's data.
+        TypePtr recvTy = lookupExprType(*mc.receiver);
+        TypePtr recvR = recvTy ? resolveInInstance(recvTy) : nullptr;
+        bool recvIsPtr = recvR && (recvR->kind == TypeKind::Ref ||
+                                   recvR->kind == TypeKind::Box);
+        llvm::Value* recv;
+        if (selfByRef) {
+            // `&self`: pass a pointer to the object. A pointer-shaped receiver
+            // (`&T`/`Box<T>`) forwards directly; a value place yields its
+            // address.
+            if (recvIsPtr) {
+                recv = emitExpr(*mc.receiver);
+            } else {
+                recv = emitPlaceAddr(*mc.receiver);
+                if (!recv) {
+                    // Fall back: spill the value to a temp and pass its
+                    // address (handles non-place receivers).
+                    llvm::Value* val = emitExpr(*mc.receiver);
+                    auto* slot = builder_->CreateAlloca(
+                        val->getType(), nullptr, "self.spill");
+                    builder_->CreateStore(val, slot);
+                    recv = slot;
+                }
+            }
+        } else {
+            // Phase 2.4b: by-value `self`. Auto-deref a `&T`/`Box<T>` receiver
+            // to the `T` value the method expects.
+            recv = emitExpr(*mc.receiver);
+            TypePtr t = recvTy;
+            unsigned refDepth = 0;
+            while (t && (resolveInInstance(t)->kind == TypeKind::Ref ||
+                         resolveInInstance(t)->kind == TypeKind::Box)) {
+                t = resolveInInstance(t)->refInner;
+                ++refDepth;
+            }
+            for (unsigned d = 0; d < refDepth; ++d) {
+                llvm::Type* underlying = mapKardashevType(t);
+                recv = builder_->CreateLoad(underlying, recv,
+                                             "deref" + std::to_string(d));
+            }
         }
         args.push_back(recv);
         for (const auto& a : mc.args) args.push_back(emitExpr(*a));
         return builder_->CreateCall(fn, args, "mcall_" + mc.methodName);
+    }
+
+    // Phase 11: lower a dynamic-dispatch method call through a trait object's
+    // vtable. `mc.receiver` evaluates to the `{ data, vtable }` fat pointer.
+    llvm::Value* emitDynMethodCall(const ast::MethodCallExpr& mc,
+                                   const ResolvedMethod& res) {
+        auto* i8PtrTy = llvm::PointerType::get(*ctx_, 0);
+        llvm::Value* fat = emitExpr(*mc.receiver);
+        // If the receiver is `&(&dyn ...)` etc., it is still represented as
+        // the dynPtr aggregate value here (mapKardashevType collapses a Ref-
+        // to-Dyn to the fat pointer), so a direct ExtractValue is correct.
+        // But a receiver loaded as a pointer to the fat struct must be loaded
+        // first; handle that by checking the LLVM type.
+        if (fat->getType()->isPointerTy()) {
+            fat = builder_->CreateLoad(dynPtrTy_, fat, "dyn.load");
+        }
+        llvm::Value* dataPtr =
+            builder_->CreateExtractValue(fat, {0}, "dyn.data");
+        llvm::Value* vtPtr =
+            builder_->CreateExtractValue(fat, {1}, "dyn.vtable");
+
+        // The vtable's static layout: N fn-pointer slots. We only need this
+        // method's slot, so build a struct type up to and including it.
+        unsigned slot = static_cast<unsigned>(res.dynMethodSlot);
+        std::vector<llvm::Type*> slotTys(slot + 1, i8PtrTy);
+        auto* vtTy = llvm::StructType::get(*ctx_, slotTys);
+        llvm::Value* slotPtr =
+            builder_->CreateStructGEP(vtTy, vtPtr, slot, "vt.slot");
+        llvm::Value* fnPtr =
+            builder_->CreateLoad(i8PtrTy, slotPtr, "vt.fn");
+
+        // Reconstruct the callee signature: `ret(ptr self, args...)`, where
+        // ret/arg types come from the call's resolved types.
+        TypePtr retKd = lookupExprType(mc);
+        llvm::Type* retTy = retKd ? mapKardashevType(retKd)
+                                  : llvm::Type::getInt64Ty(*ctx_);
+        std::vector<llvm::Type*> argTys;
+        argTys.push_back(i8PtrTy); // self (data pointer)
+        std::vector<llvm::Value*> callArgs;
+        callArgs.push_back(dataPtr);
+        for (const auto& a : mc.args) {
+            llvm::Value* av = emitExpr(*a);
+            argTys.push_back(av->getType());
+            callArgs.push_back(av);
+        }
+        auto* fnTy = llvm::FunctionType::get(retTy, argTys, /*isVarArg=*/false);
+        return builder_->CreateCall(fnTy, fnPtr, callArgs,
+                                    retTy->isVoidTy() ? "" : "dyncall");
     }
 
     llvm::Value* emitMatch(const ast::MatchExpr& me) {

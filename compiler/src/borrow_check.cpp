@@ -56,6 +56,11 @@ bool isCopyType(const TypePtr& t) {
     case TypeKind::Struct:
     case TypeKind::Enum:
         return false;
+    // Phase 11: a trait object `dyn Trait` is unsized (only seen behind a
+    // pointer); `Box<T>` is an owning heap pointer and moves like a struct.
+    case TypeKind::Dyn:
+    case TypeKind::Box:
+        return false;
     }
     return false;
 }
@@ -171,6 +176,11 @@ private:
         if (auto* mc = dynamic_cast<const ast::MethodCallExpr*>(&e)) {
             prePass(*mc->receiver);
             for (const auto& a : mc->args) prePass(*a);
+            return;
+        }
+        if (auto* bn = dynamic_cast<const ast::BoxNewExpr*>(&e)) {
+            // Phase 11: `Box::new(v)` — mirror `consume`'s traversal order.
+            prePass(*bn->value);
             return;
         }
         if (auto* ie = dynamic_cast<const ast::IfExpr*>(&e)) {
@@ -362,6 +372,12 @@ private:
                 lastInSubtree = std::max(lastInSubtree,
                                            consume(*a, expectExpire));
             }
+            return lastInSubtree;
+        }
+        if (auto* bn = dynamic_cast<const ast::BoxNewExpr*>(&e)) {
+            // Phase 11: `Box::new(v)` moves v into the heap box.
+            lastInSubtree = std::max(lastInSubtree,
+                                       consume(*bn->value, expectExpire));
             return lastInSubtree;
         }
         if (auto* ie = dynamic_cast<const ast::IfExpr*>(&e)) {

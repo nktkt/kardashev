@@ -319,6 +319,22 @@ private:
             tr.fnEffects = std::move(row.labels);
             return tr;
         }
+        // Phase 11: `dyn Trait` — an unsized trait object. `dyn` stays an
+        // Identifier at the lexer level (like `mut`/`async`), so match by
+        // lexeme. The trait name follows; combine with the `&` prefix above
+        // for `&dyn Trait`, or nest under `Box<...>` for `Box<dyn Trait>`.
+        if (check(TokenKind::Identifier) && peek().lexeme == "dyn") {
+            consume();
+            Token traitTok = expect(TokenKind::Identifier, "trait name after `dyn`");
+            ast::TypeRef tr;
+            tr.isDyn = true;
+            tr.name = traitTok.lexeme;
+            tr.isRef = isRef;
+            tr.refIsMut = refIsMut;
+            tr.line = isRef ? ampTok.line : traitTok.line;
+            tr.column = isRef ? ampTok.column : traitTok.column;
+            return tr;
+        }
         Token t = consumePathName("type name");
         ast::TypeRef tr;
         tr.name = t.lexeme;
@@ -412,10 +428,43 @@ private:
     }
 
     // Trait/impl method first param is conventionally `self` (lowercase).
-    // We accept either `self` (without an explicit type — it implicitly
-    // becomes `Self`) or `name: Type` for additional params.
+    // We accept either `self` (by value, type `Self`), `&self` (by shared
+    // reference, type `&Self` — Phase 11, required for dyn dispatch), or
+    // `name: Type` for additional params.
     ast::Param parseSelfOrParam() {
         const Token& t = peek();
+        // Phase 11: `&self` / `&mut self` — the receiver is borrowed. Lowers
+        // to a `self: &Self` (`&mut Self`) param, so the method's LLVM first
+        // arg is a pointer into the object's data. This is what a trait
+        // object's vtable thunk hands across (the fat pointer's data slot).
+        if (t.kind == TokenKind::Ampersand) {
+            Token amp = consume();
+            bool isMut = false;
+            if (check(TokenKind::Identifier) && peek().lexeme == "mut") {
+                consume();
+                isMut = true;
+            }
+            if (check(TokenKind::Identifier) && peek().lexeme == "self") {
+                Token selfTok = consume();
+                ast::Param p;
+                p.name = "self";
+                p.type.name = "Self";
+                p.type.isRef = true;
+                p.type.refIsMut = isMut;
+                p.type.line = amp.line;
+                p.type.column = amp.column;
+                return p;
+            }
+            // `&` not followed by `self` in receiver position is unsupported
+            // here; emit a diagnostic via the normal param path's expect.
+            errorHere("expected `self` after `&` in receiver position");
+            ast::Param p;
+            p.name = "self";
+            p.type.name = "Self";
+            p.type.isRef = true;
+            p.type.refIsMut = isMut;
+            return p;
+        }
         if (t.kind == TokenKind::Identifier && t.lexeme == "self") {
             Token selfTok = consume();
             ast::Param p;
@@ -572,6 +621,12 @@ private:
             isMut = true;
         }
         Token nameTok = expect(TokenKind::Identifier, "identifier after 'let'");
+        // Phase 11: optional `: Type` annotation (needed to spell out a
+        // coercion target like `let b: Box<dyn Shape> = Box::new(...)`).
+        std::shared_ptr<ast::TypeRef> annotation;
+        if (accept(TokenKind::Colon)) {
+            annotation = std::make_shared<ast::TypeRef>(parseTypeRef());
+        }
         expect(TokenKind::Eq, "=");
         auto value = parseExpr();
         expect(TokenKind::Semi, ";");
@@ -581,6 +636,7 @@ private:
         stmt->name = nameTok.lexeme;
         stmt->value = std::move(value);
         stmt->isMut = isMut;
+        stmt->annotation = std::move(annotation);
         return stmt;
     }
 
@@ -805,6 +861,21 @@ private:
             // since that's where the user's path begins.
             tok.line = first.line;
             tok.column = first.column;
+            // Phase 11: `Box::new(value)` is a built-in heap allocation, not
+            // a user fn. Recognize the full path here (before it collapses to
+            // the bare `new` segment) and produce a dedicated BoxNewExpr.
+            if (wasPath && first.lexeme == "Box" && tok.lexeme == "new") {
+                expect(TokenKind::LParen, "(");
+                auto bn = std::make_unique<ast::BoxNewExpr>();
+                bn->line = first.line;
+                bn->column = first.column;
+                bool prevRestrict = restrictStructLit_;
+                restrictStructLit_ = false;
+                bn->value = parseExpr();
+                restrictStructLit_ = prevRestrict;
+                expect(TokenKind::RParen, ")");
+                return bn;
+            }
             if (check(TokenKind::LParen)) {
                 advance(); // consume '('
                 auto call = std::make_unique<ast::CallExpr>();
