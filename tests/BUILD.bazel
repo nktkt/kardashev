@@ -241,6 +241,21 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 26 capstone: a recursive-descent arithmetic expression interpreter
+# written in kardashev (tokenizer over str_char_at + a precedence parser that
+# returns (value, pos, err) tuples + on-the-fly evaluation), plus a focused
+# str_char_at builtin check (in-bounds byte / past-end -> -1). The test builds
+# the ACTUAL examples/calc/main.kd, so the shipped capstone source is staged
+# into the sh_test runfiles alongside kardc.
+sh_test(
+    name = "smoke_test_calc",
+    srcs = ["smoke_test_calc.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/calc:main.kd",
+    ],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

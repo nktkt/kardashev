@@ -1,0 +1,20 @@
+load("//bazel/rules_kardashev:defs.bzl", "kardashev_binary")
+
+# Make the capstone source readable by //tests:smoke_test_calc, which builds
+# the real file (rather than an inlined copy) so the test doubles as a build
+# check of the shipped example.
+exports_files(
+    ["main.kd"],
+    visibility = ["//visibility:public"],
+)
+
+# Phase 26 capstone: a recursive-descent arithmetic expression interpreter
+# written in kardashev. It tokenizes a string with str_char_at, parses with
+# correct operator precedence + parens via mutually-recursive descent, and
+# evaluates to an integer. Exercises String byte-scanning, Vec<Tok>, an
+# enum + match parser, const kind codes, tuples, recursion, and loops.
+# AOT-compiled via //compiler:kardc.
+kardashev_binary(
+    name = "calc",
+    src = "main.kd",
+)

@@ -1067,6 +1067,47 @@ private:
             declaredFns_["str_len"] = fn;
         }
 
+        // --- Phase 26: str_char_at(s: &String, i: i64) -> i64 ---
+        // Returns the byte at index `i` zero-extended to i64, or -1 when `i`
+        // is negative, >= len, or the data pointer is null (an empty string).
+        // Bounds-checked exactly like vec_get (PR#24) so a tokenizer can scan
+        // past the end safely and use -1 as a clean EOF sentinel. The byte is
+        // ZERO-extended (a byte is 0..255), so the sentinel -1 is unambiguous.
+        {
+            auto* fnTy =
+                llvm::FunctionType::get(i64Ty, {i8PtrTy, i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "str_char_at",
+                module_.get());
+            fn->getArg(0)->setName("s");
+            fn->getArg(1)->setName("i");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* inBoundsBB = llvm::BasicBlock::Create(ctx, "in_bounds", fn);
+            auto* oobBB = llvm::BasicBlock::Create(ctx, "oob", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+            auto* dataPtr = b.CreateStructGEP(strTy, fn->getArg(0), 0, "data_p");
+            auto* lenPtr = b.CreateStructGEP(strTy, fn->getArg(0), 1, "len_p");
+            auto* data = b.CreateLoad(i8PtrTy, dataPtr, "data");
+            auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
+            auto* idx = fn->getArg(1);
+            auto* idxNonNeg = b.CreateICmpSGE(idx, zeroI64, "idx_non_neg");
+            auto* idxInRange = b.CreateICmpSLT(idx, len, "idx_in_range");
+            auto* dataNonNull = b.CreateICmpNE(
+                data, llvm::Constant::getNullValue(i8PtrTy), "data_non_null");
+            auto* canRead = b.CreateAnd(
+                b.CreateAnd(idxNonNeg, idxInRange, "bounds_ok"), dataNonNull,
+                "can_read");
+            b.CreateCondBr(canRead, inBoundsBB, oobBB);
+            b.SetInsertPoint(inBoundsBB);
+            auto* bytePtr = b.CreateGEP(i8Ty, data, idx, "byte_ptr");
+            auto* byte = b.CreateLoad(i8Ty, bytePtr, "byte");
+            b.CreateRet(b.CreateZExt(byte, i64Ty, "byte_i64"));
+            b.SetInsertPoint(oobBB);
+            b.CreateRet(llvm::ConstantInt::get(i64Ty, -1));
+            declaredFns_["str_char_at"] = fn;
+        }
+
         // --- Phase 13b: growable String runtime ---
 
         // string_new() -> String : an empty heap string {null, 0, 0}. The

@@ -104,6 +104,18 @@ public:
                 {makeRef(stringTy, /*isMut=*/false)}, makeInt());
             fnSchemas_["str_len"] = std::move(sch);
         }
+        // Phase 26: str_char_at(s: &String, i: i64) -> i64 — the byte at index
+        // `i` widened to i64, or -1 when `i` is negative / past the end (a
+        // bounds-checked read, mirroring vec_get's Phase 24 guard). This is the
+        // one stdlib gap the calc-interpreter capstone needs: a way to read an
+        // individual byte out of a String so a tokenizer can scan characters.
+        // Pure (no effect) — it only reads borrowed memory.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(stringTy, /*isMut=*/false), makeInt()}, makeInt());
+            fnSchemas_["str_char_at"] = std::move(sch);
+        }
 
         // Phase 13b growable-String builtins. `String` is now a heap-backed
         // {ptr,len,cap}; these mirror the Vec builtin family. string_new and

@@ -1496,6 +1496,43 @@ void test_string_push_grows_past_initial_cap() {
     expectEquals(v, 20, "string_push_grows");
 }
 
+void test_str_char_at_in_bounds() {
+    // Phase 26: str_char_at reads the byte at an index, zero-extended. The
+    // string is "AB" so byte 0 is 'A' (65) and byte 1 is 'B' (66); their
+    // sum is 131.
+    auto v = compileAndRun(
+        "fn main() -> i64 {\n"
+        "    let s = \"AB\";\n"
+        "    str_char_at(&s, 0) + str_char_at(&s, 1)\n"
+        "}",
+        "main", "str_char_at_in_bounds");
+    expectEquals(v, 131, "str_char_at_in_bounds");
+}
+
+void test_str_char_at_out_of_bounds_is_minus_one() {
+    // Phase 26: a past-the-end index returns the -1 sentinel (bounds-checked,
+    // no OOB read). "AB" has length 2, so index 2 and index 5 are both -1;
+    // their sum is -2.
+    auto v = compileAndRun(
+        "fn main() -> i64 {\n"
+        "    let s = \"AB\";\n"
+        "    str_char_at(&s, 2) + str_char_at(&s, 5)\n"
+        "}",
+        "main", "str_char_at_oob");
+    expectEquals(v, -2, "str_char_at_oob");
+}
+
+void test_str_char_at_negative_is_minus_one() {
+    // Phase 26: a negative index is also rejected (returns -1).
+    auto v = compileAndRun(
+        "fn main() -> i64 {\n"
+        "    let s = \"AB\";\n"
+        "    str_char_at(&s, 0 - 1)\n"
+        "}",
+        "main", "str_char_at_negative");
+    expectEquals(v, -1, "str_char_at_negative");
+}
+
 void test_hashmap_insert_get_overwrite() {
     // Needs Option in scope (codegen's hashmap_get builds Option<i64>); the
     // unit-test harness bypasses the prelude, so declare it inline.
@@ -2473,6 +2510,10 @@ int main() {
     // Phase 13b growable String, HashMap<i64,i64>, slices
     test_string_build_and_len();
     test_string_push_grows_past_initial_cap();
+    // Phase 26: str_char_at builtin (in-bounds byte / past-end / negative)
+    test_str_char_at_in_bounds();
+    test_str_char_at_out_of_bounds_is_minus_one();
+    test_str_char_at_negative_is_minus_one();
     test_hashmap_insert_get_overwrite();
     test_hashmap_rehash_all_retrievable();
     // Phase 17b generic HashMap<i64,V>: value type follows the inserts
