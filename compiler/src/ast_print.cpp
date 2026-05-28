@@ -162,6 +162,7 @@ private:
     }
 
     void printStruct(const StructDecl& s) {
+        if (s.isPub) out_ += "pub ";
         out_ += "struct " + s.name + genericParamsToString(s.genericParams);
         if (s.fields.empty()) {
             out_ += " {}\n";
@@ -177,6 +178,7 @@ private:
     }
 
     void printEnum(const EnumDecl& e) {
+        if (e.isPub) out_ += "pub ";
         out_ += "enum " + e.name + genericParamsToString(e.genericParams);
         if (e.variants.empty()) {
             out_ += " {}\n";
@@ -200,6 +202,7 @@ private:
     }
 
     void printTrait(const TraitDecl& t) {
+        if (t.isPub) out_ += "pub ";
         out_ += "trait " + t.name;
         if (t.methods.empty()) {
             out_ += " {}\n";
@@ -216,7 +219,13 @@ private:
     }
 
     void printImpl(const ImplDecl& im) {
-        out_ += "impl " + im.traitName + " for " + typeToString(im.forType);
+        if (im.isPub) out_ += "pub ";
+        // Phase 15: inherent impls print as `impl Type { ... }` (no trait).
+        if (im.isInherent()) {
+            out_ += "impl " + typeToString(im.forType);
+        } else {
+            out_ += "impl " + im.traitName + " for " + typeToString(im.forType);
+        }
         if (im.methods.empty()) {
             out_ += " {}\n";
             return;
@@ -369,6 +378,19 @@ private:
     void printExpr(const Expr& e, int depth, int parentPrec) {
         if (auto* lit = dynamic_cast<const IntLitExpr*>(&e)) {
             out_ += std::to_string(lit->value);
+            return;
+        }
+        // Phase 15: boolean literal.
+        if (auto* bl = dynamic_cast<const BoolLitExpr*>(&e)) {
+            out_ += bl->value ? "true" : "false";
+            return;
+        }
+        // Phase 15: prefix unary operator. It binds tighter than every binary
+        // operator, so wrap a binary operand in parens (`-(a + b)`); atoms and
+        // postfix chains print bare (`-x`, `!a.b`, `- -3`).
+        if (auto* un = dynamic_cast<const UnaryExpr*>(&e)) {
+            out_ += un->op == UnaryOp::Neg ? "-" : "!";
+            printExpr(*un->operand, depth, /*parentPrec=*/100);
             return;
         }
         if (auto* sl = dynamic_cast<const StringLitExpr*>(&e)) {

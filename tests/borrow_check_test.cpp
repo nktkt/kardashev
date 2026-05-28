@@ -238,6 +238,33 @@ void test_mut_self_on_nested_field_receiver_ok() {
              "mut_self_on_nested_field_receiver_ok");
 }
 
+void test_inherent_mut_self_repeated_calls_ok() {
+    // Phase 15: the autoref machinery applies to inherent-impl `&mut self`
+    // methods too, so repeated calls on the same receiver don't report a move.
+    expectOk("struct Counter { n: i64 }\n"
+             "impl Counter {\n"
+             "    fn inc(&mut self) -> i64 { self.n = self.n + 1; self.n }\n"
+             "}\n"
+             "fn main() -> i64 {\n"
+             "    let mut c = Counter { n: 0 };\n"
+             "    c.inc(); c.inc(); c.inc()\n"
+             "}",
+             "inherent_mut_self_repeated_calls_ok");
+}
+
+void test_unary_operand_walked_ok() {
+    // Phase 15: the borrow checker must walk UnaryExpr operands (so move /
+    // use accounting stays correct). `-x` and `!b` are reads, not moves, of
+    // Copy values; using them twice is fine.
+    expectOk("fn main() -> i64 {\n"
+             "    let x = 5;\n"
+             "    let b = true;\n"
+             "    let y = -x + -x;\n"
+             "    if !b { y } else { -y }\n"
+             "}",
+             "unary_operand_walked_ok");
+}
+
 void test_by_value_self_double_use_errors() {
     // By-value `self` still moves the receiver, so the 2nd call is an error.
     expectErr("trait Take { fn take(self) -> i64; }\n"
@@ -562,6 +589,8 @@ int main() {
     test_mut_self_repeated_calls_ok();
     test_shared_self_repeated_calls_ok();
     test_mut_self_on_nested_field_receiver_ok();
+    test_inherent_mut_self_repeated_calls_ok();
+    test_unary_operand_walked_ok();
     test_by_value_self_double_use_errors();
     test_generic_fn_body_move_uses_owned_arg_ok();
     test_generic_fn_body_use_after_move_errors();
@@ -587,8 +616,9 @@ int main() {
     test_for_loop_body_ok();
     test_move_inside_loop_body_detected();
     test_break_value_walked_ok();
-    std::cout << "All borrow_check tests passed (39 cases) — Phase 2.4c "
+    std::cout << "All borrow_check tests passed (41 cases) — Phase 2.4c "
                  "NLL + mutable references; Phase 9 loops; Phase 13a "
-                 "method-receiver autoref\n";
+                 "method-receiver autoref; Phase 15 inherent &mut self + "
+                 "unary operands\n";
     return 0;
 }

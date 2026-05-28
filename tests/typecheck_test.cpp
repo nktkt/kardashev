@@ -1613,6 +1613,108 @@ void test_async_sync_fn_awaiting_errors() {
         "async_sync_fn_awaiting_errors");
 }
 
+// --- Phase 15: bool literals, unary ops, else-if, inherent impls ---
+
+void test_bool_literal_typechecks_as_bool() {
+    expectOk("fn f() -> bool { true }", "bool_literal_true");
+    expectOk("fn f() -> bool { false }", "bool_literal_false");
+}
+
+void test_bool_literal_in_if_cond() {
+    expectOk("fn f() -> i64 { let t = true; if t { 1 } else { 0 } }",
+             "bool_literal_in_if_cond");
+}
+
+void test_bool_literal_not_i64() {
+    expectErr("fn f() -> i64 { true }", "bool_literal_not_i64");
+}
+
+void test_unary_neg_ok_and_type() {
+    expectOk("fn f() -> i64 { -5 }", "unary_neg_literal");
+    expectOk("fn f() -> i64 { let x = 3; -x }", "unary_neg_var");
+    expectOk("fn f() -> i64 { -(-3) }", "unary_double_neg");
+}
+
+void test_unary_neg_on_bool_errors() {
+    expectErrContains("fn f() -> i64 { -true }", "i64", "unary_neg_on_bool");
+}
+
+void test_unary_not_ok_and_type() {
+    expectOk("fn f() -> bool { !true }", "unary_not_literal");
+    expectOk("fn f() -> bool { !(2 < 1) }", "unary_not_comparison");
+    expectOk("fn f() -> i64 { let d = false; if !d { 1 } else { 0 } }",
+             "unary_not_branch");
+}
+
+void test_unary_not_on_int_errors() {
+    expectErrContains("fn f() -> bool { !5 }", "bool", "unary_not_on_int");
+}
+
+void test_else_if_chain_typechecks() {
+    expectOk(
+        "fn classify(a: i64) -> i64 {\n"
+        "  if a == 0 { 100 } else if a == 1 { 200 } else { 300 }\n"
+        "}",
+        "else_if_chain");
+}
+
+void test_else_if_branch_type_mismatch_errors() {
+    // A mismatched branch type in an else-if ladder is still caught.
+    expectErr(
+        "fn f(a: i64) -> i64 {\n"
+        "  if a == 0 { 1 } else if a == 1 { true } else { 3 }\n"
+        "}",
+        "else_if_branch_mismatch");
+}
+
+void test_inherent_impl_method_resolves() {
+    expectOk(
+        "struct P { x: i64 }\n"
+        "impl P { fn get(&self) -> i64 { self.x } }\n"
+        "fn main() -> i64 { let p = P { x: 9 }; p.get() }",
+        "inherent_impl_method_resolves");
+}
+
+void test_inherent_mut_self_method_ok() {
+    expectOk(
+        "struct C { n: i64 }\n"
+        "impl C {\n"
+        "  fn get(&self) -> i64 { self.n }\n"
+        "  fn bump(&mut self) -> i64 { self.n = self.n + 1; self.n }\n"
+        "}\n"
+        "fn main() -> i64 { let mut c = C { n: 0 }; c.bump(); c.bump(); c.get() }",
+        "inherent_mut_self_method");
+}
+
+void test_inherent_and_trait_method_coexist() {
+    expectOk(
+        "trait Show { fn show(&self) -> i64; }\n"
+        "struct W { v: i64 }\n"
+        "impl Show for W { fn show(&self) -> i64 { self.v } }\n"
+        "impl W { fn dbl(&self) -> i64 { self.v + self.v } }\n"
+        "fn main() -> i64 { let w = W { v: 6 }; w.show() + w.dbl() }",
+        "inherent_and_trait_coexist");
+}
+
+void test_inherent_unknown_method_errors() {
+    expectErr(
+        "struct P { x: i64 }\n"
+        "impl P { fn get(&self) -> i64 { self.x } }\n"
+        "fn main() -> i64 { let p = P { x: 9 }; p.nope() }",
+        "inherent_unknown_method");
+}
+
+void test_duplicate_method_across_impls_errors() {
+    // The same method name on both an inherent and a trait impl collides.
+    expectErr(
+        "trait Show { fn m(&self) -> i64; }\n"
+        "struct P { x: i64 }\n"
+        "impl Show for P { fn m(&self) -> i64 { self.x } }\n"
+        "impl P { fn m(&self) -> i64 { self.x } }\n"
+        "fn main() -> i64 { 0 }",
+        "duplicate_method_across_impls");
+}
+
 } // namespace
 
 int main() {
@@ -1790,6 +1892,21 @@ int main() {
     test_for_over_non_iterator_errors();
     test_fold_io_closure_positive();
     test_fold_io_closure_negative();
-    std::cout << "All typecheck tests passed (160 cases)\n";
+    // Phase 15: bool literals, unary ops, else-if, inherent impls
+    test_bool_literal_typechecks_as_bool();
+    test_bool_literal_in_if_cond();
+    test_bool_literal_not_i64();
+    test_unary_neg_ok_and_type();
+    test_unary_neg_on_bool_errors();
+    test_unary_not_ok_and_type();
+    test_unary_not_on_int_errors();
+    test_else_if_chain_typechecks();
+    test_else_if_branch_type_mismatch_errors();
+    test_inherent_impl_method_resolves();
+    test_inherent_mut_self_method_ok();
+    test_inherent_and_trait_method_coexist();
+    test_inherent_unknown_method_errors();
+    test_duplicate_method_across_impls_errors();
+    std::cout << "All typecheck tests passed (174 cases)\n";
     return 0;
 }

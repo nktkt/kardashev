@@ -1315,6 +1315,153 @@ void test_slice_len_direct() {
     expectEquals(v, 40, "slice_len_direct");
 }
 
+// --- Phase 15: bool literals, unary ops, else-if, inherent impls ---
+
+void test_bool_literal_true_branch() {
+    auto v = compileAndRun(
+        "fn main() -> i64 { let t = true; if t { 1 } else { 0 } }", "main",
+        "bool_literal_true_branch");
+    expectEquals(v, 1, "bool_literal_true_branch");
+}
+
+void test_bool_literal_false_branch() {
+    auto v = compileAndRun(
+        "fn main() -> i64 { let f = false; if f { 1 } else { 0 } }", "main",
+        "bool_literal_false_branch");
+    expectEquals(v, 0, "bool_literal_false_branch");
+}
+
+void test_unary_neg_literal() {
+    auto v = compileAndRun("fn main() -> i64 { -5 }", "main",
+                           "unary_neg_literal");
+    expectEquals(v, -5, "unary_neg_literal");
+}
+
+void test_unary_neg_var() {
+    auto v = compileAndRun("fn main() -> i64 { let x = 7; -x }", "main",
+                           "unary_neg_var");
+    expectEquals(v, -7, "unary_neg_var");
+}
+
+void test_unary_double_neg() {
+    auto v = compileAndRun("fn main() -> i64 { -(-3) }", "main",
+                           "unary_double_neg");
+    expectEquals(v, 3, "unary_double_neg");
+}
+
+void test_unary_neg_precedence() {
+    // `-a * b` == `(-a) * b` == -12 (not -(a*b), which is also -12, so use a
+    // case that distinguishes: `-a + b` == (-a)+b == 1, vs -(a+b) == -7).
+    auto v = compileAndRun(
+        "fn main() -> i64 { let a = 3; let b = 4; -a + b }", "main",
+        "unary_neg_precedence");
+    expectEquals(v, 1, "unary_neg_precedence");
+}
+
+void test_unary_not_true_is_false() {
+    // `!true` lowers to i1 0; branch on it to surface as i64.
+    auto v = compileAndRun(
+        "fn main() -> i64 { if !true { 1 } else { 0 } }", "main",
+        "unary_not_true_is_false");
+    expectEquals(v, 0, "unary_not_true_is_false");
+}
+
+void test_unary_not_comparison() {
+    // `!(2 < 1)` == true; branch yields 1.
+    auto v = compileAndRun(
+        "fn main() -> i64 { if !(2 < 1) { 1 } else { 0 } }", "main",
+        "unary_not_comparison");
+    expectEquals(v, 1, "unary_not_comparison");
+}
+
+void test_branch_on_not_done() {
+    auto v = compileAndRun(
+        "fn main() -> i64 { let done = false; if !done { 11 } else { 22 } }",
+        "main", "branch_on_not_done");
+    expectEquals(v, 11, "branch_on_not_done");
+}
+
+void test_else_if_chain_first() {
+    auto v = compileAndRun(
+        "fn classify(a: i64) -> i64 {\n"
+        "  if a == 0 { 100 } else if a == 1 { 200 } else { 300 }\n"
+        "}\n"
+        "fn main() -> i64 { classify(0) }",
+        "main", "else_if_chain_first");
+    expectEquals(v, 100, "else_if_chain_first");
+}
+
+void test_else_if_chain_middle() {
+    auto v = compileAndRun(
+        "fn classify(a: i64) -> i64 {\n"
+        "  if a == 0 { 100 } else if a == 1 { 200 } else { 300 }\n"
+        "}\n"
+        "fn main() -> i64 { classify(1) }",
+        "main", "else_if_chain_middle");
+    expectEquals(v, 200, "else_if_chain_middle");
+}
+
+void test_else_if_chain_last() {
+    auto v = compileAndRun(
+        "fn classify(a: i64) -> i64 {\n"
+        "  if a == 0 { 100 } else if a == 1 { 200 } else { 300 }\n"
+        "}\n"
+        "fn main() -> i64 { classify(7) }",
+        "main", "else_if_chain_last");
+    expectEquals(v, 300, "else_if_chain_last");
+}
+
+void test_inherent_getter() {
+    auto v = compileAndRun(
+        "struct P { x: i64 }\n"
+        "impl P { fn get(&self) -> i64 { self.x } }\n"
+        "fn main() -> i64 { let p = P { x: 9 }; p.get() }",
+        "main", "inherent_getter");
+    expectEquals(v, 9, "inherent_getter");
+}
+
+void test_inherent_mut_self_persists() {
+    // Build, mutate via a &mut self inherent method twice, read back: the
+    // mutation must persist across the two calls (0 + 5 + 5 == 10).
+    auto v = compileAndRun(
+        "struct Counter { n: i64 }\n"
+        "impl Counter {\n"
+        "  fn get(&self) -> i64 { self.n }\n"
+        "  fn bump(&mut self) -> i64 { self.n = self.n + 5; self.n }\n"
+        "}\n"
+        "fn main() -> i64 {\n"
+        "  let mut c = Counter { n: 0 };\n"
+        "  c.bump();\n"
+        "  c.bump();\n"
+        "  c.get()\n"
+        "}",
+        "main", "inherent_mut_self_persists");
+    expectEquals(v, 10, "inherent_mut_self_persists");
+}
+
+void test_inherent_method_with_arg() {
+    auto v = compileAndRun(
+        "struct Acc { t: i64 }\n"
+        "impl Acc { fn add(&mut self, k: i64) -> i64 { self.t = self.t + k;"
+        " self.t } }\n"
+        "fn main() -> i64 { let mut a = Acc { t: 1 }; a.add(10); a.add(100) }",
+        "main", "inherent_method_with_arg");
+    expectEquals(v, 111, "inherent_method_with_arg");
+}
+
+void test_inherent_and_trait_coexist() {
+    // An inherent method and a trait-impl method on the same type both
+    // dispatch correctly (static dispatch for both).
+    auto v = compileAndRun(
+        "trait Show { fn show(&self) -> i64; }\n"
+        "struct W { v: i64 }\n"
+        "impl Show for W { fn show(&self) -> i64 { self.v } }\n"
+        "impl W { fn dbl(&self) -> i64 { self.v + self.v } }\n"
+        "fn main() -> i64 { let w = W { v: 6 }; w.show() + w.dbl() }",
+        "main", "inherent_and_trait_coexist");
+    expectEquals(v, 18, "inherent_and_trait_coexist");
+}
+
 } // namespace
 
 int main() {
@@ -1416,7 +1563,24 @@ int main() {
     test_hashmap_rehash_all_retrievable();
     test_slice_of_vec_len_and_get();
     test_slice_len_direct();
-    std::cout << "All codegen tests passed (88 cases) — Phase 13b growable "
-                 "String + HashMap + slices + combinators\n";
+    // Phase 15: bool literals, unary ops, else-if, inherent impls
+    test_bool_literal_true_branch();
+    test_bool_literal_false_branch();
+    test_unary_neg_literal();
+    test_unary_neg_var();
+    test_unary_double_neg();
+    test_unary_neg_precedence();
+    test_unary_not_true_is_false();
+    test_unary_not_comparison();
+    test_branch_on_not_done();
+    test_else_if_chain_first();
+    test_else_if_chain_middle();
+    test_else_if_chain_last();
+    test_inherent_getter();
+    test_inherent_mut_self_persists();
+    test_inherent_method_with_arg();
+    test_inherent_and_trait_coexist();
+    std::cout << "All codegen tests passed (104 cases) — Phase 15 bool "
+                 "literals + unary ops + else-if + inherent impls\n";
     return 0;
 }

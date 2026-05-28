@@ -172,10 +172,15 @@ private:
             return;
         }
         if (dynamic_cast<const ast::IntLitExpr*>(&e)) return;
+        if (dynamic_cast<const ast::BoolLitExpr*>(&e)) return;
         if (dynamic_cast<const ast::StringLitExpr*>(&e)) return;
         if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(&e)) {
             prePass(*bin->lhs);
             prePass(*bin->rhs);
+            return;
+        }
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+            prePass(*un->operand);
             return;
         }
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
@@ -364,6 +369,9 @@ private:
         if (dynamic_cast<const ast::IntLitExpr*>(&e)) {
             return startPos;
         }
+        if (dynamic_cast<const ast::BoolLitExpr*>(&e)) {
+            return startPos;
+        }
         if (dynamic_cast<const ast::StringLitExpr*>(&e)) {
             return startPos;
         }
@@ -373,6 +381,10 @@ private:
             lastInSubtree = std::max(lastInSubtree,
                                        consume(*bin->rhs, expectExpire));
             return lastInSubtree;
+        }
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+            return std::max(lastInSubtree,
+                            consume(*un->operand, expectExpire));
         }
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
             for (const auto& a : call->args) {

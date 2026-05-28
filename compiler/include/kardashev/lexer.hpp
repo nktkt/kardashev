@@ -3,7 +3,7 @@
 // Recognized tokens:
 //   - Integer literals: [0-9]+
 //   - Identifiers:      [A-Za-z_][A-Za-z0-9_]*
-//   - Keywords:         fn let if else return struct enum match trait impl for mod pub async await
+//   - Keywords:         fn let if else return struct enum match trait impl for mod pub async await true false
 //   - Operators:        +  -  *  /  <  <=  >  >=  ==  !=  =  ->  =>  ?  !
 //   - Punctuation:      (  )  {  }  ,  ;  :  .  _  &
 //   - Skipped:          whitespace, `// ... \n` line comments
@@ -43,6 +43,8 @@ enum class TokenKind {
     KwContinue, // Phase 9: `continue`
     KwMod, // Phase 7: `mod foo;` file-import
     KwPub, // Phase 7.2: visibility marker on top-level decls
+    KwTrue,  // Phase 15: `true` boolean literal
+    KwFalse, // Phase 15: `false` boolean literal
     // Note: `async` / `await` stay as Identifiers — they appear in
     // effect rows (`! { async }`) and need lexeme-level lookup in the
     // parser's top-level / postfix logic anyway. Making them keywords

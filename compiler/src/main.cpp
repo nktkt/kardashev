@@ -296,6 +296,19 @@ std::optional<std::int64_t> compileAndRun(const std::string& srcRaw,
         return std::nullopt;
     }
 
+    // Capture the entry's return-type width before the module is moved into
+    // the JIT. The JIT pointer is typed `int64_t(*)()`, but Phase 15 lets the
+    // entry return `bool` (an i1); calling an i1-returning fn through an i64
+    // pointer leaves the upper 63 bits undefined. We mask the raw result to
+    // the entry's real width below so `fn main() -> bool` prints 0/1, not
+    // garbage. Default to 64 (the common i64 case, and any non-integer ret).
+    unsigned entryRetBits = 64;
+    if (auto* entryFn = cgr.module->getFunction(entry)) {
+        if (auto* rt = entryFn->getReturnType(); rt && rt->isIntegerTy()) {
+            entryRetBits = rt->getIntegerBitWidth();
+        }
+    }
+
     auto jitOrErr = llvm::orc::LLJITBuilder().create();
     if (!jitOrErr) {
         llvm::errs() << "LLJIT create failed: "
@@ -320,7 +333,12 @@ std::optional<std::int64_t> compileAndRun(const std::string& srcRaw,
 
     using EntryFn = std::int64_t (*)();
     auto fn = symOrErr->toPtr<EntryFn>();
-    return fn();
+    std::int64_t raw = fn();
+    // Mask off bits above the entry's real return width (see entryRetBits).
+    if (entryRetBits < 64) {
+        raw &= (static_cast<std::int64_t>(1) << entryRetBits) - 1;
+    }
+    return raw;
 }
 
 // Heuristic: a line whose first non-whitespace token is `fn `,
@@ -425,8 +443,18 @@ void addCMainWrapper(llvm::Module& mod) {
     auto* entry = llvm::BasicBlock::Create(ctx, "entry", cmain);
     llvm::IRBuilder<> b(entry);
     auto* result = b.CreateCall(userMain, {}, "kdresult");
-    auto* truncated = b.CreateTrunc(result, i32Ty, "exitcode");
-    b.CreateRet(truncated);
+    // The user's `main` is usually `-> i64`, but Phase 15 allows `-> bool`
+    // (an i1). Adapt to the i32 exit code by integer width: truncate a wider
+    // result (i64 -> i32) or zero-extend a narrower one (i1 -> i32). A trunc
+    // from i1 would be invalid IR, so the width check is load-bearing.
+    llvm::Value* exitCode = result;
+    unsigned bits = result->getType()->getIntegerBitWidth();
+    if (bits > 32) {
+        exitCode = b.CreateTrunc(result, i32Ty, "exitcode");
+    } else if (bits < 32) {
+        exitCode = b.CreateZExt(result, i32Ty, "exitcode");
+    }
+    b.CreateRet(exitCode);
 }
 
 // Emit `module` to an object file at `outObjPath`. Returns true on

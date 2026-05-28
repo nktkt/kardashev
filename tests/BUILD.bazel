@@ -74,6 +74,12 @@ sh_test(
 )
 
 sh_test(
+    name = "smoke_test_surface",
+    srcs = ["smoke_test_surface.sh"],
+    data = ["//compiler:kardc"],
+)
+
+sh_test(
     name = "smoke_test_effects",
     srcs = ["smoke_test_effects.sh"],
     data = ["//compiler:kardc"],

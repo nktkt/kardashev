@@ -270,6 +270,15 @@ void test_range_operators() {
     ASSERT_KIND(t[6], TokenKind::EndOfInput);
 }
 
+// Phase 15: `true` / `false` are keyword tokens; `trueish` stays an Ident.
+void test_bool_keywords() {
+    auto t = lex("true false trueish");
+    ASSERT_KIND(t[0], TokenKind::KwTrue);
+    ASSERT_KIND(t[1], TokenKind::KwFalse);
+    ASSERT_KIND(t[2], TokenKind::Identifier);
+    assert(t[2].lexeme == "trueish");
+}
+
 } // namespace
 
 int main() {
@@ -294,6 +303,7 @@ int main() {
     test_match_arm_combined();
     test_loop_keywords();
     test_range_operators();
-    std::cout << "All lexer tests passed (21 cases)\n";
+    test_bool_keywords();
+    std::cout << "All lexer tests passed (22 cases)\n";
     return 0;
 }

@@ -430,11 +430,20 @@ public:
         for (std::size_t implIdx = 0; implIdx < program.impls.size();
              ++implIdx) {
             const auto& impl = program.impls[implIdx];
-            auto traitIt = traits_.find(impl.traitName);
-            if (traitIt == traits_.end()) {
-                error("impl references unknown trait '" + impl.traitName + "'",
-                      impl.line, impl.column);
-                continue;
+            // Phase 15: inherent impls (`impl Type { ... }`) carry an empty
+            // trait name and have no trait signature to validate methods
+            // against. Trait impls keep the Phase 3.3 path (lookup + match).
+            const bool inherent = impl.isInherent();
+            const std::vector<ast::MethodSig>* traitMethods = nullptr;
+            if (!inherent) {
+                auto traitIt = traits_.find(impl.traitName);
+                if (traitIt == traits_.end()) {
+                    error("impl references unknown trait '" + impl.traitName +
+                              "'",
+                          impl.line, impl.column);
+                    continue;
+                }
+                traitMethods = &traitIt->second;
             }
             TypePtr forTy = resolveTypeRef(impl.forType);
             TypePtr rfor = resolve(forTy);
@@ -448,8 +457,11 @@ public:
                       impl.forType.line, impl.forType.column);
                 continue;
             }
+            // Key inherent impls under the same `inherent` token codegen uses
+            // for mangling, so the per-type/per-"trait" map stays consistent.
+            const std::string implKey = inherent ? "inherent" : impl.traitName;
             ImplRegistration reg;
-            reg.traitName = impl.traitName;
+            reg.traitName = impl.traitName; // empty for inherent
             reg.typeName = typeName;
             // Validate methods + collect.
             std::unordered_set<std::string> seenMethod;
@@ -459,35 +471,47 @@ public:
                           fn.line, fn.column);
                     continue;
                 }
-                const ast::MethodSig* traitMethod = nullptr;
-                for (const auto& m : traitIt->second) {
-                    if (m.name == fn.name) { traitMethod = &m; break; }
-                }
-                if (!traitMethod) {
-                    error("method '" + fn.name +
-                              "' is not declared in trait '" + impl.traitName +
-                              "'",
-                          fn.line, fn.column);
-                    continue;
+                if (!inherent) {
+                    const ast::MethodSig* traitMethod = nullptr;
+                    for (const auto& m : *traitMethods) {
+                        if (m.name == fn.name) { traitMethod = &m; break; }
+                    }
+                    if (!traitMethod) {
+                        error("method '" + fn.name +
+                                  "' is not declared in trait '" +
+                                  impl.traitName + "'",
+                              fn.line, fn.column);
+                        continue;
+                    }
                 }
                 reg.methods[fn.name] = &fn;
             }
-            // Verify the impl covers every trait method (no missing impls).
-            for (const auto& m : traitIt->second) {
-                if (!reg.methods.count(m.name)) {
-                    error("impl of '" + impl.traitName + "' for '" +
-                              typeName +
-                              "' is missing method '" + m.name + "'",
-                          impl.line, impl.column);
+            // Verify a trait impl covers every trait method (no missing
+            // impls). Inherent impls have no obligation here.
+            if (!inherent) {
+                for (const auto& m : *traitMethods) {
+                    if (!reg.methods.count(m.name)) {
+                        error("impl of '" + impl.traitName + "' for '" +
+                                  typeName +
+                                  "' is missing method '" + m.name + "'",
+                              impl.line, impl.column);
+                    }
                 }
             }
-            implMethodByType_[typeName][impl.traitName] = std::move(reg);
+            implMethodByType_[typeName][implKey] = std::move(reg);
             // Also build a quick (typeName, methodName) -> impl-method lookup
-            // for the method-call resolver.
+            // for the method-call resolver. A method name that exists on both
+            // an inherent impl and a trait impl would collide here; we report
+            // it rather than silently shadowing.
             for (const auto& [mname, mfn] :
-                 implMethodByType_[typeName][impl.traitName].methods) {
-                methodImplLookup_[typeName][mname] =
-                    {impl.traitName, mfn};
+                 implMethodByType_[typeName][implKey].methods) {
+                auto& slot = methodImplLookup_[typeName][mname];
+                if (slot.second != nullptr && slot.second != mfn) {
+                    error("method '" + mname + "' is defined more than once "
+                          "for type '" + typeName + "'",
+                          mfn->line, mfn->column);
+                }
+                slot = {impl.traitName, mfn};
             }
         }
 
@@ -903,11 +927,16 @@ private:
     // unknown callees (the typechecker already errored on them) we skip.
     void collectEffects(const ast::Expr& e, EffectSet& out) {
         if (dynamic_cast<const ast::IntLitExpr*>(&e)) return;
+        if (dynamic_cast<const ast::BoolLitExpr*>(&e)) return;
         if (dynamic_cast<const ast::StringLitExpr*>(&e)) return;
         if (dynamic_cast<const ast::IdentExpr*>(&e)) return;
         if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(&e)) {
             collectEffects(*bin->lhs, out);
             collectEffects(*bin->rhs, out);
+            return;
+        }
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+            collectEffects(*un->operand, out);
             return;
         }
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
@@ -1136,7 +1165,12 @@ private:
     std::string implMethodMangledName(const std::string& trait,
                                        const ast::TypeRef& forType,
                                        const std::string& method) {
-        return "__impl_" + trait + "_for_" + forType.name + "__" + method;
+        // Phase 15: inherent impls carry an empty trait name. Mangle them
+        // under a fixed `inherent` token so the name is stable + readable
+        // and can never collide with a real trait impl. Codegen mirrors this
+        // in `implMethodMangle`.
+        const std::string t = trait.empty() ? "inherent" : trait;
+        return "__impl_" + t + "_for_" + forType.name + "__" + method;
     }
 
     void checkImplMethod(const ast::FnDecl& fn, const std::string& traitName,
@@ -1589,6 +1623,12 @@ private:
     TypePtr computeExprType(const ast::Expr& e) {
         if (dynamic_cast<const ast::IntLitExpr*>(&e)) {
             return makeInt();
+        }
+        if (dynamic_cast<const ast::BoolLitExpr*>(&e)) {
+            return makeBool();
+        }
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+            return checkUnary(*un);
         }
         if (dynamic_cast<const ast::StringLitExpr*>(&e)) {
             auto it = structSchemas_.find("String");
@@ -2435,6 +2475,10 @@ private:
             collectFreeVars(*bin->rhs, bound, order, seen);
             return;
         }
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+            collectFreeVars(*un->operand, bound, order, seen);
+            return;
+        }
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
             // The callee name can itself be a captured fn value.
             noteUse(call->callee);
@@ -2874,6 +2918,29 @@ private:
         error("unknown function: " + call.callee, call.line, call.column);
         for (const auto& a : call.args) checkExpr(*a);
         return makeInt();
+    }
+
+    // Phase 15: prefix unary operators. `-x` negates an i64; `!x` logically
+    // negates a bool. Both are total over their input type and reproduce it.
+    TypePtr checkUnary(const ast::UnaryExpr& un) {
+        TypePtr operand = checkExpr(*un.operand);
+        switch (un.op) {
+        case ast::UnaryOp::Neg:
+            if (!unify(operand, makeInt())) {
+                error("unary `-` requires an i64 operand, got " +
+                          typeToString(operand),
+                      un.operand->line, un.operand->column);
+            }
+            return makeInt();
+        case ast::UnaryOp::Not:
+            if (!unify(operand, makeBool())) {
+                error("unary `!` requires a bool operand, got " +
+                          typeToString(operand),
+                      un.operand->line, un.operand->column);
+            }
+            return makeBool();
+        }
+        return makeInt(); // unreachable
     }
 
     TypePtr checkIf(const ast::IfExpr& ie) {

@@ -121,7 +121,10 @@ public:
     std::string implMethodMangle(const std::string& trait,
                                   const ast::TypeRef& forType,
                                   const std::string& method) {
-        return "__impl_" + trait + "_for_" + forType.name + "__" + method;
+        // Phase 15: inherent impls (empty trait name) mangle under the fixed
+        // `inherent` token — must match typecheck's implMethodMangledName.
+        const std::string t = trait.empty() ? "inherent" : trait;
+        return "__impl_" + t + "_for_" + forType.name + "__" + method;
     }
 
     CodegenResult finish() {
@@ -2675,6 +2678,15 @@ private:
                 llvm::Type::getInt64Ty(*ctx_),
                 static_cast<uint64_t>(lit->value), /*isSigned=*/true);
         }
+        // Phase 15: boolean literal -> i1 constant (1/0).
+        if (auto* bl = dynamic_cast<const ast::BoolLitExpr*>(&e)) {
+            return llvm::ConstantInt::get(llvm::Type::getInt1Ty(*ctx_),
+                                          bl->value ? 1 : 0);
+        }
+        // Phase 15: prefix unary operators.
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+            return emitUnary(*un);
+        }
         if (auto* sl = dynamic_cast<const ast::StringLitExpr*>(&e)) {
             return emitStringLit(*sl);
         }
@@ -2973,6 +2985,21 @@ private:
             mallocFn_, {llvm::ConstantInt::get(i64Ty, size)}, "box.raw");
         builder_->CreateStore(inner, raw);
         return raw; // opaque pointer == Box<T>
+    }
+
+    // Phase 15: lower a prefix unary operator. `-x` is integer negation
+    // (`0 - x` via CreateNeg); `!x` is logical not on an i1 (CreateNot ==
+    // `xor i1 x, true`). The typechecker has already constrained the operand
+    // to i64 / bool respectively.
+    llvm::Value* emitUnary(const ast::UnaryExpr& un) {
+        llvm::Value* v = emitExpr(*un.operand);
+        switch (un.op) {
+        case ast::UnaryOp::Neg:
+            return builder_->CreateNeg(v, "neg");
+        case ast::UnaryOp::Not:
+            return builder_->CreateNot(v, "not");
+        }
+        return v; // unreachable
     }
 
     llvm::Value* emitBinary(const ast::BinaryExpr& bin) {

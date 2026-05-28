@@ -33,10 +33,14 @@ public:
             } else if (check(TokenKind::KwMod)) {
                 prog.mods.push_back(parseModDecl());
             } else if (check(TokenKind::KwPub)) {
-                // Phase 7.3b: `pub` now sticks to fn decls and is enforced
-                // on path-qualified call sites. Bare-name calls keep
-                // working under Phase 7.1's flat-merge — only
-                // `foo::bar()` form goes through the visibility check.
+                // Phase 7.3b: `pub` sticks to fn decls and is enforced on
+                // path-qualified call sites. Bare-name calls keep working
+                // under Phase 7.1's flat-merge — only `foo::bar()` form goes
+                // through the visibility check. Phase 15: `pub` now also
+                // sticks to struct / enum / trait / impl decls (stored on the
+                // decl; type-level visibility enforcement is deferred — see
+                // the report). Bare-name type references still resolve under
+                // flat-merge, matching the fn behavior.
                 advance();
                 if (check(TokenKind::KwFn) ||
                     (peek().kind == TokenKind::Identifier &&
@@ -46,13 +50,21 @@ public:
                     fn.isPub = true;
                     prog.functions.push_back(std::move(fn));
                 } else if (check(TokenKind::KwStruct)) {
-                    prog.structs.push_back(parseStructDecl());
+                    auto s = parseStructDecl();
+                    s.isPub = true;
+                    prog.structs.push_back(std::move(s));
                 } else if (check(TokenKind::KwEnum)) {
-                    prog.enums.push_back(parseEnumDecl());
+                    auto en = parseEnumDecl();
+                    en.isPub = true;
+                    prog.enums.push_back(std::move(en));
                 } else if (check(TokenKind::KwTrait)) {
-                    prog.traits.push_back(parseTraitDecl());
+                    auto tr = parseTraitDecl();
+                    tr.isPub = true;
+                    prog.traits.push_back(std::move(tr));
                 } else if (check(TokenKind::KwImpl)) {
-                    prog.impls.push_back(parseImplDecl());
+                    auto im = parseImplDecl();
+                    im.isPub = true;
+                    prog.impls.push_back(std::move(im));
                 } else {
                     errorHere("`pub` must precede fn / struct / enum / "
                               "trait / impl");
@@ -497,10 +509,37 @@ private:
         ast::ImplDecl decl;
         decl.line = implTok.line;
         decl.column = implTok.column;
-        Token traitTok = expect(TokenKind::Identifier, "trait name");
-        decl.traitName = traitTok.lexeme;
-        expect(TokenKind::KwFor, "for");
-        decl.forType = parseTypeRef();
+        // Two forms:
+        //   impl Trait for Type { ... }   -- trait impl (since Phase 3.3)
+        //   impl Type { ... }             -- inherent impl (Phase 15)
+        // Parse the leading name, then disambiguate on the following token:
+        // `for` => it was the trait name (parse the real forType next); a
+        // `<` (generic args) or `{` (method block) => it was the type itself
+        // and this is an inherent impl (empty traitName).
+        Token nameTok = expect(TokenKind::Identifier, "trait or type name");
+        if (accept(TokenKind::KwFor)) {
+            decl.traitName = nameTok.lexeme;
+            decl.forType = parseTypeRef();
+        } else {
+            // Inherent impl: `nameTok` is the implementing type's base name.
+            // Complete its TypeRef (it may carry generic args, e.g.
+            // `impl Pair<T> { ... }`). traitName stays empty.
+            ast::TypeRef tr;
+            tr.name = nameTok.lexeme;
+            tr.line = nameTok.line;
+            tr.column = nameTok.column;
+            if (accept(TokenKind::Lt)) {
+                if (!check(TokenKind::Gt)) {
+                    while (true) {
+                        tr.typeArgs.push_back(parseTypeRef());
+                        if (!accept(TokenKind::Comma)) break;
+                        if (check(TokenKind::Gt)) break; // trailing comma
+                    }
+                }
+                expect(TokenKind::Gt, ">");
+            }
+            decl.forType = std::move(tr);
+        }
         expect(TokenKind::LBrace, "{");
         while (!check(TokenKind::RBrace) && !check(TokenKind::EndOfInput)) {
             if (errors_.size() > 20) break;
@@ -727,7 +766,7 @@ private:
     }
 
     ast::ExprPtr parseExprPrec(int minPrec) {
-        auto lhs = parsePostfix();
+        auto lhs = parseUnary();
         while (true) {
             int prec = binPrec(peek().kind);
             if (prec == 0 || prec < minPrec) break;
@@ -742,6 +781,29 @@ private:
             lhs = std::move(bin);
         }
         return lhs;
+    }
+
+    // Phase 15: prefix unary operators `-` (integer negation) and `!`
+    // (logical not). They bind tighter than every binary operator but
+    // looser than postfix `.`/`?`/`[..]`, matching Rust: `-a * b` parses
+    // as `(-a) * b`, `-a.b` as `-(a.b)`, and `!a == b` as `(!a) == b`.
+    // Unary operators stack and right-recurse (`- -3`, `!!b`), so the
+    // operand is itself parsed via parseUnary. A bare `&`/`&mut` prefix
+    // and the closure `|` are still handled by parsePrimary, so `-&x` and
+    // `&-x` both flow through correctly.
+    ast::ExprPtr parseUnary() {
+        if (check(TokenKind::Minus) || check(TokenKind::Bang)) {
+            Token opTok = consume();
+            auto operand = parseUnary();
+            auto ue = std::make_unique<ast::UnaryExpr>();
+            ue->line = opTok.line;
+            ue->column = opTok.column;
+            ue->op = opTok.kind == TokenKind::Minus ? ast::UnaryOp::Neg
+                                                     : ast::UnaryOp::Not;
+            ue->operand = std::move(operand);
+            return ue;
+        }
+        return parsePostfix();
     }
 
     ast::ExprPtr parsePostfix() {
@@ -883,6 +945,16 @@ private:
             e->line = tok.line;
             e->column = tok.column;
             e->value = tok.lexeme;
+            return e;
+        }
+
+        // Phase 15: boolean literals `true` / `false`.
+        if (t.kind == TokenKind::KwTrue || t.kind == TokenKind::KwFalse) {
+            Token tok = consume();
+            auto e = std::make_unique<ast::BoolLitExpr>();
+            e->line = tok.line;
+            e->column = tok.column;
+            e->value = (tok.kind == TokenKind::KwTrue);
             return e;
         }
 
@@ -1076,13 +1148,25 @@ private:
         restrictStructLit_ = prev;
         auto thenBlock = parseBlockExpr();
         expect(TokenKind::KwElse, "else");
-        auto elseBlock = parseBlockExpr();
+        // Phase 15: `else if C { ... }` chains. When the token after `else`
+        // is `if`, the else branch is itself an if-expression (rather than
+        // requiring `else { ... }`). This desugars `else if C { ... }` to
+        // `else { if C { ... } }` — we store the nested IfExpr directly as
+        // the else branch (checkIf / emitIf accept any expr there, and the
+        // formatter prints the inline ladder). Arbitrarily long chains with
+        // a final bare `else { ... }` fall out of the recursion.
+        ast::ExprPtr elseBranch;
+        if (check(TokenKind::KwIf)) {
+            elseBranch = parseIfExpr();
+        } else {
+            elseBranch = parseBlockExpr();
+        }
         auto ie = std::make_unique<ast::IfExpr>();
         ie->line = ifTok.line;
         ie->column = ifTok.column;
         ie->cond = std::move(cond);
         ie->thenBranch = std::move(thenBlock);
-        ie->elseBranch = std::move(elseBlock);
+        ie->elseBranch = std::move(elseBranch);
         return ie;
     }
 

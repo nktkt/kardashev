@@ -67,6 +67,14 @@ enum class BinOp {
     Eq, NotEq,
 };
 
+// Phase 15: prefix unary operators. `Neg` is integer negation (`-x`,
+// i64 -> i64); `Not` is logical not (`!x`, bool -> bool). Both bind
+// tighter than every binary operator.
+enum class UnaryOp {
+    Neg, // -x
+    Not, // !x
+};
+
 // Base expression. Polymorphic by design — use `dynamic_cast<...*>` in
 // consumers, or extend with a virtual visitor later.
 struct Expr {
@@ -126,6 +134,12 @@ struct IntLitExpr : Expr {
     std::int64_t value = 0;
 };
 
+// Phase 15: `true` / `false` boolean literal. Codegen lowers to an i1
+// constant (1/0); typechecks to `bool`. Mirrors IntLitExpr.
+struct BoolLitExpr : Expr {
+    bool value = false;
+};
+
 // Phase 5.y: `"..."` string literal. Codegen lowers to a heap-immutable
 // global byte buffer wrapped in the built-in `String` struct.
 struct StringLitExpr : Expr {
@@ -140,6 +154,16 @@ struct BinaryExpr : Expr {
     BinOp op = BinOp::Add;
     ExprPtr lhs;
     ExprPtr rhs;
+};
+
+// Phase 15: prefix unary expression `-operand` / `!operand`. Parsed in
+// prefix position, binding tighter than any binary operator so that
+// `-a * b` == `(-a) * b` and `!a == b` == `(!a) == b`. Typecheck:
+// `Neg` requires/produces i64; `Not` requires/produces bool. Mirrors
+// BinaryExpr.
+struct UnaryExpr : Expr {
+    UnaryOp op = UnaryOp::Neg;
+    ExprPtr operand;
 };
 
 struct CallExpr : Expr {
@@ -453,6 +477,7 @@ struct StructDecl {
     std::string name;
     std::vector<TypeParam> genericParams; // empty = monomorphic struct
     std::vector<Param> fields;
+    bool isPub = false; // Phase 15: `pub struct` — parsed + stored.
     std::size_t line = 1;
     std::size_t column = 1;
 };
@@ -468,6 +493,7 @@ struct EnumDecl {
     std::string name;
     std::vector<TypeParam> genericParams; // empty = monomorphic enum
     std::vector<EnumVariant> variants;
+    bool isPub = false; // Phase 15: `pub enum` — parsed + stored.
     std::size_t line = 1;
     std::size_t column = 1;
 };
@@ -488,6 +514,7 @@ struct MethodSig {
 struct TraitDecl {
     std::string name;
     std::vector<MethodSig> methods;
+    bool isPub = false; // Phase 15: `pub trait` — parsed + stored.
     std::size_t line = 1;
     std::size_t column = 1;
 };
@@ -496,10 +523,19 @@ struct TraitDecl {
 // TypeRef so it can be a generic instantiation (e.g. `Box<i64>`); the
 // typechecker validates that each method's signature matches the trait's
 // after substituting Self -> forType.
+//
+// Phase 15: inherent impls `impl TypeRef { fn ... }` (no trait) set
+// `traitName` to the empty string. Their methods are registered as
+// inherent methods on the type (no trait signature to match against);
+// method resolution checks them alongside trait impls. Codegen mangles
+// them with a fixed sentinel trait token so the existing static-dispatch
+// path applies unchanged.
 struct ImplDecl {
-    std::string traitName;
+    std::string traitName; // empty => inherent impl (Phase 15)
     TypeRef forType;
     std::vector<FnDecl> methods;
+    bool isPub = false; // Phase 15: `pub impl` — parsed + stored.
+    bool isInherent() const { return traitName.empty(); }
     std::size_t line = 1;
     std::size_t column = 1;
 };

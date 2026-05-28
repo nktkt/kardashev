@@ -1163,6 +1163,157 @@ void test_box_new_expr() {
     assert(v && v->value == 7);
 }
 
+// --- Phase 15: bool literals, unary ops, else-if, inherent impls, pub ---
+
+void test_bool_literal_true() {
+    auto r = parseWrapped("true");
+    const auto* bl = dynamic_cast<const ast::BoolLitExpr*>(tailExprOf(r));
+    assert(bl != nullptr);
+    assert(bl->value == true);
+}
+
+void test_bool_literal_false() {
+    auto r = parseWrapped("false");
+    const auto* bl = dynamic_cast<const ast::BoolLitExpr*>(tailExprOf(r));
+    assert(bl != nullptr);
+    assert(bl->value == false);
+}
+
+void test_unary_neg_literal() {
+    auto r = parseWrapped("-5");
+    const auto* un = dynamic_cast<const ast::UnaryExpr*>(tailExprOf(r));
+    assert(un != nullptr);
+    assert(un->op == ast::UnaryOp::Neg);
+    const auto* v = dynamic_cast<const ast::IntLitExpr*>(un->operand.get());
+    assert(v && v->value == 5);
+}
+
+void test_unary_not() {
+    auto r = parseWrapped("!true");
+    const auto* un = dynamic_cast<const ast::UnaryExpr*>(tailExprOf(r));
+    assert(un != nullptr);
+    assert(un->op == ast::UnaryOp::Not);
+    const auto* v = dynamic_cast<const ast::BoolLitExpr*>(un->operand.get());
+    assert(v && v->value == true);
+}
+
+void test_unary_double_neg() {
+    // `-(-3)` => Neg(Neg(3)) (the inner parens nest but collapse to the
+    // operand expression).
+    auto r = parseWrapped("-(-3)");
+    const auto* outer = dynamic_cast<const ast::UnaryExpr*>(tailExprOf(r));
+    assert(outer != nullptr && outer->op == ast::UnaryOp::Neg);
+    const auto* inner =
+        dynamic_cast<const ast::UnaryExpr*>(outer->operand.get());
+    assert(inner != nullptr && inner->op == ast::UnaryOp::Neg);
+    const auto* v = dynamic_cast<const ast::IntLitExpr*>(inner->operand.get());
+    assert(v && v->value == 3);
+}
+
+void test_unary_binds_tighter_than_mul() {
+    // `-a * b` parses as `(-a) * b`: a Mul whose lhs is a UnaryExpr.
+    auto r = parseWrapped("-a * b");
+    const auto* bin = dynamic_cast<const ast::BinaryExpr*>(tailExprOf(r));
+    assert(bin != nullptr && bin->op == ast::BinOp::Mul);
+    const auto* lhs = dynamic_cast<const ast::UnaryExpr*>(bin->lhs.get());
+    assert(lhs != nullptr && lhs->op == ast::UnaryOp::Neg);
+    const auto* rhs = dynamic_cast<const ast::IdentExpr*>(bin->rhs.get());
+    assert(rhs != nullptr && rhs->name == "b");
+}
+
+void test_unary_not_binds_tighter_than_eq() {
+    // `!a == b` parses as `(!a) == b`: an Eq whose lhs is a UnaryExpr.
+    auto r = parseWrapped("!a == b");
+    const auto* bin = dynamic_cast<const ast::BinaryExpr*>(tailExprOf(r));
+    assert(bin != nullptr && bin->op == ast::BinOp::Eq);
+    const auto* lhs = dynamic_cast<const ast::UnaryExpr*>(bin->lhs.get());
+    assert(lhs != nullptr && lhs->op == ast::UnaryOp::Not);
+}
+
+void test_unary_neg_binds_looser_than_field() {
+    // `-a.b` parses as `-(a.b)`: a UnaryExpr whose operand is a FieldExpr.
+    auto r = parseWrapped("-a.b");
+    const auto* un = dynamic_cast<const ast::UnaryExpr*>(tailExprOf(r));
+    assert(un != nullptr && un->op == ast::UnaryOp::Neg);
+    const auto* fe = dynamic_cast<const ast::FieldExpr*>(un->operand.get());
+    assert(fe != nullptr && fe->fieldName == "b");
+}
+
+void test_else_if_chain() {
+    // `if a { 1 } else if b { 2 } else { 3 }` desugars to a nested IfExpr in
+    // the else branch.
+    auto r = parseWrapped("if a < 0 { 1 } else if a < 5 { 2 } else { 3 }");
+    const auto* ie = dynamic_cast<const ast::IfExpr*>(tailExprOf(r));
+    assert(ie != nullptr);
+    // The else branch is itself an IfExpr (not a BlockExpr).
+    const auto* elseIf = dynamic_cast<const ast::IfExpr*>(ie->elseBranch.get());
+    assert(elseIf != nullptr);
+    // Its else branch is the final bare block.
+    const auto* finalBlock =
+        dynamic_cast<const ast::BlockExpr*>(elseIf->elseBranch.get());
+    assert(finalBlock != nullptr && finalBlock->tail);
+}
+
+void test_inherent_impl_no_trait() {
+    // `impl Type { ... }` parses with an empty traitName (inherent impl).
+    auto r = parse(
+        "struct P { x: i64 }\n"
+        "impl P { fn get(&self) -> i64 { self.x } }");
+    if (!r.ok()) {
+        std::cerr << "parse failed:\n";
+        for (const auto& e : r.errors) {
+            std::cerr << "  " << e.line << ":" << e.column << ": " << e.message
+                      << '\n';
+        }
+        std::abort();
+    }
+    assert(r.program.impls.size() == 1);
+    const auto& im = r.program.impls[0];
+    assert(im.traitName.empty());
+    assert(im.isInherent());
+    assert(im.forType.name == "P");
+    assert(im.methods.size() == 1 && im.methods[0].name == "get");
+}
+
+void test_trait_impl_still_has_trait_name() {
+    // Regression: `impl Trait for Type` keeps its trait name (not inherent).
+    auto r = parse(
+        "struct P { x: i64 } trait Show { fn show(&self) -> i64; }\n"
+        "impl Show for P { fn show(&self) -> i64 { self.x } }");
+    assert(r.ok());
+    assert(r.program.impls.size() == 1);
+    assert(!r.program.impls[0].isInherent());
+    assert(r.program.impls[0].traitName == "Show");
+}
+
+void test_pub_struct_enum_trait() {
+    auto r = parse(
+        "pub struct S { v: i64 }\n"
+        "pub enum E { A, B(i64) }\n"
+        "pub trait T { fn m(&self) -> i64; }");
+    if (!r.ok()) {
+        std::cerr << "parse failed:\n";
+        for (const auto& e : r.errors) {
+            std::cerr << "  " << e.line << ":" << e.column << ": " << e.message
+                      << '\n';
+        }
+        std::abort();
+    }
+    assert(r.program.structs.size() == 1 && r.program.structs[0].isPub);
+    assert(r.program.enums.size() == 1 && r.program.enums[0].isPub);
+    assert(r.program.traits.size() == 1 && r.program.traits[0].isPub);
+}
+
+void test_pub_inherent_impl() {
+    auto r = parse(
+        "struct P { x: i64 }\n"
+        "pub impl P { fn get(&self) -> i64 { self.x } }");
+    assert(r.ok());
+    assert(r.program.impls.size() == 1);
+    assert(r.program.impls[0].isPub);
+    assert(r.program.impls[0].isInherent());
+}
+
 } // namespace
 
 int main() {
@@ -1254,6 +1405,20 @@ int main() {
     test_dyn_ref_param_type();
     test_box_dyn_let_annotation();
     test_box_new_expr();
-    std::cout << "All parser tests passed (78 cases)\n";
+    // Phase 15: bool literals, unary ops, else-if, inherent impls, pub
+    test_bool_literal_true();
+    test_bool_literal_false();
+    test_unary_neg_literal();
+    test_unary_not();
+    test_unary_double_neg();
+    test_unary_binds_tighter_than_mul();
+    test_unary_not_binds_tighter_than_eq();
+    test_unary_neg_binds_looser_than_field();
+    test_else_if_chain();
+    test_inherent_impl_no_trait();
+    test_trait_impl_still_has_trait_name();
+    test_pub_struct_enum_trait();
+    test_pub_inherent_impl();
+    std::cout << "All parser tests passed (91 cases)\n";
     return 0;
 }
