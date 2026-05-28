@@ -1918,8 +1918,9 @@ private:
     enum {
         TASK_POLL = 0,  // i8* — the future's poll fn
         TASK_FRAME = 1, // i8* — the future's heap frame
-        TASK_DONE = 2,  // i64 — 1 once Ready
-        TASK_SLOT = 3   // i8* — the spawner-sized Poll<T> result slot
+        TASK_DONE = 2,   // i64 — 1 once Ready
+        TASK_SLOT = 3,   // i8* — the spawner-sized Poll<T> result slot
+        TASK_TYPE = 4    // i64 — compile-time type tag for join<T>
     };
 
     // Build the executor types + global + scheduler/reactor functions. Called
@@ -1934,7 +1935,7 @@ private:
         auto* voidTy = llvm::Type::getVoidTy(ctx);
 
         taskTy_ = llvm::StructType::create(
-            ctx, {i8PtrTy, i8PtrTy, i64Ty, i8PtrTy}, "kd.task");
+            ctx, {i8PtrTy, i8PtrTy, i64Ty, i8PtrTy, i64Ty}, "kd.task");
         execTy_ = llvm::StructType::create(
             ctx,
             {i8PtrTy, i64Ty, i64Ty, i64Ty, i64Ty, i64Ty, i32Ty, i32Ty},
@@ -1999,13 +2000,14 @@ private:
         // append a task; grow the array if needed; return its index (handle).
         {
             auto* fnTy = llvm::FunctionType::get(
-                i64Ty, {i8PtrTy, i8PtrTy, i8PtrTy}, false);
+                i64Ty, {i8PtrTy, i8PtrTy, i8PtrTy, i64Ty}, false);
             auto* fn = llvm::Function::Create(
                 fnTy, llvm::Function::InternalLinkage, "__kd_exec_push",
                 module_.get());
             fn->getArg(0)->setName("poll");
             fn->getArg(1)->setName("frame");
             fn->getArg(2)->setName("slot");
+            fn->getArg(3)->setName("type_tag");
             auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
             auto* growBB = llvm::BasicBlock::Create(ctx, "grow", fn);
             auto* storeBB = llvm::BasicBlock::Create(ctx, "store", fn);
@@ -2050,6 +2052,8 @@ private:
                           b.CreateStructGEP(taskTy_, slot, TASK_DONE, "d"));
             b.CreateStore(fn->getArg(2),
                           b.CreateStructGEP(taskTy_, slot, TASK_SLOT, "s"));
+            b.CreateStore(fn->getArg(3),
+                          b.CreateStructGEP(taskTy_, slot, TASK_TYPE, "t"));
             b.CreateStore(
                 b.CreateAdd(count, llvm::ConstantInt::get(i64Ty, 1)), countP);
             b.CreateRet(count);
@@ -2438,7 +2442,8 @@ private:
         uint64_t sz = module_->getDataLayout().getTypeAllocSize(pollT);
         auto* slot = b.CreateCall(
             mallocFn_, {llvm::ConstantInt::get(i64Ty, sz)}, "poll_slot");
-        auto* h = b.CreateCall(execPushFn_, {pollPtr, framePtr, slot}, "handle");
+        auto* typeTag = llvm::ConstantInt::get(i64Ty, std::hash<std::string>{}(mangleType(T)));
+        auto* h = b.CreateCall(execPushFn_, {pollPtr, framePtr, slot, typeTag}, "handle");
         b.CreateCall(execDriveFn_, {h});
         // result = Poll<T>.value from the task's slot.
         auto* valP = b.CreateStructGEP(pollT, slot, 1, "val_ptr");
@@ -2619,7 +2624,8 @@ private:
         uint64_t sz = module_->getDataLayout().getTypeAllocSize(pollT);
         auto* slot = b.CreateCall(
             mallocFn_, {llvm::ConstantInt::get(i64Ty, sz)}, "poll_slot");
-        auto* h = b.CreateCall(execPushFn_, {pollPtr, framePtr, slot}, "handle");
+        auto* typeTag = llvm::ConstantInt::get(i64Ty, std::hash<std::string>{}(mangleType(T)));
+        auto* h = b.CreateCall(execPushFn_, {pollPtr, framePtr, slot, typeTag}, "handle");
         b.CreateRet(h);
         declaredFns_[mangled] = fn;
         return fn;
@@ -2644,8 +2650,26 @@ private:
         auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
         llvm::IRBuilder<> b(entry);
         auto* h = fn->getArg(0);
+        auto* countP = b.CreateStructGEP(execTy_, execGlobal_, EXEC_COUNT, "count_ptr");
+        auto* count = b.CreateLoad(i64Ty, countP, "count");
+        auto* inRange = b.CreateICmpULT(h, count, "in_range");
+        auto* okBB = llvm::BasicBlock::Create(ctx, "ok", fn);
+        auto* badBB = llvm::BasicBlock::Create(ctx, "bad", fn);
+        b.CreateCondBr(inRange, okBB, badBB);
+        b.SetInsertPoint(badBB);
+        b.CreateRet(llvm::Constant::getNullValue(valTy));
+        b.SetInsertPoint(okBB);
         b.CreateCall(execDriveFn_, {h});
         auto* slot = b.CreateCall(execSlotFn_, {h}, "tslot");
+        auto* expected = llvm::ConstantInt::get(i64Ty, std::hash<std::string>{}(mangleType(T)));
+        auto* gotType = b.CreateLoad(i64Ty, b.CreateStructGEP(taskTy_, slot, TASK_TYPE, "tp"), "got_type");
+        auto* typeOk = b.CreateICmpEQ(expected, gotType, "type_ok");
+        auto* typeBadBB = llvm::BasicBlock::Create(ctx, "type_bad", fn);
+        auto* readBB = llvm::BasicBlock::Create(ctx, "read", fn);
+        b.CreateCondBr(typeOk, readBB, typeBadBB);
+        b.SetInsertPoint(typeBadBB);
+        b.CreateRet(llvm::Constant::getNullValue(valTy));
+        b.SetInsertPoint(readBB);
         auto* pslot = b.CreateLoad(
             i8PtrTy, b.CreateStructGEP(taskTy_, slot, TASK_SLOT, "sp"),
             "pslot");
@@ -2698,12 +2722,13 @@ private:
             b.CreateCall(fcntlFn_,
                          {rfd, llvm::ConstantInt::get(i32Ty, 4 /*F_SETFL*/),
                           llvm::ConstantInt::get(i32Ty, 04000 /*O_NONBLOCK*/)});
-            // handle = (wfd << 32) | (rfd & 0xffffffff).
+            // handle = 0x4b44500000000000 | (wfd << 32) | (rfd & 0xffffffff).
             auto* rfd64 = b.CreateZExt(rfd, i64Ty, "rfd64");
             auto* wfd64 = b.CreateZExt(wfd, i64Ty, "wfd64");
             auto* hi = b.CreateShl(wfd64, llvm::ConstantInt::get(i64Ty, 32),
                                    "hi");
-            auto* handle = b.CreateOr(hi, rfd64, "handle");
+            auto* raw = b.CreateOr(hi, rfd64, "raw");
+            auto* handle = b.CreateOr(raw, llvm::ConstantInt::get(i64Ty, 0x4b44500000000000ULL), "handle");
             b.CreateRet(handle);
             declaredFns_["pipe_make"] = fn;
         }
@@ -2719,8 +2744,17 @@ private:
             fn->getArg(1)->setName("byte");
             auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
             llvm::IRBuilder<> b(entry);
+            auto* magic = b.CreateAnd(fn->getArg(0), llvm::ConstantInt::get(i64Ty, 0xfffff00000000000ULL));
+            auto* ok = b.CreateICmpEQ(magic, llvm::ConstantInt::get(i64Ty, 0x4b44500000000000ULL));
+            auto* badBB = llvm::BasicBlock::Create(ctx, "bad", fn);
+            auto* okBB = llvm::BasicBlock::Create(ctx, "ok", fn);
+            b.CreateCondBr(ok, okBB, badBB);
+            b.SetInsertPoint(badBB);
+            b.CreateRet(llvm::ConstantInt::getSigned(i64Ty, -1));
+            b.SetInsertPoint(okBB);
+            auto* masked = b.CreateAnd(fn->getArg(0), llvm::ConstantInt::get(i64Ty, 0x000000ffffffffffULL));
             auto* wfd64 = b.CreateLShr(
-                fn->getArg(0), llvm::ConstantInt::get(i64Ty, 32), "wfd64");
+                masked, llvm::ConstantInt::get(i64Ty, 32), "wfd64");
             auto* wfd = b.CreateTrunc(wfd64, i32Ty, "wfd");
             auto* buf = b.CreateAlloca(i8Ty, nullptr, "buf");
             b.CreateStore(b.CreateTrunc(fn->getArg(1), i8Ty, "b8"), buf);
@@ -2806,8 +2840,22 @@ private:
             uint64_t sz = module_->getDataLayout().getTypeAllocSize(frameTy);
             auto* frame = b.CreateCall(
                 mallocFn_, {llvm::ConstantInt::get(i64Ty, sz)}, "rp_frame");
+            auto* magic = b.CreateAnd(fn->getArg(0), llvm::ConstantInt::get(i64Ty, 0xfffff00000000000ULL));
+            auto* ok = b.CreateICmpEQ(magic, llvm::ConstantInt::get(i64Ty, 0x4b44500000000000ULL));
+            auto* goodBB = llvm::BasicBlock::Create(ctx, "good", fn);
+            auto* badBB = llvm::BasicBlock::Create(ctx, "bad", fn);
+            b.CreateCondBr(ok, goodBB, badBB);
+            b.SetInsertPoint(badBB);
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, -1), b.CreateStructGEP(frameTy, frame, 0, "fd_bad"));
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, 0), b.CreateStructGEP(frameTy, frame, 1, "reg_bad"));
+            llvm::Value* badf = llvm::UndefValue::get(futureTy);
+            badf = b.CreateInsertValue(badf, readPipePollFn_, {0}, "fut.poll.bad");
+            badf = b.CreateInsertValue(badf, frame, {1}, "fut.frame.bad");
+            b.CreateRet(badf);
+            b.SetInsertPoint(goodBB);
+            auto* masked = b.CreateAnd(fn->getArg(0), llvm::ConstantInt::get(i64Ty, 0x000000ffffffffffULL));
             auto* rfd = b.CreateAnd(
-                fn->getArg(0), llvm::ConstantInt::get(i64Ty, 0xffffffff),
+                masked, llvm::ConstantInt::get(i64Ty, 0xffffffff),
                 "rfd");
             b.CreateStore(rfd, b.CreateStructGEP(frameTy, frame, 0, "fd0"));
             b.CreateStore(llvm::ConstantInt::get(i64Ty, 0),
