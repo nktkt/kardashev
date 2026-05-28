@@ -600,6 +600,15 @@ void test_drop_impl_move_into_fn_ok() {
              "drop_impl_move_into_fn_ok");
 }
 
+void test_return_slice_of_local_vec_errors() {
+    expectErr("fn head() -> Slice[i64] {\n"
+              "  let v = vec[i64]{};\n"
+              "  return &v[0..0];\n"
+              "}\n"
+              "fn main() -> i64 { 0 }",
+              "return_slice_of_local_vec_errors");
+}
+
 // --- Phase 17a: richer closures & first-class fn values ---
 
 void test_call_value_through_field_ok() {
@@ -669,6 +678,7 @@ int main() {
     // Phase 16: Drop trait + move analysis
     test_drop_impl_type_use_after_move_errors();
     test_drop_impl_move_into_fn_ok();
+    test_return_slice_of_local_vec_errors();
     // Phase 17a: richer closures & first-class fn values
     test_call_value_through_field_ok();
     test_fnmut_closure_borrow_ok();

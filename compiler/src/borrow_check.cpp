@@ -655,6 +655,10 @@ private:
             }
             if (auto* ret = dynamic_cast<const ast::ReturnStmt*>(stmt.get())) {
                 if (ret->value) {
+                    if (returnsEscapingSlice(*ret->value)) {
+                        error("cannot return a slice that borrows from a local value",
+                              ret->line, ret->column);
+                    }
                     int p = consume(*ret->value, /*expectExpire=*/-1);
                     retireExpiredLoans(p);
                     last = std::max(last, p);
@@ -691,6 +695,14 @@ private:
         }
         scopes_.pop_back();
         return last;
+    }
+
+    bool returnsEscapingSlice(const ast::Expr& e) {
+        auto* slice = dynamic_cast<const ast::SliceExpr*>(&e);
+        if (!slice) return false;
+        auto* id = dynamic_cast<const ast::IdentExpr*>(slice->operand.get());
+        if (!id) return true;
+        return lookupBinding(id->name) != nullptr;
     }
 
     int handleRefExpr(const ast::RefExpr& re, int expectExpire) {
