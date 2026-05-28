@@ -2596,23 +2596,21 @@ private:
         for (const auto& name : order) {
             TypePtr t = lookupLocal(name);
             if (!t) continue; // defensive — collectFreeVars only adds locals
-            // MVP capture-by-value rule: only Copy types (i64, bool, &T) may
-            // be captured. Capturing a non-Copy aggregate (struct / enum /
-            // &mut / fn-value) by value would be a move the borrow checker
-            // cannot currently see (it does not descend into closure bodies),
-            // so we reject it with a clear error rather than risk an
-            // untracked use-after-move. (Documented Phase 10b limitation;
-            // capture-by-reference / FnMut are deferred.)
+            // MVP capture-by-value rule: only immediate scalar Copy types
+            // (i64, bool, unit) may be captured. Capturing references here is
+            // unsound because closure envs may outlive the referenced stack
+            // frame (use-after-return). Capturing non-Copy aggregates by value
+            // would also be a move the borrow checker cannot currently see
+            // (it does not descend into closure bodies), so we reject both.
             TypePtr rt = resolve(t);
             bool copyable = rt->kind == TypeKind::Int ||
                             rt->kind == TypeKind::Bool ||
-                            rt->kind == TypeKind::Unit ||
-                            (rt->kind == TypeKind::Ref && !rt->refIsMut);
+                            rt->kind == TypeKind::Unit;
             if (!copyable) {
                 error("closure captures `" + name + "` of type " +
                           typeToString(t) +
-                          ", but only Copy types (i64, bool, &T) may be "
-                          "captured by value in this MVP; aggregate / mutable "
+                          ", but only Copy scalar types (i64, bool, unit) may be "
+                          "captured by value in this MVP; reference/aggregate "
                           "captures are not yet supported",
                       cl.line, cl.column);
                 // Continue recording it so codegen still gets a consistent
