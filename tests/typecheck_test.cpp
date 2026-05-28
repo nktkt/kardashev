@@ -948,6 +948,115 @@ void test_impl_missing_method_errors() {
         "impl_missing_method_errors");
 }
 
+// ---- Phase 21a: generic trait parameters ----
+
+// A generic trait with impls at two element types; calling `.first()` on each
+// yields the correctly-typed value (i64 used as i64, bool used in `if`).
+void test_generic_trait_two_impls_ok() {
+    expectOk(
+        "trait Container<T> { fn first(&self) -> T; }\n"
+        "struct IntBox { v: i64 }\n"
+        "struct BoolBox { b: bool }\n"
+        "impl Container<i64> for IntBox { fn first(&self) -> i64 { self.v } }\n"
+        "impl Container<bool> for BoolBox { fn first(&self) -> bool { self.b } }\n"
+        "fn main() -> i64 {\n"
+        "    let ib = IntBox { v: 1 };\n"
+        "    let bb = BoolBox { b: true };\n"
+        "    let x = ib.first();\n"
+        "    if bb.first() { x } else { 0 }\n"
+        "}",
+        "generic_trait_two_impls_ok");
+}
+
+// A generic-trait-bounded fn: `head<T, C: Container<T>>(c: C) -> T` resolves
+// the element type through the bound at both element types.
+void test_generic_trait_bounded_fn_ok() {
+    expectOk(
+        "trait Container<T> { fn first(&self) -> T; }\n"
+        "struct IntBox { v: i64 }\n"
+        "struct BoolBox { b: bool }\n"
+        "impl Container<i64> for IntBox { fn first(&self) -> i64 { self.v } }\n"
+        "impl Container<bool> for BoolBox { fn first(&self) -> bool { self.b } }\n"
+        "fn head<T, C: Container<T>>(c: C) -> T { c.first() }\n"
+        "fn main() -> i64 {\n"
+        "    let ib = IntBox { v: 7 };\n"
+        "    let bb = BoolBox { b: false };\n"
+        "    let a = head(ib);\n"
+        "    if head(bb) { a } else { a }\n"
+        "}",
+        "generic_trait_bounded_fn_ok");
+}
+
+// The bound's element type must flow: returning the wrong-typed value from a
+// `Container<bool>` impl method (an i64 where bool is declared) is rejected.
+void test_generic_trait_impl_wrong_elem_errors() {
+    expectErr(
+        "trait Container<T> { fn first(&self) -> T; }\n"
+        "struct BoolBox { b: bool }\n"
+        "impl Container<bool> for BoolBox { fn first(&self) -> bool { self.b } }\n"
+        "fn use_it(c: BoolBox) -> i64 { c.first() }",
+        "generic_trait_impl_wrong_elem_errors");
+}
+
+// An impl supplying the wrong NUMBER of trait type-args is rejected.
+void test_generic_trait_impl_arity_errors() {
+    expectErr(
+        "trait Container<T> { fn first(&self) -> T; }\n"
+        "struct B { v: i64 }\n"
+        "impl Container<i64, i64> for B { fn first(&self) -> i64 { self.v } }",
+        "generic_trait_impl_arity_errors");
+}
+
+// A parameterized bound with the wrong arity is rejected.
+void test_parameterized_bound_arity_errors() {
+    expectErr(
+        "trait Container<T> { fn first(&self) -> T; }\n"
+        "fn head<T, C: Container<T, T>>(c: C) -> T { c.first() }",
+        "parameterized_bound_arity_errors");
+}
+
+// Phase 21a: `dyn` of a generic trait is rejected with a clear message
+// (generic trait objects unsupported this phase).
+void test_dyn_generic_trait_rejected() {
+    expectErr(
+        "trait Iterator<T> { fn next(&mut self) -> T; }\n"
+        "fn use_it(it: &dyn Iterator) -> i64 { 0 }",
+        "dyn_generic_trait_rejected");
+}
+
+// Regression: a NON-generic trait used as `dyn` still works.
+void test_dyn_nongeneric_trait_still_ok() {
+    expectOk(
+        "trait Shape { fn area(&self) -> i64; }\n"
+        "struct Sq { side: i64 }\n"
+        "impl Shape for Sq { fn area(&self) -> i64 { self.side * self.side } }\n"
+        "fn describe(s: &dyn Shape) -> i64 { s.area() }\n"
+        "fn main() -> i64 { let sq = Sq { side: 5 }; describe(&sq) }",
+        "dyn_nongeneric_trait_still_ok");
+}
+
+// A generic Iterator<T> bound carrying a fn-typed param whose effect row is a
+// generic effect-row var still composes (effects keep flowing through the
+// generic-trait bound). `fold` is `! {e}` and inherits the closure's effects.
+void test_generic_trait_bound_effects_compose() {
+    expectOk(
+        "enum Option<T> { Some(T), None }\n"
+        "trait Iterator<T> { fn next(&mut self) -> Option<T>; }\n"
+        "fn fold<T, I: Iterator<T>, e>(it: I, init: i64,"
+        " f: fn(i64, T) -> i64 ! {e}) -> i64 ! {e} {\n"
+        "    let mut iter = it;\n"
+        "    let mut acc = init;\n"
+        "    loop {\n"
+        "        match iter.next() {\n"
+        "            Some(x) => { acc = f(acc, x); },\n"
+        "            None => { break; },\n"
+        "        }\n"
+        "    }\n"
+        "    acc\n"
+        "}",
+        "generic_trait_bound_effects_compose");
+}
+
 // ---- Phase 11: dyn Trait + trait objects ----
 
 void test_dyn_ref_param_ok() {
@@ -2099,6 +2208,15 @@ int main() {
     test_method_on_unbounded_generic_errors();
     test_method_not_in_trait_errors();
     test_impl_missing_method_errors();
+    // Phase 21a generic trait parameters
+    test_generic_trait_two_impls_ok();
+    test_generic_trait_bounded_fn_ok();
+    test_generic_trait_impl_wrong_elem_errors();
+    test_generic_trait_impl_arity_errors();
+    test_parameterized_bound_arity_errors();
+    test_dyn_generic_trait_rejected();
+    test_dyn_nongeneric_trait_still_ok();
+    test_generic_trait_bound_effects_compose();
     // Phase 11 dyn Trait + trait objects
     test_dyn_ref_param_ok();
     test_dyn_box_ok();
@@ -2219,6 +2337,6 @@ int main() {
     test_thread_spawn_propagates_closure_io_effect();
     test_mutex_ops_typecheck_ok();
     test_mutex_new_requires_alloc_effect();
-    std::cout << "All typecheck tests passed (199 cases)\n";
+    std::cout << "All typecheck tests passed (207 cases)\n";
     return 0;
 }

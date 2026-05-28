@@ -73,6 +73,15 @@ struct FnSchema {
     // unbounded param). Phase 3.3 only supports a single trait bound per
     // param; multi-bounds (`T: A + B`) can append entries here later.
     std::vector<std::string> genericBounds;
+    // Phase 21a: one entry per genericVars[i], parallel to genericBounds:
+    // the resolved type arguments of a *parameterized* trait bound
+    // (`<I: Iterator<T>>` -> the bound's `T`, resolved against this fn's own
+    // generic env so it shares the schema Var for `T`). Empty vector when the
+    // bound trait is non-generic / the param is unbounded. A method call on a
+    // bounded param uses these to bind the trait's type params, so the
+    // method's element type (e.g. `Option<T>` from `Iterator<T>::next`)
+    // resolves to the fn's own `T`.
+    std::vector<std::vector<TypePtr>> genericBoundArgs;
     // Phase 4: effects declared in the fn's `! { ... }` row. Empty = pure.
     // Entries are concrete built-in labels (`io`, ...) and/or effect-row
     // variable names (Phase 10a, e.g. `e`).

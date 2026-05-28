@@ -419,6 +419,19 @@ private:
                     Token boundTok = expect(TokenKind::Identifier,
                                              "trait name after ':'");
                     tp.bound = boundTok.lexeme;
+                    // Phase 21a: a parameterized trait bound `I: Iterator<T>`.
+                    // The trait's type args follow the bound name; they
+                    // typically name another generic param of this same decl.
+                    if (accept(TokenKind::Lt)) {
+                        if (!check(TokenKind::Gt)) {
+                            while (true) {
+                                tp.boundTypeArgs.push_back(parseTypeRef());
+                                if (!accept(TokenKind::Comma)) break;
+                                if (check(TokenKind::Gt)) break; // trailing ,
+                            }
+                        }
+                        expect(TokenKind::Gt, ">");
+                    }
                 }
                 result.push_back(std::move(tp));
                 if (!accept(TokenKind::Comma)) break;
@@ -436,6 +449,9 @@ private:
         decl.column = traitTok.column;
         Token nameTok = expect(TokenKind::Identifier, "trait name");
         decl.name = nameTok.lexeme;
+        // Phase 21a: trait type params `trait Name<T0, T1> { ... }`. Mirrors
+        // struct/enum/fn generics (the `<` after a trait name is unambiguous).
+        decl.genericParams = parseOptionalGenericParams();
         expect(TokenKind::LBrace, "{");
         while (!check(TokenKind::RBrace) && !check(TokenKind::EndOfInput)) {
             if (errors_.size() > 20) break;
@@ -521,35 +537,42 @@ private:
         ast::ImplDecl decl;
         decl.line = implTok.line;
         decl.column = implTok.column;
-        // Two forms:
-        //   impl Trait for Type { ... }   -- trait impl (since Phase 3.3)
-        //   impl Type { ... }             -- inherent impl (Phase 15)
-        // Parse the leading name, then disambiguate on the following token:
-        // `for` => it was the trait name (parse the real forType next); a
-        // `<` (generic args) or `{` (method block) => it was the type itself
+        // Three forms:
+        //   impl Trait for Type { ... }        -- trait impl (since Phase 3.3)
+        //   impl Trait<Args...> for Type { ... } -- generic trait impl (21a)
+        //   impl Type { ... } / impl Type<T>{}  -- inherent impl (Phase 15)
+        // Parse the leading name, then an optional `<...>` arg list, then
+        // disambiguate on the following token: `for` => the name (and any
+        // parsed `<...>`) was the trait + its type args (parse the real
+        // forType next); otherwise (`{`) it was the implementing type itself
         // and this is an inherent impl (empty traitName).
         Token nameTok = expect(TokenKind::Identifier, "trait or type name");
+        std::vector<ast::TypeRef> leadingArgs;
+        if (accept(TokenKind::Lt)) {
+            if (!check(TokenKind::Gt)) {
+                while (true) {
+                    leadingArgs.push_back(parseTypeRef());
+                    if (!accept(TokenKind::Comma)) break;
+                    if (check(TokenKind::Gt)) break; // trailing comma
+                }
+            }
+            expect(TokenKind::Gt, ">");
+        }
         if (accept(TokenKind::KwFor)) {
+            // Trait impl: the leading name is the trait, `leadingArgs` are the
+            // trait's type args (Phase 21a), and the forType follows `for`.
             decl.traitName = nameTok.lexeme;
+            decl.traitTypeArgs = std::move(leadingArgs);
             decl.forType = parseTypeRef();
         } else {
-            // Inherent impl: `nameTok` is the implementing type's base name.
-            // Complete its TypeRef (it may carry generic args, e.g.
-            // `impl Pair<T> { ... }`). traitName stays empty.
+            // Inherent impl: `nameTok` + `leadingArgs` form the implementing
+            // type's TypeRef (e.g. `impl Pair<T> { ... }`). traitName stays
+            // empty.
             ast::TypeRef tr;
             tr.name = nameTok.lexeme;
             tr.line = nameTok.line;
             tr.column = nameTok.column;
-            if (accept(TokenKind::Lt)) {
-                if (!check(TokenKind::Gt)) {
-                    while (true) {
-                        tr.typeArgs.push_back(parseTypeRef());
-                        if (!accept(TokenKind::Comma)) break;
-                        if (check(TokenKind::Gt)) break; // trailing comma
-                    }
-                }
-                expect(TokenKind::Gt, ">");
-            }
+            tr.typeArgs = std::move(leadingArgs);
             decl.forType = std::move(tr);
         }
         expect(TokenKind::LBrace, "{");

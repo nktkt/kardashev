@@ -78,16 +78,20 @@ std::string applyPrelude(const std::string& userSrc) {
     if (userSrc.find("enum Result") == std::string::npos) {
         prelude += "enum Result<T, E> { Ok(T), Err(E) }\n";
     }
-    // Phase 13a: the `Iterator` trait + its impl for the built-in `Range`.
-    // Element type is i64 (the accepted MVP). Adding `impl Iterator for
-    // Range` lets `for x in <range>` route through `next()` and lets ranges
-    // feed the iterator adaptors (fold/map/filter). `for` over literal
-    // ranges keeps its Phase 9 fast path in codegen, so this impl is only
-    // exercised when a Range is used as a generic `Iterator`.
+    // Phase 13a / 21a: the generic `Iterator<T>` trait + its impl for the
+    // built-in `Range`. Phase 21a migrated the element type from a hardcoded
+    // i64 to a trait type parameter `T`; `Range` impls `Iterator<i64>` (its
+    // element is still i64), so `for x in <range>` and the adaptors keep
+    // working byte-for-byte, while user types can now `impl Iterator<bool>`
+    // etc. `next` returns `Option<T>`; the impl supplies T=i64 and writes
+    // `Option<i64>` directly. `for` over literal ranges keeps its Phase 9 fast
+    // path in codegen, so this impl is only exercised when a Range is used as
+    // a generic `Iterator`. Guard: a user who defines their own `Iterator`
+    // (generic or not) suppresses the prelude one entirely.
     if (userSrc.find("trait Iterator") == std::string::npos) {
         prelude +=
-            "trait Iterator { fn next(&mut self) -> Option<i64>; }\n"
-            "impl Iterator for Range {\n"
+            "trait Iterator<T> { fn next(&mut self) -> Option<T>; }\n"
+            "impl Iterator<i64> for Range {\n"
             "    fn next(&mut self) -> Option<i64> {\n"
             "        if self.inclusive != 0 {\n"
             "            if self.start > self.end { None }\n"

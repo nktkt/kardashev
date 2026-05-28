@@ -482,6 +482,14 @@ struct EffectRow {
 struct TypeParam {
     std::string name;
     std::string bound; // empty = unbounded
+    // Phase 21a: type arguments supplied to a *parameterized* trait bound,
+    // e.g. the `<T>` in `<I: Iterator<T>>`. Empty when the bound trait takes
+    // no type params (or there is no bound). Each TypeRef typically names
+    // another of the enclosing decl's generic params (the trait's element
+    // type is bound to the fn's own type param), so the typechecker resolves
+    // them against the enclosing generic env. Stored on TypeParam (additive,
+    // so non-generic bounds are byte-for-byte unchanged).
+    std::vector<TypeRef> boundTypeArgs;
     std::size_t line = 1;
     std::size_t column = 1;
 };
@@ -541,6 +549,14 @@ struct MethodSig {
 
 struct TraitDecl {
     std::string name;
+    // Phase 21a: generic trait type parameters, e.g. the `T` in
+    // `trait Iterator<T> { fn next(&mut self) -> Option<T>; }`. Empty for a
+    // non-generic trait (the pre-Phase-21a shape). Method signatures may
+    // mention these names in type position; the typechecker binds them to an
+    // impl's concrete trait-args (or a bound's args) when checking method
+    // bodies / calls. These are bound names only — bounds-on-trait-params
+    // (`trait T<X: Bound>`) aren't in the grammar.
+    std::vector<TypeParam> genericParams;
     std::vector<MethodSig> methods;
     bool isPub = false; // Phase 15: `pub trait` — parsed + stored.
     std::size_t line = 1;
@@ -560,6 +576,13 @@ struct TraitDecl {
 // path applies unchanged.
 struct ImplDecl {
     std::string traitName; // empty => inherent impl (Phase 15)
+    // Phase 21a: the concrete type arguments this impl supplies to a
+    // parameterized trait, e.g. the `i64` in `impl Iterator<i64> for Range`.
+    // Empty for a non-generic trait impl or an inherent impl. The typechecker
+    // binds the trait's genericParams[k] to traitTypeArgs[k] (Self -> forType
+    // as before) while resolving each impl method's signature, so a method
+    // returning `Option<T>` lands as `Option<i64>` for this impl.
+    std::vector<TypeRef> traitTypeArgs;
     TypeRef forType;
     std::vector<FnDecl> methods;
     bool isPub = false; // Phase 15: `pub impl` — parsed + stored.

@@ -585,6 +585,28 @@ public:
                 error("trait redefined: " + td.name, td.line, td.column);
                 continue;
             }
+            // Phase 21a: record the trait's generic type-param names (in
+            // declaration order). Reject duplicates and names that shadow a
+            // built-in / declared type, mirroring the fn/struct rules.
+            std::vector<std::string> tparams;
+            std::unordered_set<std::string> seenTp;
+            for (const auto& gp : td.genericParams) {
+                if (!seenTp.insert(gp.name).second) {
+                    error("duplicate generic parameter '" + gp.name +
+                              "' on trait '" + td.name + "'",
+                          gp.line, gp.column);
+                    continue;
+                }
+                if (gp.name == "Self" || gp.name == "i64" ||
+                    gp.name == "bool" || structSchemas_.count(gp.name) ||
+                    enumSchemas_.count(gp.name)) {
+                    error("trait generic parameter '" + gp.name +
+                              "' shadows an existing type",
+                          gp.line, gp.column);
+                }
+                tparams.push_back(gp.name);
+            }
+            traitGenericParams_[td.name] = std::move(tparams);
             std::unordered_set<std::string> seenMethod;
             std::vector<ast::MethodSig> uniqueMethods;
             uniqueMethods.reserve(td.methods.size());
@@ -628,6 +650,17 @@ public:
                     continue;
                 }
                 traitMethods = &traitIt->second;
+                // Phase 21a: the impl must supply exactly as many trait type
+                // args as the trait declares generic params. (A non-generic
+                // trait keeps the 0/0 case unchanged.)
+                std::size_t want = traitGenericParams_[impl.traitName].size();
+                if (impl.traitTypeArgs.size() != want) {
+                    error("impl of trait '" + impl.traitName + "' supplies " +
+                              std::to_string(impl.traitTypeArgs.size()) +
+                              " type arg(s), but the trait declares " +
+                              std::to_string(want),
+                          impl.line, impl.column);
+                }
             }
             TypePtr forTy = resolveTypeRef(impl.forType);
             TypePtr rfor = resolve(forTy);
@@ -727,6 +760,11 @@ public:
             std::vector<std::pair<std::string, TypePtr>> effectRowVars;
             genVars.reserve(fn.genericParams.size());
             genBounds.reserve(fn.genericParams.size());
+            // Phase 21a: the AST TypeParam backing each genVars[i], so a
+            // second pass can resolve its parameterized-bound args once every
+            // type param is registered in genEnv (a bound may reference a
+            // later-declared param). nullptr-safe: only set for type vars.
+            std::vector<const ast::TypeParam*> genBoundParam;
             std::unordered_set<std::string> seenGp;
             for (const auto& gp : fn.genericParams) {
                 if (!seenGp.insert(gp.name).second) {
@@ -757,6 +795,7 @@ public:
                     }
                     genVars.push_back(v);
                     genBounds.push_back(gp.bound);
+                    genBoundParam.push_back(&gp);
                 }
             }
             // Implicit row vars (named only in fn-type rows, not in `<...>`)
@@ -769,6 +808,42 @@ public:
             }
             currentGenericEnv_ = &genEnv;
             currentEffectRowVarNames_ = &rowVarNames;
+
+            // Phase 21a: now that every type param is in genEnv, resolve each
+            // parameterized bound's trait-args + validate the bound's arity
+            // against the trait's declared generic-param count.
+            std::vector<std::vector<TypePtr>> genBoundArgs(genBounds.size());
+            for (std::size_t i = 0; i < genBoundParam.size(); ++i) {
+                const ast::TypeParam* gp = genBoundParam[i];
+                if (!gp || gp->bound.empty()) continue;
+                std::size_t want = traitGenericParams_.count(gp->bound)
+                                       ? traitGenericParams_[gp->bound].size()
+                                       : 0;
+                // Phase 21a: an OMITTED arg list on a generic-trait bound
+                // (`<I: Iterator>` when `Iterator` takes a `T`) means "infer
+                // every element" — bind each trait param to a fresh Var so the
+                // element type is inferred from how the method's result is used
+                // in the body. This keeps the pre-21a `<I: Iterator>` spelling
+                // working after migrating `Iterator` to `Iterator<T>`. A
+                // NON-empty arg list must match the trait's arity exactly.
+                std::vector<TypePtr> resolved;
+                if (gp->boundTypeArgs.empty()) {
+                    for (std::size_t k = 0; k < want; ++k)
+                        resolved.push_back(makeFreshVar());
+                } else {
+                    if (gp->boundTypeArgs.size() != want) {
+                        error("trait bound '" + gp->bound + "' on '" +
+                                  gp->name + "' expects " +
+                                  std::to_string(want) + " type arg(s), got " +
+                                  std::to_string(gp->boundTypeArgs.size()),
+                              gp->line, gp->column);
+                    }
+                    resolved.reserve(gp->boundTypeArgs.size());
+                    for (const auto& a : gp->boundTypeArgs)
+                        resolved.push_back(resolveTypeRef(a));
+                }
+                genBoundArgs[i] = std::move(resolved);
+            }
 
             std::vector<TypePtr> argTypes;
             argTypes.reserve(fn.params.size());
@@ -784,6 +859,7 @@ public:
             schema.signature = makeFunction(std::move(argTypes), ret);
             schema.genericVars = std::move(genVars);
             schema.genericBounds = std::move(genBounds);
+            schema.genericBoundArgs = std::move(genBoundArgs);
             // Note: effect-row vars are deliberately NOT added to
             // genericVars — that list drives codegen monomorphization, and
             // effects are compile-time only (zero runtime cost). Row vars
@@ -820,17 +896,24 @@ public:
                 std::unordered_map<std::string, TypePtr> genEnv;
                 std::vector<TypePtr> genVars;
                 std::vector<std::string> genBounds;
+                std::vector<const ast::TypeParam*> genBoundParam;
                 for (const auto& gp : fn.genericParams) {
                     TypePtr v = makeFreshVar();
                     genEnv[gp.name] = v;
                     genVars.push_back(v);
                     genBounds.push_back(gp.bound);
+                    genBoundParam.push_back(&gp);
                 }
                 // Bind Self to the impl's forType while resolving params /
                 // return. This lets the impl write `self: Self -> i64`
                 // and have it land as `self: ConcreteType -> i64`.
                 TypePtr selfTy = resolveTypeRef(impl.forType);
                 genEnv["Self"] = selfTy;
+                // Phase 21a: bind the trait's generic params to this impl's
+                // concrete trait-args, so a method signature mentioning `T`
+                // (e.g. `-> Option<T>` from `Iterator<T>`) resolves to the
+                // impl's arg (`Option<i64>` for `impl Iterator<i64>`).
+                bindTraitParamsForImpl(impl, genEnv);
                 // Phase 10a: classify effect-row vars for impl methods too,
                 // so a method may take fn-typed params with effect rows.
                 std::unordered_set<std::string> rowVarNames =
@@ -846,6 +929,21 @@ public:
                 }
                 currentGenericEnv_ = &genEnv;
                 currentEffectRowVarNames_ = &rowVarNames;
+                // Phase 21a: resolve any parameterized-bound trait args on the
+                // method's own generic params (rare, but kept consistent with
+                // free fns).
+                std::vector<std::vector<TypePtr>> genBoundArgs(
+                    genBounds.size());
+                for (std::size_t i = 0; i < genBoundParam.size(); ++i) {
+                    const ast::TypeParam* gp = genBoundParam[i];
+                    if (!gp || gp->bound.empty() ||
+                        gp->boundTypeArgs.empty())
+                        continue;
+                    std::vector<TypePtr> resolved;
+                    for (const auto& a : gp->boundTypeArgs)
+                        resolved.push_back(resolveTypeRef(a));
+                    genBoundArgs[i] = std::move(resolved);
+                }
                 std::vector<TypePtr> argTypes;
                 for (const auto& p : fn.params) {
                     argTypes.push_back(resolveTypeRef(p.type));
@@ -857,6 +955,7 @@ public:
                 sch.signature = makeFunction(std::move(argTypes), ret);
                 sch.genericVars = std::move(genVars);
                 sch.genericBounds = std::move(genBounds);
+                sch.genericBoundArgs = std::move(genBoundArgs);
                 for (const auto& [name, v] : effectRowVars) {
                     bool dup = false;
                     for (const auto& gv : sch.genericVars)
@@ -882,7 +981,7 @@ public:
         for (const auto& impl : program.impls) {
             TypePtr selfTy = resolveTypeRef(impl.forType);
             for (const auto& fn : impl.methods) {
-                checkImplMethod(fn, impl.traitName, impl.forType, selfTy);
+                checkImplMethod(fn, impl, selfTy);
             }
         }
         // Phase 4: effect-inference pass. For each fn body, collect the
@@ -931,6 +1030,14 @@ private:
 
     // Trait declarations: traitName -> ordered list of method signatures.
     std::unordered_map<std::string, std::vector<ast::MethodSig>> traits_;
+    // Phase 21a: traitName -> the trait's generic type-param names, in
+    // declaration order (empty for a non-generic trait). Method signatures
+    // mention these names in type position; binding them to concrete args
+    // (an impl's traitTypeArgs, or a bound's args) materializes a method's
+    // element type. Kept separate from `traits_` so the dyn / non-generic
+    // paths read `traits_` exactly as before.
+    std::unordered_map<std::string, std::vector<std::string>>
+        traitGenericParams_;
     // Impl registration: per implementing-type-name, per-trait-name, the
     // method-AST table. Indexed twice so method-call resolution can hop
     // typeName -> impl in O(1) and a missing method tells us the impl
@@ -1358,6 +1465,27 @@ private:
     // mangling and the (typeName, trait) lookup to include typeArgs.
     static constexpr const char* kInherentImplSentinel = "__kd_inherent_impl";
 
+    // Phase 21a: for a trait impl, resolve the trait's generic params to the
+    // impl's concrete trait-args and insert them into `env`. `env` should
+    // already bind `Self` (so a trait-arg like `Self` would resolve), and is
+    // the active `currentGenericEnv_` so resolveTypeRef sees `Self`. The
+    // trait-args are resolved in that same env. No-op for inherent /
+    // non-generic-trait impls (their traitTypeArgs are empty). Trait-param
+    // names never clash with `Self` (validated at trait registration).
+    void bindTraitParamsForImpl(const ast::ImplDecl& impl, GenericEnv& env) {
+        if (impl.traitName.empty()) return;
+        auto pit = traitGenericParams_.find(impl.traitName);
+        if (pit == traitGenericParams_.end()) return;
+        const std::vector<std::string>& names = pit->second;
+        const GenericEnv* saved = currentGenericEnv_;
+        currentGenericEnv_ = &env; // so trait-args can see Self
+        for (std::size_t i = 0;
+             i < names.size() && i < impl.traitTypeArgs.size(); ++i) {
+            env[names[i]] = resolveTypeRef(impl.traitTypeArgs[i]);
+        }
+        currentGenericEnv_ = saved;
+    }
+
     std::string implMethodMangledName(const std::string& trait,
                                        const ast::TypeRef& forType,
                                        const std::string& method) {
@@ -1368,10 +1496,8 @@ private:
         return "__impl_" + t + "_for_" + forType.name + "__" + method;
     }
 
-    void checkImplMethod(const ast::FnDecl& fn, const std::string& traitName,
-                         const ast::TypeRef& forType, const TypePtr& selfTy) {
-        (void)traitName;
-        (void)forType;
+    void checkImplMethod(const ast::FnDecl& fn, const ast::ImplDecl& impl,
+                         const TypePtr& selfTy) {
         auto it = implMethodMangled_.find(&fn);
         if (it == implMethodMangled_.end()) return;
         auto sit = fnSchemas_.find(it->second);
@@ -1384,6 +1510,10 @@ private:
             genEnv[fn.genericParams[i].name] = schema.genericVars[i];
         }
         genEnv["Self"] = selfTy;
+        // Phase 21a: bind the trait's generic params to this impl's concrete
+        // trait-args (matches the schema-registration env), so a method body
+        // referencing `T` checks against the impl's element type.
+        bindTraitParamsForImpl(impl, genEnv);
         // Phase 10a: restore effect-row-var env so fn-typed params resolve
         // and effect collection can name still-polymorphic row vars.
         std::unordered_set<std::string> rowVarNames;
@@ -1584,6 +1714,21 @@ private:
             auto it = traits_.find(tr.name);
             if (it == traits_.end()) {
                 error("`dyn` of unknown trait '" + tr.name + "'",
+                      tr.line, tr.column);
+                return makeInt();
+            }
+            // Phase 21a: generic trait objects (`dyn Iterator<T>`) are NOT
+            // supported this phase — monomorphization keeps generic-trait
+            // method calls static. Reject with a clear message rather than
+            // emitting an unsound vtable. Non-generic `dyn Trait` is unchanged.
+            auto pit = traitGenericParams_.find(tr.name);
+            if (pit != traitGenericParams_.end() && !pit->second.empty()) {
+                error("`dyn " + tr.name + "` is not supported: trait '" +
+                          tr.name +
+                          "' has generic type parameters (generic trait "
+                          "objects aren't supported; use a generic param with "
+                          "a trait bound like `<I: " + tr.name + "<...>>` "
+                          "instead)",
                       tr.line, tr.column);
                 return makeInt();
             }
@@ -2218,6 +2363,11 @@ private:
         if (r->kind == TypeKind::Var) {
             int rId = r->varId;
             std::string bound;
+            // Phase 21a: alongside the bound trait name, capture the bound's
+            // resolved trait type-args (the `<T>` in `<I: Iterator<T>>`) so we
+            // can bind the trait's params and resolve the method's element
+            // type back to the enclosing fn's own type param.
+            std::vector<TypePtr> boundArgs;
             // Find the bound by scanning the enclosing fn's schema.
             // `currentGenericEnv_` holds name -> Var; we need the parallel
             // bound list. Look up via fnSchemas_.
@@ -2227,6 +2377,8 @@ private:
                         i < schema.genericBounds.size() &&
                         !schema.genericBounds[i].empty()) {
                         bound = schema.genericBounds[i];
+                        if (i < schema.genericBoundArgs.size())
+                            boundArgs = schema.genericBoundArgs[i];
                         break;
                     }
                 }
@@ -2256,10 +2408,12 @@ private:
                 return makeFreshVar();
             }
             // Type-check arg count + arg types against the trait's
-            // signature, substituting Self -> r (the schema Var).
+            // signature, substituting Self -> r (the schema Var) and the
+            // trait's generic params -> the bound's resolved args.
             return checkMethodCallAgainstSig(mc, *sig, r,
                                               /*concrete=*/false, bound,
-                                              /*concreteTypeName=*/{}, rId);
+                                              /*concreteTypeName=*/{}, rId,
+                                              boundArgs);
         }
 
         // Case B: receiver has a concrete type (struct/enum/i64/bool).
@@ -2364,17 +2518,36 @@ private:
                                        bool concrete,
                                        const std::string& traitName,
                                        const std::string& concreteTypeName,
-                                       int boundedVarId) {
-        // Resolve sig's param/return types with Self -> receiverTy.
+                                       int boundedVarId,
+                                       const std::vector<TypePtr>& traitArgs =
+                                           {}) {
+        // Resolve sig's param/return types with Self -> receiverTy. Phase 21a:
+        // also bind the bound trait's generic params to the resolved trait
+        // args, so a method returning `Option<T>` (from `Iterator<T>`)
+        // resolves `T` to the caller's own type param. Save/restore the
+        // active env so we don't clobber the enclosing fn's generic env
+        // (needed below to checkExpr the args).
         GenericEnv selfEnv;
         selfEnv["Self"] = receiverTy;
+        auto pit = traitGenericParams_.find(traitName);
+        if (pit != traitGenericParams_.end()) {
+            const std::vector<std::string>& names = pit->second;
+            for (std::size_t i = 0;
+                 i < names.size() && i < traitArgs.size(); ++i) {
+                selfEnv[names[i]] = traitArgs[i];
+            }
+        }
+        const GenericEnv* savedEnv = currentGenericEnv_;
         currentGenericEnv_ = &selfEnv;
         std::vector<TypePtr> paramTypes;
         for (const auto& p : sig.params) {
             paramTypes.push_back(resolveTypeRef(p.type));
         }
         TypePtr retTy = resolveTypeRef(sig.returnType);
-        currentGenericEnv_ = nullptr;
+        // Restore the enclosing fn's generic env (not nullptr) so that
+        // checkExpr on the args below can still resolve names that mention
+        // the caller's own type params.
+        currentGenericEnv_ = savedEnv;
 
         // paramTypes[0] is self (already a Self type). Skip and unify args.
         const std::size_t expectedExtra =

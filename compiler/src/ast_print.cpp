@@ -126,7 +126,19 @@ private:
         for (std::size_t i = 0; i < gps.size(); ++i) {
             if (i) s += ", ";
             s += gps[i].name;
-            if (!gps[i].bound.empty()) s += ": " + gps[i].bound;
+            if (!gps[i].bound.empty()) {
+                s += ": " + gps[i].bound;
+                // Phase 21a: parameterized bound `I: Iterator<T>`.
+                if (!gps[i].boundTypeArgs.empty()) {
+                    s += "<";
+                    for (std::size_t j = 0; j < gps[i].boundTypeArgs.size();
+                         ++j) {
+                        if (j) s += ", ";
+                        s += typeToString(gps[i].boundTypeArgs[j]);
+                    }
+                    s += ">";
+                }
+            }
         }
         s += ">";
         return s;
@@ -203,7 +215,7 @@ private:
 
     void printTrait(const TraitDecl& t) {
         if (t.isPub) out_ += "pub ";
-        out_ += "trait " + t.name;
+        out_ += "trait " + t.name + genericParamsToString(t.genericParams);
         if (t.methods.empty()) {
             out_ += " {}\n";
             return;
@@ -224,7 +236,16 @@ private:
         if (im.isInherent()) {
             out_ += "impl " + typeToString(im.forType);
         } else {
-            out_ += "impl " + im.traitName + " for " + typeToString(im.forType);
+            std::string traitRef = im.traitName;
+            // Phase 21a: render the trait's type args (`impl Iterator<i64> for
+            // Range`). Build a TypeRef so typeToString formats the `<...>`.
+            if (!im.traitTypeArgs.empty()) {
+                TypeRef tr;
+                tr.name = im.traitName;
+                tr.typeArgs = im.traitTypeArgs;
+                traitRef = typeToString(tr);
+            }
+            out_ += "impl " + traitRef + " for " + typeToString(im.forType);
         }
         if (im.methods.empty()) {
             out_ += " {}\n";

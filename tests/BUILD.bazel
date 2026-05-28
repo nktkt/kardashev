@@ -134,6 +134,14 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 21a: generic trait *parameters* — `trait Foo<T>`, `impl Foo<C> for T`,
+# bounds `<C: Foo<T>>`, and the migrated generic `Iterator<T>` prelude.
+sh_test(
+    name = "smoke_test_generic_traits",
+    srcs = ["smoke_test_generic_traits.sh"],
+    data = ["//compiler:kardc"],
+)
+
 sh_test(
     name = "smoke_test_fmt",
     srcs = ["smoke_test_fmt.sh"],

@@ -588,6 +588,123 @@ void test_trait_bounded_generic() {
     expectEquals(v, 107, "trait_bounded_generic");
 }
 
+// --- Phase 21a: generic trait parameters, end to end ---
+
+// A generic trait with impls at two element types + a generic-trait-bounded
+// fn `head<T, C: Container<T>>`, used at both element types. The bool path
+// gates the i64 path, so a correct element-type resolution returns 42.
+void test_generic_trait_bounded_head_both_elems() {
+    auto v = compileAndRun(
+        "trait Container<T> { fn first(&self) -> T; }\n"
+        "struct IntBox { v: i64 }\n"
+        "struct BoolBox { b: bool }\n"
+        "impl Container<i64> for IntBox { fn first(&self) -> i64 { self.v } }\n"
+        "impl Container<bool> for BoolBox { fn first(&self) -> bool { self.b } }\n"
+        "fn head<T, C: Container<T>>(c: C) -> T { c.first() }\n"
+        "fn main() -> i64 {\n"
+        "    let ib = IntBox { v: 42 };\n"
+        "    let bb = BoolBox { b: true };\n"
+        "    let a = head(ib);\n"
+        "    if head(bb) { a } else { 0 }\n"
+        "}",
+        "main", "generic_trait_bounded_head_both_elems");
+    expectEquals(v, 42, "generic_trait_bounded_head_both_elems");
+}
+
+// A custom `impl Iterator<bool> for Count`, iterated with `for x in c`. The
+// `for` desugar derives the bool element type from `next()`'s Option<bool>.
+// Count{n:5} yields elements for n=4,3,2,1,0; isEven is true for 4,2,0 -> 3.
+void test_generic_iterator_bool_for_loop() {
+    auto v = compileAndRun(
+        "enum Option<T> { Some(T), None }\n"
+        "trait Iterator<T> { fn next(&mut self) -> Option<T>; }\n"
+        "struct Count { n: i64 }\n"
+        "impl Iterator<bool> for Count {\n"
+        "    fn next(&mut self) -> Option<bool> {\n"
+        "        if self.n <= 0 { None } else {\n"
+        "            self.n = self.n - 1;\n"
+        "            let isEven = self.n - (self.n / 2) * 2 == 0;\n"
+        "            Some(isEven)\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+        "fn main() -> i64 {\n"
+        "    let c = Count { n: 5 };\n"
+        "    let mut trues = 0;\n"
+        "    for b in c { if b { trues = trues + 1; } else { trues = trues; } }\n"
+        "    trues\n"
+        "}",
+        "main", "generic_iterator_bool_for_loop");
+    expectEquals(v, 3, "generic_iterator_bool_for_loop");
+}
+
+// A generic adaptor `fold<T, I: Iterator<T>>` over a NON-i64 (bool) element,
+// proving the adaptor is now genuinely generic over the element type.
+void test_generic_fold_over_bool() {
+    auto v = compileAndRun(
+        "enum Option<T> { Some(T), None }\n"
+        "trait Iterator<T> { fn next(&mut self) -> Option<T>; }\n"
+        "struct Count { n: i64 }\n"
+        "impl Iterator<bool> for Count {\n"
+        "    fn next(&mut self) -> Option<bool> {\n"
+        "        if self.n <= 0 { None } else {\n"
+        "            self.n = self.n - 1;\n"
+        "            let isEven = self.n - (self.n / 2) * 2 == 0;\n"
+        "            Some(isEven)\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+        "fn fold<T, I: Iterator<T>>(it: I, init: i64, f: fn(i64, T) -> i64)"
+        " -> i64 {\n"
+        "    let mut iter = it;\n"
+        "    let mut acc = init;\n"
+        "    loop {\n"
+        "        match iter.next() {\n"
+        "            Some(x) => { acc = f(acc, x); },\n"
+        "            None => { break; },\n"
+        "        }\n"
+        "    }\n"
+        "    acc\n"
+        "}\n"
+        "fn count_true(acc: i64, b: bool) -> i64 { if b { acc + 1 } else { acc } }\n"
+        "fn main() -> i64 {\n"
+        "    let c = Count { n: 5 };\n"
+        "    fold(c, 0, count_true)\n"
+        "}",
+        "main", "generic_fold_over_bool");
+    expectEquals(v, 3, "generic_fold_over_bool");
+}
+
+// Regression: the pre-21a `<I: Iterator>` spelling (omitted element arg) over
+// an i64 element still works after migrating Iterator to Iterator<T>. A custom
+// i64 Countdown summed via fold: 4+3+2+1 == 10.
+void test_iterator_unparam_bound_i64_regression() {
+    auto v = compileAndRun(
+        "enum Option<T> { Some(T), None }\n"
+        "trait Iterator<T> { fn next(&mut self) -> Option<T>; }\n"
+        "struct Countdown { n: i64 }\n"
+        "impl Iterator<i64> for Countdown {\n"
+        "    fn next(&mut self) -> Option<i64> {\n"
+        "        if self.n <= 0 { None } else { self.n = self.n - 1; Some(self.n + 1) }\n"
+        "    }\n"
+        "}\n"
+        "fn fold<I: Iterator>(it: I, init: i64, f: fn(i64, i64) -> i64) -> i64 {\n"
+        "    let mut iter = it;\n"
+        "    let mut acc = init;\n"
+        "    loop {\n"
+        "        match iter.next() {\n"
+        "            Some(x) => { acc = f(acc, x); },\n"
+        "            None => { break; },\n"
+        "        }\n"
+        "    }\n"
+        "    acc\n"
+        "}\n"
+        "fn add(a: i64, b: i64) -> i64 { a + b }\n"
+        "fn main() -> i64 { let c = Countdown { n: 4 }; fold(c, 0, add) }",
+        "main", "iterator_unparam_bound_i64_regression");
+    expectEquals(v, 10, "iterator_unparam_bound_i64_regression");
+}
+
 // Trait with multiple methods; impl supplies both.
 void test_trait_multi_method() {
     auto v = compileAndRun(
@@ -1949,6 +2066,11 @@ int main() {
     // Phase 3.3 traits + impl + bounded generics
     test_trait_basic_show();
     test_trait_bounded_generic();
+    // Phase 21a: generic trait parameters end to end
+    test_generic_trait_bounded_head_both_elems();
+    test_generic_iterator_bool_for_loop();
+    test_generic_fold_over_bool();
+    test_iterator_unparam_bound_i64_regression();
     test_trait_multi_method();
     test_trait_method_with_args();
     // Phase 3.4 try operator
@@ -2049,11 +2171,13 @@ int main() {
     test_mutex_roundtrip_single_thread();
     test_mutex_mutual_exclusion_two_threads();
     test_thread_runtime_emits_pthread_externs();
-    std::cout << "All codegen tests passed (127 cases) — Phase 16 Drop/RAII: "
+    std::cout << "All codegen tests passed (131 cases) — Phase 16 Drop/RAII: "
                  "reverse-order scope drops, move semantics, conditional-move "
                  "drop flags, Vec/Box free, scalar codegen unchanged; Phase "
                  "17a fn-value field calls + FnMut captures; Phase 17b generic "
                  "Future<T> (bool/struct) + HashMap<i64,V> (bool/struct); "
-                 "Phase 19 OS threads + Mutex mutual exclusion\n";
+                 "Phase 19 OS threads + Mutex mutual exclusion; Phase 21a "
+                 "generic trait params (Container<T>/Iterator<T>: bounded fn, "
+                 "for-loop, fold over bool, <I: Iterator> regression)\n";
     return 0;
 }

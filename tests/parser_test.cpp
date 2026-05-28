@@ -1392,6 +1392,110 @@ void test_optional_return_type_drop_trait() {
     assert(r.program.impls[0].methods[0].returnType.name == "unit");
 }
 
+// --- Phase 21a: generic trait parameters ---
+
+void test_generic_trait_decl() {
+    // `trait Iterator<T> { fn next(&mut self) -> Option<T>; }` parses with a
+    // single generic param; the method's return type names that param.
+    auto r = parse("trait Iterator<T> { fn next(&mut self) -> Option<T>; }");
+    if (!r.ok()) {
+        std::cerr << "parse failed:\n";
+        for (const auto& e : r.errors)
+            std::cerr << "  " << e.line << ":" << e.column << ": " << e.message << '\n';
+        std::abort();
+    }
+    assert(r.program.traits.size() == 1);
+    const auto& t = r.program.traits[0];
+    assert(t.name == "Iterator");
+    assert(t.genericParams.size() == 1);
+    assert(t.genericParams[0].name == "T");
+    assert(t.methods.size() == 1 && t.methods[0].name == "next");
+    // return type `Option<T>` mentions the trait param by name.
+    assert(t.methods[0].returnType.name == "Option");
+    assert(t.methods[0].returnType.typeArgs.size() == 1);
+    assert(t.methods[0].returnType.typeArgs[0].name == "T");
+}
+
+void test_generic_trait_multi_params() {
+    // Two trait params + trailing comma.
+    auto r = parse("trait Map<K, V,> { fn get(&self, k: K) -> V; }");
+    assert(r.ok());
+    assert(r.program.traits.size() == 1);
+    const auto& t = r.program.traits[0];
+    assert(t.genericParams.size() == 2);
+    assert(t.genericParams[0].name == "K");
+    assert(t.genericParams[1].name == "V");
+}
+
+void test_generic_trait_impl_with_args() {
+    // `impl Iterator<i64> for Range { ... }` keeps the trait name AND records
+    // the supplied trait type-args; it is NOT an inherent impl.
+    auto r = parse(
+        "struct Range { start: i64, end: i64, inclusive: i64 }\n"
+        "impl Iterator<i64> for Range {\n"
+        "    fn next(&mut self) -> Option<i64> { None }\n"
+        "}");
+    if (!r.ok()) {
+        std::cerr << "parse failed:\n";
+        for (const auto& e : r.errors)
+            std::cerr << "  " << e.line << ":" << e.column << ": " << e.message << '\n';
+        std::abort();
+    }
+    assert(r.program.impls.size() == 1);
+    const auto& im = r.program.impls[0];
+    assert(!im.isInherent());
+    assert(im.traitName == "Iterator");
+    assert(im.traitTypeArgs.size() == 1);
+    assert(im.traitTypeArgs[0].name == "i64");
+    assert(im.forType.name == "Range");
+}
+
+void test_generic_inherent_impl_unaffected() {
+    // Regression: `impl Pair<T> { ... }` (a generic-type inherent impl) must
+    // still parse as inherent with the type-args on forType, NOT as a trait
+    // impl. The disambiguation (no `for`) keeps the leading `<...>` on the
+    // implementing type.
+    auto r = parse("impl Pair<T> { fn fst(&self) -> i64 { 0 } }");
+    assert(r.ok());
+    assert(r.program.impls.size() == 1);
+    const auto& im = r.program.impls[0];
+    assert(im.isInherent());
+    assert(im.traitName.empty());
+    assert(im.traitTypeArgs.empty());
+    assert(im.forType.name == "Pair");
+    assert(im.forType.typeArgs.size() == 1 && im.forType.typeArgs[0].name == "T");
+}
+
+void test_parameterized_trait_bound() {
+    // `fn head<T, C: Container<T>>(c: C) -> T` — the bound carries the trait's
+    // type args, which name the fn's own generic param.
+    auto r = parse("fn head<T, C: Container<T>>(c: C) -> T { c.first() }");
+    if (!r.ok()) {
+        std::cerr << "parse failed:\n";
+        for (const auto& e : r.errors)
+            std::cerr << "  " << e.line << ":" << e.column << ": " << e.message << '\n';
+        std::abort();
+    }
+    assert(r.program.functions.size() == 1);
+    const auto& fn = r.program.functions[0];
+    assert(fn.genericParams.size() == 2);
+    assert(fn.genericParams[0].name == "T" && fn.genericParams[0].bound.empty());
+    assert(fn.genericParams[1].name == "C");
+    assert(fn.genericParams[1].bound == "Container");
+    assert(fn.genericParams[1].boundTypeArgs.size() == 1);
+    assert(fn.genericParams[1].boundTypeArgs[0].name == "T");
+}
+
+void test_unparameterized_bound_has_no_args() {
+    // Regression: a plain `<I: Iterator>` bound has an empty boundTypeArgs.
+    auto r = parse("fn f<I: Iterator>(it: I) -> i64 { 0 }");
+    assert(r.ok());
+    const auto& fn = r.program.functions[0];
+    assert(fn.genericParams.size() == 1);
+    assert(fn.genericParams[0].bound == "Iterator");
+    assert(fn.genericParams[0].boundTypeArgs.empty());
+}
+
 } // namespace
 
 int main() {
@@ -1505,6 +1609,13 @@ int main() {
     // Phase 16: optional return type (the Drop-method surface)
     test_optional_return_type_fn();
     test_optional_return_type_drop_trait();
-    std::cout << "All parser tests passed (97 cases)\n";
+    // Phase 21a: generic trait parameters
+    test_generic_trait_decl();
+    test_generic_trait_multi_params();
+    test_generic_trait_impl_with_args();
+    test_generic_inherent_impl_unaffected();
+    test_parameterized_trait_bound();
+    test_unparameterized_bound_has_no_args();
+    std::cout << "All parser tests passed (103 cases)\n";
     return 0;
 }
