@@ -39,6 +39,7 @@
 #include "llvm/Support/Error.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Program.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
@@ -280,6 +281,23 @@ std::optional<std::int64_t> compileAndRun(const std::string& srcRaw,
     auto progOpt = buildProgram(srcRaw, srcDir);
     if (!progOpt) return std::nullopt;
     auto& program = *progOpt;
+    // PR#26 (ABI safety): the JIT calls `entry` through an i64()-typed
+    // function pointer, so reject any entry whose signature doesn't match —
+    // a non-empty parameter list or a non-integer return would corrupt the
+    // ABI. i64 and bool (i1, zero-extended by the caller since Phase 15) are
+    // the supported entry return widths.
+    bool entryOk = false;
+    for (const auto& fn : program.functions) {
+        if (fn.name != entry) continue;
+        entryOk = fn.params.empty() && (fn.returnType.name == "i64" ||
+                                        fn.returnType.name == "bool");
+        break;
+    }
+    if (!entryOk) {
+        std::cerr << "kardc: entry `" << entry << "` must have signature `fn "
+                  << entry << "() -> i64` (or `-> bool`) for JIT execution\n";
+        return std::nullopt;
+    }
     auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
         reportTypeErrors(tcr);
@@ -533,12 +551,24 @@ bool linkObject(const std::string& objPath, const std::string& outExePath) {
     // are folded into libc and `-lpthread` is a harmless no-op; on older glibc
     // and other POSIX targets it pulls in the real library. POSIX, so it's the
     // same flag on Linux and macOS — no platform branching needed.
-    std::string cmd = "clang \"" + objPath + "\" -o \"" + outExePath +
-                      "\" -lpthread";
-    int rc = std::system(cmd.c_str());
+    // PR#23 (security): exec clang directly via llvm::sys::ExecuteAndWait
+    // with an argv vector instead of std::system on a concatenated string,
+    // so a crafted object/output path can't inject shell commands. Resolve
+    // clang on PATH explicitly (ExecuteAndWait does not search PATH).
+    auto clangPath = llvm::sys::findProgramByName("clang");
+    if (!clangPath) {
+        std::cerr << "kardc: cannot find 'clang' on PATH for linking\n";
+        return false;
+    }
+    llvm::SmallVector<llvm::StringRef, 8> argv{
+        *clangPath, objPath, "-o", outExePath, "-lpthread"};
+    std::string errMsg;
+    int rc = llvm::sys::ExecuteAndWait(*clangPath, argv, std::nullopt, {}, 0, 0,
+                                       &errMsg);
     if (rc != 0) {
-        std::cerr << "kardc: linker (clang) failed with exit code "
-                  << rc << '\n';
+        std::cerr << "kardc: linker (clang) failed with exit code " << rc;
+        if (!errMsg.empty()) std::cerr << " (" << errMsg << ")";
+        std::cerr << '\n';
         return false;
     }
     return true;
