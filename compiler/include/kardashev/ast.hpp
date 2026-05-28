@@ -252,6 +252,42 @@ struct SliceExpr : Expr {
     ExprPtr end;     // i64 upper bound (exclusive)
 };
 
+// Phase 22: an array literal `[a, b, c]`. All elements must share one type T;
+// the array's type is `[T; N]` where N = elements.size(). An empty `[]`
+// literal can't infer T, so it is rejected at typecheck. Lowers to an LLVM
+// array value built via insertvalue (value type, copied like a struct).
+struct ArrayLitExpr : Expr {
+    std::vector<ExprPtr> elements;
+};
+
+// Phase 22: indexing `arr[i]` — reads element `i` (an i64 index) of a
+// fixed-size array. Distinct from the slice form `&v[a..b]` (a RangeExpr-like
+// SliceExpr): a plain `arr[i]` with no `..` is an index. A compile-time-
+// constant out-of-range literal index is a typecheck error; a dynamic index
+// is unchecked in the MVP (no runtime bounds check), matching the unchecked
+// `vec_get` / `slice_get` builtins.
+struct IndexExpr : Expr {
+    ExprPtr object; // the array expression
+    ExprPtr index;  // an i64 index
+};
+
+// Phase 22: a tuple literal `(a, b)`, `(a, b, c)`. Always >= 2 elements (the
+// parser only builds this when it sees a comma inside the parens; `(x)` is a
+// parenthesized expr, `()` is unit). Type is `(T0, T1, ...)`. Lowers to an
+// anonymous LLVM struct value built via insertvalue.
+struct TupleLitExpr : Expr {
+    std::vector<ExprPtr> elements;
+};
+
+// Phase 22: tuple field access by index `t.0`, `t.1`. The parser produces
+// this when a numeric (Integer) token follows the `.` in postfix position
+// (`recv.method()` / `recv.field` keep using MethodCallExpr / FieldExpr for
+// identifier members). `index` is the 0-based element position.
+struct TupleFieldExpr : Expr {
+    ExprPtr object;
+    std::size_t index = 0;
+};
+
 // Phase 6 (stub): `expr.await` postfix. Today this is a no-op at both
 // typecheck and codegen (the operand's type / value flow through
 // unchanged); once a state-machine transform lands this becomes the
@@ -334,6 +370,14 @@ struct ContinueExpr : Expr {};
 struct LetStmt : Stmt {
     std::string name;
     ExprPtr value;
+    // Phase 22: tuple destructuring `let (x, y) = t;`. When `tupleNames` is
+    // non-empty, this let binds each name to the corresponding tuple element
+    // of `value` (whose type must be a tuple of matching arity); `name` is
+    // unused in that case. A `_` element drops that position (kept as the
+    // literal "_" so codegen/typecheck can skip binding it). Mutually
+    // exclusive with the single-`name` form. No type annotation on the
+    // destructuring form (the element types come from the RHS tuple).
+    std::vector<std::string> tupleNames;
     // Phase 9: `let mut x = ...`. Marks the binding as reassignable; the
     // typechecker rejects assignment to a non-mut binding.
     bool isMut = false;
@@ -404,6 +448,16 @@ struct TypeRef {
     // and `isRef` is set (a slice is always spelled behind `&`). `name` is
     // unused. The element MVP is i64.
     bool isSlice = false;
+    // Phase 22: `[T; N]` — a fixed-size array type. When `isArray` is true,
+    // `typeArgs[0]` holds the element type and `arrayLen` the (literal) length.
+    // Distinct from `isSlice` (which has no length and is always behind `&`).
+    bool isArray = false;
+    std::size_t arrayLen = 0;
+    // Phase 22: `(A, B, ...)` — a tuple type. When `isTuple` is true,
+    // `tupleElems` holds the ordered element type refs (>= 2). `name` /
+    // `typeArgs` are unused. A 1-tuple isn't a type (`(T)` == `T`).
+    bool isTuple = false;
+    std::vector<TypeRef> tupleElems;
     // Function-type fields (valid only when isFn == true).
     bool isFn = false;
     std::vector<TypeRef> fnParams;

@@ -1489,6 +1489,26 @@ private:
             collectEffects(*se->end, out);
             return;
         }
+        // Phase 22: arrays / tuples are stack value types (no alloc); their
+        // sub-expressions' effects flow through. Indexing / tuple-field access
+        // are themselves pure reads.
+        if (auto* al = dynamic_cast<const ast::ArrayLitExpr*>(&e)) {
+            for (const auto& el : al->elements) collectEffects(*el, out);
+            return;
+        }
+        if (auto* tl = dynamic_cast<const ast::TupleLitExpr*>(&e)) {
+            for (const auto& el : tl->elements) collectEffects(*el, out);
+            return;
+        }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+            collectEffects(*ix->object, out);
+            collectEffects(*ix->index, out);
+            return;
+        }
+        if (auto* tf = dynamic_cast<const ast::TupleFieldExpr*>(&e)) {
+            collectEffects(*tf->object, out);
+            return;
+        }
         if (auto* bn = dynamic_cast<const ast::BoxNewExpr*>(&e)) {
             // Phase 11: the boxed value's effects flow through. (We don't
             // synthesize `alloc` for the malloc itself — consistent with
@@ -1891,6 +1911,27 @@ private:
             TypePtr elem =
                 tr.typeArgs.empty() ? makeInt() : resolveTypeRef(tr.typeArgs[0]);
             return makeSlice(elem);
+        }
+        // Phase 22: a fixed-size array type `[T; N]`. The `&` (a reference to
+        // an array) is handled by the generic ref-peel below — but since we
+        // build the array type here we must apply the ref wrapper ourselves
+        // when isRef is set on the array node.
+        if (tr.isArray) {
+            TypePtr elem =
+                tr.typeArgs.empty() ? makeInt() : resolveTypeRef(tr.typeArgs[0]);
+            TypePtr arr = makeArray(elem, tr.arrayLen);
+            if (tr.isRef) return makeRef(arr, tr.refIsMut);
+            return arr;
+        }
+        // Phase 22: a tuple type `(A, B, ...)`.
+        if (tr.isTuple) {
+            std::vector<TypePtr> elems;
+            elems.reserve(tr.tupleElems.size());
+            for (const auto& el : tr.tupleElems)
+                elems.push_back(resolveTypeRef(el));
+            TypePtr tup = makeTuple(std::move(elems));
+            if (tr.isRef) return makeRef(tup, tr.refIsMut);
+            return tup;
         }
         // Phase 2.4b: peel off the reference wrapper and wrap the inner
         // resolution. Recursive in case nested refs are introduced later.
@@ -2356,6 +2397,18 @@ private:
         }
         if (auto* se = dynamic_cast<const ast::SliceExpr*>(&e)) {
             return checkSlice(*se);
+        }
+        if (auto* al = dynamic_cast<const ast::ArrayLitExpr*>(&e)) {
+            return checkArrayLit(*al);
+        }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+            return checkIndex(*ix);
+        }
+        if (auto* tl = dynamic_cast<const ast::TupleLitExpr*>(&e)) {
+            return checkTupleLit(*tl);
+        }
+        if (auto* tf = dynamic_cast<const ast::TupleFieldExpr*>(&e)) {
+            return checkTupleField(*tf);
         }
         if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e)) {
             // Phase 12 / 17b: `expr.await` requires its operand to be a
@@ -3201,8 +3254,16 @@ private:
             for (const auto& stmt : block->stmts) {
                 if (auto* let = dynamic_cast<const ast::LetStmt*>(stmt.get())) {
                     collectFreeVars(*let->value, bound, order, seen);
-                    if (bound.insert(let->name).second)
+                    // Phase 22: a tuple-destructuring let binds each element
+                    // name (shadowing captures for the rest of the block).
+                    if (!let->tupleNames.empty()) {
+                        for (const auto& nm : let->tupleNames) {
+                            if (nm == "_") continue;
+                            if (bound.insert(nm).second) added.push_back(nm);
+                        }
+                    } else if (bound.insert(let->name).second) {
                         added.push_back(let->name);
+                    }
                 } else if (auto* ret = dynamic_cast<const ast::ReturnStmt*>(
                                stmt.get())) {
                     if (ret->value)
@@ -3273,6 +3334,32 @@ private:
             collectFreeVars(*re->operand, bound, order, seen);
             return;
         }
+        if (auto* se = dynamic_cast<const ast::SliceExpr*>(&e)) {
+            collectFreeVars(*se->operand, bound, order, seen);
+            collectFreeVars(*se->start, bound, order, seen);
+            collectFreeVars(*se->end, bound, order, seen);
+            return;
+        }
+        // Phase 22: array / tuple literals + index / tuple-field access.
+        if (auto* al = dynamic_cast<const ast::ArrayLitExpr*>(&e)) {
+            for (const auto& el : al->elements)
+                collectFreeVars(*el, bound, order, seen);
+            return;
+        }
+        if (auto* tl = dynamic_cast<const ast::TupleLitExpr*>(&e)) {
+            for (const auto& el : tl->elements)
+                collectFreeVars(*el, bound, order, seen);
+            return;
+        }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+            collectFreeVars(*ix->object, bound, order, seen);
+            collectFreeVars(*ix->index, bound, order, seen);
+            return;
+        }
+        if (auto* tf = dynamic_cast<const ast::TupleFieldExpr*>(&e)) {
+            collectFreeVars(*tf->object, bound, order, seen);
+            return;
+        }
         if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e)) {
             collectFreeVars(*ae->operand, bound, order, seen);
             return;
@@ -3325,8 +3412,20 @@ private:
         // The root binding of an assignable place (Ident or field chain).
         auto rootName = [](const ast::Expr& place) -> const std::string* {
             const ast::Expr* root = &place;
-            while (auto* fe = dynamic_cast<const ast::FieldExpr*>(root))
-                root = fe->object.get();
+            // Phase 22: descend field / index / tuple-field projections — a
+            // write to `arr[i]` / `t.0` of a captured value still mutates the
+            // root binding.
+            while (true) {
+                if (auto* fe = dynamic_cast<const ast::FieldExpr*>(root))
+                    root = fe->object.get();
+                else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(root))
+                    root = ix->object.get();
+                else if (auto* tf =
+                             dynamic_cast<const ast::TupleFieldExpr*>(root))
+                    root = tf->object.get();
+                else
+                    break;
+            }
             if (auto* id = dynamic_cast<const ast::IdentExpr*>(root))
                 return &id->name;
             return nullptr;
@@ -3374,8 +3473,15 @@ private:
             for (const auto& stmt : block->stmts) {
                 if (auto* let = dynamic_cast<const ast::LetStmt*>(stmt.get())) {
                     if (bodyMutatesCapture(*let->value, name, bound)) hit = true;
-                    if (bound.insert(let->name).second)
+                    // Phase 22: bind tuple-destructure names too.
+                    if (!let->tupleNames.empty()) {
+                        for (const auto& nm : let->tupleNames) {
+                            if (nm == "_") continue;
+                            if (bound.insert(nm).second) added.push_back(nm);
+                        }
+                    } else if (bound.insert(let->name).second) {
                         added.push_back(let->name);
+                    }
                 } else if (auto* ret = dynamic_cast<const ast::ReturnStmt*>(
                                stmt.get())) {
                     if (ret->value &&
@@ -3437,6 +3543,26 @@ private:
         }
         if (auto* fe = dynamic_cast<const ast::FieldExpr*>(&e))
             return bodyMutatesCapture(*fe->object, name, bound);
+        if (auto* se = dynamic_cast<const ast::SliceExpr*>(&e))
+            return bodyMutatesCapture(*se->operand, name, bound) ||
+                   bodyMutatesCapture(*se->start, name, bound) ||
+                   bodyMutatesCapture(*se->end, name, bound);
+        // Phase 22: array / tuple literals + index / tuple-field access.
+        if (auto* al = dynamic_cast<const ast::ArrayLitExpr*>(&e)) {
+            for (const auto& el : al->elements)
+                if (bodyMutatesCapture(*el, name, bound)) return true;
+            return false;
+        }
+        if (auto* tl = dynamic_cast<const ast::TupleLitExpr*>(&e)) {
+            for (const auto& el : tl->elements)
+                if (bodyMutatesCapture(*el, name, bound)) return true;
+            return false;
+        }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e))
+            return bodyMutatesCapture(*ix->object, name, bound) ||
+                   bodyMutatesCapture(*ix->index, name, bound);
+        if (auto* tf = dynamic_cast<const ast::TupleFieldExpr*>(&e))
+            return bodyMutatesCapture(*tf->object, name, bound);
         if (auto* te = dynamic_cast<const ast::TryExpr*>(&e))
             return bodyMutatesCapture(*te->operand, name, bound);
         if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e))
@@ -4211,6 +4337,130 @@ private:
         return makeSlice(elem);
     }
 
+    // Phase 22: is `t` a Copy value type allowed as an array/tuple element in
+    // the MVP? i64, bool, unit, and nested arrays/tuples of those. Non-Copy
+    // aggregates (Vec/String/struct/enum/Box/refs) are rejected so we never
+    // need to track moves through array/tuple element copies (stated as an MVP
+    // restriction — full move-tracking through aggregates is deferred).
+    bool isCopyAggregateElem(const TypePtr& t) {
+        TypePtr r = resolve(t);
+        switch (r->kind) {
+        case TypeKind::Int:
+        case TypeKind::Bool:
+        case TypeKind::Unit:
+            return true;
+        case TypeKind::Array:
+            return isCopyAggregateElem(r->arrayElem);
+        case TypeKind::Tuple:
+            for (const auto& el : r->tupleElems)
+                if (!isCopyAggregateElem(el)) return false;
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    // Phase 22: array literal `[a, b, c]`. All elements must share one type T;
+    // the result type is `[T; N]`. An empty `[]` can't infer T -> error.
+    TypePtr checkArrayLit(const ast::ArrayLitExpr& al) {
+        if (al.elements.empty()) {
+            error("empty array literal `[]` cannot infer its element type; "
+                  "annotate with `let a: [T; 0] = [];` is not yet supported",
+                  al.line, al.column);
+            return makeArray(makeInt(), 0);
+        }
+        TypePtr elemTy = checkExpr(*al.elements[0]);
+        for (std::size_t i = 1; i < al.elements.size(); ++i) {
+            TypePtr et = checkExpr(*al.elements[i]);
+            if (!unify(et, elemTy)) {
+                error("array element " + std::to_string(i) + " has type " +
+                          typeToString(et) + ", expected " +
+                          typeToString(elemTy) +
+                          " (all array elements must share one type)",
+                      al.elements[i]->line, al.elements[i]->column);
+            }
+        }
+        if (!isCopyAggregateElem(elemTy)) {
+            error("array elements must be Copy types (i64, bool, or nested "
+                  "arrays/tuples of those) in this version, got " +
+                      typeToString(elemTy),
+                  al.line, al.column);
+        }
+        return makeArray(elemTy, al.elements.size());
+    }
+
+    // Phase 22: indexing `arr[i]` reads element i of a fixed-size array. The
+    // index is i64; a compile-time-constant out-of-range literal index is an
+    // error (a dynamic index is unchecked in the MVP).
+    TypePtr checkIndex(const ast::IndexExpr& ix) {
+        TypePtr objTy = resolve(checkExpr(*ix.object));
+        // Auto-deref `&[T; N]` so `(&a)[i]` works like `a[i]`.
+        while (objTy->kind == TypeKind::Ref) objTy = resolve(objTy->refInner);
+        TypePtr idxTy = checkExpr(*ix.index);
+        if (!unify(idxTy, makeInt())) {
+            error("array index must be i64, got " + typeToString(idxTy),
+                  ix.index->line, ix.index->column);
+        }
+        if (objTy->kind != TypeKind::Array) {
+            error("indexing `[i]` requires a fixed-size array, got " +
+                      typeToString(objTy) +
+                      " (Vec/slice use vec_get / slice_get)",
+                  ix.object->line, ix.object->column);
+            return makeInt();
+        }
+        // Compile-time bounds check for a constant literal index.
+        if (auto* lit = dynamic_cast<const ast::IntLitExpr*>(ix.index.get())) {
+            if (lit->value < 0 ||
+                static_cast<std::size_t>(lit->value) >= objTy->arrayLen) {
+                error("array index " + std::to_string(lit->value) +
+                          " out of bounds for array of length " +
+                          std::to_string(objTy->arrayLen),
+                      ix.index->line, ix.index->column);
+            }
+        }
+        return objTy->arrayElem;
+    }
+
+    // Phase 22: tuple literal `(a, b, ...)`. The empty `()` is unit; otherwise
+    // the type is the tuple of the element types.
+    TypePtr checkTupleLit(const ast::TupleLitExpr& tl) {
+        if (tl.elements.empty()) return makeUnit(); // 0-tuple == unit
+        std::vector<TypePtr> elems;
+        elems.reserve(tl.elements.size());
+        for (const auto& el : tl.elements) {
+            TypePtr et = checkExpr(*el);
+            if (!isCopyAggregateElem(et)) {
+                error("tuple elements must be Copy types (i64, bool, or nested "
+                      "arrays/tuples of those) in this version, got " +
+                          typeToString(et),
+                      el->line, el->column);
+            }
+            elems.push_back(et);
+        }
+        return makeTuple(std::move(elems));
+    }
+
+    // Phase 22: tuple field access `t.0`, `t.1`.
+    TypePtr checkTupleField(const ast::TupleFieldExpr& tf) {
+        TypePtr objTy = resolve(checkExpr(*tf.object));
+        // Auto-deref `&(A, B)` so `(&t).0` works like `t.0`.
+        while (objTy->kind == TypeKind::Ref) objTy = resolve(objTy->refInner);
+        if (objTy->kind != TypeKind::Tuple) {
+            error("tuple field access `." + std::to_string(tf.index) +
+                      "` requires a tuple, got " + typeToString(objTy),
+                  tf.line, tf.column);
+            return makeInt();
+        }
+        if (tf.index >= objTy->tupleElems.size()) {
+            error("tuple index " + std::to_string(tf.index) +
+                      " out of range for tuple with " +
+                      std::to_string(objTy->tupleElems.size()) + " element(s)",
+                  tf.line, tf.column);
+            return makeInt();
+        }
+        return objTy->tupleElems[tf.index];
+    }
+
     // Phase 9: `break` / `break <value>`. Validates a loop is active and,
     // for valued breaks, that the enclosing loop is a `loop` (not while/
     // for) and that the value type unifies across all breaks.
@@ -4271,30 +4521,39 @@ private:
         }
     }
 
-    // Is `e` a place we may assign to? A `let mut` Ident, or a field chain
-    // rooted at a `let mut` Ident or at a `&mut` reference (e.g. through a
-    // `&mut self` receiver).
+    // Is `e` a place we may assign to? A `let mut` Ident, or a chain of field
+    // accesses (`p.x`), array indices (`a[i]`, Phase 22), and tuple-field
+    // accesses (`t.0`, Phase 22) rooted at a `let mut` Ident or at a `&mut`
+    // reference (e.g. through a `&mut self` receiver).
     bool isAssignablePlace(const ast::Expr& e) {
         if (auto* id = dynamic_cast<const ast::IdentExpr*>(&e)) {
             return isMutLocal(id->name);
         }
-        if (auto* fe = dynamic_cast<const ast::FieldExpr*>(&e)) {
-            // Walk to the root of the field chain.
-            const ast::Expr* root = fe->object.get();
-            while (auto* inner = dynamic_cast<const ast::FieldExpr*>(root)) {
-                root = inner->object.get();
+        // Walk to the root of the place chain through field / index / tuple-
+        // field projections (each just narrows into the same root storage).
+        const ast::Expr* root = &e;
+        while (true) {
+            if (auto* fe = dynamic_cast<const ast::FieldExpr*>(root)) {
+                root = fe->object.get();
+            } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(root)) {
+                root = ix->object.get();
+            } else if (auto* tf =
+                           dynamic_cast<const ast::TupleFieldExpr*>(root)) {
+                root = tf->object.get();
+            } else {
+                break;
             }
-            if (auto* rootId = dynamic_cast<const ast::IdentExpr*>(root)) {
-                // Mutable local, OR a binding of `&mut T` (mutable ref —
-                // its pointee fields are writable).
-                if (isMutLocal(rootId->name)) return true;
-                TypePtr rt = lookupLocal(rootId->name);
-                if (rt) {
-                    TypePtr r = resolve(rt);
-                    if (r->kind == TypeKind::Ref && r->refIsMut) return true;
-                }
+        }
+        if (root == &e) return false; // not a projection chain
+        if (auto* rootId = dynamic_cast<const ast::IdentExpr*>(root)) {
+            // Mutable local, OR a binding of `&mut T` (mutable ref — its
+            // pointee fields/elements are writable).
+            if (isMutLocal(rootId->name)) return true;
+            TypePtr rt = lookupLocal(rootId->name);
+            if (rt) {
+                TypePtr r = resolve(rt);
+                if (r->kind == TypeKind::Ref && r->refIsMut) return true;
             }
-            return false;
         }
         return false;
     }
@@ -4488,6 +4747,33 @@ private:
     void checkStmt(const ast::Stmt& s) {
         if (auto* let = dynamic_cast<const ast::LetStmt*>(&s)) {
             TypePtr valT = checkExpr(*let->value);
+            // Phase 22: tuple-destructuring `let (x, y) = t;`. The RHS must be
+            // a tuple of matching arity; each non-`_` name binds to the
+            // corresponding element type. `mut` applies to every bound name.
+            if (!let->tupleNames.empty()) {
+                TypePtr r = resolve(valT);
+                if (r->kind != TypeKind::Tuple) {
+                    error("tuple-destructuring `let (...)` requires a tuple "
+                          "value, got " + typeToString(valT),
+                          let->line, let->column);
+                    return;
+                }
+                if (r->tupleElems.size() != let->tupleNames.size()) {
+                    error("tuple pattern binds " +
+                              std::to_string(let->tupleNames.size()) +
+                              " name(s) but the value is a tuple with " +
+                              std::to_string(r->tupleElems.size()) +
+                              " element(s)",
+                          let->line, let->column);
+                    return;
+                }
+                for (std::size_t i = 0; i < let->tupleNames.size(); ++i) {
+                    if (let->tupleNames[i] == "_") continue;
+                    scopes_.back()[let->tupleNames[i]] = r->tupleElems[i];
+                    if (let->isMut) markMut(let->tupleNames[i]);
+                }
+                return;
+            }
             // Phase 11: an explicit annotation gives the binding's type and
             // is a coercion target (e.g. `let b: Box<dyn Shape> = Box::new(
             // Sq{..})` coerces `Box<Sq>` into `Box<dyn Shape>`).

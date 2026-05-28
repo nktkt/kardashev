@@ -732,6 +732,24 @@ private:
             if (se->end) walkExpr(*se->end);
             return;
         }
+        // Phase 22: array / tuple literals + index / tuple-field access.
+        if (auto* al = dynamic_cast<const ast::ArrayLitExpr*>(&e)) {
+            for (const auto& el : al->elements) walkExpr(*el);
+            return;
+        }
+        if (auto* tl = dynamic_cast<const ast::TupleLitExpr*>(&e)) {
+            for (const auto& el : tl->elements) walkExpr(*el);
+            return;
+        }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+            if (ix->object) walkExpr(*ix->object);
+            if (ix->index) walkExpr(*ix->index);
+            return;
+        }
+        if (auto* tf = dynamic_cast<const ast::TupleFieldExpr*>(&e)) {
+            if (tf->object) walkExpr(*tf->object);
+            return;
+        }
         if (auto* be = dynamic_cast<const ast::BreakExpr*>(&e)) {
             if (be->value) walkExpr(*be->value);
             return;
@@ -763,11 +781,19 @@ private:
     void walkStmt(const ast::Stmt& s) {
         if (auto* ls = dynamic_cast<const ast::LetStmt*>(&s)) {
             if (ls->value) walkExpr(*ls->value); // RHS sees prior bindings
+            std::string kw = ls->isMut ? "let mut " : "let ";
+            // Phase 22: tuple-destructuring binds each element name as a local.
+            if (!ls->tupleNames.empty()) {
+                for (const auto& nm : ls->tupleNames) {
+                    if (nm == "_") continue;
+                    addLocal(nm, ls->line, ls->column, kw + nm);
+                }
+                return;
+            }
             std::string ty = ls->value ? inferredType(ls->value.get()) : "";
             std::string hov = ls->name;
             if (!ty.empty()) hov += ": " + ty;
             else if (ls->annotation) hov += ": " + renderTypeRef(*ls->annotation);
-            std::string kw = ls->isMut ? "let mut " : "let ";
             addLocal(ls->name, ls->line, ls->column, kw + hov);
             return;
         }

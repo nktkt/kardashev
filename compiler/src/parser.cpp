@@ -309,6 +309,18 @@ private:
         return last;
     }
 
+    // Phase 22: wrap a parsed inner type in a reference, for `&(T)`. Nested
+    // references aren't on the grammar, so a simple flag set on the inner node
+    // suffices (the typechecker / codegen ref-peel reads isRef + refIsMut).
+    ast::TypeRef refWrapTypeRef(ast::TypeRef inner, bool isMut,
+                               const Token& ampTok) {
+        inner.isRef = true;
+        inner.refIsMut = isMut;
+        inner.line = ampTok.line;
+        inner.column = ampTok.column;
+        return inner;
+    }
+
     ast::TypeRef parseTypeRef() {
         // Reference prefix: `&` or `&mut` wraps the rest of the type.
         // Phase 2.4b: shared `&T`. Phase 2.4c: `&mut T`. Currently we
@@ -338,6 +350,75 @@ private:
             tr.column = ampTok.column;
             tr.typeArgs.push_back(parseTypeRef());
             expect(TokenKind::RBracket, "]");
+            return tr;
+        }
+        // Phase 22: a fixed-size array type `[T; N]` (no leading `&` — that is
+        // the slice form above). The length N is an integer literal for the
+        // MVP (a `const`-expr N is deferred to Phase 25). `&[T; N]` (a
+        // reference to an array) wraps the array in a Ref.
+        if (check(TokenKind::LBracket)) {
+            Token lb = consume(); // [
+            ast::TypeRef tr;
+            tr.isArray = true;
+            tr.line = isRef ? ampTok.line : lb.line;
+            tr.column = isRef ? ampTok.column : lb.column;
+            tr.typeArgs.push_back(parseTypeRef());
+            expect(TokenKind::Semi, "; in array type [T; N]");
+            Token nTok = expect(TokenKind::Integer, "array length");
+            try {
+                tr.arrayLen = static_cast<std::size_t>(std::stoull(nTok.lexeme));
+            } catch (const std::exception&) {
+                errorHere("array length out of range: " + nTok.lexeme);
+                tr.arrayLen = 0;
+            }
+            expect(TokenKind::RBracket, "]");
+            if (isRef) {
+                tr.isRef = true;
+                tr.refIsMut = refIsMut;
+            }
+            return tr;
+        }
+        // Phase 22: a tuple type `(A, B, ...)`. The empty `()` is the unit type
+        // (the parser synthesizes the same "unit" TypeRef the no-return case
+        // uses); a single `(T)` is just `T` (parenthesized). Two-or-more comma-
+        // separated types form a tuple. A `&(A, B)` wraps the tuple in a Ref.
+        if (check(TokenKind::LParen)) {
+            Token lp = consume(); // (
+            std::size_t baseLine = isRef ? ampTok.line : lp.line;
+            std::size_t baseCol = isRef ? ampTok.column : lp.column;
+            // `()` — unit.
+            if (check(TokenKind::RParen)) {
+                consume();
+                ast::TypeRef tr;
+                tr.name = "unit";
+                tr.line = baseLine;
+                tr.column = baseCol;
+                if (isRef) { tr.isRef = true; tr.refIsMut = refIsMut; }
+                return tr;
+            }
+            std::vector<ast::TypeRef> elems;
+            elems.push_back(parseTypeRef());
+            bool sawComma = false;
+            while (accept(TokenKind::Comma)) {
+                sawComma = true;
+                if (check(TokenKind::RParen)) break; // trailing comma
+                elems.push_back(parseTypeRef());
+            }
+            expect(TokenKind::RParen, ")");
+            if (!sawComma) {
+                // `(T)` — a parenthesized single type, not a tuple.
+                ast::TypeRef inner = std::move(elems[0]);
+                if (isRef) {
+                    return refWrapTypeRef(std::move(inner), refIsMut, ampTok);
+                }
+                return inner;
+            }
+            ast::TypeRef tr;
+            tr.isTuple = true;
+            tr.tupleElems = std::move(elems);
+            tr.line = baseLine;
+            tr.column = baseCol;
+            if (isRef) { tr.isRef = true; tr.refIsMut = refIsMut; }
             return tr;
         }
         // Phase 10a: function type in type position —
@@ -814,6 +895,36 @@ private:
             consume();
             isMut = true;
         }
+        // Phase 22: tuple-destructuring `let (x, y) = t;`. A `(` here begins a
+        // tuple pattern; we collect the element binding names (a `_` drops
+        // that position). No `: Type` annotation on this form (element types
+        // come from the RHS). The single-binding form is unchanged below.
+        auto stmt = std::make_unique<ast::LetStmt>();
+        stmt->line = letTok.line;
+        stmt->column = letTok.column;
+        stmt->isMut = isMut;
+        if (check(TokenKind::LParen)) {
+            consume(); // (
+            if (!check(TokenKind::RParen)) {
+                while (true) {
+                    if (check(TokenKind::Underscore)) {
+                        consume();
+                        stmt->tupleNames.push_back("_");
+                    } else {
+                        Token nm = expect(TokenKind::Identifier,
+                                          "binding name in tuple pattern");
+                        stmt->tupleNames.push_back(nm.lexeme);
+                    }
+                    if (!accept(TokenKind::Comma)) break;
+                    if (check(TokenKind::RParen)) break; // trailing comma
+                }
+            }
+            expect(TokenKind::RParen, ")");
+            expect(TokenKind::Eq, "=");
+            stmt->value = parseExpr();
+            expect(TokenKind::Semi, ";");
+            return stmt;
+        }
         Token nameTok = expect(TokenKind::Identifier, "identifier after 'let'");
         // Phase 11: optional `: Type` annotation (needed to spell out a
         // coercion target like `let b: Box<dyn Shape> = Box::new(...)`).
@@ -824,12 +935,8 @@ private:
         expect(TokenKind::Eq, "=");
         auto value = parseExpr();
         expect(TokenKind::Semi, ";");
-        auto stmt = std::make_unique<ast::LetStmt>();
-        stmt->line = letTok.line;
-        stmt->column = letTok.column;
         stmt->name = nameTok.lexeme;
         stmt->value = std::move(value);
-        stmt->isMut = isMut;
         stmt->annotation = std::move(annotation);
         return stmt;
     }
@@ -970,6 +1077,26 @@ private:
                     expr = std::move(ae);
                     continue;
                 }
+                // Phase 22: a numeric field after `.` is tuple-element access
+                // `t.0`, `t.1`. (There are no float literals, so an Integer
+                // here is unambiguously a tuple index — never part of a
+                // method/field name.)
+                if (check(TokenKind::Integer)) {
+                    Token idxTok = consume();
+                    auto tf = std::make_unique<ast::TupleFieldExpr>();
+                    tf->line = dotTok.line;
+                    tf->column = dotTok.column;
+                    tf->object = std::move(expr);
+                    try {
+                        tf->index =
+                            static_cast<std::size_t>(std::stoull(idxTok.lexeme));
+                    } catch (const std::exception&) {
+                        errorHere("tuple index out of range: " + idxTok.lexeme);
+                        tf->index = 0;
+                    }
+                    expr = std::move(tf);
+                    continue;
+                }
                 Token nameTok = expect(TokenKind::Identifier, "field name after '.'");
                 // `.name(args)` is a method call; `.name` alone is field
                 // access. The distinction matters: method calls route
@@ -1011,26 +1138,36 @@ private:
                 expr = std::move(te);
                 continue;
             }
-            // Phase 13b: `expr[a..b]` — a slice of `expr` (a Vec). Only the
-            // range form is supported (slices view a contiguous region);
-            // there is no plain integer indexing in the language (use
-            // vec_get / slice_get). Builds a SliceExpr; the enclosing `&`
-            // (required by surface syntax) is absorbed in parsePrimary.
+            // Phase 13b / 22: `expr[...]` postfix. Two forms, disambiguated by
+            // whether a `..` follows the first sub-expression:
+            //   - `v[a..b]` is a slice of a Vec (SliceExpr) — half-open range.
+            //   - `arr[i]`  is a fixed-size-array index (IndexExpr) — single
+            //     i64 index, no range.
+            // The leading `&` of a slice (`&v[a..b]`) is absorbed in
+            // parsePrimary; a bare `arr[i]` index needs no `&`.
             if (check(TokenKind::LBracket)) {
                 Token lb = consume();
-                auto se = std::make_unique<ast::SliceExpr>();
-                se->line = lb.line;
-                se->column = lb.column;
-                se->operand = std::move(expr);
-                // Parse `<start> .. <end>` (exclusive). We parse the start as
-                // a precedence-1 expression, require `..`, then the end.
-                se->start = parseExprPrec(1);
-                if (!accept(TokenKind::DotDot)) {
-                    errorHere("expected `..` in slice range");
+                // Parse the first part as a precedence-1 expression so a
+                // trailing `..` (slice range) is NOT swallowed as a RangeExpr.
+                ast::ExprPtr first = parseExprPrec(1);
+                if (accept(TokenKind::DotDot)) {
+                    auto se = std::make_unique<ast::SliceExpr>();
+                    se->line = lb.line;
+                    se->column = lb.column;
+                    se->operand = std::move(expr);
+                    se->start = std::move(first);
+                    se->end = parseExprPrec(1);
+                    expect(TokenKind::RBracket, "]");
+                    expr = std::move(se);
+                    continue;
                 }
-                se->end = parseExprPrec(1);
+                auto ix = std::make_unique<ast::IndexExpr>();
+                ix->line = lb.line;
+                ix->column = lb.column;
+                ix->object = std::move(expr);
+                ix->index = std::move(first);
                 expect(TokenKind::RBracket, "]");
-                expr = std::move(se);
+                expr = std::move(ix);
                 continue;
             }
             // Phase 17a: a `(arglist)` in postfix position calls the fn VALUE
@@ -1090,6 +1227,29 @@ private:
             re->operand = std::move(inner);
             re->isMut = isMut;
             return re;
+        }
+
+        // Phase 22: an array literal `[a, b, c]` in primary position. (A `[`
+        // in *postfix* position is an index / slice, handled in parsePostfix;
+        // here it begins a fresh value.) Element struct-literals are allowed
+        // inside the brackets regardless of the surrounding restriction.
+        if (t.kind == TokenKind::LBracket) {
+            Token lb = consume();
+            auto arr = std::make_unique<ast::ArrayLitExpr>();
+            arr->line = lb.line;
+            arr->column = lb.column;
+            bool prev = restrictStructLit_;
+            restrictStructLit_ = false;
+            if (!check(TokenKind::RBracket)) {
+                while (true) {
+                    arr->elements.push_back(parseExpr());
+                    if (!accept(TokenKind::Comma)) break;
+                    if (check(TokenKind::RBracket)) break; // trailing comma
+                }
+            }
+            restrictStructLit_ = prev;
+            expect(TokenKind::RBracket, "]");
+            return arr;
         }
 
         if (t.kind == TokenKind::Integer) {
@@ -1189,13 +1349,40 @@ private:
         }
 
         if (t.kind == TokenKind::LParen) {
-            advance();
+            Token lp = consume();
             bool prev = restrictStructLit_;
             restrictStructLit_ = false;
-            auto e = parseExpr();
+            // Phase 22: disambiguate a parenthesized expr `(e)` from a tuple
+            // literal `(a, b, ...)` by the comma. `()` is unit; a single `(e)`
+            // (no comma) is just the parenthesized expression; two-or-more
+            // comma-separated exprs form a tuple. Note `()` is currently never
+            // produced as a value elsewhere — but accepting it here keeps the
+            // grammar regular (it lowers to the unit value).
+            if (check(TokenKind::RParen)) {
+                consume();
+                restrictStructLit_ = prev;
+                auto tup = std::make_unique<ast::TupleLitExpr>();
+                tup->line = lp.line;
+                tup->column = lp.column;
+                return tup; // 0-tuple == unit
+            }
+            auto first = parseExpr();
+            if (check(TokenKind::Comma)) {
+                auto tup = std::make_unique<ast::TupleLitExpr>();
+                tup->line = lp.line;
+                tup->column = lp.column;
+                tup->elements.push_back(std::move(first));
+                while (accept(TokenKind::Comma)) {
+                    if (check(TokenKind::RParen)) break; // trailing comma
+                    tup->elements.push_back(parseExpr());
+                }
+                restrictStructLit_ = prev;
+                expect(TokenKind::RParen, ")");
+                return tup;
+            }
             restrictStructLit_ = prev;
             expect(TokenKind::RParen, ")");
-            return e;
+            return first;
         }
 
         if (t.kind == TokenKind::KwIf) {

@@ -3251,6 +3251,23 @@ private:
                 errors_.push_back("codegen: unresolved enum " + r->enumName);
                 return llvm::Type::getInt64Ty(*ctx_);
             }
+            case TypeKind::Array: {
+                // Phase 22: `[T; N]` -> LLVM `[N x <T>]`. A value type, copied
+                // by value (LLVM aggregate) like a struct.
+                llvm::Type* elemTy = mapKardashevType(r->arrayElem);
+                return llvm::ArrayType::get(elemTy, r->arrayLen);
+            }
+            case TypeKind::Tuple: {
+                // Phase 22: `(A, B, ...)` -> an anonymous (literal) LLVM struct
+                // `{ A, B, ... }`. A literal struct is structurally typed, so
+                // two `(i64, bool)` tuples map to the same LLVM type without a
+                // name-mangling table.
+                std::vector<llvm::Type*> elemTys;
+                elemTys.reserve(r->tupleElems.size());
+                for (const auto& el : r->tupleElems)
+                    elemTys.push_back(mapKardashevType(el));
+                return llvm::StructType::get(*ctx_, elemTys);
+            }
             case TypeKind::Function:
                 // Phase 10b: a function-typed VALUE (a let-bound fn, a
                 // `fn(i64)->i64 ! {e}` parameter, an if-selected fn, or a
@@ -3318,6 +3335,24 @@ private:
                                ? makeInt()
                                : astTypeRefToConcrete(tr.typeArgs[0]);
             return makeSlice(elem);
+        }
+        // Phase 22: array / tuple type refs.
+        if (tr.isArray) {
+            TypePtr elem = tr.typeArgs.empty()
+                               ? makeInt()
+                               : astTypeRefToConcrete(tr.typeArgs[0]);
+            TypePtr arr = makeArray(elem, tr.arrayLen);
+            if (tr.isRef) return makeRef(arr, tr.refIsMut);
+            return arr;
+        }
+        if (tr.isTuple) {
+            std::vector<TypePtr> elems;
+            elems.reserve(tr.tupleElems.size());
+            for (const auto& el : tr.tupleElems)
+                elems.push_back(astTypeRefToConcrete(el));
+            TypePtr tup = makeTuple(std::move(elems));
+            if (tr.isRef) return makeRef(tup, tr.refIsMut);
+            return tup;
         }
         if (tr.isRef && !tr.isFn) {
             ast::TypeRef inner = tr;
@@ -3446,6 +3481,14 @@ private:
                                       mangleType(r->refInner);
         case TypeKind::Dyn:    return "dyn_" + r->dynTraitName;
         case TypeKind::Box:    return "box_" + mangleType(r->refInner);
+        case TypeKind::Array:
+            return "arr" + std::to_string(r->arrayLen) + "_" +
+                   mangleType(r->arrayElem);
+        case TypeKind::Tuple: {
+            std::string s = "tup" + std::to_string(r->tupleElems.size());
+            for (const auto& el : r->tupleElems) s += "_" + mangleType(el);
+            return s;
+        }
         }
         return "_unknown";
     }
@@ -3521,6 +3564,24 @@ private:
             TypePtr inner = resolveInInstance(r->refInner);
             if (inner.get() == r->refInner.get()) return r;
             return makeBox(inner);
+        }
+        case TypeKind::Array: {
+            // Phase 22: pin a generic element type to the instance's concrete.
+            TypePtr elem = resolveInInstance(r->arrayElem);
+            if (elem.get() == r->arrayElem.get()) return r;
+            return makeArray(elem, r->arrayLen);
+        }
+        case TypeKind::Tuple: {
+            bool changed = false;
+            std::vector<TypePtr> newElems;
+            newElems.reserve(r->tupleElems.size());
+            for (const auto& el : r->tupleElems) {
+                TypePtr el2 = resolveInInstance(el);
+                if (el2.get() != el.get()) changed = true;
+                newElems.push_back(std::move(el2));
+            }
+            if (!changed) return r;
+            return makeTuple(std::move(newElems));
         }
         case TypeKind::Struct: {
             if (r->typeArgs.empty() && r->structFields.empty()) return r;
@@ -4776,6 +4837,29 @@ private:
 
     void emitStmt(const ast::Stmt& s) {
         if (auto* let = dynamic_cast<const ast::LetStmt*>(&s)) {
+            // Phase 22: tuple-destructuring `let (x, y) = t;`. Evaluate the
+            // tuple value, then bind each non-`_` element name to its
+            // extractvalue (each element is a Copy scalar/aggregate in the
+            // MVP, so no drop tracking is needed).
+            if (!let->tupleNames.empty()) {
+                llvm::Value* tup = emitExpr(*let->value);
+                TypePtr tupTy = lookupExprType(*let->value);
+                for (std::size_t i = 0; i < let->tupleNames.size(); ++i) {
+                    if (let->tupleNames[i] == "_") continue;
+                    llvm::Value* elt = builder_->CreateExtractValue(
+                        tup, {static_cast<unsigned>(i)},
+                        "destr." + let->tupleNames[i]);
+                    auto* alloca = builder_->CreateAlloca(
+                        elt->getType(), nullptr, let->tupleNames[i]);
+                    builder_->CreateStore(elt, alloca);
+                    locals_[let->tupleNames[i]] = alloca;
+                    if (tupTy && tupTy->kind == TypeKind::Tuple &&
+                        i < tupTy->tupleElems.size()) {
+                        localTypes_[let->tupleNames[i]] = tupTy->tupleElems[i];
+                    }
+                }
+                return;
+            }
             // Phase 16: the RHS is a consuming context — if it's a bare
             // droppable binding, ownership moves into the new binding, so the
             // source's drop flag is cleared (after the value bits are read).
@@ -4938,6 +5022,33 @@ private:
             }
             return nullptr;
         }
+        // Phase 22: `arr[i]` as a place — GEP `[0, i]` into the base array's
+        // storage. Enables `let mut a = [..]; a[i] = x;`.
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+            TypePtr baseTy;
+            llvm::Value* baseAddr = emitPlaceBase(*ix->object, baseTy);
+            if (!baseAddr || !baseTy) return nullptr;
+            TypePtr at = resolveInInstance(baseTy);
+            if (at->kind != TypeKind::Array) return nullptr;
+            llvm::Type* arrLlvm = mapKardashevType(at);
+            llvm::Value* idx = emitExpr(*ix->index);
+            llvm::Value* zero =
+                llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
+            return builder_->CreateInBoundsGEP(arrLlvm, baseAddr, {zero, idx},
+                                               "arr_elt_addr");
+        }
+        // Phase 22: `t.N` as a place — StructGEP into the base tuple's storage.
+        if (auto* tf = dynamic_cast<const ast::TupleFieldExpr*>(&e)) {
+            TypePtr baseTy;
+            llvm::Value* baseAddr = emitPlaceBase(*tf->object, baseTy);
+            if (!baseAddr || !baseTy) return nullptr;
+            TypePtr tt = resolveInInstance(baseTy);
+            if (tt->kind != TypeKind::Tuple) return nullptr;
+            llvm::Type* tupLlvm = mapKardashevType(tt);
+            return builder_->CreateStructGEP(
+                tupLlvm, baseAddr, static_cast<unsigned>(tf->index),
+                "tup_elt_addr");
+        }
         return nullptr;
     }
 
@@ -4975,6 +5086,18 @@ private:
             // The address of a nested field is itself a place.
             llvm::Value* addr = emitPlaceAddr(*fe);
             outTy = lookupExprType(*fe);
+            return addr;
+        }
+        // Phase 22: an array index / tuple field can itself be the base of a
+        // further place (e.g. `a[i].field`, `t.0.field`).
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+            llvm::Value* addr = emitPlaceAddr(*ix);
+            outTy = lookupExprType(*ix);
+            return addr;
+        }
+        if (auto* tf = dynamic_cast<const ast::TupleFieldExpr*>(&e)) {
+            llvm::Value* addr = emitPlaceAddr(*tf);
+            outTy = lookupExprType(*tf);
             return addr;
         }
         return nullptr;
@@ -5131,6 +5254,18 @@ private:
         }
         if (auto* se = dynamic_cast<const ast::SliceExpr*>(&e)) {
             return emitSlice(*se);
+        }
+        if (auto* al = dynamic_cast<const ast::ArrayLitExpr*>(&e)) {
+            return emitArrayLit(*al);
+        }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+            return emitIndex(*ix);
+        }
+        if (auto* tl = dynamic_cast<const ast::TupleLitExpr*>(&e)) {
+            return emitTupleLit(*tl);
+        }
+        if (auto* tf = dynamic_cast<const ast::TupleFieldExpr*>(&e)) {
+            return emitTupleField(*tf);
         }
         if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e)) {
             return emitAwait(*ae);
@@ -5321,6 +5456,121 @@ private:
         agg = builder_->CreateInsertValue(agg, basePtr, {0}, "slice.ptr");
         agg = builder_->CreateInsertValue(agg, len, {1}, "slice.len");
         return agg;
+    }
+
+    // Phase 22: array literal `[a, b, c]` -> an LLVM `[N x <T>]` value built by
+    // inserting each (Copy) element. Value type, copied like a struct.
+    llvm::Value* emitArrayLit(const ast::ArrayLitExpr& al) {
+        TypePtr ty = lookupExprType(al);
+        if (ty) ty = resolveInInstance(ty);
+        llvm::Type* llvmTy =
+            ty ? mapKardashevType(ty)
+               : llvm::ArrayType::get(llvm::Type::getInt64Ty(*ctx_),
+                                      al.elements.size());
+        auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(llvmTy);
+        if (!arrTy) {
+            errors_.push_back("codegen: array literal did not map to an LLVM "
+                              "array type");
+            return llvm::UndefValue::get(llvmTy);
+        }
+        llvm::Value* agg = llvm::UndefValue::get(arrTy);
+        for (unsigned i = 0; i < al.elements.size(); ++i) {
+            llvm::Value* v = emitConsume(*al.elements[i]);
+            agg = builder_->CreateInsertValue(agg, v, {i}, "arr.elt");
+        }
+        return agg;
+    }
+
+    // Phase 22: array index `arr[i]` -> read element i. We spill the array
+    // value to a temp alloca, GEP `[0, i]`, and load — uniform for both a
+    // constant and a dynamic index, and for any object expression. No runtime
+    // bounds check in the MVP (matches the unchecked vec_get/slice_get); a
+    // constant out-of-range index was already rejected at typecheck.
+    llvm::Value* emitIndex(const ast::IndexExpr& ix) {
+        TypePtr objTy = lookupExprType(*ix.object);
+        if (objTy) objTy = resolveInInstance(objTy);
+        // Auto-deref `&[T; N]`: if the object is a reference, its value is a
+        // pointer straight to the array storage — GEP through it directly.
+        unsigned refDepth = 0;
+        while (objTy && objTy->kind == TypeKind::Ref) {
+            objTy = resolveInInstance(objTy->refInner);
+            ++refDepth;
+        }
+        if (!objTy || objTy->kind != TypeKind::Array) {
+            errors_.push_back("codegen: index on non-array value");
+            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
+        }
+        llvm::Type* arrLlvm = mapKardashevType(objTy);
+        llvm::Type* elemLlvm = mapKardashevType(objTy->arrayElem);
+        llvm::Value* idx = emitExpr(*ix.index);
+
+        llvm::Value* arrPtr = nullptr;
+        if (refDepth > 0) {
+            // The reference value is a pointer to the array; follow each
+            // additional `&` layer with a load.
+            arrPtr = emitExpr(*ix.object);
+            auto* ptrTy = llvm::PointerType::get(*ctx_, 0);
+            for (unsigned d = 1; d < refDepth; ++d)
+                arrPtr = builder_->CreateLoad(ptrTy, arrPtr, "deref");
+        } else {
+            // Value array: spill to a temp slot so we can GEP+load by index.
+            llvm::Value* arrVal = emitExpr(*ix.object);
+            arrPtr = entryAlloca(arrLlvm, "arr.idx.tmp");
+            builder_->CreateStore(arrVal, arrPtr);
+        }
+        llvm::Value* zero =
+            llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
+        llvm::Value* eltPtr =
+            builder_->CreateInBoundsGEP(arrLlvm, arrPtr, {zero, idx}, "arr.eltp");
+        return builder_->CreateLoad(elemLlvm, eltPtr, "arr.elt");
+    }
+
+    // Phase 22: tuple literal `(a, b, ...)` -> an anonymous LLVM struct value.
+    llvm::Value* emitTupleLit(const ast::TupleLitExpr& tl) {
+        if (tl.elements.empty()) {
+            // 0-tuple == unit; nothing to materialize (unit lowers to void).
+            return nullptr;
+        }
+        TypePtr ty = lookupExprType(tl);
+        if (ty) ty = resolveInInstance(ty);
+        llvm::Type* llvmTy = ty ? mapKardashevType(ty) : nullptr;
+        auto* st = llvm::dyn_cast_or_null<llvm::StructType>(llvmTy);
+        if (!st) {
+            errors_.push_back("codegen: tuple literal did not map to an LLVM "
+                              "struct type");
+            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
+        }
+        llvm::Value* agg = llvm::UndefValue::get(st);
+        for (unsigned i = 0; i < tl.elements.size(); ++i) {
+            llvm::Value* v = emitConsume(*tl.elements[i]);
+            agg = builder_->CreateInsertValue(agg, v, {i}, "tup.elt");
+        }
+        return agg;
+    }
+
+    // Phase 22: tuple field access `t.0` -> extractvalue at the index.
+    llvm::Value* emitTupleField(const ast::TupleFieldExpr& tf) {
+        TypePtr objTy = lookupExprType(*tf.object);
+        if (objTy) objTy = resolveInInstance(objTy);
+        unsigned refDepth = 0;
+        while (objTy && objTy->kind == TypeKind::Ref) {
+            objTy = resolveInInstance(objTy->refInner);
+            ++refDepth;
+        }
+        if (!objTy || objTy->kind != TypeKind::Tuple) {
+            errors_.push_back("codegen: tuple field access on non-tuple value");
+            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
+        }
+        llvm::Value* obj = emitExpr(*tf.object);
+        if (refDepth > 0) {
+            llvm::Type* tupLlvm = mapKardashevType(objTy);
+            auto* ptrTy = llvm::PointerType::get(*ctx_, 0);
+            for (unsigned d = 1; d < refDepth; ++d)
+                obj = builder_->CreateLoad(ptrTy, obj, "deref");
+            obj = builder_->CreateLoad(tupLlvm, obj, "tup.deref");
+        }
+        return builder_->CreateExtractValue(
+            obj, {static_cast<unsigned>(tf.index)}, "tup.f");
     }
 
     // Phase 11: `Box::new(v)` — malloc sizeof(T), move v into the heap slot,

@@ -65,6 +65,17 @@ bool isCopyType(const TypePtr& t) {
     case TypeKind::Dyn:
     case TypeKind::Box:
         return false;
+    // Phase 22: arrays / tuples are value types; they're Copy iff every
+    // element is Copy. The typechecker already restricts array/tuple elements
+    // to Copy types in the MVP, so these are Copy in any valid program — but
+    // classify structurally so the borrow checker stays correct if that
+    // restriction is later relaxed.
+    case TypeKind::Array:
+        return isCopyType(r->arrayElem);
+    case TypeKind::Tuple:
+        for (const auto& el : r->tupleElems)
+            if (!isCopyType(el)) return false;
+        return true;
     }
     return false;
 }
@@ -142,6 +153,26 @@ private:
         // ref-peel since the `&` is part of the slice spelling).
         if (tr.isSlice) {
             return makeSlice(makeInt());
+        }
+        // Phase 22: a fixed-size array `[T; N]` value type. Classified Copy iff
+        // its element is (it always is in the MVP — typecheck-restricted).
+        if (tr.isArray) {
+            TypePtr elem = tr.typeArgs.empty()
+                               ? makeInt()
+                               : paramTypeFromAst(tr.typeArgs[0]);
+            TypePtr arr = makeArray(elem, tr.arrayLen);
+            if (tr.isRef) return makeRef(arr, tr.refIsMut);
+            return arr;
+        }
+        // Phase 22: a tuple `(A, B, ...)` value type.
+        if (tr.isTuple) {
+            std::vector<TypePtr> elems;
+            elems.reserve(tr.tupleElems.size());
+            for (const auto& el : tr.tupleElems)
+                elems.push_back(paramTypeFromAst(el));
+            TypePtr tup = makeTuple(std::move(elems));
+            if (tr.isRef) return makeRef(tup, tr.refIsMut);
+            return tup;
         }
         if (tr.isRef) {
             ast::TypeRef inner = tr;
@@ -289,6 +320,26 @@ private:
             prePass(*se->end);
             return;
         }
+        // Phase 22: array / tuple literals + index / tuple-field access. These
+        // are Copy value types (the typechecker restricts elements to Copy), so
+        // they just walk children for position accounting.
+        if (auto* al = dynamic_cast<const ast::ArrayLitExpr*>(&e)) {
+            for (const auto& el : al->elements) prePass(*el);
+            return;
+        }
+        if (auto* tl = dynamic_cast<const ast::TupleLitExpr*>(&e)) {
+            for (const auto& el : tl->elements) prePass(*el);
+            return;
+        }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+            prePass(*ix->object);
+            prePass(*ix->index);
+            return;
+        }
+        if (auto* tf = dynamic_cast<const ast::TupleFieldExpr*>(&e)) {
+            prePass(*tf->object);
+            return;
+        }
         if (auto* be = dynamic_cast<const ast::BreakExpr*>(&e)) {
             if (be->value) prePass(*be->value);
             return;
@@ -303,6 +354,22 @@ private:
         for (const auto& stmt : block.stmts) {
             if (auto* let = dynamic_cast<const ast::LetStmt*>(stmt.get())) {
                 prePass(*let->value);
+                // Phase 22: tuple-destructuring binds each element name. Copy
+                // element types (typecheck-restricted) -> Copy bindings.
+                if (!let->tupleNames.empty()) {
+                    TypePtr vt = typeOf(*let->value);
+                    TypePtr rv = vt ? resolve(vt) : nullptr;
+                    for (std::size_t i = 0; i < let->tupleNames.size(); ++i) {
+                        if (let->tupleNames[i] == "_") continue;
+                        TypePtr et =
+                            (rv && rv->kind == TypeKind::Tuple &&
+                             i < rv->tupleElems.size())
+                                ? rv->tupleElems[i]
+                                : makeInt();
+                        newBinding(let->tupleNames[i], et);
+                    }
+                    continue;
+                }
                 newBinding(let->name, typeOf(*let->value));
                 continue;
             }
@@ -529,6 +596,32 @@ private:
         if (auto* se = dynamic_cast<const ast::SliceExpr*>(&e)) {
             return handleSliceExpr(*se, expectExpire);
         }
+        // Phase 22: array / tuple literals + index / tuple-field access. Copy
+        // value types — each child is read (a Copy read of a bare Ident is a
+        // no-op in consumeIdent), so we simply recurse, mirroring prePass.
+        if (auto* al = dynamic_cast<const ast::ArrayLitExpr*>(&e)) {
+            for (const auto& el : al->elements)
+                lastInSubtree =
+                    std::max(lastInSubtree, consume(*el, expectExpire));
+            return lastInSubtree;
+        }
+        if (auto* tl = dynamic_cast<const ast::TupleLitExpr*>(&e)) {
+            for (const auto& el : tl->elements)
+                lastInSubtree =
+                    std::max(lastInSubtree, consume(*el, expectExpire));
+            return lastInSubtree;
+        }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+            lastInSubtree =
+                std::max(lastInSubtree, consume(*ix->object, expectExpire));
+            lastInSubtree =
+                std::max(lastInSubtree, consume(*ix->index, expectExpire));
+            return lastInSubtree;
+        }
+        if (auto* tf = dynamic_cast<const ast::TupleFieldExpr*>(&e)) {
+            return std::max(lastInSubtree,
+                            consume(*tf->object, expectExpire));
+        }
         if (auto* be = dynamic_cast<const ast::BreakExpr*>(&e)) {
             if (be->value) {
                 lastInSubtree = std::max(lastInSubtree,
@@ -699,6 +792,19 @@ private:
                     dynamic_cast<const ast::SliceExpr*>(let->value.get()) !=
                         nullptr;
                 int rhsEnd = consume(*let->value, /*expectExpire=*/-1);
+                // Phase 22: tuple-destructuring re-maps each element name to
+                // the declPos that pass 1 assigned (one `pos_` tick per
+                // non-`_` name, mirroring prePassBlock's newBinding calls).
+                if (!let->tupleNames.empty()) {
+                    for (const auto& nm : let->tupleNames) {
+                        if (nm == "_") continue;
+                        int dp = pos_++;
+                        scopes_.back()[nm] = dp;
+                    }
+                    retireExpiredLoans(rhsEnd);
+                    last = std::max(last, rhsEnd);
+                    continue;
+                }
                 int borrowerDp = pos_++;
                 scopes_.back()[let->name] = borrowerDp;
                 if (rhsStartsNamedBorrow) attachLoanToBorrower(borrowerDp);

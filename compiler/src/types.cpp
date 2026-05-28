@@ -102,6 +102,25 @@ TypePtr makeSlice(TypePtr elem) {
     return t;
 }
 
+TypePtr makeArray(TypePtr elem, std::size_t len) {
+    // Phase 22: `[T; N]` — a value-type fixed-size array. Element in
+    // `arrayElem`, length in `arrayLen`. Lowers to `[N x <T>]`.
+    auto t = std::make_shared<Type>();
+    t->kind = TypeKind::Array;
+    t->arrayElem = std::move(elem);
+    t->arrayLen = len;
+    return t;
+}
+
+TypePtr makeTuple(std::vector<TypePtr> elems) {
+    // Phase 22: `(A, B, ...)` — a value-type anonymous product. Lowers to an
+    // anonymous LLVM struct `{ A, B, ... }`.
+    auto t = std::make_shared<Type>();
+    t->kind = TypeKind::Tuple;
+    t->tupleElems = std::move(elems);
+    return t;
+}
+
 TypePtr makeFuture(TypePtr result) {
     // Phase 17b: a `Future<T>` is the built-in single-layout struct `Future`
     // carrying its result type in `typeArgs[0]`. Codegen lowers every Future
@@ -138,6 +157,13 @@ bool occurs(int varId, const TypePtr& t) {
     // Phase 11: a Box<T> can hold a Var T, so descend (mirrors how the
     // existing code descends into Function args).
     if (r->kind == TypeKind::Box) return occurs(varId, r->refInner);
+    // Phase 22: arrays / tuples can hold Var element types, so descend.
+    if (r->kind == TypeKind::Array) return occurs(varId, r->arrayElem);
+    if (r->kind == TypeKind::Tuple) {
+        for (const auto& el : r->tupleElems)
+            if (occurs(varId, el)) return true;
+        return false;
+    }
     return false;
 }
 } // namespace
@@ -312,6 +338,21 @@ bool unify(const TypePtr& a, const TypePtr& b) {
         return unify(ra->refInner, rb->refInner);
     }
 
+    if (ra->kind == TypeKind::Array) {
+        // Phase 22: `[T; N] ~ [U; M]` iff N == M and T ~ U.
+        if (ra->arrayLen != rb->arrayLen) return false;
+        return unify(ra->arrayElem, rb->arrayElem);
+    }
+
+    if (ra->kind == TypeKind::Tuple) {
+        // Phase 22: tuples unify iff same arity and pointwise element unify.
+        if (ra->tupleElems.size() != rb->tupleElems.size()) return false;
+        for (std::size_t i = 0; i < ra->tupleElems.size(); ++i) {
+            if (!unify(ra->tupleElems[i], rb->tupleElems[i])) return false;
+        }
+        return true;
+    }
+
     if (ra->kind == TypeKind::Enum) {
         if (ra->enumName != rb->enumName) return false;
         if (ra->typeArgs.size() != rb->typeArgs.size()) return false;
@@ -425,6 +466,23 @@ TypePtr instantiate(const TypePtr& t,
         if (inner.get() == r->refInner.get()) return r;
         return makeBox(inner);
     }
+    case TypeKind::Array: {
+        TypePtr elem = instantiate(r->arrayElem, subst);
+        if (elem.get() == r->arrayElem.get()) return r;
+        return makeArray(elem, r->arrayLen);
+    }
+    case TypeKind::Tuple: {
+        bool changed = false;
+        std::vector<TypePtr> newElems;
+        newElems.reserve(r->tupleElems.size());
+        for (const auto& el : r->tupleElems) {
+            TypePtr el2 = instantiate(el, subst);
+            if (el2.get() != el.get()) changed = true;
+            newElems.push_back(std::move(el2));
+        }
+        if (!changed) return r;
+        return makeTuple(std::move(newElems));
+    }
     default:
         return r;
     }
@@ -500,6 +558,18 @@ std::string typeToString(const TypePtr& t) {
         return "dyn " + r->dynTraitName;
     case TypeKind::Box:
         return "Box<" + typeToString(r->refInner) + ">";
+    case TypeKind::Array:
+        return "[" + typeToString(r->arrayElem) + "; " +
+               std::to_string(r->arrayLen) + "]";
+    case TypeKind::Tuple: {
+        std::string s = "(";
+        for (std::size_t i = 0; i < r->tupleElems.size(); ++i) {
+            if (i > 0) s += ", ";
+            s += typeToString(r->tupleElems[i]);
+        }
+        s += ")";
+        return s;
+    }
     }
     return "?";
 }

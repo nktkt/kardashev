@@ -90,6 +90,25 @@ private:
             std::string ref = t.refIsMut ? "&mut " : "&";
             return ref + "[" + elem + "]";
         }
+        // Phase 22: a fixed-size array type `[T; N]` (optionally `&[T; N]`).
+        if (t.isArray) {
+            std::string elem = t.typeArgs.empty() ? std::string()
+                                                  : typeToString(t.typeArgs[0]);
+            std::string s = "[" + elem + "; " + std::to_string(t.arrayLen) + "]";
+            if (t.isRef) s = std::string(t.refIsMut ? "&mut " : "&") + s;
+            return s;
+        }
+        // Phase 22: a tuple type `(A, B, ...)`.
+        if (t.isTuple) {
+            std::string s = "(";
+            for (std::size_t i = 0; i < t.tupleElems.size(); ++i) {
+                if (i) s += ", ";
+                s += typeToString(t.tupleElems[i]);
+            }
+            s += ")";
+            if (t.isRef) s = std::string(t.refIsMut ? "&mut " : "&") + s;
+            return s;
+        }
         std::string ref;
         if (t.isRef) ref = t.refIsMut ? "&mut " : "&";
         std::string core;
@@ -318,8 +337,19 @@ private:
         if (auto* let = dynamic_cast<const LetStmt*>(&s)) {
             out_ += "let ";
             if (let->isMut) out_ += "mut ";
-            out_ += let->name;
-            if (let->annotation) out_ += ": " + typeToString(*let->annotation);
+            // Phase 22: tuple-destructuring `let (x, y) = ...;`.
+            if (!let->tupleNames.empty()) {
+                out_ += "(";
+                for (std::size_t i = 0; i < let->tupleNames.size(); ++i) {
+                    if (i) out_ += ", ";
+                    out_ += let->tupleNames[i];
+                }
+                out_ += ")";
+            } else {
+                out_ += let->name;
+                if (let->annotation)
+                    out_ += ": " + typeToString(*let->annotation);
+            }
             out_ += " = ";
             printExpr(*let->value, depth, /*parentPrec=*/0);
             out_ += ";";
@@ -631,6 +661,41 @@ private:
             } else {
                 printExpr(*cl->body, depth, 0);
             }
+            return;
+        }
+        // Phase 22: array literal `[a, b, c]`.
+        if (auto* al = dynamic_cast<const ArrayLitExpr*>(&e)) {
+            out_ += "[";
+            for (std::size_t i = 0; i < al->elements.size(); ++i) {
+                if (i) out_ += ", ";
+                printExpr(*al->elements[i], depth, 0);
+            }
+            out_ += "]";
+            return;
+        }
+        // Phase 22: array index `arr[i]` (postfix, binds tight).
+        if (auto* ix = dynamic_cast<const IndexExpr*>(&e)) {
+            printExpr(*ix->object, depth, /*parentPrec=*/100);
+            out_ += "[";
+            printExpr(*ix->index, depth, 0);
+            out_ += "]";
+            return;
+        }
+        // Phase 22: tuple literal `(a, b)`. A trailing comma on the 1-tuple is
+        // unnecessary here (the parser only builds tuples of >= 2 elements).
+        if (auto* tl = dynamic_cast<const TupleLitExpr*>(&e)) {
+            out_ += "(";
+            for (std::size_t i = 0; i < tl->elements.size(); ++i) {
+                if (i) out_ += ", ";
+                printExpr(*tl->elements[i], depth, 0);
+            }
+            out_ += ")";
+            return;
+        }
+        // Phase 22: tuple field access `t.0` (postfix, binds tight).
+        if (auto* tf = dynamic_cast<const TupleFieldExpr*>(&e)) {
+            printExpr(*tf->object, depth, /*parentPrec=*/100);
+            out_ += "." + std::to_string(tf->index);
             return;
         }
         out_ += "/* <unknown expr> */";

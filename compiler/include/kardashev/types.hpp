@@ -46,6 +46,16 @@ enum class TypeKind {
     // type is stored in `refInner` (shared with Ref — they never coexist on
     // one node).
     Box,
+    // Phase 22: a fixed-size array `[T; N]` — a stack-allocated value type
+    // (copied like a struct). The element type is stored in `arrayElem` and
+    // the length in `arrayLen`. Lowers to an LLVM `[N x <T>]`. The MVP
+    // restricts T to Copy types (i64, bool, nested arrays/tuples of those).
+    Array,
+    // Phase 22: an anonymous product `(A, B, ...)` — a value type (copied like
+    // a struct). The element types are stored in `tupleElems` (>= 2 elements;
+    // the 0-tuple `()` is unit, and `(x)` is just a parenthesized expr).
+    // Lowers to an anonymous LLVM struct `{ A, B, ... }`.
+    Tuple,
 };
 
 struct Type;
@@ -113,6 +123,14 @@ struct Type {
 
     // Dyn (Phase 11): the trait name a `dyn Trait` object dispatches through.
     std::string dynTraitName;
+
+    // Array (Phase 22): element type + compile-time-known length. Lowers to
+    // an LLVM `[arrayLen x <arrayElem>]`.
+    TypePtr arrayElem;
+    std::size_t arrayLen = 0;
+
+    // Tuple (Phase 22): the ordered element types of `(A, B, ...)`.
+    std::vector<TypePtr> tupleElems;
 };
 
 TypePtr makeInt();
@@ -141,6 +159,10 @@ TypePtr makeSlice(TypePtr elem);
 // frame }` layout; the result type only affects the per-T `Poll<T>` and the
 // per-T `block_on`/`.await` value handling (sized via DataLayout, like Vec).
 TypePtr makeFuture(TypePtr result);
+// Phase 22: a fixed-size array `[T; N]` value type and an anonymous tuple
+// `(A, B, ...)` value type. Both are copied by value like structs.
+TypePtr makeArray(TypePtr elem, std::size_t len);
+TypePtr makeTuple(std::vector<TypePtr> elems);
 
 // Follow the union-find link chain to the representative. Performs
 // path compression as a side effect.
