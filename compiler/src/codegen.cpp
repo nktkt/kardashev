@@ -2083,20 +2083,20 @@ private:
         // The two stacks: { i8* entries, i64 depth, i64 cap }, zero-initialized.
         auto* stackTy =
             llvm::StructType::create(ctx, {i8PtrTy, i64Ty, i64Ty}, "kd.ustack");
-        // Thread-local so each thread unwinds its OWN cleanup/catch stacks —
-        // a panic on one thread never touches another's pending Drops. (The
-        // GeneralDynamic TLS model works under both the ORC JIT — host process
-        // links libc's TLS support — and AOT via clang.)
+        // Process-global (NOT thread-local). Thread-local would be ideal for
+        // per-thread panic isolation, but on macOS LLVM lowers a thread_local
+        // global to an `__emutls_get_address` call that the ORC JIT cannot
+        // resolve (the symbol lives in compiler-rt, only linked into AOT
+        // binaries), breaking JIT execution. Process-global works in JIT + AOT
+        // on both platforms. Trade-off: concurrent panics across OS threads
+        // (Phase 19) share these stacks and are not isolated — acceptable for
+        // the MVP since panics are typically on the main thread; documented.
         auto* cleanupG = new llvm::GlobalVariable(
             *module_, stackTy, false, llvm::GlobalValue::InternalLinkage,
             llvm::ConstantAggregateZero::get(stackTy), "__kd_cleanup");
-        cleanupG->setThreadLocalMode(
-            llvm::GlobalValue::GeneralDynamicTLSModel);
         auto* catchG = new llvm::GlobalVariable(
             *module_, stackTy, false, llvm::GlobalValue::InternalLinkage,
             llvm::ConstantAggregateZero::get(stackTy), "__kd_catch");
-        catchG->setThreadLocalMode(
-            llvm::GlobalValue::GeneralDynamicTLSModel);
 
         // Shared helper: ensure `*stack` has room for one more `entTy` element,
         // growing (realloc, doubling, min 8) when depth==cap. Returns the base
