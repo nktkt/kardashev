@@ -3025,17 +3025,19 @@ private:
 
             // next() must return Option<i64>; the element is its Some payload.
             TypePtr nr = resolve(nextRet);
-            if (nr->kind == TypeKind::Enum && nr->enumName == "Option" &&
-                !nr->enumVariants.empty()) {
+            bool validIteratorOption = false;
+            if (nr->kind == TypeKind::Enum && nr->enumName == "Option") {
                 for (const auto& v : nr->enumVariants) {
                     if (v.name == "Some" && !v.payloadTypes.empty()) {
                         elemTy = v.payloadTypes[0];
+                        validIteratorOption = true;
                         break;
                     }
                 }
-            } else {
-                error("Iterator::next must return Option<i64>, got " +
-                          typeToString(nextRet),
+            }
+            if (!validIteratorOption) {
+                error("Iterator::next must return Option with a payload-bearing "
+                      "Some variant, got " + typeToString(nextRet),
                       fe.iter->line, fe.iter->column);
             }
         }
