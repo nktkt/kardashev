@@ -78,3 +78,27 @@ if [[ "$rc" -ne 60 ]]; then
 fi
 
 echo "PASS: Vec round-trips through JIT + AOT (push×3, len=3, sum=60)"
+
+cat > "$TMP/vec_unit.kd" <<'EOF'
+fn main() -> i64 ! { alloc } {
+    let v = vec_new();
+    vec_push(&mut v, { 1; });
+    0
+}
+EOF
+
+set +e
+VEC_UNIT_OUT=$("$KARDC" "$TMP/vec_unit.kd" 2>&1)
+rc=$?
+set -e
+if [[ "$rc" -eq 0 ]]; then
+    echo "FAIL: vec_push with unit element unexpectedly compiled"
+    exit 1
+fi
+if [[ "$VEC_UNIT_OUT" != *"Vec element type cannot be unit"* ]]; then
+    echo "FAIL: expected unit-element Vec type error"
+    echo "$VEC_UNIT_OUT"
+    exit 1
+fi
+
+echo "PASS: Vec<unit> is rejected during typechecking"

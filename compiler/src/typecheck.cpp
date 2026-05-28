@@ -1532,6 +1532,15 @@ private:
             for (std::size_t i = n; i < call.args.size(); ++i) {
                 checkExpr(*call.args[i]);
             }
+            if ((call.callee == "vec_new" || call.callee == "vec_push" ||
+                 call.callee == "vec_get" || call.callee == "vec_len") &&
+                !typeArgs.empty()) {
+                TypePtr elemTy = resolve(typeArgs[0]);
+                if (elemTy->kind == TypeKind::Unit) {
+                    error("Vec element type cannot be unit", call.line,
+                          call.column);
+                }
+            }
             if (!schema.genericVars.empty()) {
                 callInstantiations_[&call] = std::move(typeArgs);
             }
