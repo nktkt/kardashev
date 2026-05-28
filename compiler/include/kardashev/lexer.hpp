@@ -81,6 +81,8 @@ enum class TokenKind {
     RParen,
     LBrace,
     RBrace,
+    LBracket, // Phase 13b: `[` (slice types `&[T]` + slice exprs `&v[a..b]`)
+    RBracket, // Phase 13b: `]`
     Comma,
     Semi,
     Colon,

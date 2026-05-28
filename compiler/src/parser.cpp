@@ -293,6 +293,21 @@ private:
                 refIsMut = true;
             }
         }
+        // Phase 13b: slice type `&[T]` — only valid behind `&`. The element
+        // type is parsed between the brackets; the whole thing becomes a
+        // TypeRef with `isSlice` set and `typeArgs[0]` the element.
+        if (isRef && check(TokenKind::LBracket)) {
+            consume(); // [
+            ast::TypeRef tr;
+            tr.isSlice = true;
+            tr.isRef = true;
+            tr.refIsMut = refIsMut;
+            tr.line = ampTok.line;
+            tr.column = ampTok.column;
+            tr.typeArgs.push_back(parseTypeRef());
+            expect(TokenKind::RBracket, "]");
+            return tr;
+        }
         // Phase 10a: function type in type position —
         // `fn(T1, T2) -> Ret ! { effects }`. The trailing effect row is
         // optional (absent = pure) and reuses the same parser as fn decls.
@@ -794,6 +809,28 @@ private:
                 expr = std::move(te);
                 continue;
             }
+            // Phase 13b: `expr[a..b]` — a slice of `expr` (a Vec). Only the
+            // range form is supported (slices view a contiguous region);
+            // there is no plain integer indexing in the language (use
+            // vec_get / slice_get). Builds a SliceExpr; the enclosing `&`
+            // (required by surface syntax) is absorbed in parsePrimary.
+            if (check(TokenKind::LBracket)) {
+                Token lb = consume();
+                auto se = std::make_unique<ast::SliceExpr>();
+                se->line = lb.line;
+                se->column = lb.column;
+                se->operand = std::move(expr);
+                // Parse `<start> .. <end>` (exclusive). We parse the start as
+                // a precedence-1 expression, require `..`, then the end.
+                se->start = parseExprPrec(1);
+                if (!accept(TokenKind::DotDot)) {
+                    errorHere("expected `..` in slice range");
+                }
+                se->end = parseExprPrec(1);
+                expect(TokenKind::RBracket, "]");
+                expr = std::move(se);
+                continue;
+            }
             break;
         }
         return expr;
@@ -811,6 +848,13 @@ private:
                 isMut = true;
             }
             auto inner = parsePostfix();
+            // Phase 13b: `&v[a..b]` — the postfix `[a..b]` already produced a
+            // SliceExpr; the leading `&` is part of the slice syntax (a slice
+            // is itself a borrow), so absorb it and hand back the SliceExpr
+            // directly rather than wrapping it in a RefExpr.
+            if (dynamic_cast<ast::SliceExpr*>(inner.get())) {
+                return inner;
+            }
             auto re = std::make_unique<ast::RefExpr>();
             re->line = amp.line;
             re->column = amp.column;

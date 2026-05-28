@@ -1200,6 +1200,121 @@ void test_map_filter_eager_vec() {
     expectEquals(v, 30, "map_filter_eager_vec"); // (1+2+3+4+5)*2 == 30
 }
 
+// --- Phase 13b: growable String, HashMap<i64,i64>, slices ---
+
+void test_string_build_and_len() {
+    // Build "ab"+"cd" incrementally; return the length (4).
+    auto v = compileAndRun(
+        "fn main() -> i64 ! { alloc } {\n"
+        "    let s = string_new();\n"
+        "    string_push_str(&mut s, \"ab\");\n"
+        "    string_push_str(&mut s, \"cd\");\n"
+        "    string_len(&s)\n"
+        "}",
+        "main", "string_build_and_len");
+    expectEquals(v, 4, "string_build_and_len");
+}
+
+void test_string_push_grows_past_initial_cap() {
+    // Append many small chunks so the buffer must realloc several times;
+    // the final length is 2*10 == 20.
+    auto v = compileAndRun(
+        "fn append_n(s: &mut String, i: i64, n: i64) -> i64 ! { alloc } {\n"
+        "    if i < n { string_push_str(s, \"xy\"); append_n(s, i + 1, n) }\n"
+        "    else { 0 }\n"
+        "}\n"
+        "fn main() -> i64 ! { alloc } {\n"
+        "    let s = string_new();\n"
+        "    append_n(&mut s, 0, 10);\n"
+        "    string_len(&s)\n"
+        "}",
+        "main", "string_push_grows");
+    expectEquals(v, 20, "string_push_grows");
+}
+
+void test_hashmap_insert_get_overwrite() {
+    // Needs Option in scope (codegen's hashmap_get builds Option<i64>); the
+    // unit-test harness bypasses the prelude, so declare it inline.
+    auto v = compileAndRun(
+        "enum Option<T> { Some(T), None }\n"
+        "fn main() -> i64 ! { alloc } {\n"
+        "    let m = hashmap_new();\n"
+        "    hashmap_insert(&mut m, 3, 30);\n"
+        "    hashmap_insert(&mut m, 7, 70);\n"
+        "    hashmap_insert(&mut m, 3, 33);\n" // overwrite
+        "    let a = match hashmap_get(&m, 7) { Some(x) => x, None => 0 - 1 };\n"
+        "    let b = match hashmap_get(&m, 3) { Some(x) => x, None => 0 - 1 };\n"
+        "    let c = match hashmap_get(&m, 99) { Some(x) => x, None => 0 - 1 };\n"
+        "    let d = hashmap_len(&m);\n"
+        // a=70, b=33, c=-1, d=2  => 70 + 33 + (-1) + 2 == 104
+        "    a + b + c + d\n"
+        "}",
+        "main", "hashmap_insert_get_overwrite");
+    expectEquals(v, 104, "hashmap_insert_get_overwrite");
+}
+
+void test_hashmap_rehash_all_retrievable() {
+    // Insert 40 keys (forces multiple rehashes from the initial cap of 8),
+    // then confirm every key still maps to its value: returns mismatch count
+    // (0) if the rehash preserved all entries.
+    auto v = compileAndRun(
+        "enum Option<T> { Some(T), None }\n"
+        "fn main() -> i64 ! { alloc } {\n"
+        "    let m = hashmap_new();\n"
+        "    let mut i = 0;\n"
+        "    while i < 40 { hashmap_insert(&mut m, i, i * 100); i = i + 1; }\n"
+        "    let mut bad = 0;\n"
+        "    let mut j = 0;\n"
+        "    while j < 40 {\n"
+        "        let got = match hashmap_get(&m, j) { Some(x) => x, None => 0 - 1 };\n"
+        "        let delta = if got == j * 100 { 0 } else { 1 };\n"
+        "        bad = bad + delta;\n"
+        "        j = j + 1;\n"
+        "    }\n"
+        "    bad\n"
+        "}",
+        "main", "hashmap_rehash");
+    expectEquals(v, 0, "hashmap_rehash");
+}
+
+void test_slice_of_vec_len_and_get() {
+    // Slice [1,4) of {10,20,30,40,50}: len 3, sum 20+30+40 == 90.
+    auto v = compileAndRun(
+        "fn sum_slice(s: &[i64], i: i64) -> i64 {\n"
+        "    if i < slice_len(s) { slice_get(s, i) + sum_slice(s, i + 1) }\n"
+        "    else { 0 }\n"
+        "}\n"
+        "fn main() -> i64 ! { alloc } {\n"
+        "    let v = vec_new();\n"
+        "    vec_push(&mut v, 10);\n"
+        "    vec_push(&mut v, 20);\n"
+        "    vec_push(&mut v, 30);\n"
+        "    vec_push(&mut v, 40);\n"
+        "    vec_push(&mut v, 50);\n"
+        "    let s = &v[1..4];\n"
+        "    sum_slice(s, 0)\n"
+        "}",
+        "main", "slice_of_vec");
+    expectEquals(v, 90, "slice_of_vec");
+}
+
+void test_slice_len_direct() {
+    // slice_len on a [0,4) slice of a 4-element Vec == 4; an empty [2,2) == 0.
+    auto v = compileAndRun(
+        "fn main() -> i64 ! { alloc } {\n"
+        "    let v = vec_new();\n"
+        "    vec_push(&mut v, 1);\n"
+        "    vec_push(&mut v, 2);\n"
+        "    vec_push(&mut v, 3);\n"
+        "    vec_push(&mut v, 4);\n"
+        "    let full = &v[0..4];\n"
+        "    let empty = &v[2..2];\n"
+        "    slice_len(full) * 10 + slice_len(empty)\n" // 40
+        "}",
+        "main", "slice_len_direct");
+    expectEquals(v, 40, "slice_len_direct");
+}
+
 } // namespace
 
 int main() {
@@ -1294,7 +1409,14 @@ int main() {
     test_for_inclusive_range_still_55();
     test_fold_closure_driven();
     test_map_filter_eager_vec();
-    std::cout << "All codegen tests passed (82 cases) — Phase 13a method-receiver "
-                 "autoref + Iterator trait + adaptors\n";
+    // Phase 13b growable String, HashMap<i64,i64>, slices
+    test_string_build_and_len();
+    test_string_push_grows_past_initial_cap();
+    test_hashmap_insert_get_overwrite();
+    test_hashmap_rehash_all_retrievable();
+    test_slice_of_vec_len_and_get();
+    test_slice_len_direct();
+    std::cout << "All codegen tests passed (88 cases) — Phase 13b growable "
+                 "String + HashMap + slices + combinators\n";
     return 0;
 }

@@ -100,6 +100,46 @@ std::string applyPrelude(const std::string& userSrc) {
             "    }\n"
             "}\n";
     }
+    // Phase 13b: Option / Result combinators as effect-row-polymorphic
+    // prelude functions. They lower like any other generic kardashev fn —
+    // closures + `! {e}` rows mean a combinator's call-site inherits its
+    // closure's effects (an `io` closure in `option_map` makes the call
+    // `io`). i64 payload is the accepted MVP. Each is guarded on its own
+    // name so a user redefinition wins without a duplicate-decl error.
+    if (userSrc.find("fn option_map") == std::string::npos) {
+        prelude +=
+            "fn option_map(o: Option<i64>, f: fn(i64) -> i64 ! {e})"
+            " -> Option<i64> ! {e} {\n"
+            "    match o { Some(x) => Some(f(x)), None => None }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn option_unwrap_or") == std::string::npos) {
+        prelude +=
+            "fn option_unwrap_or(o: Option<i64>, default: i64) -> i64 {\n"
+            "    match o { Some(x) => x, None => default }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn option_and_then") == std::string::npos) {
+        prelude +=
+            "fn option_and_then(o: Option<i64>,"
+            " f: fn(i64) -> Option<i64> ! {e}) -> Option<i64> ! {e} {\n"
+            "    match o { Some(x) => f(x), None => None }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn result_map") == std::string::npos) {
+        prelude +=
+            "fn result_map(r: Result<i64, i64>, f: fn(i64) -> i64 ! {e})"
+            " -> Result<i64, i64> ! {e} {\n"
+            "    match r { Ok(x) => Ok(f(x)), Err(e) => Err(e) }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn result_unwrap_or") == std::string::npos) {
+        prelude +=
+            "fn result_unwrap_or(r: Result<i64, i64>, default: i64)"
+            " -> i64 {\n"
+            "    match r { Ok(x) => x, Err(e) => default }\n"
+            "}\n";
+    }
     return prelude + userSrc;
 }
 

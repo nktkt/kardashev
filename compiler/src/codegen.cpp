@@ -238,6 +238,9 @@ private:
     llvm::Function* reallocFn_ = nullptr;
     llvm::Function* printfFn_ = nullptr;
     llvm::Function* mallocFn_ = nullptr;
+    llvm::Function* memcpyFn_ = nullptr; // Phase 13b: String/HashMap copies
+    llvm::Function* memsetFn_ = nullptr; // Phase 13b: HashMap bucket zeroing
+    llvm::StructType* hmEntryTy_ = nullptr; // Phase 13b: HashMap bucket entry
 
     // Phase 10b: the uniform fat-pointer LLVM type for ALL first-class fn
     // VALUES — `{ i8* fn, i8* env }`. `fn` points at a generated function
@@ -331,7 +334,16 @@ private:
         auto* reallocFn = llvm::Function::Create(
             reallocTy, llvm::Function::ExternalLinkage, "realloc",
             module_.get());
+        // Phase 13b: memcpy for String/HashMap byte copies — libc's, same
+        // linkage story as malloc/printf (host process for JIT, clang's
+        // libc for AOT). Signature mirrors C `void* memcpy(dst, src, n)`.
+        auto* memcpyTy = llvm::FunctionType::get(
+            i8PtrTy, {i8PtrTy, i8PtrTy, i64Ty}, /*isVarArg=*/false);
+        auto* memcpyFn = llvm::Function::Create(
+            memcpyTy, llvm::Function::ExternalLinkage, "memcpy",
+            module_.get());
         reallocFn_ = reallocFn;
+        memcpyFn_ = memcpyFn;
         printfFn_ = printfFn;
         mallocFn_ = mallocFn; // Phase 10b: closure env allocation
 
@@ -351,12 +363,25 @@ private:
             ctx, {i8PtrTy, i64Ty, i64Ty}, "Vec");
         structTypes_["Vec"] = vecTy;
 
-        // --- String struct layout: { i8* data, i64 len }. Immutable;
-        // string literals are emitted as LLVM private global constants
-        // and aliased through this view.
+        // --- String struct layout: { i8* data, i64 len, i64 cap }.
+        // Phase 13b made String growable (mirroring Vec's {ptr,len,cap}).
+        // A string literal is a read-only view: data points at an LLVM
+        // private global constant, len is its byte length, and cap is 0
+        // (the "borrowed / not heap-owned" marker). `string_new` allocates
+        // a heap buffer (cap > 0) and `string_push_str` reallocs to grow;
+        // it copies the literal's bytes in on first append so the original
+        // global is never mutated. `print_str` / `str_len` only read
+        // data+len, so they work uniformly over literals and grown strings.
         auto* strTy = llvm::StructType::create(
-            ctx, {i8PtrTy, i64Ty}, "String");
+            ctx, {i8PtrTy, i64Ty, i64Ty}, "String");
         structTypes_["String"] = strTy;
+
+        // --- Phase 13b: slice fat pointer { i8* ptr, i64 len }. Like Vec /
+        // String, every `&[T]` lowers to this single layout regardless of T
+        // (the element stride is computed separately at slice_get sites).
+        auto* sliceTy = llvm::StructType::create(
+            ctx, {i8PtrTy, i64Ty}, "Slice");
+        structTypes_["Slice"] = sliceTy;
 
         // --- Phase 12 real async runtime ---
         // Poll = { i1 ready, i64 value }: the result of polling a future.
@@ -453,8 +478,566 @@ private:
             declaredFns_["str_len"] = fn;
         }
 
+        // --- Phase 13b: growable String runtime ---
+
+        // string_new() -> String : an empty heap string {null, 0, 0}. The
+        // first string_push_str allocates the buffer (cap 0 -> grow), so a
+        // fresh String costs no allocation until something is appended.
+        {
+            auto* fnTy = llvm::FunctionType::get(strTy, {}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "string_new",
+                module_.get());
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            llvm::Value* v = llvm::UndefValue::get(strTy);
+            v = b.CreateInsertValue(
+                v, llvm::ConstantPointerNull::get(i8PtrTy), {0}, "data");
+            v = b.CreateInsertValue(v, zeroI64, {1}, "len");
+            v = b.CreateInsertValue(v, zeroI64, {2}, "cap");
+            b.CreateRet(v);
+            declaredFns_["string_new"] = fn;
+        }
+
+        // string_push_str(s: &mut String, other: String) -> i64 : append
+        // other's bytes to s, growing s's heap buffer if needed. `other` is
+        // passed by value (an aggregate) so a string LITERAL — itself a
+        // String value `{ptr,len,0}` — can be appended directly without an
+        // explicit `&`. Growth policy: ensure cap >= newLen, doubling from a
+        // base of 8. Because a literal view has cap 0 but a non-null data
+        // pointer, the grow path (cap < newLen) reallocs from the OLD data
+        // only when it was heap-owned; for a borrowed literal we malloc fresh
+        // and memcpy the existing len bytes first, so the literal global is
+        // never realloc'd.
+        {
+            auto* fnTy = llvm::FunctionType::get(
+                i64Ty, {i8PtrTy, strTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "string_push_str",
+                module_.get());
+            fn->getArg(0)->setName("s");
+            fn->getArg(1)->setName("other");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* growBB = llvm::BasicBlock::Create(ctx, "grow", fn);
+            auto* freshBB = llvm::BasicBlock::Create(ctx, "fresh", fn);
+            auto* reuseBB = llvm::BasicBlock::Create(ctx, "reuse", fn);
+            auto* copyBB = llvm::BasicBlock::Create(ctx, "copy", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* sPtr = fn->getArg(0);
+            auto* oVal = fn->getArg(1); // String aggregate, by value
+            auto* sDataP = b.CreateStructGEP(strTy, sPtr, 0, "s_data_p");
+            auto* sLenP = b.CreateStructGEP(strTy, sPtr, 1, "s_len_p");
+            auto* sCapP = b.CreateStructGEP(strTy, sPtr, 2, "s_cap_p");
+            auto* sLen = b.CreateLoad(i64Ty, sLenP, "s_len");
+            auto* sCap = b.CreateLoad(i64Ty, sCapP, "s_cap");
+            auto* sData = b.CreateLoad(i8PtrTy, sDataP, "s_data");
+            auto* oData = b.CreateExtractValue(oVal, {0}, "o_data");
+            auto* oLen = b.CreateExtractValue(oVal, {1}, "o_len");
+            auto* newLen = b.CreateAdd(sLen, oLen, "new_len");
+            auto* needGrow = b.CreateICmpULT(sCap, newLen, "need_grow");
+            b.CreateCondBr(needGrow, growBB, copyBB);
+
+            // grow: compute newCap = max(newLen, 8, sCap*2); then decide
+            // whether the existing buffer is heap-owned (cap != 0) — realloc —
+            // or a borrowed literal (cap == 0) — malloc + copy old bytes.
+            b.SetInsertPoint(growBB);
+            auto* eight = llvm::ConstantInt::get(i64Ty, 8);
+            auto* doubled =
+                b.CreateMul(sCap, llvm::ConstantInt::get(i64Ty, 2), "dbl");
+            auto* atLeast8 = b.CreateSelect(
+                b.CreateICmpULT(doubled, eight, "lt8"), eight, doubled,
+                "atleast8");
+            auto* newCap = b.CreateSelect(
+                b.CreateICmpULT(atLeast8, newLen, "ltnew"), newLen, atLeast8,
+                "new_cap");
+            auto* wasHeap = b.CreateICmpNE(sCap, zeroI64, "was_heap");
+            b.CreateCondBr(wasHeap, reuseBB, freshBB);
+
+            // reuse: heap-owned -> realloc preserves the existing bytes.
+            b.SetInsertPoint(reuseBB);
+            auto* realloced =
+                b.CreateCall(reallocFn_, {sData, newCap}, "realloced");
+            b.CreateStore(realloced, sDataP);
+            b.CreateStore(newCap, sCapP);
+            b.CreateBr(copyBB);
+
+            // fresh: borrowed literal (or empty) -> malloc, copy existing
+            // sLen bytes from the old data (only if sLen > 0; memcpy with a
+            // null src + 0 len is technically UB so guard it implicitly by
+            // copying sLen bytes which is 0 when empty — and the old data is
+            // non-null whenever sLen > 0 since a literal view always has a
+            // valid pointer for its bytes).
+            b.SetInsertPoint(freshBB);
+            auto* mallocked =
+                b.CreateCall(mallocFn_, {newCap}, "fresh_buf");
+            b.CreateCall(memcpyFn_, {mallocked, sData, sLen}, "copy_old");
+            b.CreateStore(mallocked, sDataP);
+            b.CreateStore(newCap, sCapP);
+            b.CreateBr(copyBB);
+
+            // copy: append other's bytes at offset sLen, bump len.
+            b.SetInsertPoint(copyBB);
+            auto* curData = b.CreateLoad(i8PtrTy, sDataP, "cur_data");
+            auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+            auto* dst = b.CreateGEP(i8Ty, curData, sLen, "dst");
+            b.CreateCall(memcpyFn_, {dst, oData, oLen}, "append");
+            b.CreateStore(newLen, sLenP);
+            b.CreateRet(zeroI64);
+            declaredFns_["string_push_str"] = fn;
+        }
+
+        // string_len(s: &String) -> i64 : same as str_len; provided so the
+        // growable-String API has a consistent `string_*` family.
+        {
+            auto* fnTy = llvm::FunctionType::get(i64Ty, {i8PtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "string_len",
+                module_.get());
+            fn->getArg(0)->setName("s");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* lenPtr = b.CreateStructGEP(strTy, fn->getArg(0), 1, "len_ptr");
+            b.CreateRet(b.CreateLoad(i64Ty, lenPtr, "len"));
+            declaredFns_["string_len"] = fn;
+        }
+
+        // print_string(s: &String) -> i64 : same body as print_str but a
+        // distinct name so growable-string code reads uniformly.
+        {
+            auto* fnTy = llvm::FunctionType::get(i64Ty, {i8PtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "print_string",
+                module_.get());
+            fn->getArg(0)->setName("s");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* dataPtr = b.CreateStructGEP(strTy, fn->getArg(0), 0, "data_ptr");
+            auto* data = b.CreateLoad(i8PtrTy, dataPtr, "data");
+            auto* lenPtr = b.CreateStructGEP(strTy, fn->getArg(0), 1, "len_ptr");
+            auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
+            auto* lenI32 = b.CreateTrunc(len, i32Ty, "len_i32");
+            auto* fmt = b.CreateGlobalString(
+                "%.*s\n", "kd_print_string_fmt", 0, module_.get());
+            b.CreateCall(printfFn, {fmt, lenI32, data});
+            b.CreateRet(zeroI64);
+            declaredFns_["print_string"] = fn;
+        }
+
+        // --- Phase 13b: slice read ops. A slice value is the {ptr,len} fat
+        // pointer produced by `&v[a..b]` (emitSlice). Both ops take the slice
+        // BY VALUE (a 16-byte aggregate). MVP element = i64; slice_get uses an
+        // i64 element stride. ---
+        {
+            // slice_len(s: Slice) -> i64
+            auto* fnTy = llvm::FunctionType::get(i64Ty, {sliceTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "slice_len",
+                module_.get());
+            fn->getArg(0)->setName("s");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* len = b.CreateExtractValue(fn->getArg(0), {1}, "len");
+            b.CreateRet(len);
+            declaredFns_["slice_len"] = fn;
+        }
+        {
+            // slice_get(s: Slice, i: i64) -> i64 : load element i (i64 stride).
+            auto* i64ElemTy = llvm::Type::getInt64Ty(ctx);
+            auto* fnTy = llvm::FunctionType::get(
+                i64Ty, {sliceTy, i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "slice_get",
+                module_.get());
+            fn->getArg(0)->setName("s");
+            fn->getArg(1)->setName("i");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* data = b.CreateExtractValue(fn->getArg(0), {0}, "data");
+            auto* elemPtr =
+                b.CreateGEP(i64ElemTy, data, fn->getArg(1), "elem_ptr");
+            auto* val = b.CreateLoad(i64ElemTy, elemPtr, "val");
+            b.CreateRet(val);
+            declaredFns_["slice_get"] = fn;
+        }
+
+        // --- Phase 13b: HashMap<i64,i64> runtime (open addressing) ---
+        declareHashMapRuntime();
+
         // --- Phase 12 async runtime ---
         declareAsyncRuntime();
+    }
+
+    // Phase 13b: build the concrete `Option<i64>` Kardashev TypePtr by
+    // instantiating the prelude's generic `Option<T>` enum schema with T=i64.
+    // hashmap_get returns this; we go through the schema (rather than hand-
+    // rolling enumVariants) so the variant order / payload slots match what
+    // pattern matching and emitCtorCall expect for `Some`/`None`.
+    TypePtr optionI64Type() {
+        auto eit = tc_.enums.find("Option");
+        if (eit == tc_.enums.end()) return nullptr;
+        const EnumSchema& schema = eit->second;
+        if (schema.genericVars.empty()) return schema.type;
+        std::unordered_map<int, TypePtr> subst;
+        subst[schema.genericVars[0]->varId] = makeInt();
+        TypePtr inst = instantiate(schema.type, subst);
+        inst->typeArgs = {makeInt()};
+        return inst;
+    }
+
+    // Phase 13b: HashMap<i64,i64> open-addressing runtime.
+    //
+    // Layout (struct %HashMap): { i8* buckets, i64 len, i64 cap }. `buckets`
+    // is a malloc'd flat array of `cap` entries; each entry is
+    // { i64 state, i64 key, i64 value } (24 bytes) where state 0 = empty,
+    // 1 = occupied. Collisions resolve by linear probing (slot, slot+1, ...
+    // mod cap). On insert, when (len+1)*2 >= cap the table doubles and every
+    // occupied entry is re-inserted (rehashed) into the new buffer.
+    //
+    // The bucket entry LLVM struct + the raw-insert helper are emitted once
+    // and cached; the four public builtins (hashmap_new / _insert / _get /
+    // _len) call into them.
+    void declareHashMapRuntime() {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* zero = llvm::ConstantInt::get(i64Ty, 0);
+        auto* one = llvm::ConstantInt::get(i64Ty, 1);
+
+        // %HashMap = { i8* buckets, i64 len, i64 cap }
+        auto* hmTy = llvm::StructType::create(
+            ctx, {i8PtrTy, i64Ty, i64Ty}, "HashMap");
+        structTypes_["HashMap"] = hmTy;
+        // entry = { i64 state, i64 key, i64 value }
+        auto* entryTy = llvm::StructType::create(
+            ctx, {i64Ty, i64Ty, i64Ty}, "kd.hm_entry");
+        hmEntryTy_ = entryTy;
+
+        // __hm_raw_insert(buckets: i8*, cap: i64, k: i64, v: i64) -> i64.
+        // Linear-probe from k % cap; if it finds the key, overwrite value and
+        // return 0 (no new slot); if it finds an empty slot, write
+        // {1,k,v} and return 1 (caller bumps len). Assumes cap > 0 and at
+        // least one empty slot exists (guaranteed by the load-factor grow).
+        {
+            auto* fnTy = llvm::FunctionType::get(
+                i64Ty, {i8PtrTy, i64Ty, i64Ty, i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "__hm_raw_insert",
+                module_.get());
+            fn->getArg(0)->setName("buckets");
+            fn->getArg(1)->setName("cap");
+            fn->getArg(2)->setName("k");
+            fn->getArg(3)->setName("v");
+            auto* buckets = fn->getArg(0);
+            auto* cap = fn->getArg(1);
+            auto* k = fn->getArg(2);
+            auto* v = fn->getArg(3);
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* loopBB = llvm::BasicBlock::Create(ctx, "probe", fn);
+            auto* checkBB = llvm::BasicBlock::Create(ctx, "check", fn);
+            auto* emptyBB = llvm::BasicBlock::Create(ctx, "empty", fn);
+            auto* notEmptyBB = llvm::BasicBlock::Create(ctx, "notempty", fn);
+            auto* hitBB = llvm::BasicBlock::Create(ctx, "hit", fn);
+            auto* nextBB = llvm::BasicBlock::Create(ctx, "next", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* idxSlot = b.CreateAlloca(i64Ty, nullptr, "idx");
+            // start = ((k % cap) + cap) % cap  — urem keeps it in range for
+            // non-negative; for negative keys the extra +cap,%cap normalizes.
+            auto* rem = b.CreateSRem(k, cap, "rem");
+            auto* plus = b.CreateAdd(rem, cap, "plus");
+            auto* start = b.CreateURem(plus, cap, "start");
+            b.CreateStore(start, idxSlot);
+            b.CreateBr(loopBB);
+
+            b.SetInsertPoint(loopBB);
+            auto* idx = b.CreateLoad(i64Ty, idxSlot, "i");
+            auto* eptr = b.CreateGEP(entryTy, buckets, idx, "eptr");
+            auto* stateP = b.CreateStructGEP(entryTy, eptr, 0, "stateP");
+            auto* state = b.CreateLoad(i64Ty, stateP, "state");
+            auto* isEmpty = b.CreateICmpEQ(state, zero, "isEmpty");
+            b.CreateCondBr(isEmpty, emptyBB, checkBB);
+
+            b.SetInsertPoint(emptyBB);
+            b.CreateStore(one, stateP);
+            auto* keyP = b.CreateStructGEP(entryTy, eptr, 1, "keyP");
+            b.CreateStore(k, keyP);
+            auto* valP = b.CreateStructGEP(entryTy, eptr, 2, "valP");
+            b.CreateStore(v, valP);
+            b.CreateRet(one);
+
+            b.SetInsertPoint(checkBB);
+            auto* keyP2 = b.CreateStructGEP(entryTy, eptr, 1, "keyP2");
+            auto* curKey = b.CreateLoad(i64Ty, keyP2, "curKey");
+            auto* keyEq = b.CreateICmpEQ(curKey, k, "keyEq");
+            b.CreateCondBr(keyEq, hitBB, notEmptyBB);
+
+            b.SetInsertPoint(hitBB);
+            auto* valP2 = b.CreateStructGEP(entryTy, eptr, 2, "valP2");
+            b.CreateStore(v, valP2);
+            b.CreateRet(zero);
+
+            b.SetInsertPoint(notEmptyBB);
+            b.CreateBr(nextBB);
+            b.SetInsertPoint(nextBB);
+            auto* inc = b.CreateAdd(idx, one, "inc");
+            auto* wrapped = b.CreateURem(inc, cap, "wrap");
+            b.CreateStore(wrapped, idxSlot);
+            b.CreateBr(loopBB);
+            declaredFns_["__hm_raw_insert"] = fn;
+            (void)notEmptyBB;
+        }
+
+        // hashmap_new() -> HashMap : empty {null,0,0}.
+        {
+            auto* fnTy = llvm::FunctionType::get(hmTy, {}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "hashmap_new",
+                module_.get());
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            llvm::Value* m = llvm::UndefValue::get(hmTy);
+            m = b.CreateInsertValue(
+                m, llvm::ConstantPointerNull::get(i8PtrTy), {0}, "buckets");
+            m = b.CreateInsertValue(m, zero, {1}, "len");
+            m = b.CreateInsertValue(m, zero, {2}, "cap");
+            b.CreateRet(m);
+            declaredFns_["hashmap_new"] = fn;
+        }
+
+        // hashmap_insert(m: &mut HashMap, k, v) -> i64. Ensures capacity
+        // (grow + rehash when (len+1)*2 >= cap), then raw-inserts the pair
+        // and bumps len if it occupied a fresh slot.
+        {
+            auto dl = module_->getDataLayout();
+            uint64_t entryBytes = dl.getTypeAllocSize(entryTy);
+            auto* entryBytesK = llvm::ConstantInt::get(i64Ty, entryBytes);
+            auto* rawInsert = declaredFns_["__hm_raw_insert"];
+
+            auto* fnTy = llvm::FunctionType::get(
+                i64Ty, {i8PtrTy, i64Ty, i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "hashmap_insert",
+                module_.get());
+            fn->getArg(0)->setName("m");
+            fn->getArg(1)->setName("k");
+            fn->getArg(2)->setName("v");
+            auto* mPtr = fn->getArg(0);
+            auto* k = fn->getArg(1);
+            auto* v = fn->getArg(2);
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* growBB = llvm::BasicBlock::Create(ctx, "grow", fn);
+            auto* rehashHdr = llvm::BasicBlock::Create(ctx, "rehash.hdr", fn);
+            auto* rehashBody = llvm::BasicBlock::Create(ctx, "rehash.body", fn);
+            auto* rehashOcc = llvm::BasicBlock::Create(ctx, "rehash.occ", fn);
+            auto* rehashStep = llvm::BasicBlock::Create(ctx, "rehash.step", fn);
+            auto* rehashDone = llvm::BasicBlock::Create(ctx, "rehash.done", fn);
+            auto* doInsertBB = llvm::BasicBlock::Create(ctx, "doinsert", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* bucketsP = b.CreateStructGEP(hmTy, mPtr, 0, "bucketsP");
+            auto* lenP = b.CreateStructGEP(hmTy, mPtr, 1, "lenP");
+            auto* capP = b.CreateStructGEP(hmTy, mPtr, 2, "capP");
+            auto* len = b.CreateLoad(i64Ty, lenP, "len");
+            auto* cap = b.CreateLoad(i64Ty, capP, "cap");
+            // need grow if (len+1)*2 >= cap   (covers cap==0 too).
+            auto* lenPlus1 = b.CreateAdd(len, one, "lenPlus1");
+            auto* twiceLen = b.CreateMul(
+                lenPlus1, llvm::ConstantInt::get(i64Ty, 2), "twiceLen");
+            auto* needGrow = b.CreateICmpUGE(twiceLen, cap, "needGrow");
+            b.CreateCondBr(needGrow, growBB, doInsertBB);
+
+            // grow: newCap = (cap==0 ? 8 : cap*2). malloc + zero-init new
+            // buffer, then rehash existing entries into it, free old (we
+            // leak instead — V1 has no free; matches Vec which never frees).
+            b.SetInsertPoint(growBB);
+            auto* capIsZero = b.CreateICmpEQ(cap, zero, "capIsZero");
+            auto* doubled =
+                b.CreateMul(cap, llvm::ConstantInt::get(i64Ty, 2), "dbl");
+            auto* newCap = b.CreateSelect(
+                capIsZero, llvm::ConstantInt::get(i64Ty, 8), doubled,
+                "newCap");
+            auto* newBytes = b.CreateMul(newCap, entryBytesK, "newBytes");
+            auto* newBuf = b.CreateCall(mallocFn_, {newBytes}, "newBuf");
+            // zero the new buffer so all states start empty.
+            b.CreateCall(
+                getOrDeclareMemset(),
+                {newBuf, llvm::ConstantInt::get(
+                             llvm::Type::getInt32Ty(ctx), 0),
+                 newBytes},
+                "");
+            auto* oldBuf = b.CreateLoad(i8PtrTy, bucketsP, "oldBuf");
+            // rehash loop over old [0, cap).
+            auto* jSlot = b.CreateAlloca(i64Ty, nullptr, "j");
+            b.CreateStore(zero, jSlot);
+            b.CreateBr(rehashHdr);
+
+            b.SetInsertPoint(rehashHdr);
+            auto* j = b.CreateLoad(i64Ty, jSlot, "j.cur");
+            auto* more = b.CreateICmpULT(j, cap, "more");
+            b.CreateCondBr(more, rehashBody, rehashDone);
+
+            b.SetInsertPoint(rehashBody);
+            auto* oeptr = b.CreateGEP(entryTy, oldBuf, j, "oeptr");
+            auto* ostateP = b.CreateStructGEP(entryTy, oeptr, 0, "ostateP");
+            auto* ostate = b.CreateLoad(i64Ty, ostateP, "ostate");
+            auto* occ = b.CreateICmpNE(ostate, zero, "occ");
+            b.CreateCondBr(occ, rehashOcc, rehashStep);
+
+            b.SetInsertPoint(rehashOcc);
+            auto* okeyP = b.CreateStructGEP(entryTy, oeptr, 1, "okeyP");
+            auto* okey = b.CreateLoad(i64Ty, okeyP, "okey");
+            auto* ovalP = b.CreateStructGEP(entryTy, oeptr, 2, "ovalP");
+            auto* oval = b.CreateLoad(i64Ty, ovalP, "oval");
+            b.CreateCall(rawInsert, {newBuf, newCap, okey, oval}, "");
+            b.CreateBr(rehashStep);
+
+            b.SetInsertPoint(rehashStep);
+            auto* jNext = b.CreateAdd(j, one, "jNext");
+            b.CreateStore(jNext, jSlot);
+            b.CreateBr(rehashHdr);
+
+            b.SetInsertPoint(rehashDone);
+            b.CreateStore(newBuf, bucketsP);
+            b.CreateStore(newCap, capP);
+            b.CreateBr(doInsertBB);
+
+            // doinsert: raw-insert into current buffer; bump len if new.
+            b.SetInsertPoint(doInsertBB);
+            auto* curBuf = b.CreateLoad(i8PtrTy, bucketsP, "curBuf");
+            auto* curCap = b.CreateLoad(i64Ty, capP, "curCap");
+            auto* added =
+                b.CreateCall(rawInsert, {curBuf, curCap, k, v}, "added");
+            auto* curLen = b.CreateLoad(i64Ty, lenP, "curLen");
+            auto* newLen = b.CreateAdd(curLen, added, "newLen");
+            b.CreateStore(newLen, lenP);
+            b.CreateRet(zero);
+            declaredFns_["hashmap_insert"] = fn;
+        }
+
+        // hashmap_get(m: &HashMap, k) -> Option<i64> : linear-probe; Some(v)
+        // if found, None if an empty slot is hit first (or cap==0). The probe
+        // index lives in an alloca (`idxSlot`); `entry` seeds it (or returns
+        // None for an empty map), `probe` reloads it each iteration, `step`
+        // advances it and branches back.
+        {
+            TypePtr optTy = optionI64Type();
+            if (!optTy) {
+                // No `Option` in scope (a self-contained unit-test fixture
+                // with no prelude). The typechecker likewise skipped
+                // registering `hashmap_get`, so a program here can't call it
+                // — skip emitting it silently rather than erroring out.
+                return;
+            }
+            mapKardashevType(optTy); // declare LLVM struct + payload slots
+            const std::string optMangled =
+                mangleStructInstance(optTy->enumName, optTy->typeArgs);
+            auto* optLlvm = enumTypes_[optMangled];
+            unsigned someIdx = variantIndexInEnum(optTy, "Some");
+            unsigned noneIdx = variantIndexInEnum(optTy, "None");
+            unsigned someSlot = enumPayloadIndices_[optMangled][someIdx][0];
+            auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+
+            auto* fnTy = llvm::FunctionType::get(
+                optLlvm, {i8PtrTy, i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "hashmap_get",
+                module_.get());
+            fn->getArg(0)->setName("m");
+            fn->getArg(1)->setName("k");
+            auto* mPtr = fn->getArg(0);
+            auto* k = fn->getArg(1);
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* loopBB = llvm::BasicBlock::Create(ctx, "probe", fn);
+            auto* checkBB = llvm::BasicBlock::Create(ctx, "check", fn);
+            auto* noneBB = llvm::BasicBlock::Create(ctx, "none", fn);
+            auto* hitBB = llvm::BasicBlock::Create(ctx, "hit", fn);
+            auto* stepBB = llvm::BasicBlock::Create(ctx, "step", fn);
+
+            // build a None aggregate at the current insert point.
+            auto buildNone = [&](llvm::IRBuilder<>& bb) {
+                llvm::Value* agg = llvm::UndefValue::get(optLlvm);
+                agg = bb.CreateInsertValue(
+                    agg, llvm::ConstantInt::get(i32Ty, noneIdx), {0}, "none");
+                return agg;
+            };
+
+            llvm::IRBuilder<> b(entry);
+            auto* idxSlot = b.CreateAlloca(i64Ty, nullptr, "idx");
+            auto* bucketsP = b.CreateStructGEP(hmTy, mPtr, 0, "bucketsP");
+            auto* capP = b.CreateStructGEP(hmTy, mPtr, 2, "capP");
+            auto* cap = b.CreateLoad(i64Ty, capP, "cap");
+            auto* buckets = b.CreateLoad(i8PtrTy, bucketsP, "buckets");
+            auto* capZero = b.CreateICmpEQ(cap, zero, "capZero");
+            // Seed idxSlot = ((k % cap)+cap)%cap, but guard the modulo: when
+            // cap==0 we'd divide by zero, so branch to None first.
+            auto* nonZeroBB = llvm::BasicBlock::Create(ctx, "nonzero", fn);
+            b.CreateCondBr(capZero, noneBB, nonZeroBB);
+            b.SetInsertPoint(nonZeroBB);
+            auto* rem = b.CreateSRem(k, cap, "rem");
+            auto* plus = b.CreateAdd(rem, cap, "plus");
+            auto* start = b.CreateURem(plus, cap, "start");
+            b.CreateStore(start, idxSlot);
+            b.CreateBr(loopBB);
+
+            b.SetInsertPoint(loopBB);
+            auto* idx = b.CreateLoad(i64Ty, idxSlot, "i");
+            auto* eptr = b.CreateGEP(entryTy, buckets, idx, "eptr");
+            auto* stateP = b.CreateStructGEP(entryTy, eptr, 0, "stateP");
+            auto* state = b.CreateLoad(i64Ty, stateP, "state");
+            auto* isEmpty = b.CreateICmpEQ(state, zero, "isEmpty");
+            b.CreateCondBr(isEmpty, noneBB, checkBB);
+
+            b.SetInsertPoint(noneBB);
+            b.CreateRet(buildNone(b));
+
+            b.SetInsertPoint(checkBB);
+            auto* keyP = b.CreateStructGEP(entryTy, eptr, 1, "keyP");
+            auto* curKey = b.CreateLoad(i64Ty, keyP, "curKey");
+            auto* keyEq = b.CreateICmpEQ(curKey, k, "keyEq");
+            b.CreateCondBr(keyEq, hitBB, stepBB);
+
+            b.SetInsertPoint(hitBB);
+            auto* valP = b.CreateStructGEP(entryTy, eptr, 2, "valP");
+            auto* val = b.CreateLoad(i64Ty, valP, "val");
+            llvm::Value* someAgg = llvm::UndefValue::get(optLlvm);
+            someAgg = b.CreateInsertValue(
+                someAgg, llvm::ConstantInt::get(i32Ty, someIdx), {0}, "some");
+            someAgg = b.CreateInsertValue(someAgg, val, {someSlot}, "someV");
+            b.CreateRet(someAgg);
+
+            b.SetInsertPoint(stepBB);
+            auto* inc = b.CreateAdd(idx, one, "inc");
+            auto* wrapped = b.CreateURem(inc, cap, "wrap");
+            b.CreateStore(wrapped, idxSlot);
+            b.CreateBr(loopBB);
+            declaredFns_["hashmap_get"] = fn;
+        }
+
+        // hashmap_len(m: &HashMap) -> i64
+        {
+            auto* fnTy = llvm::FunctionType::get(i64Ty, {i8PtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "hashmap_len",
+                module_.get());
+            fn->getArg(0)->setName("m");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* lenP = b.CreateStructGEP(hmTy, fn->getArg(0), 1, "lenP");
+            b.CreateRet(b.CreateLoad(i64Ty, lenP, "len"));
+            declaredFns_["hashmap_len"] = fn;
+        }
+    }
+
+    // memset extern (used to zero a freshly malloc'd HashMap bucket array).
+    llvm::Function* getOrDeclareMemset() {
+        if (memsetFn_) return memsetFn_;
+        auto& ctx = *ctx_;
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* ty = llvm::FunctionType::get(
+            i8PtrTy, {i8PtrTy, i32Ty, i64Ty}, false);
+        memsetFn_ = llvm::Function::Create(
+            ty, llvm::Function::ExternalLinkage, "memset", module_.get());
+        return memsetFn_;
     }
 
     // Phase 12: materialize the cooperative-future runtime — the leaf
@@ -849,7 +1432,8 @@ private:
                 // `Vec<i64>` must NOT get a distinct `%Vec__i64` instance —
                 // that would mismatch the value `vec_new()` produces (e.g.
                 // when a fn returns `Vec<i64>`).
-                if (r->structName == "Vec" || r->structName == "String") {
+                if (r->structName == "Vec" || r->structName == "String" ||
+                    r->structName == "Slice") {
                     auto bit = structTypes_.find(r->structName);
                     if (bit != structTypes_.end()) return bit->second;
                 }
@@ -893,6 +1477,14 @@ private:
     // the current generic-instance substitution and recursively
     // instantiating generic struct / enum references like `Pair<X, Y>`.
     TypePtr astTypeRefToConcrete(const ast::TypeRef& tr) {
+        // Phase 13b: slice type `&[T]`. Handle before the ref-peel (the `&`
+        // is part of the slice spelling, not an extra Ref wrapper).
+        if (tr.isSlice) {
+            TypePtr elem = tr.typeArgs.empty()
+                               ? makeInt()
+                               : astTypeRefToConcrete(tr.typeArgs[0]);
+            return makeSlice(elem);
+        }
         if (tr.isRef && !tr.isFn) {
             ast::TypeRef inner = tr;
             inner.isRef = false;
@@ -2019,6 +2611,9 @@ private:
         if (auto* re = dynamic_cast<const ast::RefExpr*>(&e)) {
             return emitRef(*re);
         }
+        if (auto* se = dynamic_cast<const ast::SliceExpr*>(&e)) {
+            return emitSlice(*se);
+        }
         if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e)) {
             return emitAwait(*ae);
         }
@@ -2045,6 +2640,11 @@ private:
         llvm::Value* v = llvm::UndefValue::get(strTy);
         v = builder_->CreateInsertValue(v, ptr, {0}, "str_data");
         v = builder_->CreateInsertValue(v, len, {1}, "str_len");
+        // cap = 0 marks a read-only literal view (not heap-owned), so a
+        // later string_push_str copies before growing rather than
+        // realloc'ing the global.
+        v = builder_->CreateInsertValue(
+            v, llvm::ConstantInt::get(i64Ty, 0), {2}, "str_cap");
         return v;
     }
 
@@ -2150,6 +2750,54 @@ private:
         // The alloca's value is already a pointer to the binding's stack
         // slot — exactly what `&T` should be at the LLVM level.
         return it->second;
+    }
+
+    // Phase 13b: `&v[a..b]` — build the slice fat pointer { ptr, len } where
+    // ptr = vec.data + start*stride and len = end - start. The element stride
+    // comes from the Vec's element type (the slice's typeArgs[0]); the MVP
+    // exercises i64. The operand may be a `Vec<T>` value or a `&Vec<T>`.
+    llvm::Value* emitSlice(const ast::SliceExpr& se) {
+        auto& ctx = *ctx_;
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* vecTy = structTypes_["Vec"];
+        auto* sliceTy = structTypes_["Slice"];
+
+        // Resolve the operand's data pointer. For a `&Vec` (pointer) operand
+        // we GEP+load the data field; for a `Vec` value we ExtractValue.
+        TypePtr opTy = lookupExprType(*se.operand);
+        if (opTy) opTy = resolveInInstance(opTy);
+        llvm::Value* dataPtr = nullptr;
+        // Element type for the stride.
+        TypePtr elemTy = makeInt();
+        TypePtr sliceTyK = lookupExprType(se);
+        if (sliceTyK) {
+            sliceTyK = resolveInInstance(sliceTyK);
+            if (!sliceTyK->typeArgs.empty()) elemTy = sliceTyK->typeArgs[0];
+        }
+        llvm::Type* elemLlvm = mapKardashevType(elemTy);
+
+        if (opTy && opTy->kind == TypeKind::Ref) {
+            // &Vec: emitExpr gives a pointer to the Vec; load its data field.
+            llvm::Value* vecPtr = emitExpr(*se.operand);
+            auto* dp = builder_->CreateStructGEP(vecTy, vecPtr, 0, "vec_data_p");
+            dataPtr = builder_->CreateLoad(i8PtrTy, dp, "vec_data");
+        } else {
+            // Vec value: extract the data field directly.
+            llvm::Value* vecVal = emitExpr(*se.operand);
+            dataPtr = builder_->CreateExtractValue(vecVal, {0}, "vec_data");
+        }
+
+        llvm::Value* start = emitExpr(*se.start);
+        llvm::Value* end = emitExpr(*se.end);
+        // ptr = data + start (GEP in element units handles the stride).
+        llvm::Value* basePtr =
+            builder_->CreateGEP(elemLlvm, dataPtr, start, "slice_ptr");
+        llvm::Value* len = builder_->CreateSub(end, start, "slice_len");
+
+        llvm::Value* agg = llvm::UndefValue::get(sliceTy);
+        agg = builder_->CreateInsertValue(agg, basePtr, {0}, "slice.ptr");
+        agg = builder_->CreateInsertValue(agg, len, {1}, "slice.len");
+        return agg;
     }
 
     // Phase 11: `Box::new(v)` — malloc sizeof(T), move v into the heap slot,

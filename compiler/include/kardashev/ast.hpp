@@ -200,6 +200,18 @@ struct RefExpr : Expr {
     bool isMut = false;
 };
 
+// Phase 13b: `&v[a..b]` — borrow a contiguous sub-region of a Vec as a
+// slice (fat pointer { ptr, len }). `operand` is the Vec being viewed;
+// `start`/`end` are the i64 bounds of the half-open range [start, end).
+// The `&` and the `[a..b]` are parsed together into this single node (the
+// slice value is itself a borrow, so no extra RefExpr wraps it). Element
+// type is the Vec's T (MVP exercises i64).
+struct SliceExpr : Expr {
+    ExprPtr operand; // the Vec expression
+    ExprPtr start;   // i64 lower bound (inclusive)
+    ExprPtr end;     // i64 upper bound (exclusive)
+};
+
 // Phase 6 (stub): `expr.await` postfix. Today this is a no-op at both
 // typecheck and codegen (the operand's type / value flow through
 // unchanged); once a state-machine transform lands this becomes the
@@ -338,6 +350,11 @@ struct TypeRef {
     // true, `name` holds the trait name and `typeArgs` is empty. Combine with
     // `isRef` for `&dyn Trait`, or nest in `Box<...>` for `Box<dyn Trait>`.
     bool isDyn = false;
+    // Phase 13b: `&[T]` — a slice type (fat pointer viewing a contiguous
+    // region). When `isSlice` is true, `typeArgs[0]` holds the element type
+    // and `isRef` is set (a slice is always spelled behind `&`). `name` is
+    // unused. The element MVP is i64.
+    bool isSlice = false;
     // Function-type fields (valid only when isFn == true).
     bool isFn = false;
     std::vector<TypeRef> fnParams;

@@ -98,6 +98,45 @@ public:
             fnSchemas_["str_len"] = std::move(sch);
         }
 
+        // Phase 13b growable-String builtins. `String` is now a heap-backed
+        // {ptr,len,cap}; these mirror the Vec builtin family. string_new and
+        // string_push_str allocate, so they carry the `alloc` effect (any
+        // caller building a string must declare `alloc`).
+        //
+        // string_new() -> String ! { alloc }
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({}, stringTy);
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["string_new"] = std::move(sch);
+        }
+        // string_push_str(s: &mut String, other: String) -> i64 ! { alloc }
+        // `other` is by value so a string literal (a String value) appends
+        // directly: `string_push_str(&mut s, "cd")`.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(stringTy, /*isMut=*/true), stringTy},
+                makeInt());
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["string_push_str"] = std::move(sch);
+        }
+        // string_len(s: &String) -> i64
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(stringTy, /*isMut=*/false)}, makeInt());
+            fnSchemas_["string_len"] = std::move(sch);
+        }
+        // print_string(s: &String) -> i64 ! { io }
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(stringTy, /*isMut=*/false)}, makeInt());
+            sch.declaredEffects.add("io");
+            fnSchemas_["print_string"] = std::move(sch);
+        }
+
         // Phase 5.z: vec_* are generic over T. Each call site infers T
         // from arg types; codegen lazily specializes the runtime per T.
         TypePtr vecFnGenericVar = makeFreshVar();
@@ -138,6 +177,60 @@ public:
                 {makeRef(vecFnInst, /*isMut=*/false)}, makeInt());
             sch.genericVars.push_back(vecFnGenericVar);
             fnSchemas_["vec_len"] = std::move(sch);
+        }
+
+        // Phase 13b built-in: `HashMap<i64, i64>` — an open-addressing map
+        // (MVP: i64 keys + i64 values). The struct is nameable but its
+        // fields are opaque to user dot-access (codegen lays it out as
+        // { i8* buckets, i64 len, i64 cap }). hashmap_get returns Option<i64>
+        // and is registered after the prelude's Option enum is resolved
+        // (see below, post pass-1).
+        {
+            StructSchema sch;
+            sch.type = makeStruct("HashMap", {});
+            structSchemas_["HashMap"] = std::move(sch);
+        }
+        TypePtr hashMapTy = structSchemas_["HashMap"].type;
+        // hashmap_new() -> HashMap ! { alloc }
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({}, hashMapTy);
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["hashmap_new"] = std::move(sch);
+        }
+        // hashmap_insert(m: &mut HashMap, k: i64, v: i64) -> i64 ! { alloc }
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(hashMapTy, /*isMut=*/true), makeInt(), makeInt()},
+                makeInt());
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["hashmap_insert"] = std::move(sch);
+        }
+        // hashmap_len(m: &HashMap) -> i64
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(hashMapTy, /*isMut=*/false)}, makeInt());
+            fnSchemas_["hashmap_len"] = std::move(sch);
+        }
+
+        // Phase 13b built-in: `&[i64]` slices (MVP element = i64). A slice is
+        // the fat pointer produced by `&v[a..b]`; the two ops mirror Vec's
+        // read API. The slice value is passed by value (it's a small {ptr,len}
+        // aggregate). Constructing a slice doesn't allocate, so no `alloc`.
+        TypePtr sliceI64Ty = makeSlice(makeInt());
+        // slice_len(s: &[i64]) -> i64
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({sliceI64Ty}, makeInt());
+            fnSchemas_["slice_len"] = std::move(sch);
+        }
+        // slice_get(s: &[i64], i: i64) -> i64
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({sliceI64Ty, makeInt()}, makeInt());
+            fnSchemas_["slice_get"] = std::move(sch);
         }
 
         // Phase 12 built-in: `yield_now(v: i64) -> Future ! { async }`. The
@@ -276,6 +369,27 @@ public:
             }
             it->second.type->enumVariants = std::move(resolvedVariants);
             currentGenericEnv_ = nullptr;
+        }
+
+        // Phase 13b: now that the prelude's generic `Option<T>` enum is fully
+        // resolved, register `hashmap_get(m: &HashMap, k: i64) -> Option<i64>`.
+        // We build the concrete Option<i64> return type via resolveTypeRef so
+        // it carries the variants + typeArgs the call-site `match` unifies
+        // against. Only registered when `Option` is in scope (always true via
+        // the prelude, but guarded so a hand-rolled program lacking Option
+        // doesn't crash here — it simply won't get hashmap_get).
+        if (enumSchemas_.count("Option") && structSchemas_.count("HashMap")) {
+            ast::TypeRef optRef;
+            optRef.name = "Option";
+            ast::TypeRef i64Ref;
+            i64Ref.name = "i64";
+            optRef.typeArgs.push_back(i64Ref);
+            TypePtr optI64 = resolveTypeRef(optRef);
+            TypePtr hashMapTy = structSchemas_["HashMap"].type;
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(hashMapTy, /*isMut=*/false), makeInt()}, optI64);
+            fnSchemas_["hashmap_get"] = std::move(sch);
         }
 
         // Pass 1c: register trait declarations. Each trait gets a global
@@ -922,6 +1036,15 @@ private:
             collectEffects(*re->operand, out);
             return;
         }
+        if (auto* se = dynamic_cast<const ast::SliceExpr*>(&e)) {
+            // Phase 13b: a slice's sub-expressions (the Vec + the bounds) may
+            // carry effects; the slicing itself is pure (no alloc — it views
+            // the existing buffer).
+            collectEffects(*se->operand, out);
+            collectEffects(*se->start, out);
+            collectEffects(*se->end, out);
+            return;
+        }
         if (auto* bn = dynamic_cast<const ast::BoxNewExpr*>(&e)) {
             // Phase 11: the boxed value's effects flow through. (We don't
             // synthesize `alloc` for the malloc itself — consistent with
@@ -1188,6 +1311,15 @@ private:
     }
 
     TypePtr resolveTypeRef(const ast::TypeRef& tr) {
+        // Phase 13b: slice type `&[T]`. The `&` is part of the slice spelling
+        // (a slice is its own fat-pointer borrow), so handle it before the
+        // generic ref-peel below, which would otherwise wrap it in an extra
+        // Ref. `typeArgs[0]` is the element type.
+        if (tr.isSlice) {
+            TypePtr elem =
+                tr.typeArgs.empty() ? makeInt() : resolveTypeRef(tr.typeArgs[0]);
+            return makeSlice(elem);
+        }
         // Phase 2.4b: peel off the reference wrapper and wrap the inner
         // resolution. Recursive in case nested refs are introduced later.
         if (tr.isRef && !tr.isFn) {
@@ -1556,6 +1688,9 @@ private:
             // borrowing temporaries — would require a stack-spill rule).
             TypePtr inner = checkExpr(*re->operand);
             return makeRef(inner, re->isMut);
+        }
+        if (auto* se = dynamic_cast<const ast::SliceExpr*>(&e)) {
+            return checkSlice(*se);
         }
         if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e)) {
             // Phase 12: `expr.await` requires its operand to be a `Future`
@@ -2937,6 +3072,36 @@ private:
         auto it = structSchemas_.find("Range");
         return it != structSchemas_.end() ? it->second.type
                                           : makeStruct("Range", {});
+    }
+
+    // Phase 13b: `&v[a..b]` — slice a Vec. The operand must be a `Vec<T>`
+    // (a `&Vec<T>` is auto-peeled); `a`/`b` must be i64. The result type is
+    // the slice `&[T]` (== makeSlice(T)). Bounds are not statically checked
+    // (a runtime view, like vec_get); codegen trusts a <= b <= len.
+    TypePtr checkSlice(const ast::SliceExpr& se) {
+        TypePtr opTy = resolve(checkExpr(*se.operand));
+        // Peel a borrow: `&v` and `v` both slice the same Vec.
+        if (opTy->kind == TypeKind::Ref) opTy = resolve(opTy->refInner);
+        TypePtr elem;
+        if (opTy->kind == TypeKind::Struct && opTy->structName == "Vec" &&
+            !opTy->typeArgs.empty()) {
+            elem = opTy->typeArgs[0];
+        } else {
+            error("slice operand must be a Vec, got " + typeToString(opTy),
+                  se.operand->line, se.operand->column);
+            elem = makeInt();
+        }
+        TypePtr s = checkExpr(*se.start);
+        TypePtr en = checkExpr(*se.end);
+        if (!unify(s, makeInt())) {
+            error("slice start must be i64, got " + typeToString(s),
+                  se.start->line, se.start->column);
+        }
+        if (!unify(en, makeInt())) {
+            error("slice end must be i64, got " + typeToString(en),
+                  se.end->line, se.end->column);
+        }
+        return makeSlice(elem);
     }
 
     // Phase 9: `break` / `break <value>`. Validates a loop is active and,

@@ -90,6 +90,18 @@ TypePtr makeBox(TypePtr inner) {
     return t;
 }
 
+TypePtr makeSlice(TypePtr elem) {
+    // Phase 13b: a slice `&[T]` is modeled as the built-in single-layout
+    // struct `Slice` carrying its element type in `typeArgs[0]`. Codegen
+    // lowers every Slice to one `{ i8* ptr, i64 len }` fat-pointer layout
+    // (element stride is computed separately, like Vec).
+    auto t = std::make_shared<Type>();
+    t->kind = TypeKind::Struct;
+    t->structName = "Slice";
+    t->typeArgs = {std::move(elem)};
+    return t;
+}
+
 TypePtr resolve(const TypePtr& t) {
     if (t->kind != TypeKind::Var || !t->link) return t;
     TypePtr rep = resolve(t->link);

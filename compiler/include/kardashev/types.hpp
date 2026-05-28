@@ -133,6 +133,9 @@ TypePtr makeRef(TypePtr inner, bool isMut);
 // Phase 11: `dyn Trait` object type and `Box<T>` heap pointer.
 TypePtr makeDyn(std::string traitName);
 TypePtr makeBox(TypePtr inner);
+// Phase 13b: a slice `&[T]` — modeled as the built-in single-layout struct
+// `Slice` with `typeArgs[0]` = element type.
+TypePtr makeSlice(TypePtr elem);
 
 // Follow the union-find link chain to the representative. Performs
 // path compression as a side effect.

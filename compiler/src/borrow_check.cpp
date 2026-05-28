@@ -51,9 +51,13 @@ bool isCopyType(const TypePtr& t) {
         // `&T` is Copy; `&mut T` is not — copying a mut-ref would create
         // aliased mutable access.
         return !r->refIsMut;
+    case TypeKind::Struct:
+        // Phase 13b: a slice `&[T]` is a fat pointer (a borrow), so it's
+        // Copy — like `&T`. Other structs move by default.
+        if (r->structName == "Slice") return true;
+        return false;
     case TypeKind::Var:
     case TypeKind::Function:
-    case TypeKind::Struct:
     case TypeKind::Enum:
         return false;
     // Phase 11: a trait object `dyn Trait` is unsized (only seen behind a
@@ -128,6 +132,11 @@ private:
     // Reconstruct a minimal TypePtr from an AST TypeRef so isCopyType
     // can classify it. We only care about the Copy/Move distinction.
     TypePtr paramTypeFromAst(const ast::TypeRef& tr) {
+        // Phase 13b: `&[T]` slice — Copy fat pointer (handle before the
+        // ref-peel since the `&` is part of the slice spelling).
+        if (tr.isSlice) {
+            return makeSlice(makeInt());
+        }
         if (tr.isRef) {
             ast::TypeRef inner = tr;
             inner.isRef = false;
@@ -253,6 +262,13 @@ private:
         if (auto* re = dynamic_cast<const ast::RangeExpr*>(&e)) {
             prePass(*re->start);
             prePass(*re->end);
+            return;
+        }
+        if (auto* se = dynamic_cast<const ast::SliceExpr*>(&e)) {
+            // Phase 13b: `&v[a..b]` shared-borrows v and uses the bounds.
+            prePass(*se->operand);
+            prePass(*se->start);
+            prePass(*se->end);
             return;
         }
         if (auto* be = dynamic_cast<const ast::BreakExpr*>(&e)) {
@@ -468,6 +484,9 @@ private:
             lastInSubtree = std::max(lastInSubtree,
                                        consume(*re->end, expectExpire));
             return lastInSubtree;
+        }
+        if (auto* se = dynamic_cast<const ast::SliceExpr*>(&e)) {
+            return handleSliceExpr(*se, expectExpire);
         }
         if (auto* be = dynamic_cast<const ast::BreakExpr*>(&e)) {
             if (be->value) {
@@ -703,6 +722,48 @@ private:
         loan.column = re.column;
         activeLoans_.push_back(loan);
         return myPos;
+    }
+
+    // Phase 13b: `&v[a..b]` borrow-checks like a shared `&v` (the slice views
+    // the Vec's buffer without moving it) plus a use of the two bounds. The
+    // operand is normally a bare Vec ident; if it's a more complex expr we
+    // fall back to plain consume of it.
+    int handleSliceExpr(const ast::SliceExpr& se, int expectExpire) {
+        // consume() already advanced pos_ for the SliceExpr node itself.
+        int myPos = pos_ - 1;
+        int last = myPos;
+        auto* id = dynamic_cast<const ast::IdentExpr*>(se.operand.get());
+        if (id) {
+            ++pos_; // mirror prePass(operand) visiting the inner ident
+            Binding* b = lookupBinding(id->name);
+            if (b) {
+                if (b->state == OwnState::Moved) {
+                    error("borrow of moved value `" + id->name + "` (moved at " +
+                              std::to_string(b->moveLine) + ":" +
+                              std::to_string(b->moveCol) + ")",
+                          id->line, id->column);
+                } else if (b->mutLoanActive) {
+                    error("cannot borrow `" + id->name +
+                              "` immutably while a mutable borrow is active",
+                          se.line, se.column);
+                } else {
+                    ++b->sharedLoans;
+                    Loan loan;
+                    loan.borrowedDeclPos = b->declPos;
+                    loan.borrowerDeclPos = -1;
+                    loan.isMut = false;
+                    loan.expirePos = myPos;
+                    loan.line = se.line;
+                    loan.column = se.column;
+                    activeLoans_.push_back(loan);
+                }
+            }
+        } else {
+            last = std::max(last, consume(*se.operand, expectExpire));
+        }
+        last = std::max(last, consume(*se.start, expectExpire));
+        last = std::max(last, consume(*se.end, expectExpire));
+        return last;
     }
 
     // After `let r = <RHS>`, find the most-recent loan added that was
