@@ -1379,6 +1379,16 @@ private:
             for (const auto& f : sl.fields) checkExpr(*f.second);
             return makeInt();
         }
+
+        // Built-in runtime-backed structs are opaque at the language
+        // level: they are nameable in signatures but cannot be
+        // constructed with user-written literals.
+        if (sl.structName == "String") {
+            error("cannot construct built-in opaque struct 'String'", sl.line,
+                  sl.column);
+            for (const auto& f : sl.fields) checkExpr(*f.second);
+            return freshInstantiateStruct(it->second);
+        }
         // For generic structs, build a fresh instantiation so field-type
         // unification with each literal expr leaves the instance's
         // typeArgs in a fully-solved state.
