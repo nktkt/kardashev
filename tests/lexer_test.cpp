@@ -279,6 +279,16 @@ void test_bool_keywords() {
     assert(t[2].lexeme == "trueish");
 }
 
+// Phase 25: `const` is a keyword token; `constant` / `const_x` stay Idents.
+void test_const_keyword() {
+    auto t = lex("const constant const_x");
+    ASSERT_KIND(t[0], TokenKind::KwConst);
+    ASSERT_KIND(t[1], TokenKind::Identifier);
+    assert(t[1].lexeme == "constant");
+    ASSERT_KIND(t[2], TokenKind::Identifier);
+    assert(t[2].lexeme == "const_x");
+}
+
 } // namespace
 
 int main() {
@@ -304,6 +314,7 @@ int main() {
     test_loop_keywords();
     test_range_operators();
     test_bool_keywords();
-    std::cout << "All lexer tests passed (22 cases)\n";
+    test_const_keyword();
+    std::cout << "All lexer tests passed (23 cases)\n";
     return 0;
 }

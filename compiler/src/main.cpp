@@ -209,6 +209,9 @@ bool resolveModules(const std::string& srcRaw,
     // so a program (or an imported `mod`) can declare + call C functions.
     for (auto& ef : pr.program.externFns)
         out.externFns.push_back(std::move(ef));
+    // Phase 25: carry top-level `const` items across the module merge.
+    for (auto& cd : pr.program.consts)
+        out.consts.push_back(std::move(cd));
 
     // Recurse into each `mod foo;` reference.
     for (const auto& m : pr.program.mods) {

@@ -46,6 +46,7 @@ enum class TokenKind {
     KwTrue,  // Phase 15: `true` boolean literal
     KwFalse, // Phase 15: `false` boolean literal
     KwExtern, // Phase 24: `extern "C" fn ...;` FFI declaration
+    KwConst,  // Phase 25: `const NAME: T = ...;` item + `const fn` qualifier
     // Note: `async` / `await` stay as Identifiers — they appear in
     // effect rows (`! { async }`) and need lexeme-level lookup in the
     // parser's top-level / postfix logic anyway. Making them keywords

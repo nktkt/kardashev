@@ -15,6 +15,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -182,10 +183,23 @@ struct AssocProjection {
     std::string assocName;
 };
 
+// Phase 25: a compile-time-evaluated constant value (i64 or bool). Codegen
+// emits these as folded LLVM literals at the use site, so a `const` reaches
+// the backend as an immediate rather than a runtime load.
+struct ConstFolded {
+    bool isBool = false;
+    std::int64_t value = 0;
+};
+
 struct TypeCheckResult {
     std::vector<TypeError> errors;
     // Per-expression resolved type, for codegen.
     std::unordered_map<const ast::Expr*, TypePtr> exprTypes;
+    // Phase 25: per-Expr compile-time constant value. Populated for every use
+    // of a `const` name (and for a const initializer / array-length expr).
+    // Codegen reads this at an IdentExpr (and any const-folded expr) to emit
+    // the literal directly.
+    std::unordered_map<const ast::Expr*, ConstFolded> constExprValues;
     // Resolved struct schemas keyed by struct name. For monomorphic
     // structs the schema's `type` is the concrete struct Type and codegen
     // uses it directly; for generic structs codegen instantiates per

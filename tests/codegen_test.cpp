@@ -2285,6 +2285,76 @@ void test_extern_symbol_name_not_mangled() {
     }
 }
 
+// --- Phase 25: compile-time constants + const evaluation -------------------
+
+void test_const_item_runs() {
+    auto v = compileAndRun("const SIZE: i64 = 3 + 2;\n"
+                           "fn main() -> i64 { SIZE }",
+                           "main", "const_item_runs");
+    expectEquals(v, 5, "const_item_runs");
+}
+
+void test_const_fn_value_runs() {
+    auto v = compileAndRun("const fn sq(x: i64) -> i64 { x * x }\n"
+                           "const NINE: i64 = sq(3);\n"
+                           "fn main() -> i64 { NINE }",
+                           "main", "const_fn_value_runs");
+    expectEquals(v, 9, "const_fn_value_runs");
+}
+
+void test_const_references_const_runs() {
+    auto v = compileAndRun("const A: i64 = 10;\n"
+                           "const B: i64 = A * 2;\n"
+                           "fn main() -> i64 { B }",
+                           "main", "const_references_const_runs");
+    expectEquals(v, 20, "const_references_const_runs");
+}
+
+void test_const_generic_array_len_runs() {
+    auto v = compileAndRun(
+        "const N: i64 = 2 + 1;\n"
+        "fn main() -> i64 { let a: [i64; N] = [10, 20, 30]; a[0] + a[2] }",
+        "main", "const_generic_array_len_runs");
+    expectEquals(v, 40, "const_generic_array_len_runs");
+}
+
+void test_const_fn_array_len_runs() {
+    auto v = compileAndRun(
+        "const fn sq(x: i64) -> i64 { x * x }\n"
+        "fn main() -> i64 { let a: [i64; sq(2)] = [1,2,3,4]; "
+        "a[0]+a[1]+a[2]+a[3] }",
+        "main", "const_fn_array_len_runs");
+    expectEquals(v, 10, "const_fn_array_len_runs");
+}
+
+void test_const_fn_runtime_call_runs() {
+    // A const fn called at runtime with a runtime argument behaves like an
+    // ordinary fn (codegen path unchanged).
+    auto v = compileAndRun("const fn sq(x: i64) -> i64 { x * x }\n"
+                           "fn main() -> i64 { let y = 7; sq(y) }",
+                           "main", "const_fn_runtime_call_runs");
+    expectEquals(v, 49, "const_fn_runtime_call_runs");
+}
+
+// The const reaches codegen as a FOLDED literal, not a runtime load: main's
+// body is just `ret i64 5`. (The const-evaluator folds before any optimizer
+// pass, so this holds independent of opt level — and there is no global
+// storage emitted for the const.)
+void test_const_folds_to_literal_in_ir() {
+    std::string ir = compileToIR("const SIZE: i64 = 3 + 2;\n"
+                                 "fn main() -> i64 { SIZE }",
+                                 "const_folds_to_literal_in_ir");
+    expectContains(ir, "ret i64 5", "const_folds_to_literal_in_ir");
+    // No `add` in main's body — the value was folded, not computed at runtime.
+    // (The smoke test additionally asserts this at -O0, where the optimizer
+    // can't be credited for the folding.)
+    if (ir.find("@SIZE") != std::string::npos) {
+        std::cerr << "[const_folds_to_literal_in_ir] unexpected global @SIZE "
+                     "(a const must not get runtime storage)\n";
+        std::abort();
+    }
+}
+
 } // namespace
 
 int main() {
@@ -2455,7 +2525,15 @@ int main() {
     test_extern_i32_return_widened();
     test_extern_ref_string_lowers_to_pointer();
     test_extern_symbol_name_not_mangled();
-    std::cout << "All codegen tests passed (147 cases) — Phase 16 Drop/RAII: "
+    // Phase 25: compile-time constants + const evaluation.
+    test_const_item_runs();
+    test_const_fn_value_runs();
+    test_const_references_const_runs();
+    test_const_generic_array_len_runs();
+    test_const_fn_array_len_runs();
+    test_const_fn_runtime_call_runs();
+    test_const_folds_to_literal_in_ir();
+    std::cout << "All codegen tests passed (154 cases) — Phase 16 Drop/RAII: "
                  "reverse-order scope drops, move semantics, conditional-move "
                  "drop flags, Vec/Box free, scalar codegen unchanged; Phase "
                  "17a fn-value field calls + FnMut captures; Phase 17b generic "

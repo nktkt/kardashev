@@ -452,7 +452,23 @@ struct TypeRef {
     // `typeArgs[0]` holds the element type and `arrayLen` the (literal) length.
     // Distinct from `isSlice` (which has no length and is always behind `&`).
     bool isArray = false;
-    std::size_t arrayLen = 0;
+    // `mutable` (Phase 25): when the length is a const-expr (`arrayLenExpr`),
+    // the typechecker evaluates it and writes the result back here so codegen
+    // — which re-resolves TypeRefs independently — reads the folded length
+    // directly. Mirrors the `mutable` pattern ForExpr uses for typecheck-
+    // populated fields on an otherwise-const AST. A literal length is written
+    // here at parse time and never mutated.
+    mutable std::size_t arrayLen = 0;
+    // Phase 25: const-expr array length. Phase 22 only accepted an integer
+    // literal for N; this phase lifts that so N may be any compile-time
+    // constant expression — a `const` item, a `const fn` call, or an
+    // arithmetic expr over them (e.g. `[i64; N]`, `[i64; sq(2)]`, `[i64; A+1]`).
+    // When `arrayLenExpr` is non-null the typechecker evaluates it at compile
+    // time and fills `arrayLen` with the result; a bare integer literal is
+    // parsed straight into `arrayLen` (arrayLenExpr stays null), so the Phase 22
+    // literal path is byte-for-byte unchanged. shared_ptr keeps TypeRef
+    // copyable (it is copied throughout resolveTypeRef / monomorphization).
+    std::shared_ptr<Expr> arrayLenExpr; // null = literal length in arrayLen
     // Phase 22: `(A, B, ...)` — a tuple type. When `isTuple` is true,
     // `tupleElems` holds the ordered element type refs (>= 2). `name` /
     // `typeArgs` are unused. A 1-tuple isn't a type (`(T)` == `T`).
@@ -567,7 +583,29 @@ struct FnDecl {
                             // that implicitly carries the `async` effect.
     bool isPub = false;   // Phase 7.3b: visible across module boundaries
                             // when referenced via path syntax.
+    // Phase 25: `const fn` — a function that MAY be evaluated at compile time.
+    // When called in a const context (a `const` initializer, an array length,
+    // or another const fn body) with constant arguments, the const-evaluator
+    // runs its body fully at compile time. It is NOT restricted to const
+    // contexts: a `const fn` is also a perfectly ordinary runtime fn (its
+    // codegen path is unchanged), so calling it at runtime works as before.
+    bool isConst = false;
     std::unique_ptr<BlockExpr> body;
+    std::size_t line = 1;
+    std::size_t column = 1;
+};
+
+// Phase 25: a top-level compile-time constant `const NAME: T = <const-expr>;`.
+// The initializer is evaluated at compile time to a constant value (i64 / bool
+// in the MVP); every use of NAME resolves to that value and codegen emits the
+// literal directly (no runtime load). A const may reference an earlier const
+// (`const B: i64 = A + 1;`) or call a `const fn`; a cyclic / forward-bad
+// reference is a clear compile error.
+struct ConstDecl {
+    std::string name;
+    TypeRef type;
+    ExprPtr value; // the const-expr initializer
+    bool isPub = false; // `pub const` — parsed + stored (mirrors other decls)
     std::size_t line = 1;
     std::size_t column = 1;
 };
@@ -751,6 +789,8 @@ struct Program {
     std::vector<ModDecl> mods;
     // Phase 24: user-declared `extern "C"` function declarations.
     std::vector<ExternFn> externFns;
+    // Phase 25: top-level `const NAME: T = ...;` items.
+    std::vector<ConstDecl> consts;
 };
 
 } // namespace kardashev::ast

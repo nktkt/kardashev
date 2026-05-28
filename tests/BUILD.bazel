@@ -229,6 +229,18 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 25: compile-time constants + const evaluation — `const` items folded to
+# literals (verified in the IR), `const fn` evaluated in const contexts, a const
+# referencing another const, const-generic array lengths (`[i64; N]` /
+# `[i64; sq(2)]`, lifting Phase 22's literal-only N), a const fn still usable at
+# runtime, and clear (bounded, non-crashing) errors for div0 / non-evaluable /
+# cyclic / runaway / overflow; through JIT + AOT.
+sh_test(
+    name = "smoke_test_const",
+    srcs = ["smoke_test_const.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

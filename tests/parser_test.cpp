@@ -1707,6 +1707,108 @@ void test_extern_and_fn_coexist() {
     assert(r.program.functions[0].name == "main");
 }
 
+// --- Phase 25: const items + const fn + const-expr array lengths -----------
+
+void test_const_item() {
+    auto r = parse("const SIZE: i64 = 3 + 2;");
+    assert(r.ok());
+    assert(r.program.consts.size() == 1);
+    const auto& cd = r.program.consts[0];
+    assert(cd.name == "SIZE");
+    assert(cd.type.name == "i64");
+    assert(!cd.isPub);
+    assert(dynamic_cast<const ast::BinaryExpr*>(cd.value.get()) != nullptr);
+}
+
+void test_pub_const_item() {
+    auto r = parse("pub const A: i64 = 10;");
+    assert(r.ok());
+    assert(r.program.consts.size() == 1);
+    assert(r.program.consts[0].isPub);
+    assert(r.program.consts[0].name == "A");
+}
+
+void test_const_bool_item() {
+    auto r = parse("const FLAG: bool = true;");
+    assert(r.ok());
+    assert(r.program.consts.size() == 1);
+    assert(r.program.consts[0].type.name == "bool");
+    assert(dynamic_cast<const ast::BoolLitExpr*>(
+               r.program.consts[0].value.get()) != nullptr);
+}
+
+void test_const_fn_decl() {
+    // `const fn` lands in functions with isConst set; otherwise a normal fn.
+    auto r = parse("const fn sq(x: i64) -> i64 { x * x }");
+    assert(r.ok());
+    assert(r.program.consts.empty());
+    assert(r.program.functions.size() == 1);
+    const auto& fn = r.program.functions[0];
+    assert(fn.name == "sq");
+    assert(fn.isConst);
+    assert(fn.params.size() == 1);
+}
+
+void test_pub_const_fn_decl() {
+    auto r = parse("pub const fn sq(x: i64) -> i64 { x * x }");
+    assert(r.ok());
+    assert(r.program.functions.size() == 1);
+    assert(r.program.functions[0].isConst);
+    assert(r.program.functions[0].isPub);
+}
+
+void test_plain_fn_is_not_const() {
+    auto r = parse("fn f(x: i64) -> i64 { x }");
+    assert(r.ok());
+    assert(r.program.functions.size() == 1);
+    assert(!r.program.functions[0].isConst);
+}
+
+void test_array_len_literal_still_literal() {
+    // Phase 22 path unchanged: a bare integer literal length goes straight to
+    // `arrayLen` with no arrayLenExpr.
+    auto r = parse("fn f() -> i64 { let a: [i64; 3] = [1, 2, 3]; a[0] }");
+    assert(r.ok());
+    const auto& fn = r.program.functions[0];
+    const auto* let =
+        dynamic_cast<const ast::LetStmt*>(fn.body->stmts[0].get());
+    assert(let != nullptr && let->annotation);
+    assert(let->annotation->isArray);
+    assert(let->annotation->arrayLen == 3);
+    assert(let->annotation->arrayLenExpr == nullptr);
+}
+
+void test_array_len_const_expr() {
+    // Phase 25: a non-literal length is stashed in arrayLenExpr for the
+    // typechecker to evaluate (arrayLen stays 0 at parse time).
+    auto r = parse("const N: i64 = 3;\n"
+                   "fn f() -> i64 { let a: [i64; N] = [1, 2, 3]; a[0] }");
+    assert(r.ok());
+    const ast::FnDecl* f = nullptr;
+    for (const auto& fn : r.program.functions)
+        if (fn.name == "f") f = &fn;
+    assert(f != nullptr);
+    const auto* let =
+        dynamic_cast<const ast::LetStmt*>(f->body->stmts[0].get());
+    assert(let != nullptr && let->annotation);
+    assert(let->annotation->isArray);
+    assert(let->annotation->arrayLenExpr != nullptr);
+    assert(dynamic_cast<const ast::IdentExpr*>(
+               let->annotation->arrayLenExpr.get()) != nullptr);
+}
+
+void test_array_len_const_fn_call() {
+    auto r = parse("fn f() -> i64 { let a: [i64; sq(2)] = [1,2,3,4]; a[0] }");
+    assert(r.ok());
+    const auto& fn = r.program.functions[0];
+    const auto* let =
+        dynamic_cast<const ast::LetStmt*>(fn.body->stmts[0].get());
+    assert(let != nullptr && let->annotation && let->annotation->isArray);
+    assert(let->annotation->arrayLenExpr != nullptr);
+    assert(dynamic_cast<const ast::CallExpr*>(
+               let->annotation->arrayLenExpr.get()) != nullptr);
+}
+
 } // namespace
 
 int main() {
@@ -1845,6 +1947,16 @@ int main() {
     test_extern_c_preserves_abi_string();
     test_extern_c_body_is_error();
     test_extern_and_fn_coexist();
-    std::cout << "All parser tests passed (119 cases)\n";
+    // Phase 25: const items + const fn + const-expr array lengths.
+    test_const_item();
+    test_pub_const_item();
+    test_const_bool_item();
+    test_const_fn_decl();
+    test_pub_const_fn_decl();
+    test_plain_fn_is_not_const();
+    test_array_len_literal_still_literal();
+    test_array_len_const_expr();
+    test_array_len_const_fn_call();
+    std::cout << "All parser tests passed (128 cases)\n";
     return 0;
 }

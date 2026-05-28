@@ -2353,6 +2353,100 @@ void test_extern_unrepresentable_type_rejected() {
         "not supported in an `extern", "extern_unrepresentable_type_rejected");
 }
 
+// --- Phase 25: const items, const fn, const-generic array lengths ----------
+
+void test_const_item_ok() {
+    expectOk("const SIZE: i64 = 3 + 2;\n"
+             "fn main() -> i64 { SIZE }",
+             "const_item_ok");
+}
+
+void test_const_bool_item_ok() {
+    expectOk("const FLAG: bool = 3 > 2;\n"
+             "fn main() -> i64 { if FLAG { 1 } else { 0 } }",
+             "const_bool_item_ok");
+}
+
+void test_const_references_const_ok() {
+    expectOk("const A: i64 = 10;\n"
+             "const B: i64 = A * 2;\n"
+             "fn main() -> i64 { B }",
+             "const_references_const_ok");
+}
+
+void test_const_fn_in_const_context_ok() {
+    expectOk("const fn sq(x: i64) -> i64 { x * x }\n"
+             "const NINE: i64 = sq(3);\n"
+             "fn main() -> i64 { NINE }",
+             "const_fn_in_const_context_ok");
+}
+
+void test_const_fn_at_runtime_ok() {
+    // A const fn is also an ordinary fn: a runtime call with a runtime arg.
+    expectOk("const fn sq(x: i64) -> i64 { x * x }\n"
+             "fn main() -> i64 { let y = 7; sq(y) }",
+             "const_fn_at_runtime_ok");
+}
+
+void test_const_generic_array_len_ok() {
+    expectOk("const N: i64 = 2 + 1;\n"
+             "fn main() -> i64 { let a: [i64; N] = [10, 20, 30]; a[0] + a[2] }",
+             "const_generic_array_len_ok");
+}
+
+void test_const_fn_array_len_ok() {
+    expectOk("const fn sq(x: i64) -> i64 { x * x }\n"
+             "fn main() -> i64 { let a: [i64; sq(2)] = [1,2,3,4]; a[3] }",
+             "const_fn_array_len_ok");
+}
+
+void test_const_div_by_zero_errors() {
+    expectErrContains("const BAD: i64 = 10 / 0;\n"
+                      "fn main() -> i64 { BAD }",
+                      "division by zero", "const_div_by_zero_errors");
+}
+
+void test_const_overflow_errors() {
+    expectErrContains("const BIG: i64 = 9223372036854775807 + 1;\n"
+                      "fn main() -> i64 { BIG }",
+                      "overflow", "const_overflow_errors");
+}
+
+void test_const_cyclic_errors() {
+    expectErrContains("const A: i64 = B + 1;\n"
+                      "const B: i64 = A + 1;\n"
+                      "fn main() -> i64 { A }",
+                      "cyclic", "const_cyclic_errors");
+}
+
+void test_const_fn_non_evaluable_errors() {
+    // A const fn that performs I/O, called in a const context, is rejected.
+    expectErrContains("const fn bad(x: i64) -> i64 { print(x); x }\n"
+                      "const V: i64 = bad(5);\n"
+                      "fn main() -> i64 { V }",
+                      "not const-evaluable", "const_fn_non_evaluable_errors");
+}
+
+void test_const_type_mismatch_errors() {
+    expectErrContains("const X: i64 = true;\n"
+                      "fn main() -> i64 { X }",
+                      "const initializer has type bool",
+                      "const_type_mismatch_errors");
+}
+
+void test_const_array_len_bool_errors() {
+    expectErrContains("fn main() -> i64 { let a: [i64; 2 > 1] = [1]; a[0] }",
+                      "expected an i64 constant",
+                      "const_array_len_bool_errors");
+}
+
+void test_const_array_len_calls_nonconst_fn_errors() {
+    expectErrContains("fn sq(x: i64) -> i64 { x * x }\n"
+                      "fn main() -> i64 { let a: [i64; sq(2)] = [1,2,3,4]; a[0] }",
+                      "not const-evaluable",
+                      "const_array_len_calls_nonconst_fn_errors");
+}
+
 } // namespace
 
 int main() {
@@ -2610,6 +2704,21 @@ int main() {
     test_extern_collision_with_builtin_rejected();
     test_extern_wrong_arg_arity_rejected();
     test_extern_unrepresentable_type_rejected();
-    std::cout << "All typecheck tests passed (233 cases)\n";
+    // Phase 25: const items, const fn, const-generic array lengths.
+    test_const_item_ok();
+    test_const_bool_item_ok();
+    test_const_references_const_ok();
+    test_const_fn_in_const_context_ok();
+    test_const_fn_at_runtime_ok();
+    test_const_generic_array_len_ok();
+    test_const_fn_array_len_ok();
+    test_const_div_by_zero_errors();
+    test_const_overflow_errors();
+    test_const_cyclic_errors();
+    test_const_fn_non_evaluable_errors();
+    test_const_type_mismatch_errors();
+    test_const_array_len_bool_errors();
+    test_const_array_len_calls_nonconst_fn_errors();
+    std::cout << "All typecheck tests passed (248 cases)\n";
     return 0;
 }

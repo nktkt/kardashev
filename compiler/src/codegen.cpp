@@ -6017,6 +6017,22 @@ private:
             return emitStringLit(*sl);
         }
         if (auto* id = dynamic_cast<const ast::IdentExpr*>(&e)) {
+            // Phase 25: a use of a top-level `const` resolves to a compile-time
+            // literal — emit the folded value directly (no runtime load). A
+            // local of the same name shadows the const, so this is checked
+            // only when the name is NOT a local / by-ref capture.
+            if (!locals_.count(id->name) && !refLocals_.count(id->name)) {
+                auto cvIt = tc_.constExprValues.find(id);
+                if (cvIt != tc_.constExprValues.end()) {
+                    const auto& cv = cvIt->second;
+                    if (cv.isBool)
+                        return llvm::ConstantInt::get(
+                            llvm::Type::getInt1Ty(*ctx_), cv.value ? 1 : 0);
+                    return llvm::ConstantInt::get(
+                        llvm::Type::getInt64Ty(*ctx_),
+                        static_cast<uint64_t>(cv.value), /*isSigned=*/true);
+                }
+            }
             // Phase 17a: a by-ref capture reads through the env pointer into
             // the enclosing variable's storage.
             if (auto rit = refLocals_.find(id->name); rit != refLocals_.end()) {

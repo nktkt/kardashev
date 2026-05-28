@@ -849,6 +849,23 @@ public:
             }
         }
 
+        // Pass 1a3 (Phase 25): register `const fn` names and `const` item
+        // names BEFORE signature resolution (pass 1b). A fn *signature* may use
+        // a const-expr array length (`fn f(a: [i64; N])` / `[i64; sq(2)]`), and
+        // `resolveTypeRef` evaluates that length on the spot — so the const
+        // item `N` and any const fn it calls must already be findable. Only the
+        // name->AST mapping is needed here; evaluation stays on-demand.
+        for (const auto& fn : program.functions) {
+            if (fn.isConst && !constFns_.count(fn.name)) constFns_[fn.name] = &fn;
+        }
+        for (const auto& cd : program.consts) {
+            if (constDecls_.count(cd.name)) {
+                error("constant redefined: " + cd.name, cd.line, cd.column);
+                continue;
+            }
+            constDecls_[cd.name] = &cd;
+        }
+
         // Pass 1b: register every fn signature so calls can see siblings
         // (and the function can recurse into itself). For each fn, allocate
         // a fresh Var per generic parameter and resolve param / return type
@@ -1004,6 +1021,10 @@ public:
                 schema.signature->ret = makeFuture(schema.signature->ret);
             }
             schema.isPub = fn.isPub;
+            // Note (Phase 25): a `const fn` was already registered in
+            // `constFns_` by pass 1a3 (so array-length const-exprs in
+            // signatures can call it). It keeps its normal FnSchema here too,
+            // so a runtime call type-checks + codegens exactly like any fn.
             fnSchemas_[fn.name] = std::move(schema);
         }
         // Pass 1c (Phase 24): register every `extern "C" fn` as a callable
@@ -1011,6 +1032,24 @@ public:
         // like any other fn. Extern fns are monomorphic (no generic params),
         // opaque, and carry the `io` effect by default.
         registerExternFns(program);
+        // Pass 1d (Phase 25): now that every fn schema exists, flag a `const`
+        // whose name collides with a function. (Const items + const fns were
+        // registered for name resolution before pass 1b.)
+        for (const auto& cd : program.consts) {
+            if (fnSchemas_.count(cd.name)) {
+                error("constant '" + cd.name +
+                          "' collides with a function of the same name",
+                      cd.line, cd.column);
+            }
+        }
+        // Pass 1f (Phase 25): type-check + compile-time-evaluate every const
+        // item. This populates `constValues_` (so later array lengths /
+        // expression uses read a memoized value) and records the folded value
+        // for codegen. Done after all signatures exist so a const initializer
+        // can call a const fn declared later in the file.
+        for (const auto& cd : program.consts) {
+            checkConstItem(cd);
+        }
         // Pass 1e: register each impl method as a regular fn schema under
         // its mangled name so call routing through MethodCallExpr can
         // re-use the existing fn-call machinery. The mangled name encodes
@@ -1138,6 +1177,10 @@ public:
         TypeCheckResult result;
         result.errors = std::move(errors_);
         result.exprTypes = std::move(exprTypes_);
+        // Phase 25: hand the folded const values to codegen.
+        for (const auto& [exprPtr, cv] : constExprValues_) {
+            result.constExprValues[exprPtr] = ConstFolded{cv.isBool, cv.i};
+        }
         result.structs = std::move(structSchemas_);
         result.enums = std::move(enumSchemas_);
         result.variantIndex = std::move(variantIndex_);
@@ -1159,6 +1202,49 @@ private:
     std::unordered_map<std::string, FnSchema> fnSchemas_;
     std::unordered_map<std::string, StructSchema> structSchemas_;
     std::unordered_map<std::string, EnumSchema> enumSchemas_;
+
+    // --- Phase 25: compile-time constants + const evaluation ----------------
+    //
+    // A const-evaluated value is i64 or bool (the MVP scalar set). `isBool`
+    // distinguishes the two; `i` holds the i64 (or 0/1 for a bool).
+    struct ConstValue {
+        bool isBool = false;
+        std::int64_t i = 0;
+    };
+    // Raised (and caught at const-eval entry points) when an initializer /
+    // array length / const fn cannot be evaluated at compile time, or hits a
+    // bound / overflow / div-by-zero. Carries a source position so the error
+    // points at the offending construct.
+    struct ConstEvalError {
+        std::string message;
+        std::size_t line = 1;
+        std::size_t column = 1;
+    };
+    // Top-level `const` items by name -> their AST decl (for on-demand eval).
+    std::unordered_map<std::string, const ast::ConstDecl*> constDecls_;
+    // Memoized evaluated values of top-level consts (name -> value).
+    std::unordered_map<std::string, ConstValue> constValues_;
+    // Names currently mid-evaluation — used to detect cyclic references
+    // (`const A = B; const B = A;`).
+    std::unordered_set<std::string> constEvalInProgress_;
+    // Phase 25: every Expr that resolved to a compile-time constant (a use of
+    // a `const` name, or a const-fn call / arithmetic in a const context that
+    // codegen should emit as a folded literal). Flows to codegen via the
+    // TypeCheckResult so a `const` reaches the backend as an immediate, not a
+    // runtime load. Keyed by the use-site Expr*.
+    std::unordered_map<const ast::Expr*, ConstValue> constExprValues_;
+    // `const fn` ASTs by name (registered alongside fnSchemas_), so the
+    // evaluator can find + run a const fn body. A non-const fn is absent here
+    // and calling it in a const context is a clear error.
+    std::unordered_map<std::string, const ast::FnDecl*> constFns_;
+    // Bounds for the evaluator (a runaway const fn -> clear error, not a hang).
+    // `kConstEvalMaxDepth` caps nested const-fn CALL depth (so the native C++
+    // recursion stays well under the stack limit while still allowing deep but
+    // legitimate bounded recursion). `kConstEvalMaxSteps` is the global work
+    // budget that catches non-terminating-yet-shallow loops of evaluation.
+    static constexpr int kConstEvalMaxDepth = 1000;
+    static constexpr long kConstEvalMaxSteps = 5'000'000;
+    long constEvalSteps_ = 0;
 
     // Trait declarations: traitName -> ordered list of method signatures.
     std::unordered_map<std::string, std::vector<ast::MethodSig>> traits_;
@@ -2076,7 +2162,30 @@ private:
         if (tr.isArray) {
             TypePtr elem =
                 tr.typeArgs.empty() ? makeInt() : resolveTypeRef(tr.typeArgs[0]);
-            TypePtr arr = makeArray(elem, tr.arrayLen);
+            // Phase 25: a const-expr length is evaluated at compile time. A
+            // bare literal length (Phase 22) is already in `arrayLen`. A
+            // negative / non-evaluable length is an error; length falls back
+            // to 0 so resolution continues (the error is already reported).
+            std::size_t len = tr.arrayLen;
+            if (tr.arrayLenExpr) {
+                std::int64_t n = 0;
+                if (evalConstI64(*tr.arrayLenExpr, n)) {
+                    if (n < 0) {
+                        error("array length must be non-negative, got " +
+                                  std::to_string(n),
+                              tr.arrayLenExpr->line, tr.arrayLenExpr->column);
+                        len = 0;
+                    } else {
+                        len = static_cast<std::size_t>(n);
+                        // Cache the resolved length on the AST node so codegen
+                        // (which re-resolves TypeRefs) reads it directly.
+                        tr.arrayLen = len;
+                    }
+                } else {
+                    len = 0;
+                }
+            }
+            TypePtr arr = makeArray(elem, len);
             if (tr.isRef) return makeRef(arr, tr.refIsMut);
             return arr;
         }
@@ -2434,6 +2543,319 @@ private:
         currentVarBound_.clear();
     }
 
+    // --- Phase 25: the compile-time evaluator -------------------------------
+    //
+    // Evaluates a const-expr over the supported subset to an i64/bool value:
+    // int/bool literals, the arithmetic/comparison binops, unary `-`/`!`,
+    // `if/else`, `let`, and calls to `const fn`s (recursively). Anything else
+    // (I/O, heap, loops, method calls, structs, ...) is a clear error. The
+    // evaluator is bounded by depth (kConstEvalMaxDepth) and a global step
+    // budget (kConstEvalMaxSteps); integer overflow and division/modulo by
+    // zero are compile errors. Errors are thrown as ConstEvalError and caught
+    // at the public entry points (evalConst / evalArrayLen) which turn them
+    // into a typecheck diagnostic.
+
+    [[noreturn]] void constFail(const std::string& msg, const ast::Expr& e) {
+        throw ConstEvalError{msg, e.line, e.column};
+    }
+
+    void constTick(const ast::Expr& e) {
+        if (++constEvalSteps_ > kConstEvalMaxSteps) {
+            constFail("const evaluation exceeded the step budget (" +
+                          std::to_string(kConstEvalMaxSteps) +
+                          " steps) — possible non-terminating const fn",
+                      e);
+        }
+    }
+
+    // Evaluate a top-level const item by name, memoizing the result and
+    // detecting cyclic references. Returns the ConstValue or throws.
+    ConstValue evalConstByName(const std::string& name, const ast::Expr& site) {
+        auto cached = constValues_.find(name);
+        if (cached != constValues_.end()) return cached->second;
+        auto declIt = constDecls_.find(name);
+        if (declIt == constDecls_.end()) {
+            constFail("'" + name + "' is not a constant", site);
+        }
+        if (!constEvalInProgress_.insert(name).second) {
+            constFail("cyclic constant definition: '" + name +
+                          "' depends on itself",
+                      site);
+        }
+        ConstValue v = evalConstExpr(*declIt->second->value, /*env=*/nullptr,
+                                     /*depth=*/0);
+        constEvalInProgress_.erase(name);
+        constValues_[name] = v;
+        return v;
+    }
+
+    // The recursive evaluator. `env` (when non-null) maps in-scope local /
+    // parameter names (inside a const fn body) to their evaluated values;
+    // null means a top-level const initializer / array length (only other
+    // consts + const-fn calls are reachable). `depth` bounds recursion.
+    using ConstEnv = std::unordered_map<std::string, ConstValue>;
+
+    ConstValue evalConstExpr(const ast::Expr& e, ConstEnv* env, int depth) {
+        constTick(e);
+        // `depth` counts const-fn CALL nesting (not AST-node nesting), so the
+        // limit corresponds to the call-stack depth and lets a legitimately
+        // deep-but-bounded recursion (e.g. a 100-deep countdown) run while
+        // still catching true infinite recursion before it overflows the
+        // native C++ stack. Intra-expression recursion below passes `depth`
+        // unchanged; only `evalConstCall` increments it.
+        if (depth > kConstEvalMaxDepth) {
+            constFail("const evaluation exceeded the recursion-depth limit (" +
+                          std::to_string(kConstEvalMaxDepth) +
+                          " nested const-fn calls) — possible infinitely "
+                          "recursive const fn",
+                      e);
+        }
+        if (auto* lit = dynamic_cast<const ast::IntLitExpr*>(&e)) {
+            return {false, lit->value};
+        }
+        if (auto* bl = dynamic_cast<const ast::BoolLitExpr*>(&e)) {
+            return {true, bl->value ? 1 : 0};
+        }
+        if (auto* id = dynamic_cast<const ast::IdentExpr*>(&e)) {
+            if (env) {
+                auto it = env->find(id->name);
+                if (it != env->end()) return it->second;
+            }
+            // Not a local — must be another const.
+            return evalConstByName(id->name, e);
+        }
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+            ConstValue v = evalConstExpr(*un->operand, env, depth);
+            if (un->op == ast::UnaryOp::Neg) {
+                if (v.isBool)
+                    constFail("unary `-` requires i64 in a const expr", e);
+                if (v.i == INT64_MIN)
+                    constFail("integer overflow in const expr (negating "
+                              "i64::MIN)",
+                              e);
+                return {false, -v.i};
+            }
+            // Not (bool -> bool).
+            if (!v.isBool)
+                constFail("unary `!` requires bool in a const expr", e);
+            return {true, v.i ? 0 : 1};
+        }
+        if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+            return evalConstBinary(*bin, env, depth);
+        }
+        if (auto* ie = dynamic_cast<const ast::IfExpr*>(&e)) {
+            ConstValue c = evalConstExpr(*ie->cond, env, depth);
+            if (!c.isBool)
+                constFail("`if` condition must be bool in a const expr", e);
+            return evalConstExpr(c.i ? *ie->thenBranch : *ie->elseBranch, env,
+                                 depth);
+        }
+        if (auto* blk = dynamic_cast<const ast::BlockExpr*>(&e)) {
+            return evalConstBlock(*blk, env, depth);
+        }
+        if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+            return evalConstCall(*call, env, depth);
+        }
+        constFail("expression is not allowed in a const context (only int/"
+                  "bool literals, arithmetic/comparison/unary operators, "
+                  "`if`/`else`, `let`, and calls to `const fn`s are "
+                  "const-evaluable)",
+                  e);
+    }
+
+    ConstValue evalConstBinary(const ast::BinaryExpr& bin, ConstEnv* env,
+                               int depth) {
+        ConstValue l = evalConstExpr(*bin.lhs, env, depth);
+        ConstValue r = evalConstExpr(*bin.rhs, env, depth);
+        using Op = ast::BinOp;
+        // Comparisons produce bool; arithmetic produces i64.
+        switch (bin.op) {
+        case Op::Eq:
+            return {true, (l.i == r.i) ? 1 : 0};
+        case Op::NotEq:
+            return {true, (l.i != r.i) ? 1 : 0};
+        case Op::Lt:
+        case Op::Le:
+        case Op::Gt:
+        case Op::Ge: {
+            if (l.isBool || r.isBool)
+                constFail("ordering comparison requires i64 operands in a "
+                          "const expr",
+                          bin);
+            bool b = false;
+            if (bin.op == Op::Lt) b = l.i < r.i;
+            else if (bin.op == Op::Le) b = l.i <= r.i;
+            else if (bin.op == Op::Gt) b = l.i > r.i;
+            else b = l.i >= r.i;
+            return {true, b ? 1 : 0};
+        }
+        case Op::Add:
+        case Op::Sub:
+        case Op::Mul:
+        case Op::Div: {
+            if (l.isBool || r.isBool)
+                constFail("arithmetic requires i64 operands in a const expr",
+                          bin);
+            std::int64_t out = 0;
+            bool of = false;
+            if (bin.op == Op::Add) of = __builtin_add_overflow(l.i, r.i, &out);
+            else if (bin.op == Op::Sub)
+                of = __builtin_sub_overflow(l.i, r.i, &out);
+            else if (bin.op == Op::Mul)
+                of = __builtin_mul_overflow(l.i, r.i, &out);
+            else { // Div
+                if (r.i == 0) constFail("division by zero in const expr", bin);
+                // i64::MIN / -1 overflows.
+                if (l.i == INT64_MIN && r.i == -1)
+                    constFail("integer overflow in const expr (i64::MIN / -1)",
+                              bin);
+                out = l.i / r.i;
+            }
+            if (of) constFail("integer overflow in const expr", bin);
+            return {false, out};
+        }
+        }
+        constFail("unsupported operator in const expr", bin);
+    }
+
+    ConstValue evalConstBlock(const ast::BlockExpr& blk, ConstEnv* outer,
+                              int depth) {
+        // A block opens a fresh scope layered over the caller's env. Only
+        // `let` (with a const-evaluable RHS) and a tail expression are
+        // supported; a non-tail expr stmt with no effect is a no-op, but a
+        // block whose tail is missing (unit value) can't yield an i64/bool.
+        ConstEnv local = outer ? *outer : ConstEnv{};
+        for (const auto& s : blk.stmts) {
+            if (auto* let = dynamic_cast<const ast::LetStmt*>(s.get())) {
+                if (!let->tupleNames.empty())
+                    throw ConstEvalError{"tuple-destructuring `let` is not "
+                                         "const-evaluable",
+                                         let->line, let->column};
+                if (!let->value)
+                    throw ConstEvalError{"`let` without an initializer is not "
+                                         "const-evaluable",
+                                         let->line, let->column};
+                ConstValue v = evalConstExpr(*let->value, &local, depth);
+                local[let->name] = v;
+            } else if (auto* ret =
+                           dynamic_cast<const ast::ReturnStmt*>(s.get())) {
+                if (!ret->value)
+                    throw ConstEvalError{"bare `return;` is not "
+                                         "const-evaluable (a const fn must "
+                                         "yield a value)",
+                                         ret->line, ret->column};
+                // An early `return e;` short-circuits the block's value.
+                return evalConstExpr(*ret->value, &local, depth);
+            } else if (auto* es =
+                           dynamic_cast<const ast::ExprStmt*>(s.get())) {
+                // Evaluate for its (absence of) effects; the value is dropped.
+                // This also surfaces an error for a non-const-evaluable stmt.
+                evalConstExpr(*es->expr, &local, depth);
+            } else {
+                throw ConstEvalError{"statement is not const-evaluable",
+                                     s->line, s->column};
+            }
+        }
+        if (!blk.tail)
+            throw ConstEvalError{"a const block must end in a value "
+                                 "expression",
+                                 blk.line, blk.column};
+        return evalConstExpr(*blk.tail, &local, depth);
+    }
+
+    ConstValue evalConstCall(const ast::CallExpr& call, ConstEnv* env,
+                             int depth) {
+        auto it = constFns_.find(call.callee);
+        if (it == constFns_.end()) {
+            constFail("call to '" + call.callee +
+                          "' is not const-evaluable (only `const fn`s can be "
+                          "called in a const context)",
+                      call);
+        }
+        const ast::FnDecl& fn = *it->second;
+        if (fn.params.size() != call.args.size()) {
+            constFail("const fn '" + call.callee + "' expects " +
+                          std::to_string(fn.params.size()) + " argument(s), "
+                          "got " + std::to_string(call.args.size()),
+                      call);
+        }
+        // Evaluate the arguments in the CALLER's env (same call depth), then
+        // bind them by name into a fresh callee env (call-by-value). Entering
+        // the callee BODY is the one place call depth increments.
+        ConstEnv callee;
+        for (std::size_t i = 0; i < call.args.size(); ++i) {
+            callee[fn.params[i].name] =
+                evalConstExpr(*call.args[i], env, depth);
+        }
+        if (!fn.body) {
+            constFail("const fn '" + call.callee + "' has no body", call);
+        }
+        return evalConstBlock(*fn.body, &callee, depth + 1);
+    }
+
+    // Public entry point: evaluate a const-expr that is required to be an
+    // i64 (e.g. an array length). Catches ConstEvalError -> typecheck error,
+    // returns false on failure (with `out` untouched).
+    bool evalConstI64(const ast::Expr& e, std::int64_t& out) {
+        try {
+            constEvalSteps_ = 0;
+            ConstValue v = evalConstExpr(e, /*env=*/nullptr, /*depth=*/0);
+            if (v.isBool) {
+                error("expected an i64 constant, got bool", e.line, e.column);
+                return false;
+            }
+            out = v.i;
+            constExprValues_[&e] = v;
+            return true;
+        } catch (const ConstEvalError& ce) {
+            error(ce.message, ce.line, ce.column);
+            return false;
+        }
+    }
+
+    // Phase 25: type-check + evaluate a top-level `const NAME: T = init;`.
+    // T must be i64 or bool (the MVP scalar set). The initializer is checked
+    // for type agreement, then evaluated at compile time; the value is
+    // memoized by name and recorded (keyed by the initializer expr) so codegen
+    // emits it as a folded literal.
+    void checkConstItem(const ast::ConstDecl& cd) {
+        TypePtr declared = resolveTypeRef(cd.type);
+        TypePtr rDeclared = resolve(declared);
+        bool okType = rDeclared->kind == TypeKind::Int ||
+                      rDeclared->kind == TypeKind::Bool;
+        if (!okType) {
+            error("a `const` must have type i64 or bool in this version, got " +
+                      typeToString(declared),
+                  cd.type.line, cd.type.column);
+        }
+        // Type-check the initializer expression (records exprTypes for codegen
+        // + surfaces ordinary type errors), then unify with the declared type.
+        if (cd.value) {
+            TypePtr initTy = checkExpr(*cd.value);
+            if (okType && !unify(initTy, declared)) {
+                error("const initializer has type " + typeToString(initTy) +
+                          ", but '" + cd.name + "' is declared " +
+                          typeToString(declared),
+                      cd.value->line, cd.value->column);
+            }
+        }
+        // Compile-time evaluation (memoized by name; also records the folded
+        // value at the initializer expr for codegen). Guarded so a cyclic /
+        // already-failed const isn't re-reported here.
+        if (constValues_.count(cd.name)) return;
+        if (!cd.value) return;
+        try {
+            constEvalSteps_ = 0;
+            ConstValue v = evalConstByName(cd.name, *cd.value);
+            constExprValues_[cd.value.get()] = v;
+        } catch (const ConstEvalError& ce) {
+            // Make sure a half-finished evaluation doesn't wedge the
+            // in-progress set for later look-ups.
+            constEvalInProgress_.erase(cd.name);
+            error(ce.message, ce.line, ce.column);
+        }
+    }
+
     TypePtr checkExpr(const ast::Expr& e) {
         TypePtr t = computeExprType(e);
         exprTypes_[&e] = t;
@@ -2457,6 +2879,24 @@ private:
         }
         if (auto* id = dynamic_cast<const ast::IdentExpr*>(&e)) {
             if (auto t = lookupLocal(id->name)) return t;
+            // Phase 25: a use of a top-level `const` name. Resolve to the
+            // const's declared type and record the folded value so codegen
+            // emits a literal instead of a runtime load. A local of the same
+            // name (above) intentionally shadows the const.
+            auto cdIt = constDecls_.find(id->name);
+            if (cdIt != constDecls_.end()) {
+                TypePtr declared = resolveTypeRef(cdIt->second->type);
+                try {
+                    constEvalSteps_ = 0;
+                    ConstValue v = evalConstByName(id->name, *id);
+                    constExprValues_[id] = v;
+                } catch (const ConstEvalError& ce) {
+                    // The error is reported once at the const's own definition
+                    // site (checkConstItem); avoid a duplicate here, but still
+                    // give the use site a sensible type.
+                }
+                return declared;
+            }
             auto fnIt = fnSchemas_.find(id->name);
             if (fnIt != fnSchemas_.end()) {
                 // Bare Ident referring to a fn name used as a first-class

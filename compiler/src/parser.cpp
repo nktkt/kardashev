@@ -34,6 +34,15 @@ public:
                 prog.mods.push_back(parseModDecl());
             } else if (check(TokenKind::KwExtern)) {
                 parseExternDecls(prog);
+            } else if (check(TokenKind::KwConst)) {
+                // Phase 25: `const fn ...` is a function with the const
+                // qualifier; `const NAME: T = ...;` is a const item. Peek the
+                // token after `const` to disambiguate.
+                if (peek(1).kind == TokenKind::KwFn) {
+                    prog.functions.push_back(parseConstFnDecl());
+                } else {
+                    prog.consts.push_back(parseConstDecl());
+                }
             } else if (check(TokenKind::KwPub)) {
                 // Phase 7.3b: `pub` sticks to fn decls and is enforced on
                 // path-qualified call sites. Bare-name calls keep working
@@ -67,9 +76,20 @@ public:
                     auto im = parseImplDecl();
                     im.isPub = true;
                     prog.impls.push_back(std::move(im));
+                } else if (check(TokenKind::KwConst)) {
+                    // Phase 25: `pub const fn` / `pub const NAME ...`.
+                    if (peek(1).kind == TokenKind::KwFn) {
+                        auto fn = parseConstFnDecl();
+                        fn.isPub = true;
+                        prog.functions.push_back(std::move(fn));
+                    } else {
+                        auto c = parseConstDecl();
+                        c.isPub = true;
+                        prog.consts.push_back(std::move(c));
+                    }
                 } else {
                     errorHere("`pub` must precede fn / struct / enum / "
-                              "trait / impl");
+                              "trait / impl / const");
                     advance();
                 }
             } else {
@@ -285,6 +305,37 @@ private:
         return decl;
     }
 
+    // Phase 25: `const fn name(params) -> T { body }`. The `const` keyword is
+    // consumed here; the rest is exactly a normal fn decl (so generics /
+    // effect rows / where-clauses all still parse), with `isConst` set. A
+    // const fn is also a normal runtime fn — the qualifier only marks it as
+    // *eligible* for compile-time evaluation.
+    ast::FnDecl parseConstFnDecl() {
+        expect(TokenKind::KwConst, "const");
+        ast::FnDecl decl = parseFnDecl();
+        decl.isConst = true;
+        return decl;
+    }
+
+    // Phase 25: a top-level `const NAME: T = <const-expr>;` item. The type
+    // annotation is mandatory (a const carries an explicit type); the
+    // initializer is any expression — the typechecker evaluates it at compile
+    // time and rejects non-const-evaluable forms.
+    ast::ConstDecl parseConstDecl() {
+        Token constTok = expect(TokenKind::KwConst, "const");
+        ast::ConstDecl decl;
+        decl.line = constTok.line;
+        decl.column = constTok.column;
+        Token nameTok = expect(TokenKind::Identifier, "constant name");
+        decl.name = nameTok.lexeme;
+        expect(TokenKind::Colon, ": (a `const` requires a type annotation)");
+        decl.type = parseTypeRef();
+        expect(TokenKind::Eq, "= in const declaration");
+        decl.value = parseExpr();
+        expect(TokenKind::Semi, "; after const initializer");
+        return decl;
+    }
+
     // Phase 16: the return type is optional. `-> T` names an explicit return
     // type; omitting it (e.g. `fn drop(&mut self) { ... }`) means the function
     // returns `unit` — the natural spelling the `Drop` trait method uses. A
@@ -452,10 +503,11 @@ private:
             expect(TokenKind::RBracket, "]");
             return tr;
         }
-        // Phase 22: a fixed-size array type `[T; N]` (no leading `&` — that is
-        // the slice form above). The length N is an integer literal for the
-        // MVP (a `const`-expr N is deferred to Phase 25). `&[T; N]` (a
-        // reference to an array) wraps the array in a Ref.
+        // Phase 22 / 25: a fixed-size array type `[T; N]` (no leading `&` —
+        // that is the slice form above). N may be any compile-time-constant
+        // expression: a bare integer literal (Phase 22), a `const` item, a
+        // `const fn` call, or an arithmetic expr over them (Phase 25).
+        // `&[T; N]` (a reference to an array) wraps the array in a Ref.
         if (check(TokenKind::LBracket)) {
             Token lb = consume(); // [
             ast::TypeRef tr;
@@ -464,12 +516,17 @@ private:
             tr.column = isRef ? ampTok.column : lb.column;
             tr.typeArgs.push_back(parseTypeRef());
             expect(TokenKind::Semi, "; in array type [T; N]");
-            Token nTok = expect(TokenKind::Integer, "array length");
-            try {
-                tr.arrayLen = static_cast<std::size_t>(std::stoull(nTok.lexeme));
-            } catch (const std::exception&) {
-                errorHere("array length out of range: " + nTok.lexeme);
-                tr.arrayLen = 0;
+            // Parse the length as a full const-expr. To keep the Phase 22
+            // literal path byte-identical, a bare non-negative integer literal
+            // is folded straight into `arrayLen` (arrayLenExpr stays null);
+            // any other expression is stashed in `arrayLenExpr` for the
+            // typechecker to const-evaluate.
+            ast::ExprPtr lenExpr = parseExpr();
+            if (auto* lit = dynamic_cast<ast::IntLitExpr*>(lenExpr.get());
+                lit && lit->value >= 0) {
+                tr.arrayLen = static_cast<std::size_t>(lit->value);
+            } else {
+                tr.arrayLenExpr = std::shared_ptr<ast::Expr>(lenExpr.release());
             }
             expect(TokenKind::RBracket, "]");
             if (isRef) {

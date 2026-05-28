@@ -49,6 +49,11 @@ public:
             sep(first);
             printExtern(ef);
         }
+        // Phase 25: top-level `const` items.
+        for (const auto& cd : p.consts) {
+            sep(first);
+            printConst(cd);
+        }
         for (const auto& f : p.functions) {
             sep(first);
             printFn(f, /*indent=*/0);
@@ -94,11 +99,16 @@ private:
             std::string ref = t.refIsMut ? "&mut " : "&";
             return ref + "[" + elem + "]";
         }
-        // Phase 22: a fixed-size array type `[T; N]` (optionally `&[T; N]`).
+        // Phase 22 / 25: a fixed-size array type `[T; N]` (optionally
+        // `&[T; N]`). N is either a literal length (Phase 22, in `arrayLen`)
+        // or a const-expr (Phase 25, in `arrayLenExpr`) — print whichever the
+        // source used so the formatter round-trips a `[i64; sq(2)]` faithfully.
         if (t.isArray) {
             std::string elem = t.typeArgs.empty() ? std::string()
                                                   : typeToString(t.typeArgs[0]);
-            std::string s = "[" + elem + "; " + std::to_string(t.arrayLen) + "]";
+            std::string len = t.arrayLenExpr ? exprToString(*t.arrayLenExpr)
+                                             : std::to_string(t.arrayLen);
+            std::string s = "[" + elem + "; " + len + "]";
             if (t.isRef) s = std::string(t.refIsMut ? "&mut " : "&") + s;
             return s;
         }
@@ -196,6 +206,14 @@ private:
 
     void printMod(const ModDecl& m) {
         out_ += "mod " + m.name + ";\n";
+    }
+
+    // Phase 25: `[pub ]const NAME: T = <expr>;`.
+    void printConst(const ConstDecl& cd) {
+        if (cd.isPub) out_ += "pub ";
+        out_ += "const " + cd.name + ": " + typeToString(cd.type) + " = ";
+        if (cd.value) printExpr(*cd.value, /*depth=*/0, /*parentPrec=*/0);
+        out_ += ";\n";
     }
 
     // Phase 24: `extern "C" fn name(params) -> ret [! { ... }];` — a bodyless
@@ -321,6 +339,7 @@ private:
     void printFn(const FnDecl& fn, int depth) {
         indent(depth);
         if (fn.isPub) out_ += "pub ";
+        if (fn.isConst) out_ += "const "; // Phase 25
         if (fn.isAsync) out_ += "async ";
         out_ += "fn " + fn.name + genericParamsToString(fn.genericParams) + "(" +
                 paramsToString(fn.params) + ") -> " + typeToString(fn.returnType) +
@@ -464,6 +483,18 @@ private:
     // binary expr is wrapped in parens when its own precedence is lower than
     // what the parent needs to preserve the parse tree. Non-binary primaries
     // ignore it.
+    // Phase 25: render an expression to a standalone string (used by
+    // typeToString for a const-expr array length). Captures printExpr's
+    // output into a temporary buffer so it can be embedded mid-type.
+    std::string exprToString(const Expr& e) {
+        std::string saved = std::move(out_);
+        out_.clear();
+        printExpr(e, /*depth=*/0, /*parentPrec=*/0);
+        std::string result = std::move(out_);
+        out_ = std::move(saved);
+        return result;
+    }
+
     void printExpr(const Expr& e, int depth, int parentPrec) {
         if (auto* lit = dynamic_cast<const IntLitExpr*>(&e)) {
             out_ += std::to_string(lit->value);
