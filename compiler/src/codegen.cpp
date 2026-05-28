@@ -612,6 +612,14 @@ private:
                 errors_.push_back("codegen: unresolved enum " + r->enumName);
                 return llvm::Type::getInt64Ty(*ctx_);
             }
+            case TypeKind::Function:
+                // Phase 10a: a function-typed value (e.g. a `fn(i64)->i64 !
+                // {e}` parameter) lowers to an opaque function pointer.
+                // Effects are erased here — they never affect the calling
+                // convention. The concrete FunctionType used at an indirect
+                // call site is rebuilt from the value's arg/ret types in
+                // emitCall, mirroring the Phase 4.3 fn-pointer path.
+                return llvm::PointerType::get(*ctx_, /*AS=*/0);
             default:
                 errors_.push_back("codegen: unsupported type for codegen");
                 return llvm::Type::getInt64Ty(*ctx_);
@@ -622,11 +630,25 @@ private:
     // the current generic-instance substitution and recursively
     // instantiating generic struct / enum references like `Pair<X, Y>`.
     TypePtr astTypeRefToConcrete(const ast::TypeRef& tr) {
-        if (tr.isRef) {
+        if (tr.isRef && !tr.isFn) {
             ast::TypeRef inner = tr;
             inner.isRef = false;
             inner.refIsMut = false;
             return makeRef(astTypeRefToConcrete(inner), tr.refIsMut);
+        }
+        // Phase 10a: a function type lowers to a Function TypePtr; the
+        // effect row is dropped (compile-time only). mapKardashevType then
+        // turns this into an opaque pointer.
+        if (tr.isFn) {
+            std::vector<TypePtr> argTys;
+            argTys.reserve(tr.fnParams.size());
+            for (const auto& p : tr.fnParams)
+                argTys.push_back(astTypeRefToConcrete(p));
+            TypePtr retTy = tr.fnRet ? astTypeRefToConcrete(*tr.fnRet)
+                                     : makeUnit();
+            TypePtr fnTy = makeFunction(std::move(argTys), retTy);
+            if (tr.isRef) return makeRef(fnTy, tr.refIsMut);
+            return fnTy;
         }
         if (auto it = currentInstanceTypeMap_.find(tr.name);
             it != currentInstanceTypeMap_.end()) {
@@ -935,6 +957,7 @@ private:
         currentFn_ = fnIt->second;
         currentFnReturnType_ = astTypeRefToConcrete(fn.returnType);
         locals_.clear();
+        localTypes_.clear();
         auto* entry =
             llvm::BasicBlock::Create(*ctx_, "entry", currentFn_);
         builder_->SetInsertPoint(entry);
@@ -947,6 +970,14 @@ private:
             auto* alloca = builder_->CreateAlloca(arg.getType(), nullptr, name);
             builder_->CreateStore(&arg, alloca);
             locals_[name] = alloca;
+            // Phase 10a: record fn-typed params' Kardashev type so an
+            // indirect call `f(args)` through the parameter can rebuild the
+            // concrete LLVM FunctionType (same machinery as let-bound fn
+            // values). Effects on the type are irrelevant to lowering.
+            TypePtr paramTy = astTypeRefToConcrete(fn.params[i].type);
+            if (resolve(paramTy)->kind == TypeKind::Function) {
+                localTypes_[name] = paramTy;
+            }
             ++i;
         }
 

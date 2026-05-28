@@ -872,6 +872,44 @@ void test_no_effect_row_defaults_pure() {
     assert(r.program.functions[0].effects.labels.empty());
 }
 
+void test_fn_type_param_with_effect_row() {
+    // Phase 10a: a function type in parameter position carries an effect
+    // row. `fn(i64) -> i64 ! {io}` parses into TypeRef.isFn with fnParams,
+    // fnRet, and fnEffects populated.
+    auto r = parse("fn takes(f: fn(i64) -> i64 ! {io}) -> i64 { f(1) }");
+    if (!r.ok()) {
+        std::cerr << "parse failed\n";
+        for (const auto& e : r.errors)
+            std::cerr << "  " << e.line << ":" << e.column << ": "
+                      << e.message << '\n';
+        std::abort();
+    }
+    assert(r.program.functions.size() == 1);
+    const auto& fn = r.program.functions[0];
+    assert(fn.params.size() == 1);
+    const auto& pty = fn.params[0].type;
+    assert(pty.isFn);
+    assert(pty.fnParams.size() == 1);
+    assert(pty.fnParams[0].name == "i64");
+    assert(pty.fnRet && pty.fnRet->name == "i64");
+    assert(pty.fnEffects.size() == 1);
+    assert(pty.fnEffects[0] == "io");
+}
+
+void test_fn_type_param_row_var_no_effects() {
+    // `fn(T) -> U ! {e}` with a row var, plus a fn type with no effect row.
+    auto r = parse(
+        "fn map(f: fn(i64) -> i64 ! {e}, g: fn(i64) -> i64) -> i64 { 0 }");
+    assert(r.ok());
+    const auto& fn = r.program.functions[0];
+    assert(fn.params.size() == 2);
+    assert(fn.params[0].type.isFn);
+    assert(fn.params[0].type.fnEffects.size() == 1);
+    assert(fn.params[0].type.fnEffects[0] == "e");
+    assert(fn.params[1].type.isFn);
+    assert(fn.params[1].type.fnEffects.empty()); // pure fn type
+}
+
 void test_mod_decl_basic() {
     auto r = parse("mod util;\nfn main() -> i64 { 0 }");
     if (!r.ok()) {
@@ -1074,6 +1112,9 @@ int main() {
     test_effect_row_on_fn_decl();
     test_effect_row_empty_braces();
     test_no_effect_row_defaults_pure();
+    // Phase 10a function types with effect rows
+    test_fn_type_param_with_effect_row();
+    test_fn_type_param_row_var_no_effects();
     // Phase 7 mod
     test_mod_decl_basic();
     test_mod_multiple();
@@ -1089,6 +1130,6 @@ int main() {
     test_assign_stmt();
     test_field_assign_stmt();
     test_while_as_statement_then_tail();
-    std::cout << "All parser tests passed (67 cases)\n";
+    std::cout << "All parser tests passed (69 cases)\n";
     return 0;
 }

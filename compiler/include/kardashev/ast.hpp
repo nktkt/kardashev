@@ -289,11 +289,25 @@ struct AssignStmt : Stmt {
 //
 // `&T` and `&mut T` (Phase 2.4b/c) set isRef + refIsMut on the same node.
 // Nested references (`&&T`) aren't yet on the grammar.
+// Phase 10a: a function *type* in type position, e.g. `fn(i64) -> i64 !
+// {io}` or `fn(T) -> U ! {e}`. When `isFn` is true, `fnParams` / `fnRet`
+// describe the signature and `fnEffects` its effect row (which may name an
+// effect-row variable bound by the enclosing fn's generic params). `name`
+// is left empty for fn types. Effect-carrying function types are how
+// kardashev threads effects through first-class fn values + higher-order
+// functions.
+struct EffectRow; // fwd (defined below)
+
 struct TypeRef {
     std::string name;
     std::vector<TypeRef> typeArgs;
     bool isRef = false;
     bool refIsMut = false;
+    // Function-type fields (valid only when isFn == true).
+    bool isFn = false;
+    std::vector<TypeRef> fnParams;
+    std::shared_ptr<TypeRef> fnRet; // shared_ptr so TypeRef stays copyable
+    std::vector<std::string> fnEffects; // effect-row labels (concrete + vars)
     std::size_t line = 1;
     std::size_t column = 1;
 };

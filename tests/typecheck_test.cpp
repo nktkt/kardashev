@@ -1049,6 +1049,143 @@ void test_effect_row_recorded_in_schema() {
     assert(!it->second.declaredEffects.contains("panic"));
 }
 
+// --- Phase 10a: effect-carrying function types + effect-row polymorphism ---
+
+// The README capstone: a higher-order fn polymorphic over its argument's
+// effect row. `apply` is pure when given a pure fn, effectful when given an
+// effectful one.
+static const char* kApplyPrelude =
+    "fn apply(f: fn(i64) -> i64 ! {e}) -> i64 ! {e} { f(10) }\n"
+    "fn pureInc(x: i64) -> i64 { x + 1 }\n"
+    "fn ioInc(x: i64) -> i64 ! {io} { print(x); x + 1 }\n";
+
+void test_effect_poly_apply_pure_ok() {
+    expectOk(std::string(kApplyPrelude) +
+                 "fn usePure() -> i64 { apply(pureInc) }",
+             "effect_poly_apply_pure_ok");
+}
+
+void test_effect_poly_apply_io_ok() {
+    expectOk(std::string(kApplyPrelude) +
+                 "fn useIo() -> i64 ! {io} { apply(ioInc) }",
+             "effect_poly_apply_io_ok");
+}
+
+void test_effect_poly_apply_io_leak_errors() {
+    // Pure signature, but `e := {io}` leaks io through apply: must error.
+    expectErr(std::string(kApplyPrelude) +
+                  "fn useIoBad() -> i64 { apply(ioInc) }",
+              "effect_poly_apply_io_leak_errors");
+}
+
+void test_effect_poly_apply_io_caller_declares_more_ok() {
+    // Caller may declare a superset of the propagated effects.
+    expectOk(std::string(kApplyPrelude) +
+                 "fn useIo() -> i64 ! {io, alloc} { apply(ioInc) }",
+             "effect_poly_apply_io_caller_declares_more_ok");
+}
+
+void test_concrete_fn_type_param_io_ok() {
+    // A concrete (non-polymorphic) fn-type param `fn(i64)->i64 ! {io}`: the
+    // body's indirect call performs io, so the caller must declare it.
+    expectOk("fn callIt(f: fn(i64) -> i64 ! {io}) -> i64 ! {io} { f(3) }\n"
+             "fn ioInc(x: i64) -> i64 ! {io} { print(x); x + 1 }\n"
+             "fn main() -> i64 ! {io} { callIt(ioInc) }",
+             "concrete_fn_type_param_io_ok");
+}
+
+void test_concrete_fn_type_param_pure_body_errors() {
+    // The fn-type param declares io, so calling it inside a pure-bodied
+    // higher-order fn must error.
+    expectErr("fn callIt(f: fn(i64) -> i64 ! {io}) -> i64 { f(3) }\n"
+              "fn main() -> i64 { 0 }",
+              "concrete_fn_type_param_pure_body_errors");
+}
+
+void test_fn_value_preserves_effects_via_let() {
+    // A first-class fn value bound with `let` keeps its declared effects:
+    // calling it requires the caller to declare them.
+    expectErr("fn ioInc(x: i64) -> i64 ! {io} { print(x); x + 1 }\n"
+              "fn main() -> i64 { let g = ioInc; g(5) }",
+              "fn_value_preserves_effects_via_let_errors");
+}
+
+void test_fn_value_preserves_effects_via_let_ok() {
+    expectOk("fn ioInc(x: i64) -> i64 ! {io} { print(x); x + 1 }\n"
+             "fn main() -> i64 ! {io} { let g = ioInc; g(5) }",
+             "fn_value_preserves_effects_via_let_ok");
+}
+
+void test_pure_fn_value_via_let_ok() {
+    // A pure fn value imposes no effect obligation on a pure caller.
+    expectOk("fn inc(x: i64) -> i64 { x + 1 }\n"
+             "fn main() -> i64 { let g = inc; g(5) }",
+             "pure_fn_value_via_let_ok");
+}
+
+void test_fn_type_param_arg_must_match_effects() {
+    // Passing a pure fn where the param type fixes `io` is fine (pure ⊆ io);
+    // passing an io fn where the param is pure must be rejected, because the
+    // body would then be allowed to call a pure fn yet the caller passed an
+    // effectful one — the effect rows don't unify.
+    expectErr("fn takesPure(f: fn(i64) -> i64) -> i64 { f(1) }\n"
+              "fn ioInc(x: i64) -> i64 ! {io} { print(x); x + 1 }\n"
+              "fn main() -> i64 { takesPure(ioInc) }",
+              "fn_type_param_arg_must_match_effects");
+}
+
+void test_effect_row_var_classified_in_schema() {
+    auto r = tc("fn apply(f: fn(i64) -> i64 ! {e}) -> i64 ! {e} { f(10) }");
+    if (!r.ok()) {
+        std::cerr << "[effect_row_var_classified_in_schema] tc failed\n";
+        dump(r);
+        std::abort();
+    }
+    auto it = r.fnSchemas.find("apply");
+    assert(it != r.fnSchemas.end());
+    // `e` is an effect-row variable (appears in `! { ... }`), so it is
+    // recorded in effectRowVars and listed among declaredEffects by name.
+    assert(it->second.effectRowVars.size() == 1);
+    assert(it->second.effectRowVars[0].first == "e");
+    assert(it->second.declaredEffects.contains("e"));
+}
+
+void test_generic_param_type_and_effect_conflict_errors() {
+    // `e` used in both a type position and an effect position: rejected.
+    expectErr("fn bad<e>(x: e, f: fn(i64) -> i64 ! {e}) -> i64 ! {e} { f(1) }\n"
+              "fn main() -> i64 { 0 }",
+              "generic_param_type_and_effect_conflict_errors");
+}
+
+void test_higher_order_type_var_and_effect_var_together_ok() {
+    // Mixed generics: `T` is a type var, `e` an effect-row var. Both roles
+    // coexist cleanly in one signature.
+    expectOk("fn run<T, e>(x: T, f: fn(T) -> T ! {e}) -> T ! {e} { f(x) }\n"
+             "fn dbl(x: i64) -> i64 { x + x }\n"
+             "fn main() -> i64 { run(21, dbl) }",
+             "higher_order_type_var_and_effect_var_together_ok");
+}
+
+void test_implicit_row_var_in_fn_type_ok() {
+    // A non-built-in label in a fn-type effect row is an (implicitly
+    // introduced) effect-row variable, not an error — even when the
+    // enclosing fn doesn't thread it through its own return row. Here the
+    // row var stays free/pure at the `takes` definition site, so calling
+    // `f(1)` adds no concrete effect and the pure body type-checks.
+    expectOk("fn takes(f: fn(i64) -> i64 ! {row}) -> i64 { f(1) }\n"
+             "fn main() -> i64 { 0 }",
+             "implicit_row_var_in_fn_type_ok");
+}
+
+void test_unknown_top_level_effect_label_errors() {
+    // A non-built-in label in a fn's OWN top-level effect row, with no
+    // backing generic param or fn-type-row use, remains an unknown-label
+    // error (it cannot be a row var — nothing introduces it).
+    expectErr("fn bad() -> i64 ! { totally_unknown } { 0 }\n"
+              "fn main() -> i64 { 0 }",
+              "unknown_top_level_effect_label_errors");
+}
+
 // --- Phase 9: loops, ranges, assignment, mutability ---
 
 void test_while_basic_ok() {
@@ -1263,6 +1400,22 @@ int main() {
     test_undeclared_effect_label_errors();
     test_multiple_effects_union_ok();
     test_effect_row_recorded_in_schema();
+    // Phase 10a effect-carrying fn types + effect-row polymorphism
+    test_effect_poly_apply_pure_ok();
+    test_effect_poly_apply_io_ok();
+    test_effect_poly_apply_io_leak_errors();
+    test_effect_poly_apply_io_caller_declares_more_ok();
+    test_concrete_fn_type_param_io_ok();
+    test_concrete_fn_type_param_pure_body_errors();
+    test_fn_value_preserves_effects_via_let();
+    test_fn_value_preserves_effects_via_let_ok();
+    test_pure_fn_value_via_let_ok();
+    test_fn_type_param_arg_must_match_effects();
+    test_effect_row_var_classified_in_schema();
+    test_generic_param_type_and_effect_conflict_errors();
+    test_higher_order_type_var_and_effect_var_together_ok();
+    test_implicit_row_var_in_fn_type_ok();
+    test_unknown_top_level_effect_label_errors();
     // Phase 9 loops + ranges + assignment + mutability
     test_while_basic_ok();
     test_while_cond_must_be_bool();
@@ -1279,6 +1432,6 @@ int main() {
     test_range_endpoints_must_be_int();
     test_loop_io_effect_propagates();
     test_nested_loops_ok();
-    std::cout << "All typecheck tests passed (116 cases)\n";
+    std::cout << "All typecheck tests passed (131 cases)\n";
     return 0;
 }

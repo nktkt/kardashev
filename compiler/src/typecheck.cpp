@@ -357,9 +357,18 @@ public:
                 // Skip the second decl entirely — keep the first schema.
                 continue;
             }
+            // Phase 10a: classify which names are effect-row vars (appear
+            // inside a `! { ... }` row) BEFORE allocating type Vars, so an
+            // effect-row generic param does NOT enter `genVars` (codegen's
+            // monomorphization list). Effects are compile-time only.
+            std::unordered_set<std::string> rowVarNames = classifyEffectRowVars(
+                fn.params, fn.returnType, fn.effects, fn.genericParams,
+                fn.name);
+
             std::unordered_map<std::string, TypePtr> genEnv;
             std::vector<TypePtr> genVars;
             std::vector<std::string> genBounds;
+            std::vector<std::pair<std::string, TypePtr>> effectRowVars;
             genVars.reserve(fn.genericParams.size());
             genBounds.reserve(fn.genericParams.size());
             std::unordered_set<std::string> seenGp;
@@ -377,17 +386,33 @@ public:
                               "' shadows an existing type",
                           gp.line, gp.column);
                 }
-                if (!gp.bound.empty() && !traits_.count(gp.bound)) {
-                    error("unknown trait bound '" + gp.bound + "' on '" +
-                              gp.name + "'",
-                          gp.line, gp.column);
-                }
                 TypePtr v = makeFreshVar();
                 genEnv[gp.name] = v;
-                genVars.push_back(v);
-                genBounds.push_back(gp.bound);
+                if (rowVarNames.count(gp.name)) {
+                    // Explicit effect-row generic param: tracked separately,
+                    // kept out of genVars/genBounds (no monomorphization, no
+                    // trait bound).
+                    effectRowVars.emplace_back(gp.name, v);
+                } else {
+                    if (!gp.bound.empty() && !traits_.count(gp.bound)) {
+                        error("unknown trait bound '" + gp.bound + "' on '" +
+                                  gp.name + "'",
+                              gp.line, gp.column);
+                    }
+                    genVars.push_back(v);
+                    genBounds.push_back(gp.bound);
+                }
+            }
+            // Implicit row vars (named only in fn-type rows, not in `<...>`)
+            // each get a fresh Var, registered in genEnv for resolution.
+            for (const auto& name : rowVarNames) {
+                if (genEnv.count(name)) continue; // explicit, handled above
+                TypePtr v = makeFreshVar();
+                genEnv[name] = v;
+                effectRowVars.emplace_back(name, v);
             }
             currentGenericEnv_ = &genEnv;
+            currentEffectRowVarNames_ = &rowVarNames;
 
             std::vector<TypePtr> argTypes;
             argTypes.reserve(fn.params.size());
@@ -397,14 +422,20 @@ public:
             TypePtr ret = resolveTypeRef(fn.returnType);
 
             currentGenericEnv_ = nullptr;
+            currentEffectRowVarNames_ = nullptr;
 
             FnSchema schema;
             schema.signature = makeFunction(std::move(argTypes), ret);
             schema.genericVars = std::move(genVars);
             schema.genericBounds = std::move(genBounds);
+            // Note: effect-row vars are deliberately NOT added to
+            // genericVars — that list drives codegen monomorphization, and
+            // effects are compile-time only (zero runtime cost). Row vars
+            // are substituted separately at call sites via `effectRowVars`.
+            schema.effectRowVars = std::move(effectRowVars);
             schema.declaredEffects = buildEffectSet(fn.effects,
                                                        fn.genericParams,
-                                                       fn.name);
+                                                       fn.name, &rowVarNames);
             // Phase 6.1: `async fn` wraps the declared return type in
             // the built-in `Future` struct. The body still emits the
             // inner type (which we stash on the schema for codegen);
@@ -447,20 +478,42 @@ public:
                 // and have it land as `self: ConcreteType -> i64`.
                 TypePtr selfTy = resolveTypeRef(impl.forType);
                 genEnv["Self"] = selfTy;
+                // Phase 10a: classify effect-row vars for impl methods too,
+                // so a method may take fn-typed params with effect rows.
+                std::unordered_set<std::string> rowVarNames =
+                    classifyEffectRowVars(fn.params, fn.returnType, fn.effects,
+                                          fn.genericParams, fn.name);
+                std::vector<std::pair<std::string, TypePtr>> effectRowVars;
+                for (const auto& name : rowVarNames) {
+                    auto git = genEnv.find(name);
+                    TypePtr v = git != genEnv.end() ? git->second
+                                                    : makeFreshVar();
+                    if (git == genEnv.end()) genEnv[name] = v;
+                    effectRowVars.emplace_back(name, v);
+                }
                 currentGenericEnv_ = &genEnv;
+                currentEffectRowVarNames_ = &rowVarNames;
                 std::vector<TypePtr> argTypes;
                 for (const auto& p : fn.params) {
                     argTypes.push_back(resolveTypeRef(p.type));
                 }
                 TypePtr ret = resolveTypeRef(fn.returnType);
                 currentGenericEnv_ = nullptr;
+                currentEffectRowVarNames_ = nullptr;
                 FnSchema sch;
                 sch.signature = makeFunction(std::move(argTypes), ret);
                 sch.genericVars = std::move(genVars);
                 sch.genericBounds = std::move(genBounds);
+                for (const auto& [name, v] : effectRowVars) {
+                    bool dup = false;
+                    for (const auto& gv : sch.genericVars)
+                        if (gv.get() == v.get()) { dup = true; break; }
+                    if (!dup) sch.genericVars.push_back(v);
+                }
+                sch.effectRowVars = std::move(effectRowVars);
                 sch.declaredEffects = buildEffectSet(fn.effects,
                                                        fn.genericParams,
-                                                       fn.name);
+                                                       fn.name, &rowVarNames);
                 if (fn.isAsync) sch.declaredEffects.add("async");
                 fnSchemas_[mangled] = std::move(sch);
                 implMethodMangled_[&fn] = mangled;
@@ -557,6 +610,18 @@ private:
     std::unordered_map<const ast::Expr*, TypePtr> exprTypes_;
     std::unordered_map<const ast::CallExpr*, std::vector<TypePtr>>
         callInstantiations_;
+    // Phase 10a: per-call-site effect contribution, in source-level label
+    // names (concrete built-ins and/or effect-row-var names). Populated
+    // during body-checking (`checkCall` / `checkMethodCall`) where the
+    // instantiated, unified types are available; consumed by the later
+    // effect pass via `collectEffects`. Absent => fall back to the callee's
+    // statically declared effects (the pre-Phase-10a behavior).
+    std::unordered_map<const ast::Expr*, EffectSet> exprEffects_;
+    // Phase 10a: name -> Var for the effect-row variables of the fn whose
+    // body is currently being checked. Lets us map a resolved Type Var back
+    // to the row-var name it stands for (so a still-polymorphic row var
+    // contributes its name, e.g. `e`, to the enclosing fn's effect set).
+    std::unordered_map<int, std::string> currentEffectRowVarById_;
     std::unordered_map<const ast::MatchExpr*,
                        std::unique_ptr<pattern_match::DecisionTree>>
         matchTrees_;
@@ -583,6 +648,11 @@ private:
     // specialization in a body — e.g. `x + 1` in `fn id<T>(x: T) -> T` —
     // doesn't taint the stored schema).
     const GenericEnv* currentGenericEnv_ = nullptr;
+    // Phase 10a: names of generic params that are effect-row variables in
+    // the signature currently being resolved. Active alongside
+    // `currentGenericEnv_`; lets `resolveTypeRef` distinguish a row-var name
+    // from a concrete label when building a function type's effect row.
+    const std::unordered_set<std::string>* currentEffectRowVarNames_ = nullptr;
 
     void error(std::string msg, std::size_t line, std::size_t col) {
         errors_.push_back({std::move(msg), line, col});
@@ -594,6 +664,74 @@ private:
     static bool isBuiltinEffect(const std::string& l) {
         return l == "alloc" || l == "io" || l == "panic" ||
                l == "async" || l == "unwind";
+    }
+
+    // Phase 10a classification: collect, from a signature, the names that
+    // appear in *type* position and the names that appear inside a *function-
+    // type* effect row (`fn(...) -> ... ! { e }`). The latter are the
+    // syntactic sites that introduce effect-row variables (a row var must
+    // flow through a fn-typed value to be observable). A label in a fn's own
+    // top-level effect row that is neither a built-in nor backed by such a
+    // use (or a declared generic param) stays an unknown-label error.
+    static void collectNameUses(const ast::TypeRef& tr,
+                                std::unordered_set<std::string>& inType,
+                                std::unordered_set<std::string>& inFnEffect) {
+        if (tr.isFn) {
+            for (const auto& p : tr.fnParams)
+                collectNameUses(p, inType, inFnEffect);
+            if (tr.fnRet) collectNameUses(*tr.fnRet, inType, inFnEffect);
+            for (const auto& l : tr.fnEffects)
+                if (!isBuiltinEffect(l)) inFnEffect.insert(l);
+            return;
+        }
+        // A bare/applied type name uses `tr.name` in type position. (Built-
+        // in `i64`/`bool` and concrete struct/enum names are filtered out
+        // later against the actual generic-param list.)
+        inType.insert(tr.name);
+        for (const auto& a : tr.typeArgs)
+            collectNameUses(a, inType, inFnEffect);
+    }
+
+    // Compute, for one fn decl, the set of names that are effect-row
+    // variables. Classification rule (Phase 10a, decidable): a name is an
+    // effect-row variable iff it appears inside a `! { ... }` row anywhere
+    // in the signature and is not a built-in effect. In practice this means
+    // either (a) it is named in a function-type effect row `fn(...) ! {e}`
+    // (which introduces it — explicitly listing it in `<...>` is optional),
+    // or (b) it is a declared generic parameter mentioned in an effect row.
+    // A name used in both a type position and an effect position is an error.
+    std::unordered_set<std::string> classifyEffectRowVars(
+        const std::vector<ast::Param>& params,
+        const ast::TypeRef& returnType,
+        const ast::EffectRow& effects,
+        const std::vector<ast::TypeParam>& genericParams,
+        const std::string& fnName) {
+        std::unordered_set<std::string> inType;
+        std::unordered_set<std::string> inFnEffect; // names in fn-type rows
+        for (const auto& p : params)
+            collectNameUses(p.type, inType, inFnEffect);
+        collectNameUses(returnType, inType, inFnEffect);
+
+        // Row vars: every name used in a function-type effect row, plus any
+        // declared generic param that appears in an effect row (the decl's
+        // own row or a fn-type row).
+        std::unordered_set<std::string> rowVars = inFnEffect;
+        std::unordered_set<std::string> declRowLabels;
+        for (const auto& l : effects.labels)
+            if (!isBuiltinEffect(l)) declRowLabels.insert(l);
+        for (const auto& g : genericParams) {
+            bool usedInEffect =
+                inFnEffect.count(g.name) > 0 || declRowLabels.count(g.name) > 0;
+            bool usedInType = inType.count(g.name) > 0;
+            if (usedInEffect && usedInType) {
+                error("generic parameter '" + g.name + "' on fn '" + fnName +
+                          "' is used both as a type and as an effect-row "
+                          "variable; pick one role",
+                      g.line, g.column);
+            }
+            if (usedInEffect) rowVars.insert(g.name);
+        }
+        return rowVars;
     }
 
     // Phase 4.2: walk a function body and collect the effects induced by
@@ -611,9 +749,22 @@ private:
         }
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
             for (const auto& a : call->args) collectEffects(*a, out);
-            auto fnIt = fnSchemas_.find(call->callee);
-            if (fnIt != fnSchemas_.end()) {
-                out.unionWith(fnIt->second.declaredEffects);
+            // Phase 10a: prefer the per-call-site contribution recorded
+            // during body-checking (it reflects instantiated effect-row
+            // vars — e.g. `apply(ioInc)` yields `io`, `apply(pureInc)`
+            // yields nothing). Fall back to the callee's statically declared
+            // effects only for fns with no effect-row vars (where declared
+            // == actual), preserving pre-Phase-10a behavior. Indirect calls
+            // (callee not in fnSchemas_) rely entirely on the recorded set.
+            auto eit = exprEffects_.find(call);
+            if (eit != exprEffects_.end()) {
+                out.unionWith(eit->second);
+            } else {
+                auto fnIt = fnSchemas_.find(call->callee);
+                if (fnIt != fnSchemas_.end() &&
+                    fnIt->second.effectRowVars.empty()) {
+                    out.unionWith(fnIt->second.declaredEffects);
+                }
             }
             // Constructor calls don't go through fnSchemas_; they're
             // pure (no effect added).
@@ -738,19 +889,25 @@ private:
 
     EffectSet buildEffectSet(const ast::EffectRow& row,
                               const std::vector<ast::TypeParam>& genericParams,
-                              const std::string& fnName) {
+                              const std::string& fnName,
+                              const std::unordered_set<std::string>*
+                                  rowVarNames = nullptr) {
         EffectSet result;
         for (const auto& l : row.labels) {
             if (isBuiltinEffect(l)) {
                 result.add(l);
                 continue;
             }
-            // Effect-row variable: must match a generic parameter name.
-            // (Phase 4.3 wires these into instantiation; Phase 4.2 only
-            // validates the label is declared.)
-            bool isRowVar = false;
-            for (const auto& gp : genericParams) {
-                if (gp.name == l) { isRowVar = true; break; }
+            // Effect-row variable: an explicit generic parameter, or (Phase
+            // 10a) any name classified as a row var by `classifyEffectRowVars`
+            // (which includes implicit row vars introduced by first use in an
+            // effect row). Such names are recorded by name in the effect set
+            // and bound to a schema Var at instantiation.
+            bool isRowVar = rowVarNames && rowVarNames->count(l) > 0;
+            if (!isRowVar) {
+                for (const auto& gp : genericParams) {
+                    if (gp.name == l) { isRowVar = true; break; }
+                }
             }
             if (isRowVar) {
                 result.add(l);
@@ -794,7 +951,19 @@ private:
             genEnv[fn.genericParams[i].name] = schema.genericVars[i];
         }
         genEnv["Self"] = selfTy;
+        // Phase 10a: restore effect-row-var env so fn-typed params resolve
+        // and effect collection can name still-polymorphic row vars.
+        std::unordered_set<std::string> rowVarNames;
+        currentEffectRowVarById_.clear();
+        for (const auto& [name, var] : schema.effectRowVars) {
+            rowVarNames.insert(name);
+            genEnv[name] = var;
+            TypePtr rv = resolve(var);
+            if (rv->kind == TypeKind::Var)
+                currentEffectRowVarById_[rv->varId] = name;
+        }
         currentGenericEnv_ = &genEnv;
+        currentEffectRowVarNames_ = &rowVarNames;
         pushScope();
         for (const auto& p : fn.params) {
             scopes_.back()[p.name] = resolveTypeRef(p.type);
@@ -813,6 +982,8 @@ private:
         popScope();
         currentReturnType_.reset();
         currentGenericEnv_ = nullptr;
+        currentEffectRowVarNames_ = nullptr;
+        currentEffectRowVarById_.clear();
     }
 
     // Allocate a schema shell: an opaque Type (Struct or Enum kind, empty
@@ -936,11 +1107,53 @@ private:
     TypePtr resolveTypeRef(const ast::TypeRef& tr) {
         // Phase 2.4b: peel off the reference wrapper and wrap the inner
         // resolution. Recursive in case nested refs are introduced later.
-        if (tr.isRef) {
+        if (tr.isRef && !tr.isFn) {
             ast::TypeRef inner = tr;
             inner.isRef = false;
             inner.refIsMut = false;
             return makeRef(resolveTypeRef(inner), tr.refIsMut);
+        }
+        // Phase 10a: a function type `fn(P...) -> R ! { effects }`. Build a
+        // Function Type carrying the effect row. Concrete labels go in
+        // `effectLabels`; a single effect-row variable (the polymorphic
+        // tail) becomes the `effectRowVar`, resolved against the enclosing
+        // fn's generic env. A `&fn(...)` reference wraps the result.
+        if (tr.isFn) {
+            std::vector<TypePtr> argTys;
+            argTys.reserve(tr.fnParams.size());
+            for (const auto& p : tr.fnParams) argTys.push_back(resolveTypeRef(p));
+            TypePtr retTy = tr.fnRet ? resolveTypeRef(*tr.fnRet) : makeUnit();
+            std::vector<std::string> labels;
+            TypePtr rowVar;
+            for (const auto& l : tr.fnEffects) {
+                if (isBuiltinEffect(l)) {
+                    if (std::find(labels.begin(), labels.end(), l) ==
+                        labels.end())
+                        labels.push_back(l);
+                    continue;
+                }
+                bool isRowVar = currentEffectRowVarNames_ &&
+                                currentEffectRowVarNames_->count(l) > 0;
+                if (isRowVar && currentGenericEnv_) {
+                    auto git = currentGenericEnv_->find(l);
+                    if (git != currentGenericEnv_->end()) {
+                        // All occurrences of the same row-var name in one
+                        // signature share the schema Var, so the function-
+                        // type rows are linked through unification.
+                        rowVar = git->second;
+                    }
+                } else {
+                    error("unknown effect label `" + l +
+                              "` in function type (built-ins: alloc, io, "
+                              "panic, async, unwind; or declare `" + l +
+                              "` as a generic effect-row parameter)",
+                          tr.line, tr.column);
+                }
+            }
+            TypePtr fnTy = makeFunction(std::move(argTys), retTy,
+                                        std::move(labels), rowVar);
+            if (tr.isRef) return makeRef(fnTy, tr.refIsMut);
+            return fnTy;
         }
         // Generic params from the enclosing fn/struct/enum decl.
         if (currentGenericEnv_) {
@@ -1077,7 +1290,20 @@ private:
              ++i) {
             genEnv[fn.genericParams[i].name] = schema.genericVars[i];
         }
+        // Phase 10a: reconstruct the effect-row-var name set and the
+        // Var-id -> name map so (a) `resolveTypeRef` builds fn-typed params
+        // with the right row var, and (b) effect collection can recover a
+        // row var's source name when it is still polymorphic in this body.
+        std::unordered_set<std::string> rowVarNames;
+        currentEffectRowVarById_.clear();
+        for (const auto& [name, var] : schema.effectRowVars) {
+            rowVarNames.insert(name);
+            TypePtr rv = resolve(var);
+            if (rv->kind == TypeKind::Var)
+                currentEffectRowVarById_[rv->varId] = name;
+        }
         currentGenericEnv_ = &genEnv;
+        currentEffectRowVarNames_ = &rowVarNames;
 
         pushScope();
         for (const auto& p : fn.params) {
@@ -1101,6 +1327,8 @@ private:
         popScope();
         currentReturnType_.reset();
         currentGenericEnv_ = nullptr;
+        currentEffectRowVarNames_ = nullptr;
+        currentEffectRowVarById_.clear();
     }
 
     TypePtr checkExpr(const ast::Expr& e) {
@@ -1122,16 +1350,17 @@ private:
             if (auto t = lookupLocal(id->name)) return t;
             auto fnIt = fnSchemas_.find(id->name);
             if (fnIt != fnSchemas_.end()) {
-                // Bare Ident referring to a fn name: instantiate so callers
-                // never see the raw schema Vars escape. Phase 3.1 has no
-                // first-class fn values, so this branch is effectively
-                // unused; we instantiate defensively in case future code
-                // (e.g. let-bind a fn name) reaches it.
+                // Bare Ident referring to a fn name used as a first-class
+                // value (Phase 4.3). Instantiate so callers never see the
+                // raw schema Vars escape, and (Phase 10a) attach the fn's
+                // declared effects as the value's Function-type effect row,
+                // so the effects survive being passed around / stored.
                 std::unordered_map<int, TypePtr> subst;
                 for (const auto& gv : fnIt->second.genericVars) {
                     subst[gv->varId] = makeFreshVar();
                 }
-                return instantiate(fnIt->second.signature, subst);
+                TypePtr sig = instantiate(fnIt->second.signature, subst);
+                return attachDeclaredEffects(sig, fnIt->second);
             }
             // Fall through to variant table: a bare Ident resolving to a
             // unit constructor is the value of that constructor.
@@ -1313,8 +1542,10 @@ private:
         // The trait that supplies this method.
         const std::string& trait = methodIt->second.first;
         // Get the impl method's signature via its FnSchema (mangled name).
-        std::string mangled = implMethodMangledName(
-            trait, ast::TypeRef{typeName, {}, 0, 0}, mc.methodName);
+        ast::TypeRef forTypeRef;
+        forTypeRef.name = typeName;
+        std::string mangled =
+            implMethodMangledName(trait, forTypeRef, mc.methodName);
         auto schemaIt = fnSchemas_.find(mangled);
         if (schemaIt == fnSchemas_.end()) {
             error("internal: missing impl method schema for " + mangled,
@@ -1584,6 +1815,75 @@ private:
         return isComparison ? makeBool() : makeInt();
     }
 
+    // Phase 10a: build the first-class-value type of a declared fn — its
+    // (already-instantiated) signature plus an effect row reflecting the
+    // schema's declared effects. Concrete built-in labels become closed
+    // row labels; a declared effect-row-var name becomes the row var tail
+    // (mapped to the instantiated Var via `subst` when available, else a
+    // fresh var). This is what makes `let f = ioInc; f(x)` still account
+    // for `io`, and what lets a higher-order fn value stay polymorphic.
+    TypePtr attachDeclaredEffects(const TypePtr& instSig,
+                                  const FnSchema& schema,
+                                  const std::unordered_map<int, TypePtr>*
+                                      subst = nullptr) {
+        TypePtr r = resolve(instSig);
+        if (r->kind != TypeKind::Function) return instSig;
+        std::vector<std::string> labels;
+        TypePtr rowVar;
+        for (const auto& l : schema.declaredEffects.labels) {
+            if (isBuiltinEffect(l)) {
+                if (std::find(labels.begin(), labels.end(), l) == labels.end())
+                    labels.push_back(l);
+                continue;
+            }
+            // An effect-row-var name: find its schema Var, then its
+            // instantiated counterpart (if a subst was supplied).
+            TypePtr schemaVar;
+            for (const auto& [n, v] : schema.effectRowVars) {
+                if (n == l) { schemaVar = v; break; }
+            }
+            if (schemaVar) {
+                if (subst) {
+                    auto it = subst->find(resolve(schemaVar)->varId);
+                    rowVar = it != subst->end() ? it->second : makeFreshVar();
+                } else {
+                    rowVar = makeFreshVar();
+                }
+            }
+        }
+        return makeFunction(r->args, r->ret, std::move(labels), rowVar);
+    }
+
+    // Phase 10a: add a row var's effect contribution (in source-level
+    // names) to `out`. If the var was solved during unification, its
+    // concrete labels are added; if it is still polymorphic but is one of
+    // the enclosing fn's declared effect-row vars, its name is added (so
+    // the enclosing fn must itself declare that row var). A fully-free row
+    // var (neither solved nor a known name) contributes nothing — it is
+    // pure at this site.
+    void addRowVarContribution(const TypePtr& rowVar, EffectSet& out) {
+        TypePtr rv = resolve(rowVar);
+        if (rv->kind != TypeKind::Var) return;
+        if (rv->effectRowSolved) {
+            for (const auto& l : rv->effectLabels) out.add(l);
+            return;
+        }
+        auto it = currentEffectRowVarById_.find(rv->varId);
+        if (it != currentEffectRowVarById_.end()) out.add(it->second);
+    }
+
+    // Phase 10a: record the effect contribution of an indirect call given
+    // the resolved Function type of the fn value. Concrete row labels are
+    // added directly; the row-var tail (if any) goes through
+    // addRowVarContribution.
+    void recordCallEffectsFromFnType(const ast::CallExpr& call,
+                                     const TypePtr& fnTy) {
+        EffectSet contrib;
+        for (const auto& l : fnTy->effectLabels) contrib.add(l);
+        if (fnTy->effectRowVar) addRowVarContribution(fnTy->effectRowVar, contrib);
+        if (!contrib.labels.empty()) exprEffects_[&call] = contrib;
+    }
+
     TypePtr checkCall(const ast::CallExpr& call) {
         // Phase 4.3: first-class fn values. If the call's callee name
         // resolves to a local binding with a Function type, this is an
@@ -1619,6 +1919,12 @@ private:
                 for (std::size_t i = n; i < call.args.size(); ++i) {
                     checkExpr(*call.args[i]);
                 }
+                // Phase 10a: an indirect call performs the effects carried
+                // by the fn value's type. Record them (as source-level
+                // names) for the effect pass: solved/concrete labels pass
+                // through; an unsolved row var that is one of the enclosing
+                // fn's effect-row vars contributes its name.
+                recordCallEffectsFromFnType(call, r);
                 return r->ret;
             }
         }
@@ -1649,6 +1955,17 @@ private:
                 subst[gv->varId] = fresh;
                 typeArgs.push_back(fresh);
             }
+            // Phase 10a: also freshen effect-row vars so each call site gets
+            // its own row var to bind (they live outside genericVars to stay
+            // out of monomorphization, but still need per-call instantiation
+            // so effect inference doesn't leak across call sites).
+            for (const auto& [name, rv] : schema.effectRowVars) {
+                TypePtr resolvedRv = resolve(rv);
+                if (resolvedRv->kind == TypeKind::Var &&
+                    !subst.count(resolvedRv->varId)) {
+                    subst[resolvedRv->varId] = makeFreshVar();
+                }
+            }
             TypePtr instSig = instantiate(schema.signature, subst);
             if (instSig->args.size() != call.args.size()) {
                 error("function '" + call.callee + "' expects " +
@@ -1673,6 +1990,27 @@ private:
             }
             if (!schema.genericVars.empty()) {
                 callInstantiations_[&call] = std::move(typeArgs);
+            }
+            // Phase 10a: record this call's effect contribution. Concrete
+            // declared effects pass through; a declared effect-row-var name
+            // resolves to its instantiated row var (just unified against the
+            // actual argument), whose solved labels — or, if still
+            // polymorphic, the enclosing fn's row-var name — are added. This
+            // is what makes `apply(ioInc)` contribute `io` while
+            // `apply(pureInc)` contributes nothing.
+            {
+                EffectSet contrib;
+                for (const auto& l : schema.declaredEffects.labels) {
+                    if (isBuiltinEffect(l)) { contrib.add(l); continue; }
+                    TypePtr schemaVar;
+                    for (const auto& [n, v] : schema.effectRowVars)
+                        if (n == l) { schemaVar = v; break; }
+                    if (!schemaVar) continue;
+                    auto it = subst.find(resolve(schemaVar)->varId);
+                    if (it == subst.end()) continue;
+                    addRowVarContribution(it->second, contrib);
+                }
+                if (!contrib.labels.empty()) exprEffects_[&call] = contrib;
             }
             return instSig->ret;
         }

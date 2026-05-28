@@ -780,6 +780,31 @@ void test_field_assign_through_mut_local() {
     expectEquals(v, 42, "field_assign_through_mut_local");
 }
 
+// Phase 10a: a higher-order fn with an effect-polymorphic fn-typed
+// parameter, instantiated at a pure argument and invoked indirectly. The
+// effect row is compile-time only — codegen lowers the param to an opaque
+// fn pointer and the indirect call must execute exactly as before.
+void test_effect_poly_higher_order_pure() {
+    auto v = compileAndRun(
+        "fn apply(f: fn(i64) -> i64 ! {e}) -> i64 ! {e} { f(10) }\n"
+        "fn dbl(x: i64) -> i64 { x + x }\n"
+        "fn main() -> i64 { apply(dbl) }",
+        "main", "effect_poly_higher_order_pure");
+    expectEquals(v, 20, "effect_poly_higher_order_pure");
+}
+
+// A concrete (non-polymorphic) effect-carrying fn-type parameter: the
+// effect annotation `! {io}` is irrelevant to lowering; the indirect call
+// must still dispatch correctly.
+void test_concrete_effect_fn_type_param() {
+    auto v = compileAndRun(
+        "fn run(f: fn(i64) -> i64 ! {io}) -> i64 ! {io} { f(21) + 1 }\n"
+        "fn idn(x: i64) -> i64 ! {io} { x }\n"
+        "fn main() -> i64 ! {io} { run(idn) }",
+        "main", "concrete_effect_fn_type_param");
+    expectEquals(v, 22, "concrete_effect_fn_type_param");
+}
+
 } // namespace
 
 int main() {
@@ -842,6 +867,10 @@ int main() {
     test_nested_loops_break_continue_innermost();
     test_range_value_iterated();
     test_field_assign_through_mut_local();
-    std::cout << "All codegen tests passed (55 cases) — Phase 9 loops/ranges\n";
+    // Phase 10a effect-carrying fn types (effects erased in lowering)
+    test_effect_poly_higher_order_pure();
+    test_concrete_effect_fn_type_param();
+    std::cout << "All codegen tests passed (57 cases) — Phase 10a fn-type "
+                 "effects\n";
     return 0;
 }

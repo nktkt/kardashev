@@ -74,7 +74,16 @@ struct FnSchema {
     // param; multi-bounds (`T: A + B`) can append entries here later.
     std::vector<std::string> genericBounds;
     // Phase 4: effects declared in the fn's `! { ... }` row. Empty = pure.
+    // Entries are concrete built-in labels (`io`, ...) and/or effect-row
+    // variable names (Phase 10a, e.g. `e`).
     EffectSet declaredEffects;
+    // Phase 10a: effect-row variables this fn is generic over, mapping the
+    // source name (`e`) to the schema Type Var that stands for it. These
+    // Vars are a subset of `genericVars` (the ones classified as effect-row
+    // vars rather than type vars). At a call site, instantiation maps each
+    // to a fresh row var that unification then binds to the actual callee's
+    // effects, propagating them to the caller.
+    std::vector<std::pair<std::string, TypePtr>> effectRowVars;
     // Phase 7.3b: `pub fn` makes a fn callable via path syntax
     // (`foo::fn_name(args)`). Bare-name calls bypass this check
     // because Phase 7.1 still flat-merges modules.

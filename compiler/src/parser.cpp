@@ -293,6 +293,32 @@ private:
                 refIsMut = true;
             }
         }
+        // Phase 10a: function type in type position —
+        // `fn(T1, T2) -> Ret ! { effects }`. The trailing effect row is
+        // optional (absent = pure) and reuses the same parser as fn decls.
+        if (check(TokenKind::KwFn)) {
+            Token fnTok = consume();
+            ast::TypeRef tr;
+            tr.isFn = true;
+            tr.isRef = isRef;
+            tr.refIsMut = refIsMut;
+            tr.line = isRef ? ampTok.line : fnTok.line;
+            tr.column = isRef ? ampTok.column : fnTok.column;
+            expect(TokenKind::LParen, "(");
+            if (!check(TokenKind::RParen)) {
+                while (true) {
+                    tr.fnParams.push_back(parseTypeRef());
+                    if (!accept(TokenKind::Comma)) break;
+                    if (check(TokenKind::RParen)) break; // trailing comma
+                }
+            }
+            expect(TokenKind::RParen, ")");
+            expect(TokenKind::Arrow, "->");
+            tr.fnRet = std::make_shared<ast::TypeRef>(parseTypeRef());
+            ast::EffectRow row = parseOptionalEffectRow();
+            tr.fnEffects = std::move(row.labels);
+            return tr;
+        }
         Token t = consumePathName("type name");
         ast::TypeRef tr;
         tr.name = t.lexeme;

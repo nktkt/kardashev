@@ -33,6 +33,18 @@ TypePtr makeFunction(std::vector<TypePtr> args, TypePtr ret) {
     return t;
 }
 
+TypePtr makeFunction(std::vector<TypePtr> args, TypePtr ret,
+                     std::vector<std::string> effectLabels,
+                     TypePtr effectRowVar) {
+    auto t = std::make_shared<Type>();
+    t->kind = TypeKind::Function;
+    t->args = std::move(args);
+    t->ret = std::move(ret);
+    t->effectLabels = std::move(effectLabels);
+    t->effectRowVar = std::move(effectRowVar);
+    return t;
+}
+
 TypePtr makeFreshVar() {
     auto t = std::make_shared<Type>();
     t->kind = TypeKind::Var;
@@ -79,11 +91,107 @@ bool occurs(int varId, const TypePtr& t) {
         for (const auto& a : r->args) {
             if (occurs(varId, a)) return true;
         }
-        return occurs(varId, r->ret);
+        if (occurs(varId, r->ret)) return true;
+        // The effect-row tail var is part of the function type, so the
+        // occurs check must descend into it too.
+        if (r->effectRowVar && occurs(varId, r->effectRowVar)) return true;
+        return false;
     }
     return false;
 }
 } // namespace
+
+namespace {
+// Phase 10a helpers for effect-row unification.
+//
+// An effect row on a Function type is (closed-labels L, optional tail var
+// v). A solved tail var stashes its concrete labels on its own node
+// (`effectRowSolved` + `effectLabels`). These helpers read/extend that.
+
+bool labelSetContains(const std::vector<std::string>& v, const std::string& l) {
+    for (const auto& x : v) if (x == l) return true;
+    return false;
+}
+
+// The labels a (resolved) row-var node currently stands for: nothing while
+// unbound, or its solved remainder once unification pinned it.
+const std::vector<std::string>& rowVarLabels(const TypePtr& rv) {
+    static const std::vector<std::string> kEmpty;
+    if (rv->effectRowSolved) return rv->effectLabels;
+    return kEmpty;
+}
+
+// Pull the closed labels of a function row, merging in a solved tail var's
+// labels (so e.g. `{io, e}` with `e := {alloc}` reads back as {io, alloc}).
+std::vector<std::string> effectiveRowLabels(const TypePtr& fn) {
+    std::vector<std::string> out = fn->effectLabels;
+    if (fn->effectRowVar) {
+        TypePtr v = resolve(fn->effectRowVar);
+        if (v->kind == TypeKind::Var) {
+            for (const auto& l : rowVarLabels(v))
+                if (!labelSetContains(out, l)) out.push_back(l);
+        }
+    }
+    return out;
+}
+
+// Solve an (unbound) row-var node to exactly the given label set.
+void solveRowVar(const TypePtr& rv, const std::vector<std::string>& labels) {
+    rv->effectRowSolved = true;
+    rv->effectLabels = labels;
+}
+
+// Unify two function effect rows. Concrete labels present on one side but
+// absent on the other must be absorbed by that other side's tail var; if
+// the other side has no tail var (a closed row) this is a mismatch and we
+// return false. When both sides carry an (unbound) tail var we link them so
+// future solving stays in sync. This mirrors HM type-var unification but
+// over effect-label sets.
+bool unifyEffectRows(const TypePtr& fa, const TypePtr& fb) {
+    std::vector<std::string> la = effectiveRowLabels(fa);
+    std::vector<std::string> lb = effectiveRowLabels(fb);
+    TypePtr va = fa->effectRowVar ? resolve(fa->effectRowVar) : nullptr;
+    TypePtr vb = fb->effectRowVar ? resolve(fb->effectRowVar) : nullptr;
+    bool aOpen = va && va->kind == TypeKind::Var && !va->effectRowSolved;
+    bool bOpen = vb && vb->kind == TypeKind::Var && !vb->effectRowSolved;
+
+    // Labels only on A: B must be able to absorb them via an open tail.
+    std::vector<std::string> onlyA, onlyB;
+    for (const auto& l : la) if (!labelSetContains(lb, l)) onlyA.push_back(l);
+    for (const auto& l : lb) if (!labelSetContains(la, l)) onlyB.push_back(l);
+    if (!onlyA.empty() && !bOpen) return false;
+    if (!onlyB.empty() && !aOpen) return false;
+
+    // Grow each open tail var so the rows become label-equal. After this,
+    // both rows denote the union of their labels.
+    if (bOpen && !onlyA.empty()) {
+        std::vector<std::string> grown = rowVarLabels(vb);
+        for (const auto& l : onlyA)
+            if (!labelSetContains(grown, l)) grown.push_back(l);
+        solveRowVar(vb, grown);
+    }
+    if (aOpen && !onlyB.empty()) {
+        std::vector<std::string> grown = rowVarLabels(va);
+        for (const auto& l : onlyB)
+            if (!labelSetContains(grown, l)) grown.push_back(l);
+        solveRowVar(va, grown);
+    }
+    // Two still-open tail vars: link them so they solve together later.
+    if (va && vb && va.get() != vb.get() &&
+        va->kind == TypeKind::Var && vb->kind == TypeKind::Var &&
+        !va->effectRowSolved && !vb->effectRowSolved) {
+        if (va->varId < vb->varId) vb->link = va;
+        else va->link = vb;
+    }
+    return true;
+}
+} // namespace
+
+std::vector<std::string> resolveEffectRow(const TypePtr& fnType) {
+    TypePtr r = resolve(fnType);
+    if (r->kind != TypeKind::Function) return {};
+    return effectiveRowLabels(r);
+}
 
 bool unify(const TypePtr& a, const TypePtr& b) {
     TypePtr ra = resolve(a);
@@ -120,7 +228,9 @@ bool unify(const TypePtr& a, const TypePtr& b) {
         for (std::size_t i = 0; i < ra->args.size(); ++i) {
             if (!unify(ra->args[i], rb->args[i])) return false;
         }
-        return unify(ra->ret, rb->ret);
+        if (!unify(ra->ret, rb->ret)) return false;
+        // Phase 10a: function types agree only if their effect rows do.
+        return unifyEffectRows(ra, rb);
     }
 
     if (ra->kind == TypeKind::Struct) {
@@ -193,8 +303,18 @@ TypePtr instantiate(const TypePtr& t,
         }
         TypePtr newRet = instantiate(r->ret, subst);
         if (newRet.get() != r->ret.get()) changed = true;
+        // Phase 10a: the effect-row tail var is substituted exactly like a
+        // type Var, so instantiating a schema at a call site gives each use
+        // a fresh row var (which unification then binds to the actual
+        // callee's effects). Concrete labels are copied verbatim.
+        TypePtr newRowVar = r->effectRowVar;
+        if (r->effectRowVar) {
+            newRowVar = instantiate(r->effectRowVar, subst);
+            if (newRowVar.get() != r->effectRowVar.get()) changed = true;
+        }
         if (!changed) return r;
-        return makeFunction(std::move(newArgs), newRet);
+        return makeFunction(std::move(newArgs), newRet, r->effectLabels,
+                            newRowVar);
     }
     case TypeKind::Struct: {
         bool changed = false;
@@ -269,6 +389,38 @@ std::string typeToString(const TypePtr& t) {
         }
         s += ") -> ";
         s += typeToString(r->ret);
+        // Phase 10a: append the effect row when non-pure, so diagnostics
+        // distinguish `fn(i64)->i64` from `fn(i64)->i64 ! {io}`. An unsolved
+        // row var prints as its Var name (e.g. `'7`).
+        std::vector<std::string> labels = r->effectLabels;
+        bool hasOpenVar = false;
+        if (r->effectRowVar) {
+            TypePtr v = resolve(r->effectRowVar);
+            if (v->kind == TypeKind::Var && v->effectRowSolved) {
+                for (const auto& l : v->effectLabels) {
+                    bool dup = false;
+                    for (const auto& e : labels) if (e == l) { dup = true; break; }
+                    if (!dup) labels.push_back(l);
+                }
+            } else if (v->kind == TypeKind::Var) {
+                hasOpenVar = true;
+            }
+        }
+        if (!labels.empty() || hasOpenVar) {
+            s += " ! {";
+            bool first = true;
+            for (const auto& l : labels) {
+                s += (first ? " " : ", ");
+                s += l;
+                first = false;
+            }
+            if (hasOpenVar) {
+                s += (first ? " " : ", ");
+                s += typeToString(r->effectRowVar);
+                first = false;
+            }
+            s += " }";
+        }
         return s;
     }
     case TypeKind::Struct:

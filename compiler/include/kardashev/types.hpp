@@ -51,10 +51,31 @@ struct Type {
     // Function:
     std::vector<TypePtr> args;
     TypePtr ret;
+    // Phase 10a: effect row carried by the function type. `effectLabels`
+    // holds the row's concrete portion — built-in labels (`io`, `alloc`,
+    // ...) — mirroring `FnSchema.declaredEffects` so the same string
+    // vocabulary flows through first-class fn values. `effectRowVar` is an
+    // optional polymorphic tail: a Type Var (Hindley-Milner row variable)
+    // standing for "the rest of the effects, unknown until instantiation".
+    // `{io}` is {labels=["io"], rowVar=null} (closed); `{io, e}` is
+    // {labels=["io"], rowVar=Var}; `{e}` is {labels={}, rowVar=Var}; pure
+    // is both empty. The row var participates in union-find exactly like a
+    // type Var, so `instantiate` substitutes it by varId and `unify` binds
+    // it — that is what makes a higher-order fn pure-or-effectful by its
+    // argument. Effects are compile-time only: this field never reaches
+    // codegen's LLVM lowering (the calling convention is unchanged).
+    std::vector<std::string> effectLabels;
+    TypePtr effectRowVar; // null = closed row (no polymorphic tail)
 
     // Var:
     int varId = -1;
     TypePtr link; // union-find link; null while unbound
+    // Phase 10a: when this Var is used as an effect-row tail variable and
+    // gets solved to a concrete remainder during unification, the solved
+    // labels are stashed here (in this node's `effectLabels`) and this flag
+    // is set. We avoid `link` for this so ordinary type-Var resolution and
+    // the occurs check are unaffected; `resolveEffectRow` reads it back.
+    bool effectRowSolved = false;
 
     // Struct:
     std::string structName;
@@ -82,7 +103,14 @@ struct Type {
 TypePtr makeInt();
 TypePtr makeBool();
 TypePtr makeUnit();
+// Build a function type. The 2-arg form yields a pure (empty) effect row;
+// the 4-arg form attaches an explicit row (concrete labels + optional row
+// Var tail). Phase 10a uses the latter to carry declared effects on first-
+// class fn values and effect-row polymorphism through fn-typed params.
 TypePtr makeFunction(std::vector<TypePtr> args, TypePtr ret);
+TypePtr makeFunction(std::vector<TypePtr> args, TypePtr ret,
+                     std::vector<std::string> effectLabels,
+                     TypePtr effectRowVar);
 TypePtr makeFreshVar();
 TypePtr makeStruct(std::string name, std::vector<std::pair<std::string, TypePtr>> fields);
 TypePtr makeEnum(std::string name, std::vector<EnumVariantType> variants);
@@ -95,7 +123,18 @@ TypePtr resolve(const TypePtr& t);
 // Unify two types. Returns false on failure (kind mismatch, arity
 // mismatch on functions, or occurs-check violation). Successful
 // unification mutates the link pointers of involved type variables.
+// For Function types this also unifies their effect rows (Phase 10a):
+// concrete labels must agree modulo what a polymorphic row-var tail can
+// absorb, and an unbound row var binds to the other row's remainder.
 bool unify(const TypePtr& a, const TypePtr& b);
+
+// Phase 10a: collect the fully-resolved concrete effect labels of a
+// function type's row. Walks the closed labels plus, if a row-var tail is
+// present, the labels it was solved to during unification (an unsolved row
+// var contributes nothing — it is still polymorphic / treated as pure).
+// `fnType` must be a resolved Function type. Order is unspecified; callers
+// treat the result as a set.
+std::vector<std::string> resolveEffectRow(const TypePtr& fnType);
 
 // Pretty-print a type (after `resolve()`).
 std::string typeToString(const TypePtr& t);
