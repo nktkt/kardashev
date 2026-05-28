@@ -116,6 +116,12 @@ private:
         return &it->second;
     }
 
+    Binding* lookupBindingByDeclPos(int dp) {
+        auto it = bindings_.find(dp);
+        if (it == bindings_.end()) return nullptr;
+        return &it->second;
+    }
+
     int newBinding(const std::string& name, const TypePtr& ty) {
         int dp = pos_++;
         if (scopes_.empty()) scopes_.push_back({});
@@ -643,8 +649,8 @@ private:
         struct Snap {
             Binding* binding;
             OwnState state;
-            int moveLine;
-            int moveCol;
+            std::size_t moveLine;
+            std::size_t moveCol;
         };
         std::vector<Snap> snaps;
         for (auto& scope : scopes_) {

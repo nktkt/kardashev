@@ -1412,7 +1412,7 @@ void test_async_block_on_option_type_args_do_not_collide() {
         "async fn ob() -> Option<bool> { Some(true) }\n"
         "async fn oi() -> Option<i64> { Some(512) }\n"
         "fn main() -> i64 {\n"
-        "    let _ = block_on(ob());\n"
+        "    let _r = block_on(ob());\n"
         "    match block_on(oi()) {\n"
         "        Some(x) => x,\n"
         "        None => 0,\n"
