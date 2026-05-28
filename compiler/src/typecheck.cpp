@@ -323,6 +323,92 @@ public:
             sch.genericVars.push_back(joinVar);
             fnSchemas_["join"] = std::move(sch);
         }
+
+        // Phase 19 built-in: OS threads on pthread.
+        //
+        //   thread_spawn(f: fn() -> i64) -> i64 ! { io }
+        // Spawns a real OS thread running the fn VALUE `f` and returns an
+        // opaque thread handle. `io`-effecting (it has an observable effect
+        // beyond pure computation — like spawning a task). The argument is a
+        // `fn() -> i64` value (a top-level fn, a let-bound fn value, or a
+        // closure). NOTE the compile-time Send rule enforced in checkCall: a
+        // closure passed here must not capture anything BY REFERENCE (FnMut) —
+        // a by-ref capture aliases a stack slot across the thread boundary (a
+        // data race + use-after-free once the spawning frame exits), so it is
+        // rejected. All captures into a thread must be by value (Send / moved).
+        // Effect-polymorphic over the closure's effects: spelled
+        // `thread_spawn<e>(f: fn() -> i64 ! {e}) -> i64 ! {io, e}`. The row var
+        // `e` lets a closure that itself performs effects (e.g. `io` via
+        // `mutex_lock`, or `alloc`) be accepted, and propagates those effects
+        // to the caller (they DO happen as a consequence of the spawn, even if
+        // on the new thread) — so the spawning fn must declare them, just like
+        // calling the closure directly would require. The unconditional `io`
+        // is the spawn's own effect.
+        {
+            TypePtr rowVar = makeFreshVar();
+            TypePtr fnParam = makeFunction({}, makeInt(),
+                                           /*effectLabels=*/{}, rowVar);
+            FnSchema sch;
+            sch.signature = makeFunction({fnParam}, makeInt());
+            sch.declaredEffects.add("io");
+            sch.declaredEffects.add("e"); // row-var name (flows the closure's)
+            sch.effectRowVars.emplace_back("e", rowVar);
+            fnSchemas_["thread_spawn"] = std::move(sch);
+        }
+        //   thread_join(handle: i64) -> i64 ! { io }
+        // Joins the thread named by `handle` and returns the i64 value its fn
+        // produced. `io`-effecting (it blocks on / observes another thread).
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeInt()}, makeInt());
+            sch.declaredEffects.add("io");
+            fnSchemas_["thread_join"] = std::move(sch);
+        }
+        // Phase 19 built-in: `Mutex<i64>` represented as an i64 HANDLE (a
+        // pointer to a heap `{ pthread_mutex_t, i64 value }`). The handle is
+        // i64 — therefore Copy — so it can be captured BY VALUE into each
+        // thread's closure, giving every thread the same underlying lock +
+        // cell (the cross-thread sharing mechanism).
+        //
+        //   mutex_new(v: i64) -> i64 ! { alloc }   (heap-allocates the block)
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeInt()}, makeInt());
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["mutex_new"] = std::move(sch);
+        }
+        //   mutex_lock(h: i64) -> i64 ! { io }
+        //   mutex_unlock(h: i64) -> i64 ! { io }
+        // Acquire / release the lock; `io`-effecting (cross-thread sync is an
+        // observable side effect). Return 0 (an i64 so they compose).
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeInt()}, makeInt());
+            sch.declaredEffects.add("io");
+            fnSchemas_["mutex_lock"] = std::move(sch);
+        }
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeInt()}, makeInt());
+            sch.declaredEffects.add("io");
+            fnSchemas_["mutex_unlock"] = std::move(sch);
+        }
+        //   mutex_get(h: i64) -> i64           (read the guarded cell)
+        //   mutex_set(h: i64, v: i64) -> i64   (write the guarded cell)
+        // The caller is expected to hold the lock. `io`-effecting for the
+        // write (a shared-memory mutation other threads observe); the read is
+        // left pure so reading under a lock needs no extra annotation.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeInt()}, makeInt());
+            fnSchemas_["mutex_get"] = std::move(sch);
+        }
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeInt(), makeInt()}, makeInt());
+            sch.declaredEffects.add("io");
+            fnSchemas_["mutex_set"] = std::move(sch);
+        }
 #if defined(__linux__)
         // Phase 18 stretch (Linux/epoll ONLY): real fd-readiness primitives.
         // Registered only on Linux — the codegen reactor is epoll-based and
@@ -2927,6 +3013,21 @@ private:
         return false;
     }
 
+    // Phase 19 (Send): if `e` is a closure that captures something BY
+    // REFERENCE (FnMut), return that capture's name; else "". Used to reject
+    // sending such a closure across a thread boundary — a by-ref capture
+    // aliases a stack slot of the spawning frame, which is both a data race
+    // (two threads touching the same unsynchronized slot) and a
+    // use-after-free once the spawning frame exits. (`checkClosure` has
+    // already populated `captures` by the time this runs.)
+    std::string closureByRefCaptureName(const ast::Expr& e) {
+        if (auto* cl = dynamic_cast<const ast::ClosureExpr*>(&e)) {
+            for (const auto& cap : cl->captures)
+                if (cap.byRef) return cap.name;
+        }
+        return "";
+    }
+
     // Phase 10b: type-check a capturing closure `|params| body`. Determines
     // the captured free variables (recorded on the AST node for codegen),
     // checks the body in a scope holding ONLY the params + captures (so an
@@ -3188,6 +3289,28 @@ private:
             }
             for (std::size_t i = n; i < call.args.size(); ++i) {
                 checkExpr(*call.args[i]);
+            }
+            // Phase 19 (Send / compile-time data-race freedom): the closure
+            // handed to `thread_spawn` must be `Send` — i.e. it must not
+            // capture anything BY REFERENCE. A by-ref (FnMut) capture aliases a
+            // stack slot of the spawning frame across the new thread; that is a
+            // data race (two threads touching one unsynchronized slot) AND a
+            // use-after-free once the spawning frame returns. By-VALUE captures
+            // (i64 / bool / &T, incl. a Mutex i64 handle) are moved into the
+            // thread and are fine. This is the enforced Send floor.
+            if (call.callee == "thread_spawn" && !call.args.empty()) {
+                std::string offending =
+                    closureByRefCaptureName(*call.args[0]);
+                if (!offending.empty()) {
+                    error("cannot send a by-reference capture across a thread "
+                          "boundary: closure passed to `thread_spawn` captures "
+                          "`" + offending +
+                              "` by reference (FnMut), which would alias the "
+                              "spawning frame's stack across threads (data race "
+                              "+ use-after-free). Capture it by value (move a "
+                              "Copy value, or share via a Mutex handle) instead",
+                          call.args[0]->line, call.args[0]->column);
+                }
             }
             if (!schema.genericVars.empty()) {
                 callInstantiations_[&call] = std::move(typeArgs);

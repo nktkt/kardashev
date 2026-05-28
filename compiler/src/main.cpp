@@ -523,7 +523,13 @@ bool emitObject(llvm::Module& module, const std::string& outObjPath) {
 // to clang's default so it picks the right linker per platform (lld on
 // Linux if installed, ld64 on macOS). Returns true on success.
 bool linkObject(const std::string& objPath, const std::string& outExePath) {
-    std::string cmd = "clang \"" + objPath + "\" -o \"" + outExePath + "\"";
+    // Phase 19: link libpthread for the OS-thread / Mutex builtins
+    // (pthread_create/join/mutex_*). On modern glibc (>= 2.34) these symbols
+    // are folded into libc and `-lpthread` is a harmless no-op; on older glibc
+    // and other POSIX targets it pulls in the real library. POSIX, so it's the
+    // same flag on Linux and macOS — no platform branching needed.
+    std::string cmd = "clang \"" + objPath + "\" -o \"" + outExePath +
+                      "\" -lpthread";
     int rc = std::system(cmd.c_str());
     if (rc != 0) {
         std::cerr << "kardc: linker (clang) failed with exit code "
@@ -554,7 +560,7 @@ bool linkObject(const std::string& objPath, const std::string& outExePath) {
 // Bump when the object-file format / codegen ABI changes in a way that
 // must invalidate every existing cache entry. Combined into the key so an
 // upgraded kardc never reuses a stale object.
-constexpr const char* kCacheFormatVersion = "kardashev-cache-v2";
+constexpr const char* kCacheFormatVersion = "kardashev-cache-v3";
 
 // FNV-1a 64-bit over a byte string. Small, dependency-free, and good
 // enough for a content-addressed local cache (no adversarial inputs).

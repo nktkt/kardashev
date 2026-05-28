@@ -1801,6 +1801,88 @@ void test_no_drop_glue_for_scalars() {
     expectAbsent(ir, "droplive", "no_drop_glue_for_scalars");
 }
 
+// --- Phase 19: OS threads (pthread) + Mutex run end-to-end through the JIT.
+// pthread symbols resolve in-process (the test binary links libc/pthread).
+
+void test_thread_spawn_join_runs() {
+    // Two real threads compute distinct values; join returns each; combine.
+    auto v = compileAndRun(
+        "fn ca() -> i64 { 10 + 11 }\n"
+        "fn cb() -> i64 { 100 + 23 }\n"
+        "fn main() -> i64 ! { io } {\n"
+        "  let a = thread_spawn(ca);\n"
+        "  let b = thread_spawn(cb);\n"
+        "  thread_join(a) + thread_join(b)\n"
+        "}",
+        "main", "thread_spawn_join_runs");
+    expectEquals(v, 144, "thread_spawn_join_runs"); // 21 + 123
+}
+
+void test_thread_spawn_closure_byvalue_runs() {
+    auto v = compileAndRun(
+        "fn main() -> i64 ! { io } {\n"
+        "  let base = 1000;\n"
+        "  let a = thread_spawn(|| base + 21);\n"
+        "  let b = thread_spawn(|| base + 23);\n"
+        "  thread_join(a) + thread_join(b)\n"
+        "}",
+        "main", "thread_spawn_closure_byvalue_runs");
+    expectEquals(v, 2044, "thread_spawn_closure_byvalue_runs");
+}
+
+void test_mutex_roundtrip_single_thread() {
+    auto v = compileAndRun(
+        "fn main() -> i64 ! { alloc, io } {\n"
+        "  let m = mutex_new(40);\n"
+        "  mutex_lock(m);\n"
+        "  mutex_set(m, mutex_get(m) + 2);\n"
+        "  mutex_unlock(m);\n"
+        "  mutex_get(m)\n"
+        "}",
+        "main", "mutex_roundtrip_single_thread");
+    expectEquals(v, 42, "mutex_roundtrip_single_thread");
+}
+
+void test_mutex_mutual_exclusion_two_threads() {
+    // 2 threads x 50000 increments of a SHARED Mutex counter == exactly
+    // 100000. (Smaller N than the smoke test to keep the unit suite quick;
+    // still proves mutual exclusion + that both threads run.)
+    auto v = compileAndRun(
+        "fn bump(c: i64, n: i64) -> i64 ! { io } {\n"
+        "  let mut i = 0;\n"
+        "  while i < n {\n"
+        "    mutex_lock(c);\n"
+        "    mutex_set(c, mutex_get(c) + 1);\n"
+        "    mutex_unlock(c);\n"
+        "    i = i + 1;\n"
+        "  }\n"
+        "  0\n"
+        "}\n"
+        "fn main() -> i64 ! { alloc, io } {\n"
+        "  let c = mutex_new(0);\n"
+        "  let n = 50000;\n"
+        "  let t1 = thread_spawn(|| bump(c, n));\n"
+        "  let t2 = thread_spawn(|| bump(c, n));\n"
+        "  thread_join(t1);\n"
+        "  thread_join(t2);\n"
+        "  mutex_get(c)\n"
+        "}",
+        "main", "mutex_mutual_exclusion_two_threads");
+    expectEquals(v, 100000, "mutex_mutual_exclusion_two_threads");
+}
+
+void test_thread_runtime_emits_pthread_externs() {
+    // The pthread externs + trampoline must appear in the emitted IR.
+    std::string ir = compileToIR(
+        "fn w() -> i64 { 1 }\n"
+        "fn main() -> i64 ! { io } { thread_join(thread_spawn(w)) }",
+        "thread_runtime_emits_pthread_externs");
+    expectContains(ir, "pthread_create", "thread_runtime_emits_pthread_externs");
+    expectContains(ir, "pthread_join", "thread_runtime_emits_pthread_externs");
+    expectContains(ir, "__kd_thread_trampoline",
+                   "thread_runtime_emits_pthread_externs");
+}
+
 } // namespace
 
 int main() {
@@ -1941,10 +2023,17 @@ int main() {
     test_drop_user_impl_emits_call();
     test_drop_emits_free_for_vec();
     test_no_drop_glue_for_scalars();
-    std::cout << "All codegen tests passed (122 cases) — Phase 16 Drop/RAII: "
+    // Phase 19: OS threads (pthread) + Mutex
+    test_thread_spawn_join_runs();
+    test_thread_spawn_closure_byvalue_runs();
+    test_mutex_roundtrip_single_thread();
+    test_mutex_mutual_exclusion_two_threads();
+    test_thread_runtime_emits_pthread_externs();
+    std::cout << "All codegen tests passed (127 cases) — Phase 16 Drop/RAII: "
                  "reverse-order scope drops, move semantics, conditional-move "
                  "drop flags, Vec/Box free, scalar codegen unchanged; Phase "
                  "17a fn-value field calls + FnMut captures; Phase 17b generic "
-                 "Future<T> (bool/struct) + HashMap<i64,V> (bool/struct)\n";
+                 "Future<T> (bool/struct) + HashMap<i64,V> (bool/struct); "
+                 "Phase 19 OS threads + Mutex mutual exclusion\n";
     return 0;
 }

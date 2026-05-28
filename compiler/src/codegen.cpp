@@ -492,6 +492,27 @@ private:
     llvm::Function* readPipePollFn_ = nullptr; // __kd_readpipe_poll
 #endif
 
+    // --- Phase 19: OS threads + Mutex (pthread) ---
+    // pthread externs. POSIX — present in libc on both glibc (folded since
+    // 2.34) and macOS, so NO platform `#if` guard (unlike Phase 18's epoll).
+    // Same linkage story as malloc/printf: the host kardc process for JIT
+    // (it links libc/pthread), clang's libc for AOT (with -lpthread as a
+    // belt-and-braces flag). `pthread_t`/`pthread_mutex_t` are opaque to us —
+    // we heap-allocate generously-sized storage and only ever pass pointers /
+    // the 8-byte tid by value, so we never depend on their exact layout.
+    llvm::Function* pthreadCreateFn_ = nullptr;  // pthread_create
+    llvm::Function* pthreadJoinFn_ = nullptr;    // pthread_join
+    llvm::Function* pthreadMutexInitFn_ = nullptr;   // pthread_mutex_init
+    llvm::Function* pthreadMutexLockFn_ = nullptr;   // pthread_mutex_lock
+    llvm::Function* pthreadMutexUnlockFn_ = nullptr; // pthread_mutex_unlock
+    // The thread control block `{ i64 tid, i8* fn, i8* env, i64 result }` and
+    // the Mutex block `{ [64 x i8] pthread_mutex_t storage, i64 value }`.
+    // 64 bytes covers pthread_mutex_t on both Linux (40) and macOS (64); the
+    // value cell is i64 (the MVP payload). Built once in declareThreadRuntime.
+    llvm::StructType* threadBlkTy_ = nullptr;
+    llvm::StructType* mutexBlkTy_ = nullptr;
+    llvm::Function* threadTrampolineFn_ = nullptr; // __kd_thread_trampoline
+
     // Phase 10b: the uniform fat-pointer LLVM type for ALL first-class fn
     // VALUES — `{ i8* fn, i8* env }`. `fn` points at a generated function
     // whose first parameter is the env pointer (`ret(i8* env, params...)`);
@@ -627,6 +648,11 @@ private:
         printfFn_ = printfFn;
         mallocFn_ = mallocFn; // Phase 10b: closure env allocation
         freeFn_ = freeFn;     // Phase 16: drop glue
+        // Phase 19: the pthread externs + thread/Mutex runtime are declared
+        // LAZILY (ensureThreadRuntime, on first use of a thread/mutex builtin)
+        // so a program that never touches threads stays byte-identical (no
+        // stray pthread declarations or a @free-bearing thread_join body in
+        // its IR). See declareThreadRuntime below.
 
         // --- Phase 18: time / sleep externs for the timer future + reactor.
         // `struct timespec { time_t tv_sec; long tv_nsec; }` — both 64-bit on
@@ -1020,6 +1046,9 @@ private:
 
         // --- Phase 12 async runtime ---
         declareAsyncRuntime();
+
+        // Phase 19: the OS-thread + Mutex runtime (pthread) is declared lazily
+        // on first use (ensureThreadRuntime), not here — see declareThreadRuntime.
     }
 
     // Phase 13b / 17b: HashMap<i64, V> open-addressing runtime.
@@ -1538,6 +1567,260 @@ private:
             llvm::IRBuilder<> b(entry);
             b.CreateRet(b.CreateLoad(i64Ty, kdPollCount_, "pc"));
             declaredFns_["poll_count"] = fn;
+        }
+    }
+
+    // ====================================================================
+    // Phase 19: OS threads + Mutex on pthread.
+    // ====================================================================
+    //
+    // Threads. A kardashev fn VALUE is the fat pointer `{ i8* fn, i8* env }`
+    // (Phase 10b); calling it is `fn(env)` (the env-calling convention with
+    // zero further args, since `thread_spawn` takes `fn() -> i64`). We can't
+    // hand that pair straight to pthread_create (its start routine is the C
+    // ABI `void* (*)(void*)`), so we generate ONE trampoline that adapts it:
+    //
+    //   void* __kd_thread_trampoline(void* arg):
+    //       blk = (kd.thread_blk*)arg
+    //       r   = ((i64 (*)(i8*))blk->fn)(blk->env)   // run the closure
+    //       blk->result = r                            // stash the i64 result
+    //       return null
+    //
+    // `thread_spawn({fn,env})` heap-allocates the control block
+    // `{ i64 tid, i8* fn, i8* env, i64 result }`, stores fn+env, then
+    // pthread_create(&blk->tid, null, trampoline, blk) and returns (i64)blk as
+    // an opaque handle. `thread_join(h)` casts h back, pthread_join(blk->tid,
+    // null), reads blk->result, frees the block, and returns the result. The
+    // i64 result therefore flows: closure return -> trampoline -> block slot ->
+    // join return. The control block leaks only if a thread is spawned but
+    // never joined (documented; never a double-free / UAF).
+    //
+    // Mutex<i64> (handle-based). `mutex_new(v)` heap-allocates
+    // `{ [64 x i8] mtx, i64 value }` (64 bytes covers pthread_mutex_t on glibc
+    // (40) and macOS (64)), pthread_mutex_init(&mtx, null), stores v, and
+    // returns (i64)blk. The handle is a plain i64 — therefore Copy — so it can
+    // be captured BY VALUE into each thread's closure, giving every thread the
+    // same underlying lock + cell (the sharing mechanism). mutex_lock/unlock
+    // call pthread_mutex_lock/unlock(&mtx); mutex_get/mutex_set read/write the
+    // value cell (the caller is expected to hold the lock). Two threads each
+    // doing { lock; set(get()+1); unlock } N times therefore land on exactly
+    // 2N with mutual exclusion (an unsynchronized get/set races and loses
+    // updates -> < 2N).
+    //
+    // Declared LAZILY (idempotent guard) on the first use of any thread/mutex
+    // builtin — emitCall calls ensureThreadRuntime() before routing to the
+    // declaredFns_ entry. This keeps a thread-free program's IR unchanged (no
+    // pthread externs, no @free-bearing thread_join body).
+    bool threadRuntimeDeclared_ = false;
+    void ensureThreadRuntime() {
+        if (threadRuntimeDeclared_) return;
+        threadRuntimeDeclared_ = true;
+        declareThreadRuntime();
+    }
+    void declareThreadRuntime() {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* voidTy = llvm::Type::getVoidTy(ctx);
+
+        // --- pthread externs (declared here, lazily). POSIX, so NO platform
+        // guard. Pointers are opaque `i8*`; `pthread_t` is an 8-byte handle on
+        // both glibc (unsigned long) and macOS (a pointer), modeled as i64 by
+        // value for pthread_join and `&tid` (i64*) for pthread_create.
+        //   int pthread_create(pthread_t*, const attr*, void*(*)(void*), void*)
+        pthreadCreateFn_ = llvm::Function::Create(
+            llvm::FunctionType::get(
+                i32Ty, {i8PtrTy, i8PtrTy, i8PtrTy, i8PtrTy}, false),
+            llvm::Function::ExternalLinkage, "pthread_create", module_.get());
+        //   int pthread_join(pthread_t, void** retval)
+        pthreadJoinFn_ = llvm::Function::Create(
+            llvm::FunctionType::get(i32Ty, {i64Ty, i8PtrTy}, false),
+            llvm::Function::ExternalLinkage, "pthread_join", module_.get());
+        //   int pthread_mutex_init(pthread_mutex_t*, const attr*)
+        pthreadMutexInitFn_ = llvm::Function::Create(
+            llvm::FunctionType::get(i32Ty, {i8PtrTy, i8PtrTy}, false),
+            llvm::Function::ExternalLinkage, "pthread_mutex_init",
+            module_.get());
+        //   int pthread_mutex_lock/unlock(pthread_mutex_t*)
+        auto* pmLockTy = llvm::FunctionType::get(i32Ty, {i8PtrTy}, false);
+        pthreadMutexLockFn_ = llvm::Function::Create(
+            pmLockTy, llvm::Function::ExternalLinkage, "pthread_mutex_lock",
+            module_.get());
+        pthreadMutexUnlockFn_ = llvm::Function::Create(
+            pmLockTy, llvm::Function::ExternalLinkage, "pthread_mutex_unlock",
+            module_.get());
+
+        // Control-block types.
+        threadBlkTy_ = llvm::StructType::create(
+            ctx, {i64Ty, i8PtrTy, i8PtrTy, i64Ty}, "kd.thread_blk");
+        auto* mtxStorageTy = llvm::ArrayType::get(
+            llvm::Type::getInt8Ty(ctx), 64);
+        mutexBlkTy_ = llvm::StructType::create(
+            ctx, {mtxStorageTy, i64Ty}, "kd.mutex_blk");
+        // The closure's fn pointer has the env-calling-convention type for a
+        // `fn() -> i64` value: i64(i8* env).
+        auto* closureCallTy =
+            llvm::FunctionType::get(i64Ty, {i8PtrTy}, /*isVarArg=*/false);
+
+        // void* __kd_thread_trampoline(void* arg)
+        {
+            auto* fnTy =
+                llvm::FunctionType::get(i8PtrTy, {i8PtrTy}, /*isVarArg=*/false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::InternalLinkage,
+                "__kd_thread_trampoline", module_.get());
+            fn->getArg(0)->setName("arg");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* blk = fn->getArg(0);
+            auto* fnP = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(threadBlkTy_, blk, 1, "fn_ptr"),
+                "fn");
+            auto* envP = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(threadBlkTy_, blk, 2, "env_ptr"),
+                "env");
+            auto* r = b.CreateCall(closureCallTy, fnP, {envP}, "thread_ret");
+            b.CreateStore(
+                r, b.CreateStructGEP(threadBlkTy_, blk, 3, "result_ptr"));
+            b.CreateRet(llvm::ConstantPointerNull::get(i8PtrTy));
+            threadTrampolineFn_ = fn;
+        }
+
+        // i64 thread_spawn({ i8* fn, i8* env })
+        {
+            auto* fnTy =
+                llvm::FunctionType::get(i64Ty, {fnValTy_}, /*isVarArg=*/false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "thread_spawn",
+                module_.get());
+            fn->getArg(0)->setName("f");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* fnPtr = b.CreateExtractValue(fn->getArg(0), {0}, "f.fn");
+            auto* envPtr = b.CreateExtractValue(fn->getArg(0), {1}, "f.env");
+            uint64_t sz =
+                module_->getDataLayout().getTypeAllocSize(threadBlkTy_);
+            auto* blk = b.CreateCall(
+                mallocFn_, {llvm::ConstantInt::get(i64Ty, sz)}, "thread_blk");
+            b.CreateStore(
+                fnPtr, b.CreateStructGEP(threadBlkTy_, blk, 1, "fn_slot"));
+            b.CreateStore(
+                envPtr, b.CreateStructGEP(threadBlkTy_, blk, 2, "env_slot"));
+            auto* tidPtr =
+                b.CreateStructGEP(threadBlkTy_, blk, 0, "tid_ptr");
+            b.CreateCall(pthreadCreateFn_,
+                         {tidPtr,
+                          llvm::ConstantPointerNull::get(i8PtrTy),
+                          threadTrampolineFn_, blk});
+            b.CreateRet(b.CreatePtrToInt(blk, i64Ty, "handle"));
+            declaredFns_["thread_spawn"] = fn;
+        }
+
+        // i64 thread_join(i64 handle)
+        {
+            auto* fnTy =
+                llvm::FunctionType::get(i64Ty, {i64Ty}, /*isVarArg=*/false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "thread_join",
+                module_.get());
+            fn->getArg(0)->setName("handle");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* blk = b.CreateIntToPtr(fn->getArg(0), i8PtrTy, "blk");
+            auto* tid = b.CreateLoad(
+                i64Ty, b.CreateStructGEP(threadBlkTy_, blk, 0, "tid_ptr"),
+                "tid");
+            b.CreateCall(pthreadJoinFn_,
+                         {tid, llvm::ConstantPointerNull::get(i8PtrTy)});
+            auto* result = b.CreateLoad(
+                i64Ty, b.CreateStructGEP(threadBlkTy_, blk, 3, "result_ptr"),
+                "result");
+            b.CreateCall(freeFn_, {blk});
+            b.CreateRet(result);
+            declaredFns_["thread_join"] = fn;
+        }
+
+        // i64 mutex_new(i64 v)
+        {
+            auto* fnTy =
+                llvm::FunctionType::get(i64Ty, {i64Ty}, /*isVarArg=*/false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "mutex_new",
+                module_.get());
+            fn->getArg(0)->setName("v");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            uint64_t sz =
+                module_->getDataLayout().getTypeAllocSize(mutexBlkTy_);
+            auto* blk = b.CreateCall(
+                mallocFn_, {llvm::ConstantInt::get(i64Ty, sz)}, "mutex_blk");
+            auto* mtxPtr =
+                b.CreateStructGEP(mutexBlkTy_, blk, 0, "mtx_ptr");
+            b.CreateCall(pthreadMutexInitFn_,
+                         {mtxPtr, llvm::ConstantPointerNull::get(i8PtrTy)});
+            b.CreateStore(
+                fn->getArg(0),
+                b.CreateStructGEP(mutexBlkTy_, blk, 1, "value_slot"));
+            b.CreateRet(b.CreatePtrToInt(blk, i64Ty, "handle"));
+            declaredFns_["mutex_new"] = fn;
+        }
+
+        // i64 mutex_lock(i64 h) / i64 mutex_unlock(i64 h) — lock/unlock and
+        // return 0 (an i64 so it composes in expression position).
+        auto emitMutexLockOp = [&](const char* name, llvm::Function* op) {
+            auto* fnTy =
+                llvm::FunctionType::get(i64Ty, {i64Ty}, /*isVarArg=*/false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, name, module_.get());
+            fn->getArg(0)->setName("h");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* blk = b.CreateIntToPtr(fn->getArg(0), i8PtrTy, "blk");
+            auto* mtxPtr = b.CreateStructGEP(mutexBlkTy_, blk, 0, "mtx_ptr");
+            b.CreateCall(op, {mtxPtr});
+            b.CreateRet(llvm::ConstantInt::get(i64Ty, 0));
+            declaredFns_[name] = fn;
+        };
+        emitMutexLockOp("mutex_lock", pthreadMutexLockFn_);
+        emitMutexLockOp("mutex_unlock", pthreadMutexUnlockFn_);
+
+        // i64 mutex_get(i64 h): read the guarded cell.
+        {
+            auto* fnTy =
+                llvm::FunctionType::get(i64Ty, {i64Ty}, /*isVarArg=*/false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "mutex_get",
+                module_.get());
+            fn->getArg(0)->setName("h");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* blk = b.CreateIntToPtr(fn->getArg(0), i8PtrTy, "blk");
+            auto* v = b.CreateLoad(
+                i64Ty, b.CreateStructGEP(mutexBlkTy_, blk, 1, "value_ptr"),
+                "value");
+            b.CreateRet(v);
+            declaredFns_["mutex_get"] = fn;
+        }
+
+        // i64 mutex_set(i64 h, i64 v): write the guarded cell, return v.
+        {
+            auto* fnTy = llvm::FunctionType::get(
+                i64Ty, {i64Ty, i64Ty}, /*isVarArg=*/false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "mutex_set",
+                module_.get());
+            fn->getArg(0)->setName("h");
+            fn->getArg(1)->setName("v");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* blk = b.CreateIntToPtr(fn->getArg(0), i8PtrTy, "blk");
+            b.CreateStore(
+                fn->getArg(1),
+                b.CreateStructGEP(mutexBlkTy_, blk, 1, "value_ptr"));
+            (void)voidTy;
+            b.CreateRet(fn->getArg(1));
+            declaredFns_["mutex_set"] = fn;
         }
     }
 
@@ -5076,6 +5359,16 @@ private:
     }
 
     llvm::Value* emitCall(const ast::CallExpr& call) {
+        // Phase 19: lazily declare the OS-thread + Mutex runtime (pthread
+        // externs + trampoline + thread_*/mutex_* bodies) the first time any
+        // of those builtins is called, then fall through to the normal
+        // declaredFns_ dispatch below. Keeps thread-free programs' IR pristine.
+        if (call.callee == "thread_spawn" || call.callee == "thread_join" ||
+            call.callee == "mutex_new" || call.callee == "mutex_lock" ||
+            call.callee == "mutex_unlock" || call.callee == "mutex_get" ||
+            call.callee == "mutex_set") {
+            ensureThreadRuntime();
+        }
         // Phase 10b: indirect call through a fn VALUE (fat pointer). Applies
         // to let-bound fn values, fn-typed params, and if-selected fns. We
         // try this BEFORE the direct/generic paths so a binding that shadows

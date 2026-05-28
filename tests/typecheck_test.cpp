@@ -1906,6 +1906,91 @@ void test_duplicate_method_across_impls_errors() {
         "duplicate_method_across_impls");
 }
 
+// --- Phase 19: OS threads + Mutex + Send (compile-time data-race freedom) ---
+
+void test_thread_spawn_join_ok() {
+    // A bare fn value spawned + joined; thread ops carry `io`.
+    expectOk(
+        "fn w() -> i64 { 7 }\n"
+        "fn main() -> i64 ! { io } {\n"
+        "  let h = thread_spawn(w);\n"
+        "  thread_join(h)\n"
+        "}",
+        "thread_spawn_join_ok");
+}
+
+void test_thread_spawn_requires_io_effect() {
+    // `main` performs `io` via thread_spawn/thread_join but doesn't declare it.
+    expectErr(
+        "fn w() -> i64 { 7 }\n"
+        "fn main() -> i64 {\n"
+        "  let h = thread_spawn(w);\n"
+        "  thread_join(h)\n"
+        "}",
+        "thread_spawn_requires_io_effect");
+}
+
+void test_thread_spawn_byvalue_closure_ok() {
+    // A closure capturing an i64 BY VALUE is Send — accepted.
+    expectOk(
+        "fn main() -> i64 ! { io } {\n"
+        "  let base = 41;\n"
+        "  let h = thread_spawn(|| base + 1);\n"
+        "  thread_join(h)\n"
+        "}",
+        "thread_spawn_byvalue_closure_ok");
+}
+
+void test_thread_spawn_byref_capture_rejected() {
+    // A closure capturing `n` BY REFERENCE (it mutates it) is !Send across a
+    // thread boundary — must be rejected at compile time.
+    expectErr(
+        "fn main() -> i64 ! { io } {\n"
+        "  let mut n = 0;\n"
+        "  let h = thread_spawn(|| { n = n + 1; n });\n"
+        "  thread_join(h)\n"
+        "}",
+        "thread_spawn_byref_capture_rejected");
+}
+
+void test_thread_spawn_propagates_closure_io_effect() {
+    // The spawned closure performs `io` (mutex_lock); thread_spawn is effect-
+    // polymorphic so that flows to the caller, which here declares it: ok.
+    expectOk(
+        "fn bump(m: i64) -> i64 ! { io } { mutex_lock(m); mutex_unlock(m); 0 }\n"
+        "fn main() -> i64 ! { alloc, io } {\n"
+        "  let m = mutex_new(0);\n"
+        "  let h = thread_spawn(|| bump(m));\n"
+        "  thread_join(h)\n"
+        "}",
+        "thread_spawn_propagates_closure_io_effect");
+}
+
+void test_mutex_ops_typecheck_ok() {
+    expectOk(
+        "fn main() -> i64 ! { alloc, io } {\n"
+        "  let m = mutex_new(10);\n"
+        "  mutex_lock(m);\n"
+        "  let v = mutex_get(m);\n"
+        "  mutex_set(m, v + 1);\n"
+        "  mutex_unlock(m);\n"
+        "  mutex_get(m)\n"
+        "}",
+        "mutex_ops_typecheck_ok");
+}
+
+void test_mutex_new_requires_alloc_effect() {
+    // mutex_new allocates -> `alloc`; main here only declares `io`.
+    expectErr(
+        "fn main() -> i64 ! { io } {\n"
+        "  let m = mutex_new(0);\n"
+        "  mutex_lock(m);\n"
+        "  mutex_unlock(m);\n"
+        "  0\n"
+        "}",
+        "mutex_new_requires_alloc_effect");
+}
+
 } // namespace
 
 int main() {
@@ -2118,6 +2203,14 @@ int main() {
     test_inherent_and_trait_method_coexist();
     test_inherent_unknown_method_errors();
     test_duplicate_method_across_impls_errors();
-    std::cout << "All typecheck tests passed (192 cases)\n";
+    // Phase 19: OS threads + Mutex + Send
+    test_thread_spawn_join_ok();
+    test_thread_spawn_requires_io_effect();
+    test_thread_spawn_byvalue_closure_ok();
+    test_thread_spawn_byref_capture_rejected();
+    test_thread_spawn_propagates_closure_io_effect();
+    test_mutex_ops_typecheck_ok();
+    test_mutex_new_requires_alloc_effect();
+    std::cout << "All typecheck tests passed (199 cases)\n";
     return 0;
 }
