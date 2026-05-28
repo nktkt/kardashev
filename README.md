@@ -274,6 +274,34 @@ Landed in order **15 → 16 → 17 → 18 → 19 → 20** (17's generic `Future<
 unblocked 18; 16's Drop underpins 19's safe sharing), each verified — clean build
 + direct behavior checks — and CI-green on ubuntu + macOS before the next built on it.
 
+## Roadmap v4 — from "a real systems language" to "one you'd choose for real work"
+
+v3 made kardashev a real systems language you can *run* (Drop, threads, async I/O,
+a stdlib). But probing it for real work surfaces a hard ceiling: the stdlib is
+**still `i64`-bound** because there are **no generic traits** (`trait Iter<T>`,
+`type Item;`, and `where` clauses are all parse errors); the `panic`/`unwind`
+effect labels have **no runtime** (`panic` isn't even callable); there's **no FFI**
+(`extern` doesn't parse — the language is sealed off from every C library); and
+there are **no arrays/tuples/`const`**. v4 closes the gap to a language you'd
+actually reach for. The **north star**: a real program that reads input through
+FFI/file I/O, keys data by `String` in a fully-generic `HashMap<K, V>`, and
+recovers from a `panic` with Drop cleanup — plus a piece of the toolchain that
+compiles itself.
+
+| Phase | Goal | What's missing today / why it's next |
+|-------|------|--------------------------------------|
+| 21 | **Generic traits + associated types + `where` clauses**: `trait Iterator<T>` / `trait Container { type Item; }` / `fn f<T>() where T: Bound` | Verified: all three are parse errors. The deepest remaining type-system gap and the direct unlock for v3's deferrals — generic `Iterator<T>` element type and `HashMap<K, V>` with arbitrary keys (via a `Hash` trait). Highest leverage: it makes the *whole* stdlib truly generic instead of `i64`-bound. |
+| 22 | **Aggregate data: fixed-size arrays `[T; N]` + tuples `(A, B)`** | Verified: `[i64; 3]` and `(1, 2)` don't parse — the only compound data today is heap `Vec` / structs / enums. Stack arrays (no heap, no Drop) and anonymous tuples (with `let`/`match` destructuring) are everyday building blocks; array lengths introduce const generics, feeding Phase 25. |
+| 23 | **Real panic + unwinding**: make the `panic`/`unwind` effect labels honest | Verified: `panic` isn't even a function — `panic`/`unwind` are pure type-system labels with zero runtime. Add a real `panic(msg)` that unwinds the stack **running Drop glue on the way out** (RAII cleanup on the failure path — ties Phase 16), plus a `catch`/recover boundary and bounds-checked indexing. Today the safety labels promise something the runtime doesn't deliver. |
+| 24 | **FFI / C interop**: `extern "C"` import + export | Verified: no `extern`. kardashev can only call its own builtins, so it's cut off from the entire C ecosystem. `extern "C"` declarations to call libc/third-party C, and exporting kardashev fns to C, are the toy→usable line (the AOT path already links via `clang`, so the plumbing is close). |
+| 25 | **comptime / const evaluation**: `const` items, `const fn`, const folding, const generics | Verified: `const` / `const fn` don't parse. Compile-time evaluation enables constant tables, array sizes from expressions, and zero-cost abstractions; the `N` in `[T; N]` (Phase 22) becomes a first-class const generic. |
+| 26 | **Self-hosting milestone + stdlib depth** | The classic "the language has arrived" proof: rewrite a real, non-trivial toolchain component (e.g. the lexer) or a substantial library *in kardashev itself*, compiled by `kardc`. Rides on 21 (generic collections) + 24 (real file I/O via FFI), plus stdlib maturity — file/OS I/O, string formatting, generic `HashMap<K,V>` / sets. |
+
+Dependencies: 21 (generic traits) unblocks 26's generic collections and finally
+de-`i64`s the stdlib; 22's array lengths feed 25's const generics; 23 builds on
+v3's Drop; 24 (FFI) + 26 (real I/O) pair up. Suggested order: **21 → 22 → 23 → 24
+→ 25 → 26**, with 21 first since it's the highest-leverage unlock.
+
 ## Why "kardashev"?
 
 The [Kardashev scale](https://en.wikipedia.org/wiki/Kardashev_scale) ranks civilizations by how much energy they can harness. A systems language, in its own small way, is about controlling resources at scale — a fitting name for one that aims to be precise about effects, ownership, and computation.
