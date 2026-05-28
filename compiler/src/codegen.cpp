@@ -3355,12 +3355,21 @@ private:
     // diagnostic if it ever leaks into a real call.
     std::string mangleType(const TypePtr& t) {
         TypePtr r = resolve(t);
+        auto mangleTypeArgs = [&](const std::vector<TypePtr>& args) {
+            if (args.empty()) return std::string{};
+            std::string out = "__";
+            for (std::size_t i = 0; i < args.size(); ++i) {
+                if (i > 0) out += "_";
+                out += mangleType(args[i]);
+            }
+            return out;
+        };
         switch (r->kind) {
         case TypeKind::Int:    return "i64";
         case TypeKind::Bool:   return "bool";
         case TypeKind::Unit:   return "unit";
-        case TypeKind::Struct: return r->structName;
-        case TypeKind::Enum:   return r->enumName;
+        case TypeKind::Struct: return r->structName + mangleTypeArgs(r->typeArgs);
+        case TypeKind::Enum:   return r->enumName + mangleTypeArgs(r->typeArgs);
         case TypeKind::Var:    return "_var" + std::to_string(r->varId);
         case TypeKind::Function: return "_fn";
         case TypeKind::Ref:    return std::string(r->refIsMut ? "refmut_"
