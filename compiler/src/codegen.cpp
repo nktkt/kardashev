@@ -189,6 +189,19 @@ private:
 
     // Per-fn locals: variable name -> alloca pointer.
     std::unordered_map<std::string, llvm::AllocaInst*> locals_;
+    // Phase 9: loop-target stack, innermost last. `continueBB` is the
+    // block a `continue` branches to (loop header for `while`/`loop`, the
+    // step block for `for`); `breakBB` is the post-loop block a `break`
+    // jumps to. For value-carrying `loop`s, `breakValueAlloca` holds the
+    // slot each `break <v>` stores into and that the loop expression reads
+    // after the loop (null for unit loops).
+    struct LoopFrame {
+        llvm::BasicBlock* continueBB = nullptr;
+        llvm::BasicBlock* breakBB = nullptr;
+        llvm::AllocaInst* breakValueAlloca = nullptr;
+        bool sawBreak = false; // true once any `break` targets this loop
+    };
+    std::vector<LoopFrame> loopFrames_;
     // Phase 4.3: per-fn binding -> kardashev TypePtr, used by emitCall
     // to recover the FunctionType for indirect calls through a let-bound
     // fn-pointer. Empty for non-fn-typed bindings; we just don't query.
@@ -1020,10 +1033,91 @@ private:
             }
             return;
         }
+        if (auto* as = dynamic_cast<const ast::AssignStmt*>(&s)) {
+            emitAssign(*as);
+            return;
+        }
         if (auto* es = dynamic_cast<const ast::ExprStmt*>(&s)) {
             emitExpr(*es->expr);
             return;
         }
+    }
+
+    // Phase 9: store `rhs` into the place named by `target`. Supports a
+    // bare local Ident and a (possibly nested) field-access chain rooted
+    // at a local or a `&mut` reference. Computes a pointer to the place,
+    // then stores. For field chains rooted at an aggregate-by-value local
+    // we round-trip through the alloca (load/insert/store handled by the
+    // GEP-on-alloca path).
+    void emitAssign(const ast::AssignStmt& as) {
+        llvm::Value* slot = emitPlaceAddr(*as.target);
+        if (!slot) {
+            errors_.push_back("codegen: unsupported assignment target");
+            return;
+        }
+        llvm::Value* v = emitExpr(*as.value);
+        builder_->CreateStore(v, slot);
+    }
+
+    // Compute an address (pointer) for an assignable place. Returns null
+    // if the target shape isn't supported.
+    llvm::Value* emitPlaceAddr(const ast::Expr& e) {
+        if (auto* id = dynamic_cast<const ast::IdentExpr*>(&e)) {
+            auto it = locals_.find(id->name);
+            if (it == locals_.end()) return nullptr;
+            return it->second; // the alloca is the slot's address
+        }
+        if (auto* fe = dynamic_cast<const ast::FieldExpr*>(&e)) {
+            // Address of the base place, plus the element type describing
+            // what that address points at.
+            TypePtr baseTy;
+            llvm::Value* baseAddr = emitPlaceBase(*fe->object, baseTy);
+            if (!baseAddr || !baseTy) return nullptr;
+            TypePtr st = resolveInInstance(baseTy);
+            if (st->kind != TypeKind::Struct) return nullptr;
+            llvm::Type* structLlvm = mapKardashevType(st);
+            for (unsigned i = 0; i < st->structFields.size(); ++i) {
+                if (st->structFields[i].first == fe->fieldName) {
+                    return builder_->CreateStructGEP(
+                        structLlvm, baseAddr, i, "fld_addr_" + fe->fieldName);
+                }
+            }
+            return nullptr;
+        }
+        return nullptr;
+    }
+
+    // Compute the address of a place that a field-access is rooted at, and
+    // report the kardashev type the address points to via `outTy`. A bare
+    // local yields its alloca (pointing at the struct value). A `&mut`
+    // local yields the loaded pointer (pointing at the referent). Nested
+    // field accesses recurse through emitPlaceAddr.
+    llvm::Value* emitPlaceBase(const ast::Expr& e, TypePtr& outTy) {
+        if (auto* id = dynamic_cast<const ast::IdentExpr*>(&e)) {
+            auto it = locals_.find(id->name);
+            if (it == locals_.end()) return nullptr;
+            TypePtr t = lookupExprType(e);
+            if (t) {
+                TypePtr r = resolveInInstance(t);
+                if (r->kind == TypeKind::Ref) {
+                    // Through-reference: load the pointer; it addresses the
+                    // referent struct directly.
+                    outTy = resolveInInstance(r->refInner);
+                    return builder_->CreateLoad(
+                        it->second->getAllocatedType(), it->second,
+                        id->name + "_ref");
+                }
+            }
+            outTy = t;
+            return it->second;
+        }
+        if (auto* fe = dynamic_cast<const ast::FieldExpr*>(&e)) {
+            // The address of a nested field is itself a place.
+            llvm::Value* addr = emitPlaceAddr(*fe);
+            outTy = lookupExprType(*fe);
+            return addr;
+        }
+        return nullptr;
     }
 
     llvm::Value* emitExpr(const ast::Expr& e) {
@@ -1078,6 +1172,24 @@ private:
         }
         if (auto* m = dynamic_cast<const ast::MatchExpr*>(&e)) {
             return emitMatch(*m);
+        }
+        if (auto* we = dynamic_cast<const ast::WhileExpr*>(&e)) {
+            return emitWhile(*we);
+        }
+        if (auto* le = dynamic_cast<const ast::LoopExpr*>(&e)) {
+            return emitLoop(*le);
+        }
+        if (auto* fe = dynamic_cast<const ast::ForExpr*>(&e)) {
+            return emitFor(*fe);
+        }
+        if (auto* re = dynamic_cast<const ast::RangeExpr*>(&e)) {
+            return emitRange(*re);
+        }
+        if (auto* be = dynamic_cast<const ast::BreakExpr*>(&e)) {
+            return emitBreak(*be);
+        }
+        if (auto* ce = dynamic_cast<const ast::ContinueExpr*>(&e)) {
+            return emitContinue(*ce);
         }
         if (auto* t = dynamic_cast<const ast::TryExpr*>(&e)) {
             return emitTry(*t);
@@ -1785,6 +1897,239 @@ private:
                                          incoming.size(), "matchval");
         for (auto& [bb, val] : incoming) phi->addIncoming(val, bb);
         return phi;
+    }
+
+    // Phase 9: `while cond { body }`.
+    //   entry -> header
+    //   header: cond ? body : exit
+    //   body:   <body>; -> header   (continue target = header)
+    //   exit:   (break target)
+    // The whole expression is unit (returns null).
+    llvm::Value* emitWhile(const ast::WhileExpr& we) {
+        auto* headerBB =
+            llvm::BasicBlock::Create(*ctx_, "while.header", currentFn_);
+        auto* bodyBB =
+            llvm::BasicBlock::Create(*ctx_, "while.body", currentFn_);
+        auto* exitBB =
+            llvm::BasicBlock::Create(*ctx_, "while.exit", currentFn_);
+
+        builder_->CreateBr(headerBB);
+        builder_->SetInsertPoint(headerBB);
+        llvm::Value* cond = emitExpr(*we.cond);
+        if (cond->getType() != llvm::Type::getInt1Ty(*ctx_)) {
+            cond = builder_->CreateICmpNE(
+                cond, llvm::Constant::getNullValue(cond->getType()),
+                "tobool");
+        }
+        builder_->CreateCondBr(cond, bodyBB, exitBB);
+
+        builder_->SetInsertPoint(bodyBB);
+        loopFrames_.push_back({headerBB, exitBB, nullptr});
+        emitExpr(*we.body);
+        loopFrames_.pop_back();
+        if (!currentBlockTerminated()) builder_->CreateBr(headerBB);
+
+        builder_->SetInsertPoint(exitBB);
+        return nullptr; // unit
+    }
+
+    // Phase 9: `loop { body }`.
+    //   entry -> body
+    //   body:  <body>; -> body   (continue target = body; back-edge)
+    //   exit:  (break target)
+    // If the loop yields a value (every `break` carries one), we spill the
+    // value through `breakValueAlloca` and load it at exit.
+    llvm::Value* emitLoop(const ast::LoopExpr& le) {
+        auto* bodyBB =
+            llvm::BasicBlock::Create(*ctx_, "loop.body", currentFn_);
+        auto* exitBB =
+            llvm::BasicBlock::Create(*ctx_, "loop.exit", currentFn_);
+
+        // Determine the loop's value type from the typechecker. A non-unit
+        // type means there's at least one `break <value>`; allocate a slot.
+        llvm::AllocaInst* valSlot = nullptr;
+        llvm::Type* valTy = nullptr;
+        TypePtr loopTy = lookupExprType(le);
+        if (loopTy) {
+            TypePtr r = resolveInInstance(loopTy);
+            // Only a concrete value type means there's a `break <value>`.
+            // Unit (valueless breaks) and an unbound Var ("never" — the
+            // loop exits only via `return` or never) carry no value.
+            bool concreteValue =
+                r->kind == TypeKind::Int || r->kind == TypeKind::Bool ||
+                r->kind == TypeKind::Struct || r->kind == TypeKind::Enum ||
+                r->kind == TypeKind::Ref;
+            if (concreteValue) {
+                valTy = mapKardashevType(r);
+                valSlot = builder_->CreateAlloca(valTy, nullptr, "loopval");
+            }
+        }
+
+        builder_->CreateBr(bodyBB);
+        builder_->SetInsertPoint(bodyBB);
+        loopFrames_.push_back({bodyBB, exitBB, valSlot, /*sawBreak=*/false});
+        emitExpr(*le.body);
+        bool sawBreak = loopFrames_.back().sawBreak;
+        loopFrames_.pop_back();
+        if (!currentBlockTerminated()) builder_->CreateBr(bodyBB);
+
+        builder_->SetInsertPoint(exitBB);
+        if (!sawBreak) {
+            // No `break` targets this loop: the exit is unreachable (the
+            // loop spins forever or only leaves via `return`). Emitting
+            // `unreachable` keeps the IR well-formed even when the fn's
+            // declared return type isn't unit.
+            builder_->CreateUnreachable();
+            return nullptr;
+        }
+        if (valSlot) {
+            return builder_->CreateLoad(valTy, valSlot, "loopval.out");
+        }
+        return nullptr; // unit
+    }
+
+    // Phase 9: `for <pat> in a..b { body }`. Direct integer-range lowering
+    // (the trait-level spelling is `loop { match it.next() { Some(x) =>
+    // body, None => break } }`; we emit the equivalent counted loop). The
+    // pattern is a VarPat for ranges; we bind it to the induction var.
+    //   entry: i = start
+    //   header: i </<= end ? body : exit
+    //   body:   bind pat = i; <body>; -> step
+    //   step:   i = i + 1; -> header   (continue target = step)
+    //   exit:   (break target)
+    llvm::Value* emitFor(const ast::ForExpr& fe) {
+        auto* i64Ty = llvm::Type::getInt64Ty(*ctx_);
+        // Evaluate the range bounds. We optimize the common case where the
+        // iterable is written directly as `a..b`; otherwise read the Range
+        // struct value's fields.
+        llvm::Value* startV = nullptr;
+        llvm::Value* endV = nullptr;
+        // For a literal range we know `inclusive` at compile time; for a
+        // general Range value we carry the runtime flag (i64, !=0 means
+        // inclusive) and fold it into the loop condition with a select.
+        bool literalRange =
+            dynamic_cast<const ast::RangeExpr*>(fe.iter.get()) != nullptr;
+        bool inclusiveConst = false;
+        llvm::Value* inclusiveFlag = nullptr; // runtime i64, general case
+        if (auto* rng = dynamic_cast<const ast::RangeExpr*>(fe.iter.get())) {
+            startV = emitExpr(*rng->start);
+            endV = emitExpr(*rng->end);
+            inclusiveConst = rng->inclusive;
+        } else {
+            // General Range value: extract fields {start, end, inclusive}.
+            llvm::Value* rv = emitExpr(*fe.iter);
+            startV = builder_->CreateExtractValue(rv, {0}, "rng.start");
+            endV = builder_->CreateExtractValue(rv, {1}, "rng.end");
+            inclusiveFlag =
+                builder_->CreateExtractValue(rv, {2}, "rng.incl");
+        }
+
+        auto* iSlot = builder_->CreateAlloca(i64Ty, nullptr, "for.i");
+        builder_->CreateStore(startV, iSlot);
+
+        auto* headerBB =
+            llvm::BasicBlock::Create(*ctx_, "for.header", currentFn_);
+        auto* bodyBB =
+            llvm::BasicBlock::Create(*ctx_, "for.body", currentFn_);
+        auto* stepBB =
+            llvm::BasicBlock::Create(*ctx_, "for.step", currentFn_);
+        auto* exitBB =
+            llvm::BasicBlock::Create(*ctx_, "for.exit", currentFn_);
+
+        builder_->CreateBr(headerBB);
+        builder_->SetInsertPoint(headerBB);
+        llvm::Value* iCur = builder_->CreateLoad(i64Ty, iSlot, "for.i.cur");
+        llvm::Value* cond;
+        if (literalRange) {
+            cond = inclusiveConst
+                       ? builder_->CreateICmpSLE(iCur, endV, "for.cond")
+                       : builder_->CreateICmpSLT(iCur, endV, "for.cond");
+        } else {
+            // Runtime inclusive flag: select the SLE result when
+            // inclusive != 0, else the SLT result.
+            llvm::Value* lt = builder_->CreateICmpSLT(iCur, endV, "for.lt");
+            llvm::Value* le = builder_->CreateICmpSLE(iCur, endV, "for.le");
+            llvm::Value* inclBool = builder_->CreateICmpNE(
+                inclusiveFlag, llvm::ConstantInt::get(i64Ty, 0), "for.incl1");
+            cond = builder_->CreateSelect(inclBool, le, lt, "for.cond");
+        }
+        builder_->CreateCondBr(cond, bodyBB, exitBB);
+
+        builder_->SetInsertPoint(bodyBB);
+        // Bind the loop variable to the current induction value.
+        if (auto* vp = dynamic_cast<const ast::VarPat*>(fe.pattern.get())) {
+            auto* vAlloca =
+                builder_->CreateAlloca(i64Ty, nullptr, vp->name);
+            builder_->CreateStore(iCur, vAlloca);
+            locals_[vp->name] = vAlloca;
+        }
+        loopFrames_.push_back({stepBB, exitBB, nullptr});
+        emitExpr(*fe.body);
+        loopFrames_.pop_back();
+        if (!currentBlockTerminated()) builder_->CreateBr(stepBB);
+
+        builder_->SetInsertPoint(stepBB);
+        llvm::Value* iStep = builder_->CreateLoad(i64Ty, iSlot, "for.i.step");
+        llvm::Value* iNext = builder_->CreateAdd(
+            iStep, llvm::ConstantInt::get(i64Ty, 1), "for.i.next");
+        builder_->CreateStore(iNext, iSlot);
+        builder_->CreateBr(headerBB);
+
+        builder_->SetInsertPoint(exitBB);
+        return nullptr; // unit
+    }
+
+    // Phase 9: `break` / `break <value>`. Stores the value into the
+    // innermost loop's value slot (if any) and branches to its exit. The
+    // block becomes terminated; the expression value is unused.
+    llvm::Value* emitBreak(const ast::BreakExpr& be) {
+        if (loopFrames_.empty()) {
+            errors_.push_back("codegen: `break` outside loop");
+            return nullptr;
+        }
+        LoopFrame& frame = loopFrames_.back();
+        frame.sawBreak = true;
+        if (be.value) {
+            llvm::Value* v = emitExpr(*be.value);
+            if (frame.breakValueAlloca) {
+                builder_->CreateStore(v, frame.breakValueAlloca);
+            }
+        }
+        builder_->CreateBr(frame.breakBB);
+        return nullptr;
+    }
+
+    // Phase 9: `continue`. Branches to the innermost loop's continue
+    // target (header for while/loop, step block for for).
+    llvm::Value* emitContinue(const ast::ContinueExpr& ce) {
+        if (loopFrames_.empty()) {
+            errors_.push_back("codegen: `continue` outside loop");
+            return nullptr;
+        }
+        builder_->CreateBr(loopFrames_.back().continueBB);
+        return nullptr;
+    }
+
+    // Phase 9: `a..b` / `a..=b` as a first-class value — build the Range
+    // struct aggregate { start, end, inclusive }.
+    llvm::Value* emitRange(const ast::RangeExpr& re) {
+        TypePtr rangeTy = lookupExprType(re);
+        llvm::Type* llvmTy = rangeTy ? mapKardashevType(rangeTy) : nullptr;
+        auto* st = llvm::dyn_cast_or_null<llvm::StructType>(llvmTy);
+        auto* i64Ty = llvm::Type::getInt64Ty(*ctx_);
+        if (!st) {
+            errors_.push_back("codegen: Range did not map to a struct type");
+            return llvm::ConstantInt::get(i64Ty, 0);
+        }
+        llvm::Value* startV = emitExpr(*re.start);
+        llvm::Value* endV = emitExpr(*re.end);
+        llvm::Value* incV =
+            llvm::ConstantInt::get(i64Ty, re.inclusive ? 1 : 0, true);
+        llvm::Value* agg = llvm::UndefValue::get(st);
+        agg = builder_->CreateInsertValue(agg, startV, {0}, "rng.s");
+        agg = builder_->CreateInsertValue(agg, endV, {1}, "rng.e");
+        agg = builder_->CreateInsertValue(agg, incV, {2}, "rng.i");
+        return agg;
     }
 
     llvm::Value* emitIf(const ast::IfExpr& ie) {

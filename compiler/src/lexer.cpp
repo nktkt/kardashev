@@ -26,6 +26,10 @@ TokenKind keywordOrIdent(std::string_view s) {
     if (s == "trait") return TokenKind::KwTrait;
     if (s == "impl") return TokenKind::KwImpl;
     if (s == "for") return TokenKind::KwFor;
+    if (s == "while") return TokenKind::KwWhile;
+    if (s == "loop") return TokenKind::KwLoop;
+    if (s == "break") return TokenKind::KwBreak;
+    if (s == "continue") return TokenKind::KwContinue;
     if (s == "mod") return TokenKind::KwMod;
     if (s == "pub") return TokenKind::KwPub;
     // A bare `_` is the wildcard pattern; `_foo` stays an Identifier.
@@ -50,6 +54,11 @@ std::vector<Token> lex(std::string_view source) {
         tokens.push_back({k, std::string(source.substr(i, 2)), line, startCol});
         i += 2;
         col += 2;
+    };
+    auto push3 = [&](TokenKind k, std::size_t startCol) {
+        tokens.push_back({k, std::string(source.substr(i, 3)), line, startCol});
+        i += 3;
+        col += 3;
     };
 
     while (i < source.size()) {
@@ -136,6 +145,17 @@ std::vector<Token> lex(std::string_view source) {
 
         // Two-char operators.
         char n = (i + 1 < source.size()) ? source[i + 1] : '\0';
+        char n2 = (i + 2 < source.size()) ? source[i + 2] : '\0';
+        // Phase 9: range operators. `..=` (inclusive) must be tried before
+        // `..` (exclusive) so the longer match wins.
+        if (c == '.' && n == '.' && n2 == '=') {
+            push3(TokenKind::DotDotEq, startCol);
+            continue;
+        }
+        if (c == '.' && n == '.') {
+            push2(TokenKind::DotDot, startCol);
+            continue;
+        }
         if (c == '-' && n == '>') {
             push2(TokenKind::Arrow, startCol);
             continue;
@@ -214,6 +234,10 @@ std::string_view tokenKindName(TokenKind kind) {
     case TokenKind::KwTrait: return "KwTrait";
     case TokenKind::KwImpl: return "KwImpl";
     case TokenKind::KwFor: return "KwFor";
+    case TokenKind::KwWhile: return "KwWhile";
+    case TokenKind::KwLoop: return "KwLoop";
+    case TokenKind::KwBreak: return "KwBreak";
+    case TokenKind::KwContinue: return "KwContinue";
     case TokenKind::KwMod: return "KwMod";
     case TokenKind::KwPub: return "KwPub";
     case TokenKind::DoubleColon: return "DoubleColon";
@@ -230,6 +254,8 @@ std::string_view tokenKindName(TokenKind kind) {
     case TokenKind::Eq: return "Eq";
     case TokenKind::Arrow: return "Arrow";
     case TokenKind::FatArrow: return "FatArrow";
+    case TokenKind::DotDot: return "DotDot";
+    case TokenKind::DotDotEq: return "DotDotEq";
     case TokenKind::LParen: return "LParen";
     case TokenKind::RParen: return "RParen";
     case TokenKind::LBrace: return "LBrace";

@@ -66,6 +66,20 @@ public:
             structSchemas_["Future"] = std::move(sch);
         }
 
+        // Phase 9 built-in: `Range` — the iterable produced by `a..b` and
+        // `a..=b`. Fields: current `start`, `end` bound, and `inclusive`
+        // (0/1) so `for` knows whether `end` is part of the range. Codegen
+        // lays it out as { i64, i64, i64 } and `for` lowers a counted loop
+        // over it directly (the `Iterator::next` impl below is the trait-
+        // level spelling of the same logic).
+        {
+            StructSchema sch;
+            sch.type = makeStruct("Range", {{"start", makeInt()},
+                                            {"end", makeInt()},
+                                            {"inclusive", makeInt()}});
+            structSchemas_["Range"] = std::move(sch);
+        }
+
         // print_str(s: &String) -> i64 ! { io }
         {
             FnSchema sch;
@@ -548,6 +562,20 @@ private:
         matchTrees_;
     std::vector<TypeError> errors_;
     std::vector<Scope> scopes_;
+    // Phase 9: parallel to scopes_; names of `let mut` (reassignable)
+    // bindings in each scope. A name absent here is immutable.
+    std::vector<std::unordered_set<std::string>> mutScopes_;
+    // Phase 9: loop context stack. One entry per enclosing loop, innermost
+    // last. `isValueLoop` is true for `loop` (where `break <value>` is
+    // allowed); `while`/`for` are unit loops. `breakType` accumulates the
+    // unified type of all `break <value>` expressions seen so far (null
+    // until the first valued break).
+    struct LoopCtx {
+        bool isValueLoop = false;
+        TypePtr breakType; // null = no valued break yet
+        bool sawValuelessBreak = false;
+    };
+    std::vector<LoopCtx> loopStack_;
     TypePtr currentReturnType_;
     // Generic-param-name -> Type Var, scoped to the current fn declaration.
     // Set during Pass 1b sig resolution and during Pass 2 body checking
@@ -622,12 +650,42 @@ private:
                 } else if (auto* ret = dynamic_cast<const ast::ReturnStmt*>(
                                stmt.get())) {
                     if (ret->value) collectEffects(*ret->value, out);
+                } else if (auto* as = dynamic_cast<const ast::AssignStmt*>(
+                               stmt.get())) {
+                    collectEffects(*as->target, out);
+                    collectEffects(*as->value, out);
                 } else if (auto* es = dynamic_cast<const ast::ExprStmt*>(
                                stmt.get())) {
                     collectEffects(*es->expr, out);
                 }
             }
             if (block->tail) collectEffects(*block->tail, out);
+            return;
+        }
+        if (auto* we = dynamic_cast<const ast::WhileExpr*>(&e)) {
+            collectEffects(*we->cond, out);
+            collectEffects(*we->body, out);
+            return;
+        }
+        if (auto* le = dynamic_cast<const ast::LoopExpr*>(&e)) {
+            collectEffects(*le->body, out);
+            return;
+        }
+        if (auto* fe = dynamic_cast<const ast::ForExpr*>(&e)) {
+            collectEffects(*fe->iter, out);
+            collectEffects(*fe->body, out);
+            return;
+        }
+        if (auto* re = dynamic_cast<const ast::RangeExpr*>(&e)) {
+            collectEffects(*re->start, out);
+            collectEffects(*re->end, out);
+            return;
+        }
+        if (auto* be = dynamic_cast<const ast::BreakExpr*>(&e)) {
+            if (be->value) collectEffects(*be->value, out);
+            return;
+        }
+        if (dynamic_cast<const ast::ContinueExpr*>(&e)) {
             return;
         }
         if (auto* sl = dynamic_cast<const ast::StructLitExpr*>(&e)) {
@@ -737,7 +795,7 @@ private:
         }
         genEnv["Self"] = selfTy;
         currentGenericEnv_ = &genEnv;
-        scopes_.push_back({});
+        pushScope();
         for (const auto& p : fn.params) {
             scopes_.back()[p.name] = resolveTypeRef(p.type);
         }
@@ -752,7 +810,7 @@ private:
                       fn.body->tail->line, fn.body->tail->column);
             }
         }
-        scopes_.pop_back();
+        popScope();
         currentReturnType_.reset();
         currentGenericEnv_ = nullptr;
     }
@@ -945,6 +1003,32 @@ private:
         return nullptr;
     }
 
+    // Phase 9: scope helpers keep `mutScopes_` in lockstep with `scopes_`
+    // so mutability lookups respect the same shadowing rules as types.
+    void pushScope() {
+        scopes_.push_back({});
+        mutScopes_.push_back({});
+    }
+    void popScope() {
+        scopes_.pop_back();
+        if (!mutScopes_.empty()) mutScopes_.pop_back();
+    }
+    void markMut(const std::string& name) {
+        if (!mutScopes_.empty()) mutScopes_.back().insert(name);
+    }
+    // True iff `name`'s nearest-enclosing binding was declared `let mut`.
+    bool isMutLocal(const std::string& name) {
+        // Walk scopes_ + mutScopes_ together from innermost out; the first
+        // scope that defines `name` determines mutability (shadowing).
+        std::size_t n = scopes_.size();
+        for (std::size_t i = n; i-- > 0;) {
+            if (scopes_[i].count(name)) {
+                return i < mutScopes_.size() && mutScopes_[i].count(name) > 0;
+            }
+        }
+        return false;
+    }
+
     // Look up a variant by name. Returns a fresh enum-instance Type
     // (typeArgs filled with fresh Vars) plus an index into that instance's
     // variants list. Callers unify the returned Type's typeArgs / payload
@@ -995,7 +1079,7 @@ private:
         }
         currentGenericEnv_ = &genEnv;
 
-        scopes_.push_back({});
+        pushScope();
         for (const auto& p : fn.params) {
             scopes_.back()[p.name] = resolveTypeRef(p.type);
         }
@@ -1014,7 +1098,7 @@ private:
                       fn.body->tail->line, fn.body->tail->column);
             }
         }
-        scopes_.pop_back();
+        popScope();
         currentReturnType_.reset();
         currentGenericEnv_ = nullptr;
     }
@@ -1087,6 +1171,24 @@ private:
         }
         if (auto* me = dynamic_cast<const ast::MatchExpr*>(&e)) {
             return checkMatch(*me);
+        }
+        if (auto* we = dynamic_cast<const ast::WhileExpr*>(&e)) {
+            return checkWhile(*we);
+        }
+        if (auto* le = dynamic_cast<const ast::LoopExpr*>(&e)) {
+            return checkLoop(*le);
+        }
+        if (auto* fe = dynamic_cast<const ast::ForExpr*>(&e)) {
+            return checkFor(*fe);
+        }
+        if (auto* re = dynamic_cast<const ast::RangeExpr*>(&e)) {
+            return checkRange(*re);
+        }
+        if (auto* be = dynamic_cast<const ast::BreakExpr*>(&e)) {
+            return checkBreak(*be);
+        }
+        if (auto* ce = dynamic_cast<const ast::ContinueExpr*>(&e)) {
+            return checkContinue(*ce);
         }
         if (auto* te = dynamic_cast<const ast::TryExpr*>(&e)) {
             return checkTry(*te);
@@ -1626,8 +1728,192 @@ private:
         return thenT;
     }
 
+    // Phase 9: `while cond { body }`. cond must be bool; body is checked
+    // for unit (it's a statement-position block); the whole expr is unit.
+    TypePtr checkWhile(const ast::WhileExpr& we) {
+        TypePtr cond = checkExpr(*we.cond);
+        if (!unify(cond, makeBool())) {
+            error("while condition must be bool, got " + typeToString(cond),
+                  we.cond->line, we.cond->column);
+        }
+        loopStack_.push_back(LoopCtx{/*isValueLoop=*/false, nullptr, false});
+        TypePtr bodyT = checkExpr(*we.body);
+        if (!unify(bodyT, makeUnit())) {
+            error("while body must be unit-typed, got " + typeToString(bodyT),
+                  we.body->line, we.body->column);
+        }
+        loopStack_.pop_back();
+        return makeUnit();
+    }
+
+    // Phase 9: `loop { body }`. Body is unit (its tail value is ignored —
+    // the loop only exits via `break`). The loop expression's type is the
+    // unified type of all `break <value>` expressions, or unit if every
+    // break is valueless / there are no breaks (the "never" case, which we
+    // model as unit for the MVP).
+    TypePtr checkLoop(const ast::LoopExpr& le) {
+        loopStack_.push_back(LoopCtx{/*isValueLoop=*/true, nullptr, false});
+        TypePtr bodyT = checkExpr(*le.body);
+        if (!unify(bodyT, makeUnit())) {
+            error("loop body must be unit-typed, got " + typeToString(bodyT),
+                  le.body->line, le.body->column);
+        }
+        LoopCtx ctx = loopStack_.back();
+        loopStack_.pop_back();
+        if (ctx.breakType) {
+            // At least one `break <value>`. If there was also a valueless
+            // break, the loop has inconsistent break types.
+            if (ctx.sawValuelessBreak) {
+                error("loop has both `break` with and without a value",
+                      le.line, le.column);
+            }
+            return ctx.breakType;
+        }
+        if (ctx.sawValuelessBreak) {
+            // Every break is valueless: the loop completes with unit.
+            return makeUnit();
+        }
+        // No `break` at all — the loop only exits via `return` (or never).
+        // Its type is "never" (bottom); model it as a fresh Var so it
+        // unifies with whatever the surrounding context requires.
+        return makeFreshVar();
+    }
+
+    // Phase 9: `for <pat> in <range> { body }`. Range endpoints must be
+    // i64; the pattern binds the (i64) element. Body is unit; the whole
+    // expression is unit. Conceptually desugars through Iterator::next.
+    TypePtr checkFor(const ast::ForExpr& fe) {
+        TypePtr iterT = checkExpr(*fe.iter);
+        TypePtr ir = resolve(iterT);
+        if (ir->kind != TypeKind::Struct || ir->structName != "Range") {
+            error("for-loop iterable must be a range (a..b), got " +
+                      typeToString(iterT),
+                  fe.iter->line, fe.iter->column);
+        }
+        // Range elements are i64. Bind the pattern in a fresh scope.
+        pushScope();
+        Scope bindings;
+        checkPattern(*fe.pattern, makeInt(), bindings);
+        for (auto& kv : bindings) scopes_.back()[kv.first] = kv.second;
+        loopStack_.push_back(LoopCtx{/*isValueLoop=*/false, nullptr, false});
+        TypePtr bodyT = checkExpr(*fe.body);
+        if (!unify(bodyT, makeUnit())) {
+            error("for body must be unit-typed, got " + typeToString(bodyT),
+                  fe.body->line, fe.body->column);
+        }
+        loopStack_.pop_back();
+        popScope();
+        return makeUnit();
+    }
+
+    // Phase 9: `a..b` / `a..=b`. Both endpoints must be i64; the result is
+    // the built-in `Range` struct.
+    TypePtr checkRange(const ast::RangeExpr& re) {
+        TypePtr s = checkExpr(*re.start);
+        TypePtr e = checkExpr(*re.end);
+        if (!unify(s, makeInt())) {
+            error("range start must be i64, got " + typeToString(s),
+                  re.start->line, re.start->column);
+        }
+        if (!unify(e, makeInt())) {
+            error("range end must be i64, got " + typeToString(e),
+                  re.end->line, re.end->column);
+        }
+        auto it = structSchemas_.find("Range");
+        return it != structSchemas_.end() ? it->second.type
+                                          : makeStruct("Range", {});
+    }
+
+    // Phase 9: `break` / `break <value>`. Validates a loop is active and,
+    // for valued breaks, that the enclosing loop is a `loop` (not while/
+    // for) and that the value type unifies across all breaks.
+    TypePtr checkBreak(const ast::BreakExpr& be) {
+        if (loopStack_.empty()) {
+            error("`break` outside of a loop", be.line, be.column);
+            if (be.value) checkExpr(*be.value);
+            return makeFreshVar();
+        }
+        LoopCtx& ctx = loopStack_.back();
+        if (be.value) {
+            TypePtr vT = checkExpr(*be.value);
+            if (!ctx.isValueLoop) {
+                error("`break` with a value is only allowed inside `loop`",
+                      be.line, be.column);
+            } else if (!ctx.breakType) {
+                ctx.breakType = vT;
+            } else if (!unify(vT, ctx.breakType)) {
+                error("`break` value type " + typeToString(vT) +
+                          " conflicts with earlier break type " +
+                          typeToString(ctx.breakType),
+                      be.line, be.column);
+            }
+        } else {
+            ctx.sawValuelessBreak = true;
+        }
+        // `break` diverges; give it a fresh var so it unifies with any
+        // surrounding context (like a `return`).
+        return makeFreshVar();
+    }
+
+    // Phase 9: `continue`. Only valid inside a loop; diverges.
+    TypePtr checkContinue(const ast::ContinueExpr& ce) {
+        if (loopStack_.empty()) {
+            error("`continue` outside of a loop", ce.line, ce.column);
+        }
+        return makeFreshVar();
+    }
+
+    // Phase 9: `lhs = rhs;`. The target must be an assignable place:
+    //   - a bare Ident bound by `let mut`, or
+    //   - a field-access chain `place.f` whose root is assignable OR a
+    //     `&mut` reference (so `&mut self`'s fields are writable).
+    // Types must unify.
+    void checkAssign(const ast::AssignStmt& as) {
+        TypePtr targetT = checkExpr(*as.target);
+        TypePtr valT = checkExpr(*as.value);
+        if (!isAssignablePlace(*as.target)) {
+            error("cannot assign to this expression; the target is not a "
+                  "mutable place",
+                  as.target->line, as.target->column);
+        }
+        if (!unify(targetT, valT)) {
+            error("assignment type mismatch: target is " +
+                      typeToString(targetT) + ", value is " +
+                      typeToString(valT),
+                  as.line, as.column);
+        }
+    }
+
+    // Is `e` a place we may assign to? A `let mut` Ident, or a field chain
+    // rooted at a `let mut` Ident or at a `&mut` reference (e.g. through a
+    // `&mut self` receiver).
+    bool isAssignablePlace(const ast::Expr& e) {
+        if (auto* id = dynamic_cast<const ast::IdentExpr*>(&e)) {
+            return isMutLocal(id->name);
+        }
+        if (auto* fe = dynamic_cast<const ast::FieldExpr*>(&e)) {
+            // Walk to the root of the field chain.
+            const ast::Expr* root = fe->object.get();
+            while (auto* inner = dynamic_cast<const ast::FieldExpr*>(root)) {
+                root = inner->object.get();
+            }
+            if (auto* rootId = dynamic_cast<const ast::IdentExpr*>(root)) {
+                // Mutable local, OR a binding of `&mut T` (mutable ref —
+                // its pointee fields are writable).
+                if (isMutLocal(rootId->name)) return true;
+                TypePtr rt = lookupLocal(rootId->name);
+                if (rt) {
+                    TypePtr r = resolve(rt);
+                    if (r->kind == TypeKind::Ref && r->refIsMut) return true;
+                }
+            }
+            return false;
+        }
+        return false;
+    }
+
     TypePtr checkBlock(const ast::BlockExpr& block) {
-        scopes_.push_back({});
+        pushScope();
         bool diverges = false;
         for (const auto& stmt : block.stmts) {
             checkStmt(*stmt);
@@ -1647,7 +1933,7 @@ private:
         } else {
             result = makeUnit();
         }
-        scopes_.pop_back();
+        popScope();
         return result;
     }
 
@@ -1670,7 +1956,7 @@ private:
         const std::size_t errsBeforeArms = errors_.size();
         TypePtr unified;
         for (const auto& arm : me.arms) {
-            scopes_.push_back({});
+            pushScope();
             // Type the pattern against the scrutinee type. Errors are
             // recorded inline; we still process the body so secondary
             // type errors surface.
@@ -1680,7 +1966,7 @@ private:
                 scopes_.back()[kv.first] = kv.second;
             }
             TypePtr bodyT = checkExpr(*arm.body);
-            scopes_.pop_back();
+            popScope();
             if (!unified) {
                 unified = bodyT;
             } else if (!unify(bodyT, unified)) {
@@ -1816,6 +2102,11 @@ private:
         if (auto* let = dynamic_cast<const ast::LetStmt*>(&s)) {
             TypePtr valT = checkExpr(*let->value);
             scopes_.back()[let->name] = valT;
+            if (let->isMut) markMut(let->name);
+            return;
+        }
+        if (auto* as = dynamic_cast<const ast::AssignStmt*>(&s)) {
+            checkAssign(*as);
             return;
         }
         if (auto* ret = dynamic_cast<const ast::ReturnStmt*>(&s)) {

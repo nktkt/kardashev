@@ -474,12 +474,40 @@ private:
                 block->stmts.push_back(parseReturnStmt());
                 continue;
             }
-            // Bare expression — either a stmt (terminated by ';') or the
-            // block's tail value (no ';' before '}').
+            // Bare expression — either a stmt (terminated by ';'), an
+            // assignment (`lhs = rhs;`, Phase 9), or the block's tail value
+            // (no ';' before '}').
             auto expr = parseExpr();
             std::size_t line = expr->line;
             std::size_t col = expr->column;
+            // Phase 9: `lhs = rhs;` assignment. The single `=` is only an
+            // assignment here (comparison uses `==`), so seeing it after a
+            // primary expression unambiguously starts an assignment.
+            if (check(TokenKind::Eq)) {
+                Token eqTok = consume();
+                auto rhs = parseExpr();
+                expect(TokenKind::Semi, ";");
+                auto as = std::make_unique<ast::AssignStmt>();
+                as->line = eqTok.line;
+                as->column = eqTok.column;
+                as->target = std::move(expr);
+                as->value = std::move(rhs);
+                block->stmts.push_back(std::move(as));
+                continue;
+            }
             if (accept(TokenKind::Semi)) {
+                auto es = std::make_unique<ast::ExprStmt>();
+                es->line = line;
+                es->column = col;
+                es->expr = std::move(expr);
+                block->stmts.push_back(std::move(es));
+            } else if (isBlockLikeExpr(*expr) && !check(TokenKind::RBrace)) {
+                // Phase 9: block-like expressions (`if`/`match`/`while`/
+                // `loop`/`for`/`{...}`) used in statement position don't
+                // require a trailing `;`. If more statements follow (the
+                // next token isn't `}`), treat this as a statement; the
+                // tail case below still applies when it's the block's last
+                // element.
                 auto es = std::make_unique<ast::ExprStmt>();
                 es->line = line;
                 es->column = col;
@@ -495,8 +523,28 @@ private:
         return block;
     }
 
+    // Phase 9: block-like expressions can appear as statements without a
+    // trailing `;` (Rust's statement/expression distinction). Used by
+    // parseBlockExpr to decide whether a tail-position expression is
+    // actually a statement followed by more code.
+    static bool isBlockLikeExpr(const ast::Expr& e) {
+        return dynamic_cast<const ast::IfExpr*>(&e) ||
+               dynamic_cast<const ast::MatchExpr*>(&e) ||
+               dynamic_cast<const ast::WhileExpr*>(&e) ||
+               dynamic_cast<const ast::LoopExpr*>(&e) ||
+               dynamic_cast<const ast::ForExpr*>(&e) ||
+               dynamic_cast<const ast::BlockExpr*>(&e);
+    }
+
     ast::StmtPtr parseLetStmt() {
         Token letTok = expect(TokenKind::KwLet, "let");
+        // Phase 9: `let mut x = ...`. `mut` stays an Identifier at the
+        // lexer level (reserved by convention), so match by lexeme.
+        bool isMut = false;
+        if (check(TokenKind::Identifier) && peek().lexeme == "mut") {
+            consume();
+            isMut = true;
+        }
         Token nameTok = expect(TokenKind::Identifier, "identifier after 'let'");
         expect(TokenKind::Eq, "=");
         auto value = parseExpr();
@@ -506,6 +554,7 @@ private:
         stmt->column = letTok.column;
         stmt->name = nameTok.lexeme;
         stmt->value = std::move(value);
+        stmt->isMut = isMut;
         return stmt;
     }
 
@@ -559,7 +608,26 @@ private:
         }
     }
 
-    ast::ExprPtr parseExpr() { return parseExprPrec(1); }
+    ast::ExprPtr parseExpr() {
+        auto lhs = parseExprPrec(1);
+        // Phase 9: range operators bind looser than every binary operator,
+        // so `a + 1 .. b * 2` parses the arithmetic on each side first.
+        // A range is non-associative: `a..b..c` is a parse error we don't
+        // bother diagnosing precisely — the trailing `..c` just won't parse.
+        if (check(TokenKind::DotDot) || check(TokenKind::DotDotEq)) {
+            bool inclusive = check(TokenKind::DotDotEq);
+            Token opTok = consume();
+            auto rhs = parseExprPrec(1);
+            auto re = std::make_unique<ast::RangeExpr>();
+            re->line = opTok.line;
+            re->column = opTok.column;
+            re->start = std::move(lhs);
+            re->end = std::move(rhs);
+            re->inclusive = inclusive;
+            return re;
+        }
+        return lhs;
+    }
 
     ast::ExprPtr parseExprPrec(int minPrec) {
         auto lhs = parsePostfix();
@@ -758,6 +826,40 @@ private:
             return parseMatchExpr();
         }
 
+        if (t.kind == TokenKind::KwWhile) {
+            return parseWhileExpr();
+        }
+
+        if (t.kind == TokenKind::KwLoop) {
+            return parseLoopExpr();
+        }
+
+        if (t.kind == TokenKind::KwFor) {
+            return parseForExpr();
+        }
+
+        if (t.kind == TokenKind::KwBreak) {
+            Token breakTok = consume();
+            auto be = std::make_unique<ast::BreakExpr>();
+            be->line = breakTok.line;
+            be->column = breakTok.column;
+            // `break` may carry a value (`break 42`). A bare `break` is
+            // followed by `;`, `}` or (rarely) the start of another stmt.
+            // We treat the absence of a value-starting token as bare.
+            if (!check(TokenKind::Semi) && !check(TokenKind::RBrace)) {
+                be->value = parseExpr();
+            }
+            return be;
+        }
+
+        if (t.kind == TokenKind::KwContinue) {
+            Token contTok = consume();
+            auto ce = std::make_unique<ast::ContinueExpr>();
+            ce->line = contTok.line;
+            ce->column = contTok.column;
+            return ce;
+        }
+
         if (t.kind == TokenKind::LBrace) {
             return parseBlockExpr();
         }
@@ -788,6 +890,57 @@ private:
         ie->thenBranch = std::move(thenBlock);
         ie->elseBranch = std::move(elseBlock);
         return ie;
+    }
+
+    ast::ExprPtr parseWhileExpr() {
+        Token whileTok = expect(TokenKind::KwWhile, "while");
+        // Restrict struct-literal parsing in the condition so the `{` that
+        // opens the body isn't swallowed as a struct literal (same trick
+        // as `if` / `match`).
+        bool prev = restrictStructLit_;
+        restrictStructLit_ = true;
+        auto cond = parseExpr();
+        restrictStructLit_ = prev;
+        auto body = parseBlockExpr();
+        auto we = std::make_unique<ast::WhileExpr>();
+        we->line = whileTok.line;
+        we->column = whileTok.column;
+        we->cond = std::move(cond);
+        we->body = std::move(body);
+        return we;
+    }
+
+    ast::ExprPtr parseLoopExpr() {
+        Token loopTok = expect(TokenKind::KwLoop, "loop");
+        auto body = parseBlockExpr();
+        auto le = std::make_unique<ast::LoopExpr>();
+        le->line = loopTok.line;
+        le->column = loopTok.column;
+        le->body = std::move(body);
+        return le;
+    }
+
+    ast::ExprPtr parseForExpr() {
+        Token forTok = expect(TokenKind::KwFor, "for");
+        auto pat = parsePattern();
+        // `in` is not a keyword; match it by lexeme.
+        if (check(TokenKind::Identifier) && peek().lexeme == "in") {
+            consume();
+        } else {
+            errorHere("expected 'in' after for-loop pattern");
+        }
+        bool prev = restrictStructLit_;
+        restrictStructLit_ = true;
+        auto iter = parseExpr();
+        restrictStructLit_ = prev;
+        auto body = parseBlockExpr();
+        auto fe = std::make_unique<ast::ForExpr>();
+        fe->line = forTok.line;
+        fe->column = forTok.column;
+        fe->pattern = std::move(pat);
+        fe->iter = std::move(iter);
+        fe->body = std::move(body);
+        return fe;
     }
 
     ast::ExprPtr parseMatchExpr() {

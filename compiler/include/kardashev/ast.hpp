@@ -207,11 +207,59 @@ struct MatchExpr : Expr {
     std::vector<MatchArm> arms;
 };
 
+// Phase 9: `while cond { body }`. `cond` must be bool; `body` is a
+// BlockExpr that is checked for unit type. The whole expression is unit.
+struct WhileExpr : Expr {
+    ExprPtr cond;
+    ExprPtr body; // a BlockExpr
+};
+
+// Phase 9: `loop { body }`. A bare loop with no `break` never terminates
+// (type "never", treated as unit for the MVP). If every `break` carries a
+// value of a common type T, the loop expression has type T.
+struct LoopExpr : Expr {
+    ExprPtr body; // a BlockExpr
+};
+
+// Phase 9: `a..b` (exclusive) / `a..=b` (inclusive). Both endpoints must
+// be i64. Typechecks to the built-in `Range` struct so `for` can iterate
+// it through the `Iterator` trait.
+struct RangeExpr : Expr {
+    ExprPtr start;
+    ExprPtr end;
+    bool inclusive = false; // false => `..`, true => `..=`
+};
+
+// Phase 9: `for <pat> in <range> { body }`. The range is currently always
+// a RangeExpr over i64. Conceptually desugars through the `Iterator`
+// trait (`let mut it = <range>; loop { match it.next() { Some(x) => body,
+// None => break } }`); codegen lowers integer ranges directly (the impl
+// method ABI passes `&mut self` by value, so a literal method-driven
+// desugar can't advance the iterator). The whole expression is unit.
+struct ForExpr : Expr {
+    PatternPtr pattern; // the loop variable binding (a VarPat for ranges)
+    ExprPtr iter;       // a RangeExpr
+    ExprPtr body;       // a BlockExpr
+};
+
+// Phase 9: `break` / `break <value>`. Exits the innermost enclosing loop.
+// `value` is null for a bare `break`. Only legal inside `loop`/`while`/
+// `for`; `break <value>` is only meaningful inside `loop`.
+struct BreakExpr : Expr {
+    ExprPtr value; // may be null
+};
+
+// Phase 9: `continue`. Jumps to the innermost enclosing loop's header.
+struct ContinueExpr : Expr {};
+
 // --- Statements ---
 
 struct LetStmt : Stmt {
     std::string name;
     ExprPtr value;
+    // Phase 9: `let mut x = ...`. Marks the binding as reassignable; the
+    // typechecker rejects assignment to a non-mut binding.
+    bool isMut = false;
 };
 
 struct ReturnStmt : Stmt {
@@ -220,6 +268,14 @@ struct ReturnStmt : Stmt {
 
 struct ExprStmt : Stmt {
     ExprPtr expr;
+};
+
+// Phase 9: `lhs = rhs;`. `lhs` is an assignable place — either a bare
+// IdentExpr (a `let mut` binding) or a FieldExpr chain rooted at one.
+// The typechecker enforces lhs/rhs type agreement and mutability.
+struct AssignStmt : Stmt {
+    ExprPtr target;
+    ExprPtr value;
 };
 
 // --- Top-level ---

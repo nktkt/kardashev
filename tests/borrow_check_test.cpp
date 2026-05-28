@@ -442,6 +442,47 @@ void test_mut_borrow_then_move_errors() {
               "mut_borrow_then_move_errors");
 }
 
+// --- Phase 9: loop bodies are walked by the borrow checker ---
+
+void test_loop_i64_accumulator_ok() {
+    // Pure Copy-typed loop: no borrow/move issues.
+    expectOk("fn f() -> i64 {\n"
+             "  let mut s = 0;\n"
+             "  let mut i = 0;\n"
+             "  while i < 5 { s = s + i; i = i + 1; }\n"
+             "  s\n"
+             "}",
+             "loop_i64_accumulator_ok");
+}
+
+void test_for_loop_body_ok() {
+    expectOk("fn f() -> i64 {\n"
+             "  let mut s = 0;\n"
+             "  for x in 0..5 { s = s + x; }\n"
+             "  s\n"
+             "}",
+             "for_loop_body_ok");
+}
+
+void test_move_inside_loop_body_detected() {
+    // The struct `p` is moved into `consume` inside the loop body and used
+    // again afterward — the checker must walk the body to catch this.
+    expectErr("struct P { x: i64 }\n"
+              "fn consume(p: P) -> i64 { p.x }\n"
+              "fn f() -> i64 {\n"
+              "  let p = P { x: 1 };\n"
+              "  let mut i = 0;\n"
+              "  while i < 1 { consume(p); i = i + 1; }\n"
+              "  consume(p)\n"
+              "}",
+              "move_inside_loop_body_detected");
+}
+
+void test_break_value_walked_ok() {
+    expectOk("fn f() -> i64 { let x = loop { break 1 + 2; }; x }",
+             "break_value_walked_ok");
+}
+
 } // namespace
 
 int main() {
@@ -476,7 +517,12 @@ int main() {
     test_two_mut_errors();
     test_shared_while_mut_errors();
     test_mut_borrow_then_move_errors();
-    std::cout << "All borrow_check tests passed (31 cases) — Phase 2.4c "
-                 "NLL + mutable references\n";
+    // Phase 9 loop bodies
+    test_loop_i64_accumulator_ok();
+    test_for_loop_body_ok();
+    test_move_inside_loop_body_detected();
+    test_break_value_walked_ok();
+    std::cout << "All borrow_check tests passed (35 cases) — Phase 2.4c "
+                 "NLL + mutable references; Phase 9 loops\n";
     return 0;
 }

@@ -37,6 +37,10 @@ enum class TokenKind {
     KwTrait,
     KwImpl,
     KwFor,
+    KwWhile,    // Phase 9: `while cond { ... }`
+    KwLoop,     // Phase 9: `loop { ... }`
+    KwBreak,    // Phase 9: `break` / `break <value>`
+    KwContinue, // Phase 9: `continue`
     KwMod, // Phase 7: `mod foo;` file-import
     KwPub, // Phase 7.2: visibility marker on top-level decls
     // Note: `async` / `await` stay as Identifiers — they appear in
@@ -62,6 +66,8 @@ enum class TokenKind {
     Eq,
     Arrow, // ->
     FatArrow, // =>
+    DotDot,   // .. — Phase 9 exclusive range
+    DotDotEq, // ..= — Phase 9 inclusive range
     Question, // ? — Phase 3.4 try operator
     Ampersand, // & — Phase 2.4b shared borrow / reference type
     Bang, // ! — Phase 4 effect-row introducer (the `!=` two-char form has

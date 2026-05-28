@@ -1049,6 +1049,107 @@ void test_effect_row_recorded_in_schema() {
     assert(!it->second.declaredEffects.contains("panic"));
 }
 
+// --- Phase 9: loops, ranges, assignment, mutability ---
+
+void test_while_basic_ok() {
+    expectOk("fn f() -> i64 { let mut i = 0; while i < 3 { i = i + 1; } i }",
+             "while_basic_ok");
+}
+
+void test_while_cond_must_be_bool() {
+    expectErrContains(
+        "fn f() -> i64 { while 1 { } 0 }", "must be bool",
+        "while_cond_must_be_bool");
+}
+
+void test_while_is_unit() {
+    // The `while` expression itself is unit, so it can't be the i64 tail.
+    expectErr("fn f() -> i64 { while 1 < 2 { } }", "while_is_unit");
+}
+
+void test_loop_break_value_typed() {
+    expectOk("fn f() -> i64 { let x = loop { break 7; }; x }",
+             "loop_break_value_typed");
+}
+
+void test_loop_break_value_mismatch() {
+    // Mixing a valued `break` and a valueless `break` in the same loop is
+    // inconsistent: the loop can't be both i64-valued and unit.
+    expectErrContains(
+        "fn f() -> i64 { let x = loop { if 1 < 2 { break 7; } else {} "
+        "break; }; x }",
+        "both `break` with and without a value",
+        "loop_break_value_mismatch");
+}
+
+void test_break_value_in_while_errors() {
+    expectErrContains(
+        "fn f() -> i64 { while 1 < 2 { break 5; } 0 }",
+        "only allowed inside `loop`", "break_value_in_while");
+}
+
+void test_break_outside_loop_errors() {
+    expectErrContains("fn f() -> i64 { break; 0 }", "outside of a loop",
+                      "break_outside_loop");
+}
+
+void test_continue_outside_loop_errors() {
+    expectErrContains("fn f() -> i64 { continue; 0 }", "outside of a loop",
+                      "continue_outside_loop");
+}
+
+void test_for_range_ok() {
+    expectOk(
+        "fn f() -> i64 { let mut s = 0; for x in 1..=10 { s = s + x; } s }",
+        "for_range_ok");
+}
+
+void test_for_exclusive_range_ok() {
+    expectOk(
+        "fn f() -> i64 { let mut s = 0; for x in 0..5 { s = s + x; } s }",
+        "for_exclusive_range_ok");
+}
+
+void test_assign_to_immutable_errors() {
+    expectErrContains("fn f() -> i64 { let x = 0; x = 1; x }",
+                      "not a mutable place", "assign_to_immutable");
+}
+
+void test_assign_type_mismatch_errors() {
+    // `b` is bool; assigning an i64 should fail to unify.
+    expectErr("fn f() -> i64 { let mut b = 1 < 2; b = 5; 0 }",
+              "assign_type_mismatch");
+}
+
+void test_range_endpoints_must_be_int() {
+    expectErrContains("fn f() -> i64 { for x in (1 < 2)..5 { } 0 }",
+                      "range start must be i64",
+                      "range_endpoints_must_be_int");
+}
+
+void test_loop_io_effect_propagates() {
+    // A `print` inside a loop body must surface the io effect requirement.
+    expectErrContains(
+        "fn f() -> i64 { let mut i = 0; while i < 1 { print(i); i = i + 1; } "
+        "0 }",
+        "io", "loop_io_effect_propagates");
+}
+
+void test_nested_loops_ok() {
+    expectOk(
+        "fn f() -> i64 {\n"
+        "  let mut t = 0;\n"
+        "  let mut i = 0;\n"
+        "  while i < 2 {\n"
+        "    let mut j = 0;\n"
+        "    while j < 2 { j = j + 1; if j == 1 { continue; } else {} t = t + 1; }\n"
+        "    i = i + 1;\n"
+        "  }\n"
+        "  t\n"
+        "}",
+        "nested_loops_ok");
+}
+
 } // namespace
 
 int main() {
@@ -1162,6 +1263,22 @@ int main() {
     test_undeclared_effect_label_errors();
     test_multiple_effects_union_ok();
     test_effect_row_recorded_in_schema();
-    std::cout << "All typecheck tests passed (101 cases)\n";
+    // Phase 9 loops + ranges + assignment + mutability
+    test_while_basic_ok();
+    test_while_cond_must_be_bool();
+    test_while_is_unit();
+    test_loop_break_value_typed();
+    test_loop_break_value_mismatch();
+    test_break_value_in_while_errors();
+    test_break_outside_loop_errors();
+    test_continue_outside_loop_errors();
+    test_for_range_ok();
+    test_for_exclusive_range_ok();
+    test_assign_to_immutable_errors();
+    test_assign_type_mismatch_errors();
+    test_range_endpoints_must_be_int();
+    test_loop_io_effect_propagates();
+    test_nested_loops_ok();
+    std::cout << "All typecheck tests passed (116 cases)\n";
     return 0;
 }

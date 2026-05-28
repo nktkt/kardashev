@@ -219,6 +219,39 @@ private:
             prePass(*ae->operand);
             return;
         }
+        // Phase 9: loop forms. Each mirrors its `consume` counterpart's
+        // traversal order exactly so the position counters stay in sync.
+        if (auto* we = dynamic_cast<const ast::WhileExpr*>(&e)) {
+            prePass(*we->cond);
+            prePass(*we->body);
+            return;
+        }
+        if (auto* le = dynamic_cast<const ast::LoopExpr*>(&e)) {
+            prePass(*le->body);
+            return;
+        }
+        if (auto* fe = dynamic_cast<const ast::ForExpr*>(&e)) {
+            prePass(*fe->iter);
+            scopes_.push_back({});
+            // The loop variable binds an i64 (Copy), so it doesn't affect
+            // move tracking, but we register it so body references resolve.
+            bindPattern(*fe->pattern, makeInt(), /*prePass=*/true);
+            prePass(*fe->body);
+            scopes_.pop_back();
+            return;
+        }
+        if (auto* re = dynamic_cast<const ast::RangeExpr*>(&e)) {
+            prePass(*re->start);
+            prePass(*re->end);
+            return;
+        }
+        if (auto* be = dynamic_cast<const ast::BreakExpr*>(&e)) {
+            if (be->value) prePass(*be->value);
+            return;
+        }
+        if (dynamic_cast<const ast::ContinueExpr*>(&e)) {
+            return;
+        }
     }
 
     void prePassBlock(const ast::BlockExpr& block) {
@@ -231,6 +264,13 @@ private:
             }
             if (auto* ret = dynamic_cast<const ast::ReturnStmt*>(stmt.get())) {
                 if (ret->value) prePass(*ret->value);
+                continue;
+            }
+            if (auto* as = dynamic_cast<const ast::AssignStmt*>(stmt.get())) {
+                // Phase 9: walk the RHS then the LHS place, mirroring
+                // consumeBlock's order.
+                prePass(*as->value);
+                prePass(*as->target);
                 continue;
             }
             if (auto* es = dynamic_cast<const ast::ExprStmt*>(stmt.get())) {
@@ -382,6 +422,47 @@ private:
             return std::max(lastInSubtree,
                             consume(*ae->operand, expectExpire));
         }
+        // Phase 9: loop forms. Loop bodies are visited once for analysis
+        // (we don't unroll); this matches the conservative move/borrow
+        // model the rest of the checker uses.
+        if (auto* we = dynamic_cast<const ast::WhileExpr*>(&e)) {
+            lastInSubtree = std::max(lastInSubtree,
+                                       consume(*we->cond, expectExpire));
+            lastInSubtree = std::max(lastInSubtree,
+                                       consume(*we->body, expectExpire));
+            return lastInSubtree;
+        }
+        if (auto* le = dynamic_cast<const ast::LoopExpr*>(&e)) {
+            return std::max(lastInSubtree,
+                            consume(*le->body, expectExpire));
+        }
+        if (auto* fe = dynamic_cast<const ast::ForExpr*>(&e)) {
+            lastInSubtree = std::max(lastInSubtree,
+                                       consume(*fe->iter, expectExpire));
+            scopes_.push_back({});
+            bindPattern(*fe->pattern, makeInt(), /*prePass=*/false);
+            lastInSubtree = std::max(lastInSubtree,
+                                       consume(*fe->body, expectExpire));
+            scopes_.pop_back();
+            return lastInSubtree;
+        }
+        if (auto* re = dynamic_cast<const ast::RangeExpr*>(&e)) {
+            lastInSubtree = std::max(lastInSubtree,
+                                       consume(*re->start, expectExpire));
+            lastInSubtree = std::max(lastInSubtree,
+                                       consume(*re->end, expectExpire));
+            return lastInSubtree;
+        }
+        if (auto* be = dynamic_cast<const ast::BreakExpr*>(&e)) {
+            if (be->value) {
+                lastInSubtree = std::max(lastInSubtree,
+                                           consume(*be->value, expectExpire));
+            }
+            return lastInSubtree;
+        }
+        if (dynamic_cast<const ast::ContinueExpr*>(&e)) {
+            return lastInSubtree;
+        }
         return lastInSubtree;
     }
 
@@ -411,6 +492,22 @@ private:
                     retireExpiredLoans(p);
                     last = std::max(last, p);
                 }
+                continue;
+            }
+            if (auto* as = dynamic_cast<const ast::AssignStmt*>(stmt.get())) {
+                // Phase 9: the RHS value moves into the place. The LHS is a
+                // write, not a read/move — for a bare Ident target we just
+                // advance the position counter (mirroring prePass) without
+                // treating it as a use; a FieldExpr target reads its root
+                // place (handled by consume's FieldExpr arm).
+                int p = consume(*as->value, /*expectExpire=*/-1);
+                if (dynamic_cast<const ast::IdentExpr*>(as->target.get())) {
+                    ++pos_; // matches prePass's single tick for the Ident
+                } else {
+                    p = std::max(p, consume(*as->target, /*expectExpire=*/-1));
+                }
+                retireExpiredLoans(p);
+                last = std::max(last, p);
                 continue;
             }
             if (auto* es = dynamic_cast<const ast::ExprStmt*>(stmt.get())) {

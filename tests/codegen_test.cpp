@@ -668,6 +668,118 @@ void test_try_chained() {
     expectEquals(v, 35, "try_chained");
 }
 
+// --- Phase 9: loops, ranges, assignment ---
+
+void test_while_countdown_sum() {
+    // Sum 1+2+...+10 == 55 via a mutable accumulator.
+    auto v = compileAndRun(
+        "fn main() -> i64 {\n"
+        "    let mut sum = 0;\n"
+        "    let mut i = 1;\n"
+        "    while i <= 10 { sum = sum + i; i = i + 1; }\n"
+        "    sum\n"
+        "}",
+        "main", "while_countdown_sum");
+    expectEquals(v, 55, "while_countdown_sum");
+}
+
+void test_loop_break_value() {
+    auto v = compileAndRun(
+        "fn main() -> i64 { let x = loop { break 42; }; x }",
+        "main", "loop_break_value");
+    expectEquals(v, 42, "loop_break_value");
+}
+
+void test_loop_continue_sum_odds() {
+    // Skip even numbers, sum odds in 1..=10 == 25.
+    auto v = compileAndRun(
+        "fn main() -> i64 {\n"
+        "    let mut sum = 0;\n"
+        "    let mut i = 0;\n"
+        "    loop {\n"
+        "        i = i + 1;\n"
+        "        if i > 10 { break; } else {}\n"
+        "        if i / 2 * 2 == i { continue; } else {}\n"
+        "        sum = sum + i;\n"
+        "    }\n"
+        "    sum\n"
+        "}",
+        "main", "loop_continue_sum_odds");
+    expectEquals(v, 25, "loop_continue_sum_odds");
+}
+
+void test_for_inclusive_range_sum() {
+    auto v = compileAndRun(
+        "fn main() -> i64 {\n"
+        "    let mut sum = 0;\n"
+        "    for x in 1..=10 { sum = sum + x; }\n"
+        "    sum\n"
+        "}",
+        "main", "for_inclusive_range_sum");
+    expectEquals(v, 55, "for_inclusive_range_sum");
+}
+
+void test_for_exclusive_range_sum() {
+    auto v = compileAndRun(
+        "fn main() -> i64 {\n"
+        "    let mut sum = 0;\n"
+        "    for x in 1..11 { sum = sum + x; }\n"
+        "    sum\n"
+        "}",
+        "main", "for_exclusive_range_sum");
+    expectEquals(v, 55, "for_exclusive_range_sum");
+}
+
+void test_nested_loops_break_continue_innermost() {
+    // Inner loop runs j=1,2,3; skips j==2 via continue; the break exits
+    // only the inner loop. 2 increments per outer iteration, 3 outers => 6.
+    auto v = compileAndRun(
+        "fn main() -> i64 {\n"
+        "    let mut total = 0;\n"
+        "    let mut i = 0;\n"
+        "    while i < 3 {\n"
+        "        let mut j = 0;\n"
+        "        loop {\n"
+        "            j = j + 1;\n"
+        "            if j > 3 { break; } else {}\n"
+        "            if j == 2 { continue; } else {}\n"
+        "            total = total + 1;\n"
+        "        }\n"
+        "        i = i + 1;\n"
+        "    }\n"
+        "    total\n"
+        "}",
+        "main", "nested_loops_break_continue_innermost");
+    expectEquals(v, 6, "nested_loops_break_continue_innermost");
+}
+
+void test_range_value_iterated() {
+    // A range bound to a let and iterated through the general Range path.
+    auto v = compileAndRun(
+        "fn main() -> i64 {\n"
+        "    let r = 0..5;\n"
+        "    let mut sum = 0;\n"
+        "    for x in r { sum = sum + x; }\n"
+        "    sum\n"
+        "}",
+        "main", "range_value_iterated");
+    expectEquals(v, 10, "range_value_iterated");
+}
+
+void test_field_assign_through_mut_local() {
+    // Assign into a struct field of a `let mut` local.
+    auto v = compileAndRun(
+        "struct P { x: i64, y: i64 }\n"
+        "fn main() -> i64 {\n"
+        "    let mut p = P { x: 1, y: 2 };\n"
+        "    p.x = 40;\n"
+        "    p.y = p.y + 0;\n"
+        "    p.x + p.y\n"
+        "}",
+        "main", "field_assign_through_mut_local");
+    expectEquals(v, 42, "field_assign_through_mut_local");
+}
+
 } // namespace
 
 int main() {
@@ -721,6 +833,15 @@ int main() {
     test_try_ok_path();
     test_try_err_path();
     test_try_chained();
-    std::cout << "All codegen tests passed (47 cases) — Phase 3.3 traits + Phase 3.4 try\n";
+    // Phase 9 loops + ranges + assignment
+    test_while_countdown_sum();
+    test_loop_break_value();
+    test_loop_continue_sum_odds();
+    test_for_inclusive_range_sum();
+    test_for_exclusive_range_sum();
+    test_nested_loops_break_continue_innermost();
+    test_range_value_iterated();
+    test_field_assign_through_mut_local();
+    std::cout << "All codegen tests passed (55 cases) — Phase 9 loops/ranges\n";
     return 0;
 }

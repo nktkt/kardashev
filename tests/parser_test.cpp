@@ -896,6 +896,122 @@ void test_mod_multiple() {
     assert(r.program.mods[2].name == "c");
 }
 
+// --- Phase 9: loops, ranges, assignment ---
+
+void test_while_expr() {
+    auto r = parseWrapped("while x < 3 { 0 }");
+    auto* we = dynamic_cast<const ast::WhileExpr*>(tailExprOf(r));
+    assert(we != nullptr);
+    auto* cond = dynamic_cast<const ast::BinaryExpr*>(we->cond.get());
+    assert(cond && cond->op == ast::BinOp::Lt);
+    assert(dynamic_cast<const ast::BlockExpr*>(we->body.get()));
+}
+
+void test_loop_expr() {
+    auto r = parseWrapped("loop { 0 }");
+    auto* le = dynamic_cast<const ast::LoopExpr*>(tailExprOf(r));
+    assert(le != nullptr);
+    assert(dynamic_cast<const ast::BlockExpr*>(le->body.get()));
+}
+
+void test_break_with_value() {
+    auto r = parseWrapped("loop { break 42 }");
+    auto* le = dynamic_cast<const ast::LoopExpr*>(tailExprOf(r));
+    assert(le != nullptr);
+    auto* body = dynamic_cast<const ast::BlockExpr*>(le->body.get());
+    assert(body && body->tail);
+    auto* be = dynamic_cast<const ast::BreakExpr*>(body->tail.get());
+    assert(be != nullptr && be->value != nullptr);
+    auto* lit = dynamic_cast<const ast::IntLitExpr*>(be->value.get());
+    assert(lit && lit->value == 42);
+}
+
+void test_break_bare_and_continue() {
+    auto r = parseWrapped("loop { continue }");
+    auto* le = dynamic_cast<const ast::LoopExpr*>(tailExprOf(r));
+    assert(le != nullptr);
+    auto* body = dynamic_cast<const ast::BlockExpr*>(le->body.get());
+    assert(body && dynamic_cast<const ast::ContinueExpr*>(body->tail.get()));
+
+    auto r2 = parseWrapped("loop { break }");
+    auto* le2 = dynamic_cast<const ast::LoopExpr*>(tailExprOf(r2));
+    auto* body2 = dynamic_cast<const ast::BlockExpr*>(le2->body.get());
+    auto* be = dynamic_cast<const ast::BreakExpr*>(body2->tail.get());
+    assert(be != nullptr && be->value == nullptr);
+}
+
+void test_for_exclusive_range() {
+    auto r = parseWrapped("for x in 0..10 { 0 }");
+    auto* fe = dynamic_cast<const ast::ForExpr*>(tailExprOf(r));
+    assert(fe != nullptr);
+    auto* vp = dynamic_cast<const ast::VarPat*>(fe->pattern.get());
+    assert(vp && vp->name == "x");
+    auto* re = dynamic_cast<const ast::RangeExpr*>(fe->iter.get());
+    assert(re != nullptr && re->inclusive == false);
+    auto* lo = dynamic_cast<const ast::IntLitExpr*>(re->start.get());
+    auto* hi = dynamic_cast<const ast::IntLitExpr*>(re->end.get());
+    assert(lo && lo->value == 0 && hi && hi->value == 10);
+}
+
+void test_for_inclusive_range() {
+    auto r = parseWrapped("for x in 1..=10 { 0 }");
+    auto* fe = dynamic_cast<const ast::ForExpr*>(tailExprOf(r));
+    assert(fe != nullptr);
+    auto* re = dynamic_cast<const ast::RangeExpr*>(fe->iter.get());
+    assert(re != nullptr && re->inclusive == true);
+}
+
+void test_range_binds_looser_than_arith() {
+    // `1 + 1 .. 2 * 5` => RangeExpr(start = 1+1, end = 2*5).
+    auto r = parseWrapped("1 + 1 .. 2 * 5");
+    auto* re = dynamic_cast<const ast::RangeExpr*>(tailExprOf(r));
+    assert(re != nullptr);
+    assert(dynamic_cast<const ast::BinaryExpr*>(re->start.get()));
+    assert(dynamic_cast<const ast::BinaryExpr*>(re->end.get()));
+}
+
+void test_let_mut_flag() {
+    auto r = parseWrapped("let mut x = 0; x");
+    assert(r.ok());
+    const auto& fn = r.program.functions[0];
+    assert(fn.body->stmts.size() == 1);
+    auto* let = dynamic_cast<const ast::LetStmt*>(fn.body->stmts[0].get());
+    assert(let != nullptr && let->isMut == true && let->name == "x");
+}
+
+void test_assign_stmt() {
+    auto r = parseWrapped("let mut x = 0; x = 5; x");
+    assert(r.ok());
+    const auto& fn = r.program.functions[0];
+    assert(fn.body->stmts.size() == 2);
+    auto* as = dynamic_cast<const ast::AssignStmt*>(fn.body->stmts[1].get());
+    assert(as != nullptr);
+    assert(dynamic_cast<const ast::IdentExpr*>(as->target.get()));
+    auto* rhs = dynamic_cast<const ast::IntLitExpr*>(as->value.get());
+    assert(rhs && rhs->value == 5);
+}
+
+void test_field_assign_stmt() {
+    auto r = parseWrapped("p.x = 5; 0");
+    assert(r.ok());
+    const auto& fn = r.program.functions[0];
+    auto* as = dynamic_cast<const ast::AssignStmt*>(fn.body->stmts[0].get());
+    assert(as != nullptr);
+    auto* fe = dynamic_cast<const ast::FieldExpr*>(as->target.get());
+    assert(fe != nullptr && fe->fieldName == "x");
+}
+
+void test_while_as_statement_then_tail() {
+    // A while in statement position (no `;`) followed by a tail value.
+    auto r = parseWrapped("while x < 3 { 0 } 7");
+    assert(r.ok());
+    const auto& fn = r.program.functions[0];
+    assert(fn.body->stmts.size() == 1);
+    assert(dynamic_cast<const ast::ExprStmt*>(fn.body->stmts[0].get()));
+    auto* tail = dynamic_cast<const ast::IntLitExpr*>(fn.body->tail.get());
+    assert(tail && tail->value == 7);
+}
+
 } // namespace
 
 int main() {
@@ -961,6 +1077,18 @@ int main() {
     // Phase 7 mod
     test_mod_decl_basic();
     test_mod_multiple();
-    std::cout << "All parser tests passed (56 cases)\n";
+    // Phase 9 loops + ranges + assignment
+    test_while_expr();
+    test_loop_expr();
+    test_break_with_value();
+    test_break_bare_and_continue();
+    test_for_exclusive_range();
+    test_for_inclusive_range();
+    test_range_binds_looser_than_arith();
+    test_let_mut_flag();
+    test_assign_stmt();
+    test_field_assign_stmt();
+    test_while_as_statement_then_tail();
+    std::cout << "All parser tests passed (67 cases)\n";
     return 0;
 }

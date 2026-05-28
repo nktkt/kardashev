@@ -246,6 +246,30 @@ void test_match_arm_combined() {
     ASSERT_KIND(t[14], TokenKind::EndOfInput);
 }
 
+// Phase 9: loop keywords + range operators.
+void test_loop_keywords() {
+    auto t = lex("while loop break continue for");
+    ASSERT_KIND(t[0], TokenKind::KwWhile);
+    ASSERT_KIND(t[1], TokenKind::KwLoop);
+    ASSERT_KIND(t[2], TokenKind::KwBreak);
+    ASSERT_KIND(t[3], TokenKind::KwContinue);
+    ASSERT_KIND(t[4], TokenKind::KwFor);
+    ASSERT_KIND(t[5], TokenKind::EndOfInput);
+}
+
+void test_range_operators() {
+    // `..=` must out-prioritize `..` (longest match), and `..` must not be
+    // split into two `.` tokens.
+    auto t = lex("0..10 1..=5");
+    ASSERT_KIND(t[0], TokenKind::Integer);
+    ASSERT_KIND(t[1], TokenKind::DotDot);
+    ASSERT_KIND(t[2], TokenKind::Integer);
+    ASSERT_KIND(t[3], TokenKind::Integer);
+    ASSERT_KIND(t[4], TokenKind::DotDotEq);
+    ASSERT_KIND(t[5], TokenKind::Integer);
+    ASSERT_KIND(t[6], TokenKind::EndOfInput);
+}
+
 } // namespace
 
 int main() {
@@ -268,6 +292,8 @@ int main() {
     test_underscore_prefix_is_ident();
     test_eqeq_not_split_by_fat_arrow();
     test_match_arm_combined();
-    std::cout << "All lexer tests passed (19 cases)\n";
+    test_loop_keywords();
+    test_range_operators();
+    std::cout << "All lexer tests passed (21 cases)\n";
     return 0;
 }
