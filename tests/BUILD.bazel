@@ -219,6 +219,16 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 24: user-declarable `extern "C"` FFI — calling libc fns (abs/strlen/
+# putchar/getpid) with correct C-int width handling (i32 narrow/widen), the
+# &String -> C-pointer mapping, and the `io` effect carried by extern calls;
+# through JIT + AOT.
+sh_test(
+    name = "smoke_test_ffi",
+    srcs = ["smoke_test_ffi.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

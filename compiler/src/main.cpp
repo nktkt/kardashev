@@ -205,6 +205,10 @@ bool resolveModules(const std::string& srcRaw,
     for (auto& ed : pr.program.enums) out.enums.push_back(std::move(ed));
     for (auto& td : pr.program.traits) out.traits.push_back(std::move(td));
     for (auto& impl : pr.program.impls) out.impls.push_back(std::move(impl));
+    // Phase 24: carry `extern "C"` declarations across the module merge too,
+    // so a program (or an imported `mod`) can declare + call C functions.
+    for (auto& ef : pr.program.externFns)
+        out.externFns.push_back(std::move(ef));
 
     // Recurse into each `mod foo;` reference.
     for (const auto& m : pr.program.mods) {
@@ -367,16 +371,17 @@ std::optional<std::int64_t> compileAndRun(const std::string& srcRaw,
 }
 
 // Heuristic: a line whose first non-whitespace token is `fn `,
-// `struct `, or `enum ` is treated as a top-level decl to add to
-// the accumulator. Anything else is parsed as an expression and
-// evaluated.
+// `struct `, `enum `, or `extern ` (Phase 24 FFI) is treated as a top-level
+// decl to add to the accumulator. Anything else is parsed as an expression
+// and evaluated.
 bool looksLikeTopLevelDecl(const std::string& line) {
     std::size_t i = 0;
     while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
     const auto rest = std::string_view(line).substr(i);
     return rest.substr(0, 3) == "fn " ||
            rest.substr(0, 7) == "struct " ||
-           rest.substr(0, 5) == "enum ";
+           rest.substr(0, 5) == "enum " ||
+           rest.substr(0, 7) == "extern ";
 }
 
 int runREPL() {

@@ -2271,6 +2271,88 @@ void test_catch_propagates_io_effect_declared_ok() {
         "catch_propagates_io_effect_declared_ok");
 }
 
+// --- Phase 24: extern "C" FFI declarations ---
+
+void test_extern_call_typechecks() {
+    // A call to an extern type-checks against its declared signature, and
+    // the extern carries `io` by default so an `! { io }` caller is OK.
+    expectOk(
+        "extern \"C\" fn abs(x: i64) -> i64;\n"
+        "fn main() -> i64 ! { io } { abs(0 - 7) }",
+        "extern_call_typechecks");
+}
+
+void test_extern_i32_arg_is_i64_compatible() {
+    // The FFI-only `i32` spelling surfaces as kardashev i64, so an i64 value
+    // flows in/out transparently.
+    expectOk(
+        "extern \"C\" fn abs(x: i32) -> i32;\n"
+        "fn main() -> i64 ! { io } { let y = abs(0 - 7); y + 1 }",
+        "extern_i32_arg_is_i64_compatible");
+}
+
+void test_extern_ref_string_arg() {
+    expectOk(
+        "extern \"C\" fn strlen(s: &String) -> i64;\n"
+        "fn main() -> i64 ! { io } { let s = \"hi\"; strlen(&s) }",
+        "extern_ref_string_arg");
+}
+
+void test_extern_carries_io_pure_caller_rejected() {
+    expectErrContains(
+        "extern \"C\" fn getpid() -> i64;\n"
+        "fn pureFn() -> i64 { getpid() }\n"
+        "fn main() -> i64 ! { io } { pureFn() }",
+        "effect `io`", "extern_carries_io_pure_caller_rejected");
+}
+
+void test_extern_explicit_pure_row_allows_pure_caller() {
+    // `! { }` on the extern overrides the default io -> a pure caller is OK.
+    expectOk(
+        "extern \"C\" fn abs(x: i32) -> i32 ! { };\n"
+        "fn pureFn() -> i64 { abs(0 - 3) }",
+        "extern_explicit_pure_row_allows_pure_caller");
+}
+
+void test_extern_explicit_effect_row_honored() {
+    // An explicit `! { io, alloc }` row replaces the default; a caller must
+    // declare both.
+    expectErrContains(
+        "extern \"C\" fn weird() -> i64 ! { io, alloc };\n"
+        "fn caller() -> i64 ! { io } { weird() }",
+        "alloc", "extern_explicit_effect_row_honored");
+}
+
+void test_extern_bad_abi_rejected() {
+    expectErrContains(
+        "extern \"Rust\" fn abs(x: i64) -> i64;\n"
+        "fn main() -> i64 { 0 }",
+        "unsupported ABI", "extern_bad_abi_rejected");
+}
+
+void test_extern_collision_with_builtin_rejected() {
+    expectErrContains(
+        "extern \"C\" fn print(x: i64) -> i64;\n"
+        "fn main() -> i64 { 0 }",
+        "collides", "extern_collision_with_builtin_rejected");
+}
+
+void test_extern_wrong_arg_arity_rejected() {
+    expectErrContains(
+        "extern \"C\" fn abs(x: i64) -> i64;\n"
+        "fn main() -> i64 ! { io } { abs(1, 2) }",
+        "expects", "extern_wrong_arg_arity_rejected");
+}
+
+void test_extern_unrepresentable_type_rejected() {
+    // A by-value user struct has no defined C ABI in an extern signature.
+    expectErrContains(
+        "struct P { x: i64 }\n"
+        "extern \"C\" fn f(p: P) -> i64;\n"
+        "fn main() -> i64 { 0 }",
+        "not supported in an `extern", "extern_unrepresentable_type_rejected");
+}
+
 } // namespace
 
 int main() {
@@ -2517,6 +2599,17 @@ int main() {
     test_catch_clears_panic_effect_ok();
     test_catch_still_propagates_io_effect();
     test_catch_propagates_io_effect_declared_ok();
-    std::cout << "All typecheck tests passed (223 cases)\n";
+    // Phase 24: extern "C" FFI declarations.
+    test_extern_call_typechecks();
+    test_extern_i32_arg_is_i64_compatible();
+    test_extern_ref_string_arg();
+    test_extern_carries_io_pure_caller_rejected();
+    test_extern_explicit_pure_row_allows_pure_caller();
+    test_extern_explicit_effect_row_honored();
+    test_extern_bad_abi_rejected();
+    test_extern_collision_with_builtin_rejected();
+    test_extern_wrong_arg_arity_rejected();
+    test_extern_unrepresentable_type_rejected();
+    std::cout << "All typecheck tests passed (233 cases)\n";
     return 0;
 }

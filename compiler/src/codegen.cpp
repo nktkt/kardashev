@@ -63,6 +63,11 @@ public:
         for (const auto& fn : program.functions) {
             fnAst_[fn.name] = &fn;
         }
+        // Phase 24: record extern "C" declarations so emitCall can resolve
+        // their C-ABI signature + per-arg coercions.
+        for (const auto& ef : program.externFns) {
+            externFns_[ef.name] = &ef;
+        }
         // Phase 11: record each trait's method names in declaration order so
         // vtable slot layout matches the typechecker's `dynMethodSlot`.
         for (const auto& td : program.traits) {
@@ -113,6 +118,15 @@ public:
         declareAllStructs();
         declareAllEnums();
         declareBuiltins();
+        // Phase 24: declare every user `extern "C" fn` as an LLVM external
+        // function with the C-ABI-mapped signature. The LLVM symbol name is
+        // the declared name verbatim (no mangling), so the JIT resolves it
+        // from the host process and AOT links it from libc. Done after
+        // declareBuiltins so a (rejected-at-typecheck) collision with an
+        // internal extern like `malloc` never reaches here with two defns.
+        for (const auto& ef : program.externFns) {
+            declareExternFn(ef);
+        }
         // Phase 23: emit the panic + unwind runtime (cleanup stack, catch
         // stack, the `panic` body, and the helpers) only when the program can
         // actually panic. Must come after declareBuiltins (it reuses the
@@ -474,6 +488,12 @@ private:
     // Source-fn name -> AST node, populated once up front so the worklist
     // loop can look up bodies without re-walking the program.
     std::unordered_map<std::string, const ast::FnDecl*> fnAst_;
+
+    // Phase 24: extern "C" fn name -> its AST declaration. Populated up front
+    // in run(); emitCall consults it to (a) recognize an extern callee and
+    // (b) read the per-argument C-ABI TypeRefs so it can narrow/widen + pass
+    // pointers correctly at the call boundary.
+    std::unordered_map<std::string, const ast::ExternFn*> externFns_;
 
     // Monomorphization worklist + dedupe.
     struct Instance {
@@ -4101,6 +4121,167 @@ private:
         return llvm::FunctionType::get(retT, argTs, /*isVarArg=*/false);
     }
 
+    // Phase 24: is this extern-signature type the FFI-only `i32` spelling
+    // (C `int`)? Distinct from kardashev i64 — codegen narrows/widens it at
+    // the call boundary.
+    static bool isExternI32(const ast::TypeRef& tr) {
+        return !tr.isRef && !tr.isFn && !tr.isSlice && !tr.isArray &&
+               !tr.isTuple && tr.assocName.empty() && !tr.isDyn &&
+               tr.name == "i32";
+    }
+
+    // Phase 24: the LLVM type a single `extern "C"` signature position lowers
+    // to under the C ABI.
+    //   i32        -> i32 (C int)
+    //   i64        -> i64 (C long / int64_t)
+    //   bool       -> i1
+    //   &T/&mut T/&[T]/String/&String -> ptr (C pointer)
+    //   unit       -> void (return position only)
+    llvm::Type* cAbiType(const ast::TypeRef& tr) {
+        if (isExternI32(tr)) return llvm::Type::getInt32Ty(*ctx_);
+        TypePtr r = resolve(astTypeRefToConcrete(tr));
+        switch (r->kind) {
+            case TypeKind::Int:  return llvm::Type::getInt64Ty(*ctx_);
+            case TypeKind::Bool: return llvm::Type::getInt1Ty(*ctx_);
+            case TypeKind::Unit: return llvm::Type::getVoidTy(*ctx_);
+            case TypeKind::Ref:
+            case TypeKind::Box:
+                return llvm::PointerType::get(*ctx_, /*AS=*/0);
+            case TypeKind::Struct:
+                // String / Slice are passed as their data pointer.
+                return llvm::PointerType::get(*ctx_, /*AS=*/0);
+            default:
+                // The typechecker already rejected unrepresentable types; if
+                // one slips through, fall back to an i64 word so codegen still
+                // produces a verifiable module.
+                return llvm::Type::getInt64Ty(*ctx_);
+        }
+    }
+
+    // Phase 24: declare a user `extern "C" fn` as an LLVM external function
+    // using the C-ABI signature. No name mangling — the LLVM symbol name is
+    // the declared name (so the JIT resolves it from the host process and the
+    // AOT link pulls it from libc). Skipped (no-op) if the name already maps
+    // to an internal extern of the SAME C-ABI signature, so a user
+    // redeclaration of e.g. `printf` reuses the existing declaration rather
+    // than emitting a duplicate (typecheck rejects mismatched collisions).
+    void declareExternFn(const ast::ExternFn& ef) {
+        llvm::Type* retT = cAbiType(ef.returnType);
+        std::vector<llvm::Type*> argTs;
+        argTs.reserve(ef.params.size());
+        for (const auto& p : ef.params) argTs.push_back(cAbiType(p.type));
+        auto* fty = llvm::FunctionType::get(retT, argTs, /*isVarArg=*/false);
+        if (auto* existing = module_->getFunction(ef.name)) {
+            // Reuse a matching existing declaration (e.g. an internal extern).
+            if (existing->getFunctionType() == fty) {
+                declaredFns_[ef.name] = existing;
+                return;
+            }
+            // Signature mismatch with an existing symbol: typecheck should
+            // have rejected this collision; surface a codegen error rather
+            // than emit an invalid second definition.
+            errors_.push_back("codegen: extern \"C\" fn '" + ef.name +
+                              "' conflicts with an existing declaration of a "
+                              "different type");
+            return;
+        }
+        auto* f = llvm::Function::Create(
+            fty, llvm::Function::ExternalLinkage, ef.name, module_.get());
+        unsigned i = 0;
+        for (auto& arg : f->args()) {
+            if (i < ef.params.size()) arg.setName(ef.params[i].name);
+            ++i;
+        }
+        declaredFns_[ef.name] = f;
+    }
+
+    // Phase 24: lower a call to a user `extern "C" fn`, inserting the C-ABI
+    // coercions at the boundary. Each kardashev argument is materialized
+    // (by-value) and then adapted to the declared C-ABI parameter:
+    //   - i32 param: trunc the i64 value to i32.
+    //   - pointer param fed a String / &String value: extract the data
+    //     pointer (String layout field 0); a `&String`/`&[T]`/`&T` value is
+    //     already an LLVM `ptr` and passes through.
+    // The result is widened back into kardashev's world: an i32 return is
+    // sign-extended to i64 (so a C `int` result is value-correct, never
+    // upper-bit garbage).
+    llvm::Value* emitExternCall(const ast::CallExpr& call,
+                                const ast::ExternFn& ef) {
+        llvm::Function* fn = declaredFns_[ef.name];
+        if (!fn) {
+            errors_.push_back("codegen: extern fn not declared: " + ef.name);
+            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
+        }
+        auto* i32Ty = llvm::Type::getInt32Ty(*ctx_);
+        auto* strTy = structTypes_.count("String") ? structTypes_["String"]
+                                                    : nullptr;
+        auto* sliceTy = structTypes_.count("Slice") ? structTypes_["Slice"]
+                                                     : nullptr;
+        auto* i8PtrTy = llvm::PointerType::get(*ctx_, /*AS=*/0);
+        std::vector<llvm::Value*> args;
+        args.reserve(call.args.size());
+        const std::size_t n = std::min(call.args.size(), ef.params.size());
+        for (std::size_t i = 0; i < n; ++i) {
+            llvm::Value* v = emitConsume(*call.args[i]);
+            const ast::TypeRef& pt = ef.params[i].type;
+            if (isExternI32(pt)) {
+                // Narrow kardashev i64 -> C int.
+                v = builder_->CreateTrunc(v, i32Ty, "ffi.trunc");
+                args.push_back(v);
+                continue;
+            }
+            // Determine the C pointer payload for pointer-shaped params.
+            TypePtr ptype = resolve(astTypeRefToConcrete(pt));
+            if (ptype->kind == TypeKind::Ref) {
+                TypePtr inner = resolve(ptype->refInner);
+                if (inner->kind == TypeKind::Struct &&
+                    (inner->structName == "String" ||
+                     inner->structName == "Slice")) {
+                    // `&String` / `&Slice`: the value is a `ptr` to the
+                    // {data,len,cap} aggregate; load field 0 (the data
+                    // pointer at offset 0) and pass THAT, so strlen/etc. see
+                    // the bytes, not the header.
+                    llvm::Type* aggTy =
+                        inner->structName == "String" ? strTy : sliceTy;
+                    if (aggTy) {
+                        v = builder_->CreateLoad(i8PtrTy, v, "ffi.ptr.data");
+                    }
+                }
+                // Any other `&T`/`&mut T` is already an LLVM `ptr` to the
+                // pointee — pass it straight through as the C pointer.
+                args.push_back(v);
+                continue;
+            }
+            if (ptype->kind == TypeKind::Struct &&
+                (ptype->structName == "String" ||
+                 ptype->structName == "Slice") &&
+                v && v->getType()->isStructTy()) {
+                // A `String` / slice passed BY VALUE -> its data pointer
+                // (aggregate field 0).
+                v = builder_->CreateExtractValue(v, {0}, "ffi.val.data");
+                args.push_back(v);
+                continue;
+            }
+            // Scalars (i64 -> C long, bool -> i1) pass through unchanged.
+            args.push_back(v);
+        }
+        // Extra args beyond the declared arity (shouldn't happen — typecheck
+        // enforces arity) are still evaluated for their side effects.
+        for (std::size_t i = n; i < call.args.size(); ++i) {
+            (void)emitConsume(*call.args[i]);
+        }
+        bool retVoid = fn->getReturnType()->isVoidTy();
+        llvm::Value* ret =
+            builder_->CreateCall(fn, args, retVoid ? "" : "ffi.call");
+        if (isExternI32(ef.returnType)) {
+            // Widen C int result -> kardashev i64 (sign-extend: C int is
+            // signed). This is what makes `abs(0 - 7)` land as 7, not garbage.
+            ret = builder_->CreateSExt(
+                ret, llvm::Type::getInt64Ty(*ctx_), "ffi.sext");
+        }
+        return ret;
+    }
+
     // Stable, name-mangling-quality string for a (resolved) TypePtr. Only
     // the kinds reachable in valid Phase 3.1 instantiations are handled
     // meaningfully — Vars and Functions don't occur as monomorphization
@@ -6667,6 +6848,14 @@ private:
             return builder_->CreateCall(fn, args, "call_" + call.callee);
         }
 
+        // Phase 24: a user `extern "C" fn` call. Routed here (before the
+        // generic declaredFns_ dispatch) so the C-ABI boundary coercions
+        // (i32 narrow/widen, String->data-pointer) are applied. Reached only
+        // when no local binding shadows the name (the indirect-call branch
+        // above already handled that), matching the typechecker's precedence.
+        if (auto eit = externFns_.find(call.callee); eit != externFns_.end()) {
+            return emitExternCall(call, *eit->second);
+        }
         if (auto it = declaredFns_.find(call.callee);
             it != declaredFns_.end()) {
             llvm::Function* fn = it->second;

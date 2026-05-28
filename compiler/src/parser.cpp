@@ -32,6 +32,8 @@ public:
                 prog.impls.push_back(parseImplDecl());
             } else if (check(TokenKind::KwMod)) {
                 prog.mods.push_back(parseModDecl());
+            } else if (check(TokenKind::KwExtern)) {
+                parseExternDecls(prog);
             } else if (check(TokenKind::KwPub)) {
                 // Phase 7.3b: `pub` sticks to fn decls and is enforced on
                 // path-qualified call sites. Bare-name calls keep working
@@ -72,8 +74,8 @@ public:
                 }
             } else {
                 errorHere(std::string("expected 'fn', 'struct', 'enum', "
-                                      "'trait', 'impl' or 'mod' at top "
-                                      "level, got ") +
+                                      "'trait', 'impl', 'mod' or 'extern' at "
+                                      "top level, got ") +
                           std::string(tokenKindName(peek().kind)));
                 advance();
             }
@@ -86,6 +88,10 @@ private:
     std::size_t pos_ = 0;
     std::vector<ParseError> errors_;
     bool restrictStructLit_ = false;
+    // Phase 24: set by parseOptionalEffectRow when a `! { ... }` row was
+    // actually present (even an empty `! { }`), so an extern decl can tell
+    // "explicitly pure" (`! { }`) apart from "no row -> default io effect".
+    bool sawEffectRow_ = false;
 
     const Token& peek(std::size_t offset = 0) const {
         std::size_t idx = pos_ + offset;
@@ -140,6 +146,98 @@ private:
         decl.name = nameTok.lexeme;
         expect(TokenKind::Semi, ";");
         return decl;
+    }
+
+    // Phase 24: `extern "C" ...` FFI declarations. Two accepted surface
+    // forms (both supported here):
+    //   per-decl:  extern "C" fn name(params) -> ret;
+    //   block:     extern "C" { fn a(...) -> ...; fn b(...); }
+    // The ABI string MUST be a string literal; only `"C"` is accepted by the
+    // typechecker (the parser records whatever string was written and lets
+    // the typechecker emit the precise error so the message carries the
+    // offending ABI). Each parsed signature is appended to `prog.externFns`.
+    void parseExternDecls(ast::Program& prog) {
+        Token externTok = expect(TokenKind::KwExtern, "extern");
+        std::string abi;
+        if (check(TokenKind::StringLit)) {
+            abi = consume().lexeme;
+        } else {
+            errorHere("expected an ABI string literal after `extern` "
+                      "(e.g. `extern \"C\"`)");
+            // Recover: keep abi empty so the typechecker reports the bad ABI.
+        }
+        if (accept(TokenKind::LBrace)) {
+            // Block form: zero or more `fn ...;` signatures until `}`.
+            while (!check(TokenKind::RBrace) &&
+                   !check(TokenKind::EndOfInput)) {
+                if (errors_.size() > 20) break;
+                if (!check(TokenKind::KwFn)) {
+                    errorHere("expected `fn` inside `extern` block");
+                    advance();
+                    continue;
+                }
+                prog.externFns.push_back(
+                    parseExternFnSig(abi, externTok.line, externTok.column));
+            }
+            expect(TokenKind::RBrace, "}");
+        } else {
+            // Per-decl form: exactly one `fn ...;`.
+            prog.externFns.push_back(
+                parseExternFnSig(abi, externTok.line, externTok.column));
+        }
+    }
+
+    // Parse a single bodyless `fn name(params) -> ret effect_row? ;` signature
+    // for an extern block / per-decl form. Mirrors parseFnDecl's header but
+    // requires a trailing `;` and forbids a `{ body }` / generics / `async`.
+    ast::ExternFn parseExternFnSig(const std::string& abi, std::size_t line,
+                                   std::size_t column) {
+        Token fnTok = expect(TokenKind::KwFn, "fn");
+        ast::ExternFn ef;
+        ef.abi = abi;
+        ef.line = line;
+        ef.column = column;
+        Token nameTok = expect(TokenKind::Identifier, "function name");
+        ef.name = nameTok.lexeme;
+        if (check(TokenKind::Lt)) {
+            errorAt("an `extern \"C\"` fn cannot be generic", nameTok.line,
+                    nameTok.column);
+            // Best-effort: skip a balanced <...> so the rest still parses.
+            parseOptionalGenericParams();
+        }
+        expect(TokenKind::LParen, "(");
+        if (!check(TokenKind::RParen)) {
+            while (true) {
+                ef.params.push_back(parseParam());
+                if (!accept(TokenKind::Comma)) break;
+            }
+        }
+        expect(TokenKind::RParen, ")");
+        ef.returnType = parseOptionalReturnType();
+        ef.effects = parseOptionalEffectRow();
+        ef.hasExplicitEffects = !ef.effects.labels.empty() ||
+                                 sawEffectRow_;
+        if (check(TokenKind::LBrace)) {
+            errorHere("an `extern \"C\"` fn is a declaration only and cannot "
+                      "have a body");
+            // Recover by skipping the block so following decls still parse.
+            skipBalancedBraces();
+        } else {
+            expect(TokenKind::Semi, ";");
+        }
+        return ef;
+    }
+
+    // Skip a `{ ... }` region, matching nested braces, after an error so the
+    // parser can resynchronize at the next top-level declaration.
+    void skipBalancedBraces() {
+        if (!accept(TokenKind::LBrace)) return;
+        int depth = 1;
+        while (depth > 0 && !check(TokenKind::EndOfInput)) {
+            if (check(TokenKind::LBrace)) ++depth;
+            else if (check(TokenKind::RBrace)) --depth;
+            advance();
+        }
     }
 
     ast::FnDecl parseFnDecl() {
@@ -208,7 +306,9 @@ private:
     // declared effect-row variables.
     ast::EffectRow parseOptionalEffectRow() {
         ast::EffectRow row;
+        sawEffectRow_ = false;
         if (!check(TokenKind::Bang)) return row;
+        sawEffectRow_ = true;
         Token bangTok = consume();
         row.line = bangTok.line;
         row.column = bangTok.column;

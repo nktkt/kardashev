@@ -707,6 +707,41 @@ struct ModDecl {
     std::size_t column = 1;
 };
 
+// Phase 24: an `extern "C" fn name(params) -> ret;` FFI declaration — a
+// *declaration only* (no body) of a C function the program may call. The
+// `"C"` ABI string is the only supported ABI; the parser records it in `abi`
+// and the typechecker rejects anything else. The signature mirrors a normal
+// fn (params + returnType), so calls type-check against it like any fn call.
+//
+// C-ABI type mapping (resolved in the typechecker + codegen):
+//   - `i64`  <-> C `long` / `int64_t` (LLVM i64, no coercion).
+//   - `i32`  <-> C `int`   (LLVM i32). `i32` is legal ONLY in an extern
+//                signature; the kardashev-visible type is still i64 (so an
+//                i64 value flows in/out), and codegen inserts a trunc on the
+//                argument and a sign-extend on the result at the call
+//                boundary. This is how the C `int` width is handled correctly
+//                (not "lucky" upper-bit behavior).
+//   - `bool` <-> C `int` / `_Bool` (LLVM i1).
+//   - `&String` / `String` / `&[T]` / `&T` / `&mut T` <-> a C pointer
+//                (LLVM `ptr`). For a `String` / `&String` arg the *data*
+//                pointer is passed (NUL-terminated for string literals), so
+//                `strlen(&s)` works.
+//
+// Effects: an extern call is opaque, so each extern fn carries the `io`
+// effect by default (a pure caller cannot call one). An explicit `! { ... }`
+// row after the return type overrides the default (e.g. `! { }` for a known-
+// pure fn, or `! { io, alloc }`).
+struct ExternFn {
+    std::string name;
+    std::vector<Param> params;
+    TypeRef returnType;
+    std::string abi;       // the ABI string between `extern` and `fn`; only "C"
+    EffectRow effects;     // declared effect row; default {io} applied by the
+    bool hasExplicitEffects = false; // typechecker when this stays false
+    std::size_t line = 1;
+    std::size_t column = 1;
+};
+
 struct Program {
     std::vector<FnDecl> functions;
     std::vector<StructDecl> structs;
@@ -714,6 +749,8 @@ struct Program {
     std::vector<TraitDecl> traits;
     std::vector<ImplDecl> impls;
     std::vector<ModDecl> mods;
+    // Phase 24: user-declared `extern "C"` function declarations.
+    std::vector<ExternFn> externFns;
 };
 
 } // namespace kardashev::ast

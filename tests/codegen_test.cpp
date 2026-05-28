@@ -2220,6 +2220,71 @@ void test_thread_runtime_emits_pthread_externs() {
                    "thread_runtime_emits_pthread_externs");
 }
 
+// --- Phase 24: extern "C" FFI declarations ---
+
+// An `i32`-spelled extern lowers to a C-int (i32) external declaration, and
+// the call narrows the i64 arg with a `trunc`. `n` is a runtime param so the
+// call can't be constant-folded away at O2. `putchar` is used because (unlike
+// `abs`/`labs`) LLVM has no folding intrinsic for it, so the `@putchar(i32`
+// declaration survives the optimization pipeline.
+void test_extern_i32_decl_and_arg_narrowed() {
+    std::string ir = compileToIR(
+        "extern \"C\" fn putchar(c: i32) -> i32;\n"
+        "fn main(n: i64) -> i64 ! { io } { putchar(n); 0 }",
+        "extern_i32_decl_and_arg_narrowed");
+    expectContains(ir, "@putchar(i32", "extern_i32_decl_and_arg_narrowed");
+    expectContains(ir, "trunc i64", "extern_i32_decl_and_arg_narrowed");
+}
+
+// An `i32`-RETURN extern widens its C-int result back to i64 with a sext (or,
+// when the optimizer can prove non-negativity, a zext nneg — both are correct
+// widenings). We just require the result feeds a 64-bit value. `getpid`
+// survives O2 as a declaration. Its result is used so the call can't be DCE'd.
+void test_extern_i32_return_widened() {
+    std::string ir = compileToIR(
+        "extern \"C\" fn getpid() -> i32;\n"
+        "fn main() -> i64 ! { io } { let p = getpid(); p + 1 }",
+        "extern_i32_return_widened");
+    expectContains(ir, "i32 @getpid()", "extern_i32_return_widened");
+    // The i32 result is extended to i64 (sext from codegen, possibly turned
+    // into `zext nneg` by the optimizer when it proves the sign).
+    bool widened = ir.find("ext i32") != std::string::npos ||
+                   ir.find("ext nneg i32") != std::string::npos;
+    if (!widened) {
+        std::cerr << "[extern_i32_return_widened] expected an i32->i64 "
+                     "widening of the getpid result\n";
+        std::abort();
+    }
+}
+
+// A `&String` arg lowers to a C pointer: the declaration takes a `ptr`. A
+// fictional symbol name is used so the optimizer has no library knowledge to
+// fold it away (compileToIR only builds the module — it never links/runs, so
+// an unresolved symbol is fine for an IR-shape check).
+void test_extern_ref_string_lowers_to_pointer() {
+    std::string ir = compileToIR(
+        "extern \"C\" fn kd_ffi_strlen(s: &String) -> i64;\n"
+        "fn main() -> i64 ! { io } { let s = \"hello\"; kd_ffi_strlen(&s) }",
+        "extern_ref_string_lowers_to_pointer");
+    expectContains(ir, "@kd_ffi_strlen(ptr",
+                   "extern_ref_string_lowers_to_pointer");
+}
+
+// The C symbol name is the declared name verbatim — no mangling / instance
+// suffix (a fictional name so O2 can't fold it).
+void test_extern_symbol_name_not_mangled() {
+    std::string ir = compileToIR(
+        "extern \"C\" fn kd_ffi_thing() -> i32;\n"
+        "fn main() -> i64 ! { io } { let p = kd_ffi_thing(); p }",
+        "extern_symbol_name_not_mangled");
+    expectContains(ir, "@kd_ffi_thing(", "extern_symbol_name_not_mangled");
+    if (ir.find("kd_ffi_thing__") != std::string::npos) {
+        std::cerr << "[extern_symbol_name_not_mangled] unexpected mangled "
+                     "symbol kd_ffi_thing__\n";
+        std::abort();
+    }
+}
+
 } // namespace
 
 int main() {
@@ -2385,7 +2450,12 @@ int main() {
     test_array_inbounds_index_no_panic();
     test_panic_runtime_emitted_when_used();
     test_no_panic_runtime_when_unused();
-    std::cout << "All codegen tests passed (143 cases) — Phase 16 Drop/RAII: "
+    // Phase 24: extern "C" FFI lowering.
+    test_extern_i32_decl_and_arg_narrowed();
+    test_extern_i32_return_widened();
+    test_extern_ref_string_lowers_to_pointer();
+    test_extern_symbol_name_not_mangled();
+    std::cout << "All codegen tests passed (147 cases) — Phase 16 Drop/RAII: "
                  "reverse-order scope drops, move semantics, conditional-move "
                  "drop flags, Vec/Box free, scalar codegen unchanged; Phase "
                  "17a fn-value field calls + FnMut captures; Phase 17b generic "
@@ -2397,6 +2467,8 @@ int main() {
                  "where-clause equivalence; Phase 23 panic/unwind (catch "
                  "recovers via setjmp/longjmp, Drop runs on unwind + no "
                  "double-free over 50k unwinds, array OOB panics, panic runtime "
-                 "gated to may-panic programs)\n";
+                 "gated to may-panic programs); Phase 24 extern \"C\" FFI "
+                 "(i32->C-int decl + trunc/sext coercions, i64->C-long, "
+                 "&String->C pointer, unmangled C symbol name)\n";
     return 0;
 }

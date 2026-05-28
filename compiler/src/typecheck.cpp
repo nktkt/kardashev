@@ -1006,6 +1006,11 @@ public:
             schema.isPub = fn.isPub;
             fnSchemas_[fn.name] = std::move(schema);
         }
+        // Pass 1c (Phase 24): register every `extern "C" fn` as a callable
+        // FnSchema so calls to it type-check against the declared signature
+        // like any other fn. Extern fns are monomorphic (no generic params),
+        // opaque, and carry the `io` effect by default.
+        registerExternFns(program);
         // Pass 1e: register each impl method as a regular fn schema under
         // its mangled name so call routing through MethodCallExpr can
         // re-use the existing fn-call machinery. The mangled name encodes
@@ -1939,6 +1944,119 @@ private:
                   tr.assocName + "' (no impl defines it)",
               tr.line, tr.column);
         return makeInt();
+    }
+
+    // Phase 24: resolve a type written in an `extern "C"` signature to the
+    // kardashev-visible TypePtr that calls type-check against. The only
+    // extern-specific spelling is `i32` (C `int`): it surfaces as a plain
+    // kardashev `i64` so an i64 argument/result flows through transparently
+    // (codegen narrows/widens at the call boundary). Everything else resolves
+    // exactly like a normal type. Pointer-shaped arguments (`&String`,
+    // `String`, `&[T]`, `&T`, `&mut T`) resolve to their usual kardashev
+    // types and codegen lowers them to a C pointer at the boundary; we
+    // validate here that any extern type is one codegen can actually map to a
+    // C ABI value, so a misuse fails at the declaration with a clear message.
+    TypePtr resolveExternType(const ast::TypeRef& tr, const std::string& fnName,
+                              bool isReturn) {
+        // `i32` is FFI-only sugar for "C int, value-compatible with i64".
+        if (!tr.isRef && !tr.isFn && !tr.isSlice && !tr.isArray &&
+            !tr.isTuple && tr.assocName.empty() && !tr.isDyn &&
+            tr.name == "i32") {
+            if (!tr.typeArgs.empty())
+                error("i32 takes no type arguments", tr.line, tr.column);
+            return makeInt();
+        }
+        TypePtr t = resolveTypeRef(tr);
+        // Validate the resolved type is C-ABI representable. Allowed:
+        //   Int / Bool (scalars), any Ref (-> C pointer), the built-in
+        //   String / Slice value (-> data pointer), Unit (only as a return).
+        TypePtr r = resolve(t);
+        auto representable = [&](const TypePtr& ty) -> bool {
+            TypePtr rr = resolve(ty);
+            switch (rr->kind) {
+            case TypeKind::Int:
+            case TypeKind::Bool:
+            case TypeKind::Ref: // any &T / &mut T / &[T] -> C pointer
+                return true;
+            case TypeKind::Unit:
+                return isReturn; // void return is fine; a void *param* isn't
+            case TypeKind::Struct:
+                // Only the built-in String/Slice values have a defined C
+                // mapping (pass the data pointer). Other structs by value have
+                // no portable C ABI here.
+                return rr->structName == "String" || rr->structName == "Slice";
+            default:
+                return false;
+            }
+        };
+        if (!representable(r)) {
+            error("type `" + typeToString(r) + "` is not supported in an "
+                  "`extern \"C\"` signature for '" + fnName +
+                  "' (allowed: i64, i32, bool, &T / &mut T / &[T] (C pointer), "
+                  "String / &String (passes the data pointer)" +
+                  std::string(isReturn ? ", or unit (void return)" : "") + ")",
+                  tr.line, tr.column);
+        }
+        return t;
+    }
+
+    void registerExternFns(const ast::Program& program) {
+        for (const auto& ef : program.externFns) {
+            // ABI must be exactly "C" (only ABI supported this phase).
+            if (ef.abi != "C") {
+                error("unsupported ABI \"" + ef.abi +
+                          "\" on `extern` fn '" + ef.name +
+                          "' (only \"C\" is supported)",
+                      ef.line, ef.column);
+                // Continue: still register the schema so calls don't cascade
+                // into "undefined function" errors on top of the ABI error.
+            }
+            // Collision handling: a user-declared extern that shadows a name
+            // already in scope (a built-in like `print`/`malloc`, a user fn,
+            // or another extern) is a hard error rather than a silent reuse —
+            // the two could disagree on signature/effects.
+            if (fnSchemas_.count(ef.name)) {
+                error("`extern \"C\" fn` '" + ef.name +
+                          "' collides with an existing function of the same "
+                          "name (built-in, user fn, or another extern); rename "
+                          "it or drop the redeclaration",
+                      ef.line, ef.column);
+                continue;
+            }
+            std::vector<TypePtr> argTypes;
+            argTypes.reserve(ef.params.size());
+            for (const auto& p : ef.params) {
+                argTypes.push_back(
+                    resolveExternType(p.type, ef.name, /*isReturn=*/false));
+            }
+            TypePtr ret =
+                resolveExternType(ef.returnType, ef.name, /*isReturn=*/true);
+            FnSchema schema;
+            schema.signature = makeFunction(std::move(argTypes), ret);
+            // Effects: default to `io` (opaque external call) unless the decl
+            // wrote an explicit `! { ... }` row. An explicit `! { }` means the
+            // user asserts the fn is pure. Only built-in concrete effects are
+            // allowed (no effect-row variables on externs).
+            if (ef.hasExplicitEffects) {
+                for (const auto& l : ef.effects.labels) {
+                    if (!isBuiltinEffect(l)) {
+                        error("unknown effect label `" + l +
+                                  "` on `extern \"C\" fn` '" + ef.name +
+                                  "` (built-ins: alloc, io, panic, async, "
+                                  "unwind)",
+                              ef.effects.line, ef.effects.column);
+                        continue;
+                    }
+                    schema.declaredEffects.add(l);
+                }
+            } else {
+                schema.declaredEffects.add("io");
+            }
+            // Extern fns are reachable by bare name (no module path); mark pub
+            // so a path-qualified call (rare) doesn't trip the visibility check.
+            schema.isPub = true;
+            fnSchemas_[ef.name] = std::move(schema);
+        }
     }
 
     TypePtr resolveTypeRef(const ast::TypeRef& tr) {

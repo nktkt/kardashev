@@ -45,6 +45,10 @@ public:
             sep(first);
             printImpl(i);
         }
+        for (const auto& ef : p.externFns) {
+            sep(first);
+            printExtern(ef);
+        }
         for (const auto& f : p.functions) {
             sep(first);
             printFn(f, /*indent=*/0);
@@ -192,6 +196,28 @@ private:
 
     void printMod(const ModDecl& m) {
         out_ += "mod " + m.name + ";\n";
+    }
+
+    // Phase 24: `extern "C" fn name(params) -> ret [! { ... }];` — a bodyless
+    // FFI declaration. Rendered in the per-decl form (round-trips through the
+    // parser, which accepts both the per-decl and block forms). The return
+    // type is omitted from the surface when it's `unit` (mirroring printFn).
+    void printExtern(const ExternFn& ef) {
+        out_ += "extern \"" + ef.abi + "\" fn " + ef.name + "(";
+        out_ += paramsToString(ef.params);
+        out_ += ")";
+        bool retUnit = !ef.returnType.isRef && !ef.returnType.isFn &&
+                       !ef.returnType.isSlice && !ef.returnType.isArray &&
+                       !ef.returnType.isTuple && ef.returnType.assocName.empty() &&
+                       !ef.returnType.isDyn && ef.returnType.name == "unit";
+        if (!retUnit) out_ += " -> " + typeToString(ef.returnType);
+        // An explicit effect row (even an empty `! { }`) is preserved; the
+        // default (no row -> io) is left implicit.
+        if (ef.hasExplicitEffects) {
+            if (ef.effects.labels.empty()) out_ += " ! { }";
+            else out_ += effectsToString(ef.effects.labels);
+        }
+        out_ += ";\n";
     }
 
     void printStruct(const StructDecl& s) {

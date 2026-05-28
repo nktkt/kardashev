@@ -1619,6 +1619,94 @@ void test_assoc_projection_on_generic_param() {
     assert(fn.returnType.assocName == "Item");
 }
 
+// --- Phase 24: extern "C" FFI declarations ---
+
+void test_extern_c_per_decl() {
+    auto r = parse("extern \"C\" fn abs(x: i64) -> i64;");
+    assert(r.ok());
+    assert(r.program.externFns.size() == 1);
+    const auto& ef = r.program.externFns[0];
+    assert(ef.name == "abs");
+    assert(ef.abi == "C");
+    assert(ef.params.size() == 1);
+    assert(ef.params[0].name == "x");
+    assert(ef.params[0].type.name == "i64");
+    assert(ef.returnType.name == "i64");
+    assert(!ef.hasExplicitEffects); // no `! { ... }` row
+}
+
+void test_extern_c_no_args_no_ret() {
+    auto r = parse("extern \"C\" fn getpid() -> i64;");
+    assert(r.ok());
+    assert(r.program.externFns.size() == 1);
+    assert(r.program.externFns[0].params.empty());
+}
+
+void test_extern_c_i32_and_ref_param() {
+    auto r = parse("extern \"C\" fn strlen(s: &String) -> i64;\n"
+                   "extern \"C\" fn putchar(c: i32) -> i32;");
+    assert(r.ok());
+    assert(r.program.externFns.size() == 2);
+    // strlen: &String param
+    const auto& sl = r.program.externFns[0];
+    assert(sl.name == "strlen");
+    assert(sl.params[0].type.isRef);
+    assert(sl.params[0].type.name == "String");
+    // putchar: the FFI-only i32 spelling survives to the AST verbatim.
+    const auto& pc = r.program.externFns[1];
+    assert(pc.name == "putchar");
+    assert(pc.params[0].type.name == "i32");
+    assert(pc.returnType.name == "i32");
+}
+
+void test_extern_c_block_form() {
+    auto r = parse("extern \"C\" {\n"
+                   "  fn abs(x: i32) -> i32;\n"
+                   "  fn getpid() -> i32;\n"
+                   "}");
+    assert(r.ok());
+    assert(r.program.externFns.size() == 2);
+    assert(r.program.externFns[0].name == "abs");
+    assert(r.program.externFns[1].name == "getpid");
+    assert(r.program.externFns[0].abi == "C");
+    assert(r.program.externFns[1].abi == "C");
+}
+
+void test_extern_c_explicit_effect_row() {
+    // An explicit `! { }` is recorded so the typechecker can treat the extern
+    // as pure (vs. the default `io`).
+    auto r = parse("extern \"C\" fn abs(x: i32) -> i32 ! { };");
+    assert(r.ok());
+    assert(r.program.externFns.size() == 1);
+    assert(r.program.externFns[0].hasExplicitEffects);
+    assert(r.program.externFns[0].effects.labels.empty());
+}
+
+void test_extern_c_preserves_abi_string() {
+    // The parser records WHATEVER ABI string was written (the typechecker, not
+    // the parser, rejects a non-"C" ABI) so the error carries the offender.
+    auto r = parse("extern \"Rust\" fn abs(x: i64) -> i64;");
+    assert(r.ok());
+    assert(r.program.externFns.size() == 1);
+    assert(r.program.externFns[0].abi == "Rust");
+}
+
+void test_extern_c_body_is_error() {
+    // An extern decl is bodyless; a `{ body }` is a parse error.
+    auto r = parse("extern \"C\" fn abs(x: i64) -> i64 { x }");
+    assert(!r.ok());
+}
+
+void test_extern_and_fn_coexist() {
+    // An extern decl alongside a normal fn: both land in the program.
+    auto r = parse("extern \"C\" fn abs(x: i64) -> i64;\n"
+                   "fn main() -> i64 ! { io } { abs(0 - 7) }");
+    assert(r.ok());
+    assert(r.program.externFns.size() == 1);
+    assert(r.program.functions.size() == 1);
+    assert(r.program.functions[0].name == "main");
+}
+
 } // namespace
 
 int main() {
@@ -1748,6 +1836,15 @@ int main() {
     test_trait_assoc_type_decl();
     test_impl_assoc_type_def();
     test_assoc_projection_on_generic_param();
-    std::cout << "All parser tests passed (111 cases)\n";
+    // Phase 24: extern "C" FFI declarations.
+    test_extern_c_per_decl();
+    test_extern_c_no_args_no_ret();
+    test_extern_c_i32_and_ref_param();
+    test_extern_c_block_form();
+    test_extern_c_explicit_effect_row();
+    test_extern_c_preserves_abi_string();
+    test_extern_c_body_is_error();
+    test_extern_and_fn_coexist();
+    std::cout << "All parser tests passed (119 cases)\n";
     return 0;
 }
