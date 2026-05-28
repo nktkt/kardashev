@@ -3153,10 +3153,15 @@ private:
             bool mutated = bodyMutatesCapture(*cl.body, name, shadow);
             bool enclosingMut = isMutLocal(name);
             TypePtr rt = resolve(t);
+            // PR#18: only immediate scalar Copy types (i64, bool, unit) may
+            // be captured by value. A `&T` captured by value is unsound for an
+            // *escaping* closure (the env would outlive the borrowed stack
+            // slot — Phase 17a's escape check only catches by-ref/FnMut
+            // captures, not a by-value reference copy), so reject `&T`
+            // by-value captures outright in this MVP.
             bool copyable = rt->kind == TypeKind::Int ||
                             rt->kind == TypeKind::Bool ||
-                            rt->kind == TypeKind::Unit ||
-                            (rt->kind == TypeKind::Ref && !rt->refIsMut);
+                            rt->kind == TypeKind::Unit;
             if (mutated) {
                 // FnMut: capture by reference. The mutation requires the
                 // enclosing binding be `let mut`.
@@ -3177,9 +3182,9 @@ private:
                 // read-only non-Copy case, still deferred.)
                 error("closure captures `" + name + "` of type " +
                           typeToString(t) +
-                          ", but only Copy types (i64, bool, &T) may be "
-                          "captured by value in this MVP; aggregate captures "
-                          "are not yet supported",
+                          ", but only Copy scalar types (i64, bool, unit) may "
+                          "be captured by value in this MVP; reference/aggregate "
+                          "captures are not yet supported",
                       cl.line, cl.column);
             }
             ast::ClosureCapture cap;
