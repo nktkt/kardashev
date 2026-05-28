@@ -489,54 +489,226 @@ bool emitObject(llvm::Module& module, const std::string& outObjPath) {
     return true;
 }
 
-// Compile + link `src` into a native executable at `outExePath`. Uses
-// the system `clang` to link the emitted object — this is the same
-// linker our CI / Bazel build already depends on, so AOT mode adds no
-// new system requirement beyond what JIT mode needed.
-int runAot(const std::string& srcRaw, const std::string& outExePath,
-            const std::string& srcDir = ".", bool emitDebug = false,
-            const std::string& sourceFile = "<kardashev>") {
+// Link `objPath` into a native executable at `outExePath` via the system
+// `clang`. We use `clang` from PATH; the CI image has it, and Bazel's
+// LLVM-detection step already pulled it in for the build. -fuse-ld is left
+// to clang's default so it picks the right linker per platform (lld on
+// Linux if installed, ld64 on macOS). Returns true on success.
+bool linkObject(const std::string& objPath, const std::string& outExePath) {
+    std::string cmd = "clang \"" + objPath + "\" -o \"" + outExePath + "\"";
+    int rc = std::system(cmd.c_str());
+    if (rc != 0) {
+        std::cerr << "kardc: linker (clang) failed with exit code "
+                  << rc << '\n';
+        return false;
+    }
+    return true;
+}
+
+// ====================================================================
+// Phase 14b: content-addressed incremental compile cache (AOT path)
+// ====================================================================
+//
+// Recompiling unchanged source is wasteful: lex → parse → typecheck →
+// borrow → codegen → object-emit all reproduce a byte-identical object.
+// We content-address that object by a hash over the FULLY-RESOLVED source
+// (the root file + every `mod foo;` it transitively pulls in) plus the
+// flags that change codegen (`-g`) plus a cache-format version tag. On a
+// hit we skip the entire front+middle end and link the cached object
+// straight away; on a miss we compile as usual, then deposit the object in
+// the cache for next time.
+//
+// The cache is purely an optimization: a non-writable cache dir, a missing
+// HOME, or any I/O hiccup falls back to a normal compile. It never changes
+// the bytes of the produced object (so output stays identical to the
+// no-cache path) and never crashes the compiler.
+
+// Bump when the object-file format / codegen ABI changes in a way that
+// must invalidate every existing cache entry. Combined into the key so an
+// upgraded kardc never reuses a stale object.
+constexpr const char* kCacheFormatVersion = "kardashev-cache-v1";
+
+// FNV-1a 64-bit over a byte string. Small, dependency-free, and good
+// enough for a content-addressed local cache (no adversarial inputs).
+std::uint64_t fnv1a(const std::string& data, std::uint64_t seed) {
+    std::uint64_t h = seed;
+    for (unsigned char c : data) {
+        h ^= static_cast<std::uint64_t>(c);
+        h *= 1099511628211ULL; // FNV prime
+    }
+    return h;
+}
+
+// Render a 64-bit hash as 16 lowercase hex digits (the cache filename stem).
+std::string hexKey(std::uint64_t h) {
+    static const char* digits = "0123456789abcdef";
+    std::string s(16, '0');
+    for (int i = 15; i >= 0; --i) {
+        s[i] = digits[h & 0xF];
+        h >>= 4;
+    }
+    return s;
+}
+
+// Concatenate the root source with the contents of every `mod foo;` file it
+// transitively references, in resolution order, so the cache key reflects a
+// change in ANY input file — not just the root. Mirrors resolveModules'
+// path logic. Best-effort: a module that fails to parse / read simply
+// contributes its raw bytes (or nothing) to the hash; correctness of the
+// build itself is still enforced later by the real pipeline.
+void collectFullSource(const std::string& srcRaw, const std::string& parentDir,
+                       std::unordered_set<std::string>& visited,
+                       std::string& acc) {
+    acc += srcRaw;
+    acc += "\0\0"; // separator so file-boundary shifts change the hash
+    auto pr = kardashev::parse(srcRaw);
+    if (!pr.ok()) return; // can't enumerate mods on a broken parse
+    for (const auto& m : pr.program.mods) {
+        std::string modPath = parentDir + "/" + m.name + ".kd";
+        if (!visited.insert(modPath).second) continue;
+        auto content = readFile(modPath);
+        if (!content) continue;
+        collectFullSource(*content, dirOf(modPath), visited, acc);
+    }
+}
+
+// Compute the cache key for an AOT build of `srcRaw` (resolved against
+// `srcDir`) with the given flags.
+std::string computeCacheKey(const std::string& srcRaw,
+                            const std::string& srcDir, bool emitDebug) {
+    std::string material;
+    material += kCacheFormatVersion;
+    material += emitDebug ? "|g=1|" : "|g=0|";
+    std::unordered_set<std::string> visited;
+    collectFullSource(srcRaw, srcDir, visited, material);
+    return hexKey(fnv1a(material, 1469598103934665603ULL /* FNV offset */));
+}
+
+// Resolve the cache directory: ${XDG_CACHE_HOME:-$HOME/.cache}/kardashev.
+// Returns empty if neither env var is usable (caller then skips caching).
+std::string cacheDir() {
+    const char* xdg = std::getenv("XDG_CACHE_HOME");
+    std::string base;
+    if (xdg && xdg[0]) {
+        base = xdg;
+    } else if (const char* home = std::getenv("HOME"); home && home[0]) {
+        base = std::string(home) + "/.cache";
+    } else {
+        return "";
+    }
+    return base + "/kardashev";
+}
+
+// Create `dir` (and parents) if absent. Returns true if it exists and is
+// usable afterwards. Failure is non-fatal (caller falls back to no cache).
+bool ensureDir(const std::string& dir) {
+    if (dir.empty()) return false;
+    std::error_code ec;
+    llvm::sys::fs::create_directories(dir, /*IgnoreExisting=*/true);
+    return llvm::sys::fs::is_directory(dir);
+}
+
+// Copy a file byte-for-byte. Returns true on success.
+bool copyFile(const std::string& from, const std::string& to) {
+    std::ifstream in(from, std::ios::binary);
+    if (!in) return false;
+    std::ofstream out(to, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out << in.rdbuf();
+    return out.good();
+}
+
+// Compile `srcRaw` through the full pipeline and emit a native object to
+// `objPath`. Returns true on success; diagnostics go to stderr. Factored
+// out of runAot so both the cache-miss path and the no-cache path share it.
+bool compileToObject(const std::string& srcRaw, const std::string& srcDir,
+                     bool emitDebug, const std::string& sourceFile,
+                     const std::string& objPath) {
     auto progOpt = buildProgram(srcRaw, srcDir);
-    if (!progOpt) return 1;
+    if (!progOpt) return false;
     auto& program = *progOpt;
     auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
         reportTypeErrors(tcr);
-        return 1;
+        return false;
     }
     auto bcr = kardashev::borrow_check(program, tcr);
     if (!bcr.ok()) {
         reportBorrowErrors(bcr);
-        return 1;
+        return false;
     }
     auto cgr = kardashev::codegen(program, tcr, emitDebug, sourceFile);
     if (!cgr.ok()) {
         for (const auto& msg : cgr.errors) {
             std::cerr << "codegen error: " << msg << '\n';
         }
-        return 1;
+        return false;
     }
-
     addCMainWrapper(*cgr.module);
+    return emitObject(*cgr.module, objPath);
+}
 
+// Compile + link `src` into a native executable at `outExePath`. When
+// `useCache` is set we content-address the emitted object: a cache hit skips
+// the whole compile and links the cached object; a miss compiles, deposits
+// the object into the cache, then links. Cache state is logged to stderr so
+// tests (and curious users) can observe hit/miss; program stdout stays clean.
+int runAot(const std::string& srcRaw, const std::string& outExePath,
+            const std::string& srcDir = ".", bool emitDebug = false,
+            const std::string& sourceFile = "<kardashev>",
+            bool useCache = true) {
+    // Intermediate object next to the output exe; always cleaned up.
     std::string objPath = outExePath + ".o";
-    if (!emitObject(*cgr.module, objPath)) return 1;
 
-    // Link with clang. We use `clang` from PATH; the CI image has it,
-    // and Bazel's LLVM-detection step already pulled it in for the
-    // build. -fuse-ld is left to clang's default so it picks the right
-    // linker per platform (lld on Linux if installed, ld64 on macOS).
-    std::string cmd = "clang \"" + objPath + "\" -o \"" + outExePath + "\"";
-    int rc = std::system(cmd.c_str());
-    // Always try to clean up the intermediate object so the working
-    // tree stays tidy even when linking fails.
-    std::remove(objPath.c_str());
-    if (rc != 0) {
-        std::cerr << "kardc: linker (clang) failed with exit code "
-                  << rc << '\n';
-        return 1;
+    std::string dir = useCache ? cacheDir() : "";
+    bool cacheUsable = useCache && ensureDir(dir);
+
+    if (cacheUsable) {
+        std::string key = computeCacheKey(srcRaw, srcDir, emitDebug);
+        std::string cachedObj = dir + "/" + key + ".o";
+        if (llvm::sys::fs::exists(cachedObj)) {
+            // HIT: reuse the cached object, skipping the entire pipeline.
+            std::cerr << "kardc: cache hit " << key << '\n';
+            if (!copyFile(cachedObj, objPath)) {
+                // Cache read failed unexpectedly — fall back to a fresh
+                // compile rather than aborting the build.
+                std::cerr << "kardc: cache read failed; recompiling\n";
+                if (!compileToObject(srcRaw, srcDir, emitDebug, sourceFile,
+                                     objPath))
+                    return 1;
+            }
+            bool linked = linkObject(objPath, outExePath);
+            std::remove(objPath.c_str());
+            return linked ? 0 : 1;
+        }
+        // MISS: compile, then deposit the object into the cache.
+        std::cerr << "kardc: cache miss " << key << '\n';
+        if (!compileToObject(srcRaw, srcDir, emitDebug, sourceFile, objPath))
+            return 1;
+        // Populate the cache atomically-ish: write to a temp then rename so a
+        // concurrent reader never sees a half-written object. Both steps are
+        // best-effort — a failure here is non-fatal (the build still links
+        // from objPath). `rename` can fail across filesystems, so on error
+        // fall back to a direct copy into place.
+        std::string tmp = cachedObj + ".tmp" + std::to_string(::getpid());
+        if (copyFile(objPath, tmp)) {
+            std::error_code ec = llvm::sys::fs::rename(tmp, cachedObj);
+            if (ec) {
+                copyFile(objPath, cachedObj); // rename failed; copy directly
+            }
+            if (llvm::sys::fs::exists(tmp)) std::remove(tmp.c_str());
+        }
+        bool linked = linkObject(objPath, outExePath);
+        std::remove(objPath.c_str());
+        return linked ? 0 : 1;
     }
-    return 0;
+
+    // No cache (disabled, or dir not usable): compile + link as before.
+    if (!compileToObject(srcRaw, srcDir, emitDebug, sourceFile, objPath))
+        return 1;
+    bool linked = linkObject(objPath, outExePath);
+    std::remove(objPath.c_str());
+    return linked ? 0 : 1;
 }
 
 } // namespace
@@ -553,17 +725,23 @@ int main(int argc, char** argv) {
     // subprograms + line tables). Off by default so the historic codegen
     // path is byte-for-byte unchanged.
     bool emitDebug = false;
+    // Phase 14b: `--no-cache` bypasses the incremental compile cache (always
+    // recompiles + relinks; never reads or writes the cache dir).
+    bool useCache = true;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "-o" && i + 1 < argc) {
             outPath = argv[++i];
         } else if (a == "-g") {
             emitDebug = true;
+        } else if (a == "--no-cache") {
+            useCache = false;
         } else if (a == "-h" || a == "--help") {
             std::cout << "usage: kardc                     # interactive REPL\n"
                          "       kardc <file.kd>            # JIT-run main()\n"
                          "       kardc -o <out> <file.kd>   # AOT-compile to native exe\n"
-                         "       kardc -g ...               # emit DWARF debug info\n";
+                         "       kardc -g ...               # emit DWARF debug info\n"
+                         "       kardc --no-cache ...       # bypass the AOT compile cache\n";
             return 0;
         } else if (!a.empty() && a[0] == '-') {
             std::cerr << "kardc: unknown option `" << a << "`\n";
@@ -587,7 +765,8 @@ int main(int argc, char** argv) {
             std::cerr << "kardc: cannot open file: " << inputPath << '\n';
             return 1;
         }
-        return runAot(*src, outPath, dirOf(inputPath), emitDebug, inputPath);
+        return runAot(*src, outPath, dirOf(inputPath), emitDebug, inputPath,
+                      useCache);
     }
     if (!inputPath.empty()) {
         return runFile(inputPath.c_str(), emitDebug);

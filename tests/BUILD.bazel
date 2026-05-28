@@ -38,6 +38,18 @@ sh_test(
 )
 
 sh_test(
+    name = "smoke_test_lsp_rich",
+    srcs = ["smoke_test_lsp_rich.sh"],
+    data = ["//compiler:kard-lsp"],
+)
+
+sh_test(
+    name = "smoke_test_cache",
+    srcs = ["smoke_test_cache.sh"],
+    data = ["//compiler:kardc"],
+)
+
+sh_test(
     name = "smoke_test_async",
     srcs = ["smoke_test_async.sh"],
     data = ["//compiler:kardc"],
