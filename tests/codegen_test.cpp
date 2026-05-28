@@ -1403,6 +1403,25 @@ void test_async_returns_struct() {
     expectEquals(v, 1020, "async_returns_struct");
 }
 
+// Regression: Poll<T>/block_on<T> specialization keys must include generic
+// type arguments; otherwise Option<bool> and Option<i64> collide and corrupt
+// poll-slot layout.
+void test_async_block_on_option_type_args_do_not_collide() {
+    auto v = compileAndRun(
+        "enum Option<T> { Some(T), None }\n"
+        "async fn ob() -> Option<bool> { Some(true) }\n"
+        "async fn oi() -> Option<i64> { Some(512) }\n"
+        "fn main() -> i64 {\n"
+        "    let _ = block_on(ob());\n"
+        "    match block_on(oi()) {\n"
+        "        Some(x) => x,\n"
+        "        None => 0,\n"
+        "    }\n"
+        "}",
+        "main", "async_block_on_option_type_args_do_not_collide");
+    expectEquals(v, 512, "async_block_on_option_type_args_do_not_collide");
+}
+
 // --- Phase 17b: generic HashMap<i64, V> (value type follows the inserts) ---
 
 // HashMap<i64, bool>: insert (1->true),(2->false); get returns Some(bool) /
@@ -1899,6 +1918,7 @@ int main() {
     test_async_returns_bool_true();
     test_async_returns_bool_false();
     test_async_returns_struct();
+    test_async_block_on_option_type_args_do_not_collide();
     // Phase 13a method-receiver autoref + Iterator trait + adaptors
     test_mut_self_persists_across_calls();
     test_shared_self_multiple_calls();
