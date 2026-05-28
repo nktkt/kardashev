@@ -176,28 +176,24 @@ JITs, and AOT-links real programs.
 | 7 | Module system + complete `rules_kardashev` + `kard` CLI | ✅ `mod foo;` resolves siblings recursively; `pub` enforced on path-qualified references; `foo::bar` path syntax parses; `kard` shell wrapper + Bazel `kardashev_library` / `kardashev_binary` rules ship. |
 | 8 | Optimization passes + LSP + docs site | ✅ LLVM O2 PassBuilder pipeline runs on every emitted module; `kard-lsp` speaks the LSP protocol over stdio and publishes diagnostics; `docs/` carries the language reference, effects system notes, stdlib catalog, and compiler-architecture deep dive. |
 
-## Roadmap v2 — from MVP to a language you'd actually write programs in
+## Roadmap v2 — shipped
 
-v1 proves the pipeline end to end, but to keep programs small it leans on
-recursion + `match` for control flow, top-level `fn`s for higher-order code,
-and static dispatch everywhere. v2 closes those gaps. The **north star** is to
-make the headline `map` example at the top of this README compile end to end —
-an effect-polymorphic higher-order function — because that exercises closures,
-effect-carrying function types, and iteration all at once, which is precisely
-what the language's thesis ("effects are part of the type") demands.
+v1 proved the pipeline end to end but leaned on recursion + `match` for control
+flow, top-level `fn`s for higher-order code, and static dispatch everywhere. v2
+closed those gaps and is now implemented and green on the full test suite (6
+unit suites + 18 smoke tests, JIT + AOT). The **north star** held: the
+effect-polymorphic higher-order pattern — closures + effect-carrying function
+types + iteration — now composes end to end, which is exactly what the
+language's thesis ("effects are part of the type") demands.
 
-| Phase | Goal | What's missing today / why it's next |
-|-------|------|--------------------------------------|
-| 9 | **Iteration**: `while`, `loop`/`break`/`continue`, `for x in it`, and an `Iterator` trait | The `for` keyword is currently *only* `impl Trait for Type`; there are no loop forms at all, so every repetition is hand-rolled recursion. This is the biggest day-to-day ergonomics gap and a prerequisite for stdlib combinators. |
-| 10 | **Closures + effect-carrying function types** | Phase 4.3 gives first-class *top-level* `fn` values, but `types.hpp`'s `Function` kind carries only `args`/`ret` — no effect row. So `fn(T) -> U ! {e}` row-polymorphism through values isn't real yet, and there are no capturing closures (`\|x\| x + n`). This phase lowers closures to env-struct + fn-ptr pairs and threads effect rows through function types so `e` genuinely propagates. **This is the capstone of the language's signature feature.** |
-| 11 | **Trait objects + dynamic dispatch**: `dyn Trait`, vtables, `Box<dyn Trait>` | Traits today are static-only (monomorphized). Heterogeneous collections and plugin-style APIs need runtime dispatch via a vtable layout. |
-| 12 | **Real async runtime**: blocking primitives (timer/IO-readiness) + single-threaded executor + multi-state state-machine transform | Phase 6.2 scaffolded a poll loop with a `pending` block that's never taken because bodies run eagerly. This phase adds genuine suspension points and a scheduler that drives futures to completion, finally exercising that `pending` path. |
-| 13 | **Growable stdlib**: mutable `String` (`push_str`), `HashMap<K,V>`, `&[T]` slices, iterator adaptors (`map`/`filter`/`fold`), `Option`/`Result` combinators | `String` is immutable/literal-backed and there's no associative container. Builds directly on the iterators (9) and closures (10) landed above. |
-| 14 | **Tooling + ecosystem**: `kard fmt`, richer LSP (completion/hover/go-to-def), incremental build cache, dependency resolution via the Bazel module registry, DWARF debug info | ✅ (14a) `kardfmt` source formatter + DWARF debug info behind `-g`. ✅ (14b) `kard-lsp` now serves hover (type / signature **with the effect row**), scope-aware completion, and go-to-definition on top of diagnostics; `kardc -o` has a content-addressed incremental compile cache (`${XDG_CACHE_HOME:-~/.cache}/kardashev`, keyed on resolved source + flags + format version; `--no-cache` to bypass). **Deferred:** cross-project dependency resolution via the Bazel module registry — intra-project deps work today through `mod foo;` sibling resolution + the `kardashev_library`/`kardashev_binary` rules, but a third-party package registry isn't implemented (it can't be verified in this build environment, so it was intentionally not stubbed). |
-
-Dependencies: 13 needs 9 + 10; 12 extends 6; 9, 11, 14 are independent and can
-land in parallel. Suggested order: **9 → 10 → 13**, with **11 / 12 / 14** slotted
-in opportunistically.
+| Phase | Goal | Status |
+|-------|------|--------|
+| 9 | **Iteration**: `while`, `loop`/`break`/`continue`, `for x in it`, and an `Iterator` trait | ✅ `while` / `loop` with `break`/`break v`/`continue`; `let mut` + assignment; `for x in a..b` / `a..=b` over a first-class `Range`; a prelude `Iterator` trait (`fn next(&mut self) -> Option<i64>`) with `for` desugaring through `next()` for any impl (Phase 13a). |
+| 10 | **Closures + effect-carrying function types** | ✅ The `Function` type carries an effect row (`effectLabels` + an HM row variable); `fn(T) -> U ! {e}` row-polymorphism is real — a pure caller invoking `apply(ioFn)` is rejected. Capturing closures `\|x\| x + n` lower to a heap env-struct + a uniform fat-pointer fn-value that subsumes the Phase 4.3 path; a closure's effect row is inferred from its body. **The capstone of the signature feature.** |
+| 11 | **Trait objects + dynamic dispatch**: `dyn Trait`, vtables, `Box<dyn Trait>` | ✅ Trait objects are `{data, vtable}` fat pointers behind `&dyn Trait` / `Box<dyn Trait>`; per-impl vtable globals + thunks; one call site dispatches to multiple runtime impls; object-safety enforced. Static dispatch is an unchanged separate path. |
+| 12 | **Real async runtime**: suspending primitive + single-threaded executor + multi-state state-machine transform | ✅ `Future = {poll, frame}`; each `async fn` lowers to a resumable poll fn over a heap frame that `switch`es on a resume state and spills locals live across awaits; `.await` genuinely suspends (returns `Pending`) and resumes. `yield_now` suspends once; `block_on` drives to completion. Verified: the `pending` path is taken (poll count > awaits) and pre-await effects fire once. |
+| 13 | **Growable stdlib**: mutable `String`, `HashMap<K,V>`, `&[T]` slices, iterator adaptors (`map`/`filter`/`fold`), `Option`/`Result` combinators | ✅ Method receivers autoref-borrow (`&self`/`&mut self`) so stateful methods work; heap-backed growable `String` (`push_str`), `HashMap<i64,i64>` (linear-probing + rehash) returning `Option`, `&v[a..b]` slices; `fold`/`map`/`filter` as generic closure-driven library fns; prelude `Option`/`Result` combinators — all effect-row aware. |
+| 14 | **Tooling + ecosystem**: `kard fmt`, richer LSP (completion/hover/go-to-def), incremental build cache, dependency resolution via the Bazel module registry, DWARF debug info | ✅ (14a) `kardfmt` idempotent source formatter + DWARF debug info behind `-g`. ✅ (14b) `kard-lsp` serves hover (signature **with the effect row**), scope-aware completion, and go-to-definition on top of diagnostics; `kardc -o` has a content-addressed incremental compile cache (`${XDG_CACHE_HOME:-~/.cache}/kardashev`, keyed on resolved source + flags + format version; `--no-cache` to bypass). **Deferred (1 item):** cross-project dependency resolution via the Bazel module registry — intra-project deps work via `mod foo;` + the `kardashev_library`/`kardashev_binary` rules, but a third-party package registry isn't implemented (it can't be verified in this build environment, so it was intentionally not stubbed). |
 
 ## Why "kardashev"?
 
