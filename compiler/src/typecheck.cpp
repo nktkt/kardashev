@@ -641,9 +641,10 @@ public:
                       impl.forType.line, impl.forType.column);
                 continue;
             }
-            // Key inherent impls under the same `inherent` token codegen uses
-            // for mangling, so the per-type/per-"trait" map stays consistent.
-            const std::string implKey = inherent ? "inherent" : impl.traitName;
+            // Key inherent impls under an internal-only sentinel so user-defined
+            // trait names can never collide with inherent impl registrations.
+            const std::string implKey = inherent ? kInherentImplSentinel
+                                                 : impl.traitName;
             ImplRegistration reg;
             reg.traitName = impl.traitName; // empty for inherent
             reg.typeName = typeName;
@@ -1355,14 +1356,15 @@ private:
     // expressible — duplicate-impl detection rejects the second. A
     // later phase that wants per-typeArgs impls will extend this
     // mangling and the (typeName, trait) lookup to include typeArgs.
+    static constexpr const char* kInherentImplSentinel = "__kd_inherent_impl";
+
     std::string implMethodMangledName(const std::string& trait,
                                        const ast::TypeRef& forType,
                                        const std::string& method) {
-        // Phase 15: inherent impls carry an empty trait name. Mangle them
-        // under a fixed `inherent` token so the name is stable + readable
-        // and can never collide with a real trait impl. Codegen mirrors this
-        // in `implMethodMangle`.
-        const std::string t = trait.empty() ? "inherent" : trait;
+        // Inherent impls carry an empty trait name. Mangle them under an
+        // internal-only sentinel so they cannot collide with user traits.
+        // Codegen mirrors this in `implMethodMangle`.
+        const std::string t = trait.empty() ? kInherentImplSentinel : trait;
         return "__impl_" + t + "_for_" + forType.name + "__" + method;
     }
 

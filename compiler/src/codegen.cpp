@@ -155,12 +155,14 @@ public:
     // Mirror typecheck.cpp's mangling. Phase 3.3 keys impls by the
     // implementing type's BASE name only; see typecheck.cpp's comment
     // for the rationale.
+    static constexpr const char* kInherentImplSentinel = "__kd_inherent_impl";
+
     std::string implMethodMangle(const std::string& trait,
                                   const ast::TypeRef& forType,
                                   const std::string& method) {
-        // Phase 15: inherent impls (empty trait name) mangle under the fixed
-        // `inherent` token — must match typecheck's implMethodMangledName.
-        const std::string t = trait.empty() ? "inherent" : trait;
+        // Inherent impls (empty trait name) mangle under an internal-only
+        // sentinel — must match typecheck's implMethodMangledName.
+        const std::string t = trait.empty() ? kInherentImplSentinel : trait;
         return "__impl_" + t + "_for_" + forType.name + "__" + method;
     }
 
