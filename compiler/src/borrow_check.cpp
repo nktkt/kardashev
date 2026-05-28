@@ -484,28 +484,33 @@ private:
             return std::max(lastInSubtree,
                             consume(*ae->operand, expectExpire));
         }
-        // Phase 9: loop forms. Loop bodies are visited once for analysis
-        // (we don't unroll); this matches the conservative move/borrow
-        // model the rest of the checker uses.
+        // Phase 9: loop forms.
         if (auto* we = dynamic_cast<const ast::WhileExpr*>(&e)) {
-            lastInSubtree = std::max(lastInSubtree,
-                                       consume(*we->cond, expectExpire));
-            lastInSubtree = std::max(lastInSubtree,
-                                       consume(*we->body, expectExpire));
+            withLoopBackedgeMoveCheck(*we, [&]() {
+                lastInSubtree = std::max(lastInSubtree,
+                                           consume(*we->cond, expectExpire));
+                lastInSubtree = std::max(lastInSubtree,
+                                           consume(*we->body, expectExpire));
+            });
             return lastInSubtree;
         }
         if (auto* le = dynamic_cast<const ast::LoopExpr*>(&e)) {
-            return std::max(lastInSubtree,
-                            consume(*le->body, expectExpire));
+            withLoopBackedgeMoveCheck(*le, [&]() {
+                lastInSubtree = std::max(lastInSubtree,
+                                           consume(*le->body, expectExpire));
+            });
+            return lastInSubtree;
         }
         if (auto* fe = dynamic_cast<const ast::ForExpr*>(&e)) {
             lastInSubtree = std::max(lastInSubtree,
                                        consume(*fe->iter, expectExpire));
-            scopes_.push_back({});
-            bindPattern(*fe->pattern, makeInt(), /*prePass=*/false);
-            lastInSubtree = std::max(lastInSubtree,
-                                       consume(*fe->body, expectExpire));
-            scopes_.pop_back();
+            withLoopBackedgeMoveCheck(*fe, [&]() {
+                scopes_.push_back({});
+                bindPattern(*fe->pattern, makeInt(), /*prePass=*/false);
+                lastInSubtree = std::max(lastInSubtree,
+                                           consume(*fe->body, expectExpire));
+                scopes_.pop_back();
+            });
             return lastInSubtree;
         }
         if (auto* re = dynamic_cast<const ast::RangeExpr*>(&e)) {
@@ -631,6 +636,43 @@ private:
         loan.line = id.line;
         loan.column = id.column;
         activeLoans_.push_back(loan);
+    }
+
+    template <typename Fn>
+    void withLoopBackedgeMoveCheck(const ast::Expr& loopExpr, Fn&& walkBody) {
+        struct Snap {
+            Binding* binding;
+            OwnState state;
+            int moveLine;
+            int moveCol;
+        };
+        std::vector<Snap> snaps;
+        for (auto& scope : scopes_) {
+            for (const auto& [name, declPos] : scope) {
+                (void)name;
+                Binding* b = lookupBindingByDeclPos(declPos);
+                if (!b) continue;
+                snaps.push_back({b, b->state, b->moveLine, b->moveCol});
+            }
+        }
+
+        walkBody();
+
+        for (const auto& s : snaps) {
+            if (s.binding->isMoveTyped && s.state != OwnState::Moved &&
+                s.binding->state == OwnState::Moved) {
+                error("cannot move captured value out of a loop body",
+                      loopExpr.line, loopExpr.column);
+                break;
+            }
+        }
+        // Preserve pre-loop ownership state so later diagnostics are not
+        // cascaded from the speculative single-iteration walk.
+        for (const auto& s : snaps) {
+            s.binding->state = s.state;
+            s.binding->moveLine = s.moveLine;
+            s.binding->moveCol = s.moveCol;
+        }
     }
 
     int consumeBlock(const ast::BlockExpr& block) {
