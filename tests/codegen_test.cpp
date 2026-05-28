@@ -1997,6 +1997,147 @@ void test_no_drop_glue_for_scalars() {
     expectAbsent(ir, "droplive", "no_drop_glue_for_scalars");
 }
 
+// --- Phase 23: real panic + unwinding (setjmp/longjmp + cleanup stack). ----
+// _setjmp/_longjmp/exit/write/dprintf resolve in-process (the test binary links
+// libc). We only JIT-RUN the CAUGHT cases here — an uncaught panic calls
+// exit(101), which would tear down the whole unit-test process; that path is
+// covered by the smoke test (asserting the 101 exit code out-of-process).
+
+// catch over a panicking fn returns the recovery value (the panic unwound back
+// into catch). The catch helper's _setjmp/_longjmp round-trip works under JIT.
+void test_catch_recovers_from_panic() {
+    auto v = compileAndRun(
+        "fn boom() -> i64 ! { panic } { panic(\"x\"); 0 }\n"
+        "fn main() -> i64 ! { io } { catch(boom, 555) }",
+        "main", "catch_recovers_from_panic");
+    expectEquals(v, 555, "catch_recovers_from_panic");
+}
+
+// catch over a NON-panicking fn returns that fn's real value (the boundary is
+// simply never triggered; setjmp returns 0 and we run + return the callback).
+void test_catch_returns_real_value() {
+    auto v = compileAndRun(
+        "fn ok() -> i64 { 77 }\n"
+        "fn main() -> i64 ! { io } { catch(ok, 555) }",
+        "main", "catch_returns_real_value");
+    expectEquals(v, 77, "catch_returns_real_value");
+}
+
+// Execution continues normally after a caught panic: catch(boom,1) + a real
+// computation. Proves the post-catch path runs (no lingering unwind state).
+void test_execution_continues_after_catch() {
+    auto v = compileAndRun(
+        "fn boom() -> i64 ! { panic } { panic(\"x\"); 0 }\n"
+        "fn main() -> i64 ! { io } {\n"
+        "  let a = catch(boom, 1);\n"   // 1 (recovered)
+        "  let b = catch(boom, 40);\n"  // 40 (recovered again — stack is clean)
+        "  a + b + 1\n"                  // 42
+        "}",
+        "main", "execution_continues_after_catch");
+    expectEquals(v, 42, "execution_continues_after_catch");
+}
+
+// Drop runs while unwinding a caught panic. A heap Box<i64> declared before the
+// panic must be freed on the unwind path; we run it 50000 times so a leak/double
+// -free would corrupt the JIT heap and crash the test — a clean return is the
+// proof that the cleanup-stack entry ran the drop exactly once per unwind.
+void test_drop_runs_on_panic_unwind() {
+    auto v = compileAndRun(
+        "fn boom() -> i64 ! { alloc, panic } {\n"
+        "  let b = Box::new(7);\n"   // heap; must be freed on unwind
+        "  panic(\"boom\");\n"
+        "  0\n"
+        "}\n"
+        "fn main() -> i64 ! { alloc, io } {\n"
+        "  let mut k = 0;\n"
+        "  while k < 50000 { let r = catch(boom, 0); k = k + 1; }\n"
+        "  k\n"
+        "}",
+        "main", "drop_runs_on_panic_unwind");
+    expectEquals(v, 50000, "drop_runs_on_panic_unwind");
+}
+
+// A value MOVED into a callee that panics is dropped exactly once (the caller's
+// cleanup entry sees the moved-out drop flag cleared and skips it). 50000 turns
+// — a double-free would crash the JIT.
+void test_move_then_panic_no_double_free() {
+    auto v = compileAndRun(
+        "fn sink(b: Box<i64>) -> i64 ! { panic } { panic(\"x\"); 0 }\n"
+        "fn boom() -> i64 ! { alloc, panic } {\n"
+        "  let b = Box::new(9);\n"
+        "  sink(b)\n"                 // b moves into sink; sink panics holding it
+        "}\n"
+        "fn main() -> i64 ! { alloc, io } {\n"
+        "  let mut k = 0;\n"
+        "  while k < 50000 { let r = catch(boom, 0); k = k + 1; }\n"
+        "  k\n"
+        "}",
+        "main", "move_then_panic_no_double_free");
+    expectEquals(v, 50000, "move_then_panic_no_double_free");
+}
+
+// A dynamic out-of-bounds array index PANICS and is caught (returns recovery).
+void test_array_oob_index_panics_caught() {
+    auto v = compileAndRun(
+        "fn oob() -> i64 ! { panic } {\n"
+        "  let a = [10, 20, 30];\n"
+        "  let i = 5;\n"
+        "  a[i]\n"
+        "}\n"
+        "fn main() -> i64 ! { io } { catch(oob, 777) }",
+        "main", "array_oob_index_panics_caught");
+    expectEquals(v, 777, "array_oob_index_panics_caught");
+}
+
+// An in-bounds dynamic index does NOT panic (the bounds check only fires when
+// actually out of range) — regression guard.
+void test_array_inbounds_index_no_panic() {
+    auto v = compileAndRun(
+        "fn main() -> i64 {\n"
+        "  let a = [5, 15, 25, 35];\n"
+        "  let mut i = 0;\n"
+        "  let mut acc = 0;\n"
+        "  while i < 4 { acc = acc + a[i]; i = i + 1; }\n"
+        "  acc\n"
+        "}",
+        "main", "array_inbounds_index_no_panic");
+    expectEquals(v, 80, "array_inbounds_index_no_panic");
+}
+
+// A may-panic program emits the panic runtime: the `panic` body, the
+// setjmp/longjmp catch round-trip, and — when a droppable local is live across
+// a panic — the cleanup-stack machinery (push, plus the @free the unwinder
+// runs). `boom` holds a heap Box across the panic so the cleanup path survives
+// optimization.
+void test_panic_runtime_emitted_when_used() {
+    std::string ir = compileToIR(
+        "fn boom() -> i64 ! { alloc, panic } {\n"
+        "  let b = Box::new(7);\n"
+        "  panic(\"x\");\n"
+        "  0\n"
+        "}\n"
+        "fn main() -> i64 ! { alloc, io } { catch(boom, 0) }",
+        "panic_runtime_emitted_when_used");
+    expectContains(ir, "_setjmp", "panic_runtime_emitted_when_used");
+    expectContains(ir, "__kd_cleanup", "panic_runtime_emitted_when_used");
+    expectContains(ir, "@panic", "panic_runtime_emitted_when_used");
+}
+
+// The byte-identical-for-panic-free invariant: a program that never panics
+// (no panic/catch, no array indexing) emits ZERO panic runtime — no
+// setjmp/longjmp, no cleanup stack — even when it has Drop-bearing locals.
+void test_no_panic_runtime_when_unused() {
+    std::string ir = compileToIR(
+        "trait Drop { fn drop(&mut self); }\n"
+        "struct Noisy { id: i64 }\n"
+        "impl Drop for Noisy { fn drop(&mut self) { let x = self.id; } }\n"
+        "fn main() -> i64 { let a = Noisy { id: 1 }; 0 }",
+        "no_panic_runtime_when_unused");
+    expectAbsent(ir, "_setjmp", "no_panic_runtime_when_unused");
+    expectAbsent(ir, "__kd_cleanup", "no_panic_runtime_when_unused");
+    expectAbsent(ir, "__kd_catch", "no_panic_runtime_when_unused");
+}
+
 // --- Phase 19: OS threads (pthread) + Mutex run end-to-end through the JIT.
 // pthread symbols resolve in-process (the test binary links libc/pthread).
 
@@ -2235,7 +2376,16 @@ int main() {
     test_mutex_roundtrip_single_thread();
     test_mutex_mutual_exclusion_two_threads();
     test_thread_runtime_emits_pthread_externs();
-    std::cout << "All codegen tests passed (134 cases) — Phase 16 Drop/RAII: "
+    test_catch_recovers_from_panic();
+    test_catch_returns_real_value();
+    test_execution_continues_after_catch();
+    test_drop_runs_on_panic_unwind();
+    test_move_then_panic_no_double_free();
+    test_array_oob_index_panics_caught();
+    test_array_inbounds_index_no_panic();
+    test_panic_runtime_emitted_when_used();
+    test_no_panic_runtime_when_unused();
+    std::cout << "All codegen tests passed (143 cases) — Phase 16 Drop/RAII: "
                  "reverse-order scope drops, move semantics, conditional-move "
                  "drop flags, Vec/Box free, scalar codegen unchanged; Phase "
                  "17a fn-value field calls + FnMut captures; Phase 17b generic "
@@ -2244,6 +2394,9 @@ int main() {
                  "generic trait params (Container<T>/Iterator<T>: bounded fn, "
                  "for-loop, fold over bool, <I: Iterator> regression); Phase "
                  "21b associated types (Self::Item + C::Item at i64/bool) + "
-                 "where-clause equivalence\n";
+                 "where-clause equivalence; Phase 23 panic/unwind (catch "
+                 "recovers via setjmp/longjmp, Drop runs on unwind + no "
+                 "double-free over 50k unwinds, array OOB panics, panic runtime "
+                 "gated to may-panic programs)\n";
     return 0;
 }

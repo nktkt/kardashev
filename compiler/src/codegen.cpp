@@ -54,6 +54,12 @@ public:
     }
 
     void run(const ast::Program& program) {
+        // Phase 23: decide up front whether this program can panic. A program
+        // that never panics gets ZERO panic-runtime / cleanup-stack machinery
+        // (byte-identical IR to pre-Phase-23). "Can panic" = it calls
+        // `panic`/`catch`, or it indexes a fixed-size array `[T;N]` (which can
+        // go out of bounds at runtime). The scan also looks inside impl methods.
+        programMayPanic_ = programContainsPanic(program);
         for (const auto& fn : program.functions) {
             fnAst_[fn.name] = &fn;
         }
@@ -107,6 +113,13 @@ public:
         declareAllStructs();
         declareAllEnums();
         declareBuiltins();
+        // Phase 23: emit the panic + unwind runtime (cleanup stack, catch
+        // stack, the `panic` body, and the helpers) only when the program can
+        // actually panic. Must come after declareBuiltins (it reuses the
+        // String layout + malloc/realloc/free) and before fn bodies (so
+        // emitCall can resolve `panic`/`catch` and registerDroppableLocal can
+        // push cleanup entries).
+        if (programMayPanic_) declarePanicRuntime();
         // Declare monomorphic top-level functions and impl methods.
         for (const auto& fn : program.functions) {
             if (fn.genericParams.empty()) declareMonoFn(fn);
@@ -164,6 +177,117 @@ public:
         // sentinel — must match typecheck's implMethodMangledName.
         const std::string t = trait.empty() ? kInherentImplSentinel : trait;
         return "__impl_" + t + "_for_" + forType.name + "__" + method;
+    }
+
+    // --- Phase 23: whole-program "can this panic?" scan. -------------------
+    // Returns true iff any fn/impl-method body calls `panic`/`catch` or indexes
+    // a fixed-size array (`arr[i]`, an IndexExpr, which can OOB-panic). Used to
+    // gate ALL panic-runtime + cleanup-stack emission so panic-free programs
+    // are byte-identical to before.
+    bool programContainsPanic(const ast::Program& program) {
+        for (const auto& fn : program.functions)
+            if (fn.body && exprMayPanic(*fn.body)) return true;
+        for (const auto& impl : program.impls)
+            for (const auto& m : impl.methods)
+                if (m.body && exprMayPanic(*m.body)) return true;
+        return false;
+    }
+    bool exprMayPanic(const ast::Expr& e) {
+        if (dynamic_cast<const ast::IndexExpr*>(&e)) return true; // array OOB
+        if (auto* c = dynamic_cast<const ast::CallExpr*>(&e)) {
+            if (c->callee == "panic" || c->callee == "catch") return true;
+            for (const auto& a : c->args)
+                if (exprMayPanic(*a)) return true;
+            return false;
+        }
+        if (auto* b = dynamic_cast<const ast::BlockExpr*>(&e)) {
+            for (const auto& s : b->stmts)
+                if (stmtMayPanic(*s)) return true;
+            return b->tail && exprMayPanic(*b->tail);
+        }
+        if (auto* x = dynamic_cast<const ast::BinaryExpr*>(&e))
+            return exprMayPanic(*x->lhs) || exprMayPanic(*x->rhs);
+        if (auto* x = dynamic_cast<const ast::UnaryExpr*>(&e))
+            return exprMayPanic(*x->operand);
+        if (auto* x = dynamic_cast<const ast::CallValueExpr*>(&e)) {
+            if (exprMayPanic(*x->callee)) return true;
+            for (const auto& a : x->args)
+                if (exprMayPanic(*a)) return true;
+            return false;
+        }
+        if (auto* x = dynamic_cast<const ast::MethodCallExpr*>(&e)) {
+            if (exprMayPanic(*x->receiver)) return true;
+            for (const auto& a : x->args)
+                if (exprMayPanic(*a)) return true;
+            return false;
+        }
+        if (auto* x = dynamic_cast<const ast::StructLitExpr*>(&e)) {
+            for (const auto& [_n, v] : x->fields)
+                if (exprMayPanic(*v)) return true;
+            return false;
+        }
+        if (auto* x = dynamic_cast<const ast::FieldExpr*>(&e))
+            return exprMayPanic(*x->object);
+        if (auto* x = dynamic_cast<const ast::IfExpr*>(&e))
+            return exprMayPanic(*x->cond) || exprMayPanic(*x->thenBranch) ||
+                   exprMayPanic(*x->elseBranch);
+        if (auto* x = dynamic_cast<const ast::MatchExpr*>(&e)) {
+            if (exprMayPanic(*x->scrutinee)) return true;
+            for (const auto& arm : x->arms)
+                if (exprMayPanic(*arm.body)) return true;
+            return false;
+        }
+        if (auto* x = dynamic_cast<const ast::WhileExpr*>(&e))
+            return exprMayPanic(*x->cond) || exprMayPanic(*x->body);
+        if (auto* x = dynamic_cast<const ast::LoopExpr*>(&e))
+            return exprMayPanic(*x->body);
+        if (auto* x = dynamic_cast<const ast::ForExpr*>(&e))
+            return exprMayPanic(*x->iter) || exprMayPanic(*x->body);
+        if (auto* x = dynamic_cast<const ast::RangeExpr*>(&e))
+            return exprMayPanic(*x->start) || exprMayPanic(*x->end);
+        if (auto* x = dynamic_cast<const ast::BreakExpr*>(&e))
+            return x->value && exprMayPanic(*x->value);
+        if (auto* x = dynamic_cast<const ast::TryExpr*>(&e))
+            return exprMayPanic(*x->operand);
+        if (auto* x = dynamic_cast<const ast::RefExpr*>(&e))
+            return exprMayPanic(*x->operand);
+        if (auto* x = dynamic_cast<const ast::SliceExpr*>(&e))
+            return exprMayPanic(*x->operand) || exprMayPanic(*x->start) ||
+                   exprMayPanic(*x->end);
+        if (auto* x = dynamic_cast<const ast::ArrayLitExpr*>(&e)) {
+            for (const auto& el : x->elements)
+                if (exprMayPanic(*el)) return true;
+            return false;
+        }
+        if (auto* x = dynamic_cast<const ast::TupleLitExpr*>(&e)) {
+            for (const auto& el : x->elements)
+                if (exprMayPanic(*el)) return true;
+            return false;
+        }
+        if (auto* x = dynamic_cast<const ast::TupleFieldExpr*>(&e))
+            return exprMayPanic(*x->object);
+        if (auto* x = dynamic_cast<const ast::BoxNewExpr*>(&e))
+            return exprMayPanic(*x->value);
+        if (auto* x = dynamic_cast<const ast::AwaitExpr*>(&e))
+            return exprMayPanic(*x->operand);
+        // ClosureExpr: a closure body that panics only matters when CALLED;
+        // but to be safe (a closure passed to catch IS where panics live) we
+        // also descend into closure bodies.
+        if (auto* x = dynamic_cast<const ast::ClosureExpr*>(&e))
+            return x->body && exprMayPanic(*x->body);
+        // IntLit / BoolLit / StringLit / Ident / Continue: never panic.
+        return false;
+    }
+    bool stmtMayPanic(const ast::Stmt& s) {
+        if (auto* let = dynamic_cast<const ast::LetStmt*>(&s))
+            return let->value && exprMayPanic(*let->value);
+        if (auto* ret = dynamic_cast<const ast::ReturnStmt*>(&s))
+            return ret->value && exprMayPanic(*ret->value);
+        if (auto* as = dynamic_cast<const ast::AssignStmt*>(&s))
+            return exprMayPanic(*as->target) || exprMayPanic(*as->value);
+        if (auto* es = dynamic_cast<const ast::ExprStmt*>(&s))
+            return exprMayPanic(*es->expr);
+        return false;
     }
 
     CodegenResult finish() {
@@ -426,6 +550,13 @@ private:
         llvm::AllocaInst* storage = nullptr;
         llvm::AllocaInst* flag = nullptr;
         TypePtr type;
+        // Phase 23: true when this local also pushed an entry onto the runtime
+        // unwind cleanup stack (only in programs that can panic). On NORMAL
+        // scope exit we both run the inline guarded drop AND pop the cleanup
+        // entry; on PANIC the unwinder runs the cleanup entry instead (the
+        // inline path is jumped over). The SAME drop flag guards both, so the
+        // value is dropped at most once on either path. See the panic runtime.
+        bool pushedCleanup = false;
     };
     // Lexical scope stack of droppable locals, innermost last. Each entry is
     // the declaration-ordered list of owning locals in that scope; scope exit
@@ -535,6 +666,40 @@ private:
     llvm::StructType* threadBlkTy_ = nullptr;
     llvm::StructType* mutexBlkTy_ = nullptr;
     llvm::Function* threadTrampolineFn_ = nullptr; // __kd_thread_trampoline
+
+    // --- Phase 23: real panic + unwinding (setjmp/longjmp + cleanup stack) ---
+    // `programMayPanic_` is computed once in run(): true iff the program text
+    // contains a `panic`/`catch` call or any array `[T;N]` indexing (which can
+    // OOB-panic). When false, NONE of the panic runtime or per-local cleanup
+    // bookkeeping is emitted, so a panic-free program's IR is byte-identical to
+    // pre-Phase-23. When true, every droppable local registers a cleanup-stack
+    // entry so the unwinder can run its Drop glue while unwinding past its frame.
+    bool programMayPanic_ = false;
+    // libc setjmp/longjmp + process-exit/stderr-write externs. We use the
+    // non-signal-mask `_setjmp`/`_longjmp` (real symbols on both glibc and
+    // macOS/BSD; plain `setjmp` is a macro / `__sigsetjmp` with an extra arg).
+    // `_setjmp` is marked `returns_twice` so LLVM keeps values live across it.
+    llvm::Function* setjmpFn_ = nullptr;   // int _setjmp(jmp_buf)
+    llvm::Function* longjmpFn_ = nullptr;  // void _longjmp(jmp_buf, int)
+    llvm::Function* exitFn_ = nullptr;     // void exit(int)
+    // The process-global unwind cleanup stack and the catch-context stack, plus
+    // the helper fns that manage them. A cleanup entry is `{ i8* flag, i8*
+    // value, void(i8*)* drop_fn }`: on unwind we run `if(*flag){*flag=0;
+    // drop_fn(value)}` — reusing the value's Phase-16 drop flag so a moved-out
+    // value (flag already cleared) is never dropped. A catch entry is `{ [256 x
+    // i8] jmp_buf, i64 saved_cleanup_depth }`.
+    llvm::StructType* cleanupEntTy_ = nullptr; // { i8*, i8*, i8* }
+    llvm::StructType* catchEntTy_ = nullptr;   // { [256 x i8], i64 }
+    llvm::Function* cleanupPushFn_ = nullptr;  // __kd_cleanup_push(flag,val,dropfn)
+    llvm::Function* cleanupPopFn_ = nullptr;   // __kd_cleanup_pop(n) (normal exit)
+    llvm::Function* cleanupDepthFn_ = nullptr; // __kd_cleanup_depth() -> i64
+    llvm::Function* panicFn_ = nullptr;        // panic(&String)
+    llvm::Function* catchPushFn_ = nullptr;    // __kd_catch_push() -> i8* (jmp_buf)
+    llvm::Function* catchPopFn_ = nullptr;     // __kd_catch_pop()
+    llvm::Function* panicOobFn_ = nullptr;     // __kd_panic_oob(idx,len) [array OOB]
+    // Cache of per-type drop thunks `void __kd_drop_<mangled>(i8*)` that wrap
+    // emitDropGlue, so a cleanup entry can name a uniform `void(i8*)` drop fn.
+    std::unordered_map<std::string, llvm::Function*> dropThunks_;
 
     // Phase 10b: the uniform fat-pointer LLVM type for ALL first-class fn
     // VALUES — `{ i8* fn, i8* env }`. `fn` points at a generated function
@@ -1845,6 +2010,490 @@ private:
             b.CreateRet(fn->getArg(1));
             declaredFns_["mutex_set"] = fn;
         }
+    }
+
+    // --- Phase 23: real panic + unwinding (setjmp/longjmp + cleanup stack) ---
+    //
+    // Mechanism. Two process-global growable stacks live in IR:
+    //   * the CLEANUP stack — one entry per live droppable local, recording its
+    //     Phase-16 drop flag, its storage pointer, and a `void(i8*)` drop thunk.
+    //   * the CATCH stack — one entry per active `catch`, recording a `jmp_buf`
+    //     and the cleanup-stack depth captured when the catch was entered.
+    // A droppable local pushes a cleanup entry when it becomes live (right where
+    // Phase 16 sets its drop flag) and the SAME flag guards the cleanup. On
+    // NORMAL scope exit the inline Phase-16 drop runs (clearing the flag) AND we
+    // discard the scope's cleanup entries (pop N). On PANIC we longjmp past all
+    // the inline drops, so the unwinder walks the cleanup entries from the
+    // current depth down to the catching frame's saved depth and runs each one
+    // (flag-guarded — a moved-out value has flag==0 and is skipped). Because the
+    // one flag gates both the inline path and the cleanup-entry path, and the
+    // two paths are mutually exclusive (you either fall through OR longjmp),
+    // every value is dropped AT MOST once and (if still owned) EXACTLY once.
+    //
+    // Emitted only when programMayPanic_ — panic-free programs keep their
+    // pre-Phase-23 IR untouched.
+    void declarePanicRuntime() {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* voidTy = llvm::Type::getVoidTy(ctx);
+        auto* strTy = structTypes_["String"];
+
+        // libc externs. `_setjmp`/`_longjmp` are the non-signal-mask variants:
+        // real symbols (plain `setjmp` is a macro / `__sigsetjmp(env,1)`),
+        // present on glibc AND macOS/BSD, and they take only the jmp_buf.
+        setjmpFn_ = llvm::Function::Create(
+            llvm::FunctionType::get(i32Ty, {i8PtrTy}, false),
+            llvm::Function::ExternalLinkage, "_setjmp", module_.get());
+        // CRITICAL: setjmp returns twice. The attribute makes LLVM keep
+        // memory state consistent across the call (no sinking loads/stores
+        // past it), which is what lets the catch helper observe the longjmp.
+        setjmpFn_->addFnAttr(llvm::Attribute::ReturnsTwice);
+        longjmpFn_ = llvm::Function::Create(
+            llvm::FunctionType::get(voidTy, {i8PtrTy, i32Ty}, false),
+            llvm::Function::ExternalLinkage, "_longjmp", module_.get());
+        longjmpFn_->addFnAttr(llvm::Attribute::NoReturn);
+        exitFn_ = llvm::Function::Create(
+            llvm::FunctionType::get(voidTy, {i32Ty}, false),
+            llvm::Function::ExternalLinkage, "exit", module_.get());
+        exitFn_->addFnAttr(llvm::Attribute::NoReturn);
+        // POSIX `ssize_t write(int fd, const void* buf, size_t n)` — we write
+        // panic messages straight to fd 2 (stderr) so we never need the
+        // platform-specific `stderr`/`__stderrp` FILE* global. Declared here
+        // (idempotent if the Linux reactor block already created it under a
+        // different cached pointer — getOrInsertFunction would dedup, but these
+        // two declares live in different `#if` worlds so we use a local name).
+        auto* writeFn = llvm::cast<llvm::Function>(
+            module_
+                ->getOrInsertFunction(
+                    "write",
+                    llvm::FunctionType::get(i64Ty, {i32Ty, i8PtrTy, i64Ty},
+                                            false))
+                .getCallee());
+
+        // Entry struct layouts.
+        cleanupEntTy_ = llvm::StructType::create(
+            ctx, {i8PtrTy, i8PtrTy, i8PtrTy}, "kd.cleanup_ent");
+        auto* jmpBufArrTy = llvm::ArrayType::get(i8Ty, 256); // >= any jmp_buf
+        catchEntTy_ = llvm::StructType::create(
+            ctx, {jmpBufArrTy, i64Ty}, "kd.catch_ent");
+
+        // The two stacks: { i8* entries, i64 depth, i64 cap }, zero-initialized.
+        auto* stackTy =
+            llvm::StructType::create(ctx, {i8PtrTy, i64Ty, i64Ty}, "kd.ustack");
+        // Thread-local so each thread unwinds its OWN cleanup/catch stacks —
+        // a panic on one thread never touches another's pending Drops. (The
+        // GeneralDynamic TLS model works under both the ORC JIT — host process
+        // links libc's TLS support — and AOT via clang.)
+        auto* cleanupG = new llvm::GlobalVariable(
+            *module_, stackTy, false, llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantAggregateZero::get(stackTy), "__kd_cleanup");
+        cleanupG->setThreadLocalMode(
+            llvm::GlobalValue::GeneralDynamicTLSModel);
+        auto* catchG = new llvm::GlobalVariable(
+            *module_, stackTy, false, llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantAggregateZero::get(stackTy), "__kd_catch");
+        catchG->setThreadLocalMode(
+            llvm::GlobalValue::GeneralDynamicTLSModel);
+
+        // Shared helper: ensure `*stack` has room for one more `entTy` element,
+        // growing (realloc, doubling, min 8) when depth==cap. Returns the base
+        // entries pointer (post-grow). Emitted inline into the caller's block.
+        auto ensureCap = [&](llvm::IRBuilder<>& b, llvm::Value* stack,
+                             llvm::Type* entTy) -> llvm::Value* {
+            uint64_t entSz = module_->getDataLayout().getTypeAllocSize(entTy);
+            auto* depthP = b.CreateStructGEP(stackTy, stack, 1, "depthp");
+            auto* capP = b.CreateStructGEP(stackTy, stack, 2, "capp");
+            auto* dataP = b.CreateStructGEP(stackTy, stack, 0, "datap");
+            auto* depth = b.CreateLoad(i64Ty, depthP, "depth");
+            auto* cap = b.CreateLoad(i64Ty, capP, "cap");
+            auto* full = b.CreateICmpSGE(depth, cap, "full");
+            auto* fn = b.GetInsertBlock()->getParent();
+            auto* growBB = llvm::BasicBlock::Create(ctx, "grow", fn);
+            auto* doneBB = llvm::BasicBlock::Create(ctx, "grow.done", fn);
+            b.CreateCondBr(full, growBB, doneBB);
+            b.SetInsertPoint(growBB);
+            // newCap = cap < 8 ? 8 : cap*2
+            auto* dbl = b.CreateShl(cap, 1, "dbl");
+            auto* small = b.CreateICmpSLT(cap, llvm::ConstantInt::get(i64Ty, 8),
+                                          "small");
+            auto* newCap = b.CreateSelect(
+                small, llvm::ConstantInt::get(i64Ty, 8), dbl, "newcap");
+            auto* oldData = b.CreateLoad(i8PtrTy, dataP, "olddata");
+            auto* bytes = b.CreateMul(
+                newCap, llvm::ConstantInt::get(i64Ty, entSz), "bytes");
+            auto* grown = b.CreateCall(reallocFn_, {oldData, bytes}, "grown");
+            b.CreateStore(grown, dataP);
+            b.CreateStore(newCap, capP);
+            b.CreateBr(doneBB);
+            b.SetInsertPoint(doneBB);
+            return b.CreateLoad(i8PtrTy, dataP, "entries");
+        };
+
+        // void __kd_cleanup_push(i8* flag, i8* val, i8* dropfn)
+        {
+            auto* fn = llvm::Function::Create(
+                llvm::FunctionType::get(voidTy, {i8PtrTy, i8PtrTy, i8PtrTy},
+                                        false),
+                llvm::Function::InternalLinkage, "__kd_cleanup_push",
+                module_.get());
+            auto* b0 = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(b0);
+            auto* entries = ensureCap(b, cleanupG, cleanupEntTy_);
+            auto* depthP = b.CreateStructGEP(stackTy, cleanupG, 1, "depthp");
+            auto* depth = b.CreateLoad(i64Ty, depthP, "depth");
+            auto* slot =
+                b.CreateGEP(cleanupEntTy_, entries, depth, "slot");
+            b.CreateStore(fn->getArg(0),
+                          b.CreateStructGEP(cleanupEntTy_, slot, 0, "flagp"));
+            b.CreateStore(fn->getArg(1),
+                          b.CreateStructGEP(cleanupEntTy_, slot, 1, "valp"));
+            b.CreateStore(fn->getArg(2),
+                          b.CreateStructGEP(cleanupEntTy_, slot, 2, "dropp"));
+            b.CreateStore(
+                b.CreateAdd(depth, llvm::ConstantInt::get(i64Ty, 1), "d1"),
+                depthP);
+            b.CreateRetVoid();
+            cleanupPushFn_ = fn;
+        }
+
+        // void __kd_cleanup_pop(i64 n): normal scope exit discards n entries
+        // (the inline Phase-16 drops already ran for them). depth -= n.
+        {
+            auto* fn = llvm::Function::Create(
+                llvm::FunctionType::get(voidTy, {i64Ty}, false),
+                llvm::Function::InternalLinkage, "__kd_cleanup_pop",
+                module_.get());
+            auto* b0 = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(b0);
+            auto* depthP = b.CreateStructGEP(stackTy, cleanupG, 1, "depthp");
+            auto* depth = b.CreateLoad(i64Ty, depthP, "depth");
+            b.CreateStore(b.CreateSub(depth, fn->getArg(0), "dn"), depthP);
+            b.CreateRetVoid();
+            cleanupPopFn_ = fn;
+        }
+
+        // i64 __kd_cleanup_depth(): current cleanup-stack depth (catch snapshot).
+        {
+            auto* fn = llvm::Function::Create(
+                llvm::FunctionType::get(i64Ty, {}, false),
+                llvm::Function::InternalLinkage, "__kd_cleanup_depth",
+                module_.get());
+            auto* b0 = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(b0);
+            auto* depthP = b.CreateStructGEP(stackTy, cleanupG, 1, "depthp");
+            b.CreateRet(b.CreateLoad(i64Ty, depthP, "depth"));
+            cleanupDepthFn_ = fn;
+        }
+
+        // void __kd_cleanup_unwind_to(i64 target): the UNWINDER. Pop+run cleanup
+        // entries from the current depth down to `target`, each flag-guarded:
+        // `if(*flag){ *flag=0; dropfn(val); }`. This frees every owning local in
+        // the frames being unwound, exactly once (moved-out locals are skipped).
+        llvm::Function* unwindTo;
+        {
+            auto* fn = llvm::Function::Create(
+                llvm::FunctionType::get(voidTy, {i64Ty}, false),
+                llvm::Function::InternalLinkage, "__kd_cleanup_unwind_to",
+                module_.get());
+            fn->getArg(0)->setName("target");
+            auto* b0 = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* hdr = llvm::BasicBlock::Create(ctx, "hdr", fn);
+            auto* body = llvm::BasicBlock::Create(ctx, "body", fn);
+            auto* doDrop = llvm::BasicBlock::Create(ctx, "dodrop", fn);
+            auto* next = llvm::BasicBlock::Create(ctx, "next", fn);
+            auto* done = llvm::BasicBlock::Create(ctx, "done", fn);
+            llvm::IRBuilder<> b(b0);
+            auto* depthP = b.CreateStructGEP(stackTy, cleanupG, 1, "depthp");
+            auto* dataP = b.CreateStructGEP(stackTy, cleanupG, 0, "datap");
+            b.CreateBr(hdr);
+            b.SetInsertPoint(hdr);
+            auto* depth = b.CreateLoad(i64Ty, depthP, "depth");
+            auto* more = b.CreateICmpSGT(depth, fn->getArg(0), "more");
+            b.CreateCondBr(more, body, done);
+            b.SetInsertPoint(body);
+            auto* idx =
+                b.CreateSub(depth, llvm::ConstantInt::get(i64Ty, 1), "idx");
+            b.CreateStore(idx, depthP); // pop first (so re-entrancy is safe)
+            auto* entries = b.CreateLoad(i8PtrTy, dataP, "entries");
+            auto* slot = b.CreateGEP(cleanupEntTy_, entries, idx, "slot");
+            auto* flag = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(cleanupEntTy_, slot, 0, "flagp"),
+                "flag");
+            // The flag is a Phase-16 `i1` drop flag (alloca of i1Ty); load it
+            // through that exact type so we read the stored 0/1 correctly.
+            auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+            auto* live = b.CreateLoad(i1Ty, flag, "live");
+            b.CreateCondBr(live, doDrop, next);
+            b.SetInsertPoint(doDrop);
+            b.CreateStore(llvm::ConstantInt::getFalse(ctx), flag); // clear flag
+            auto* val = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(cleanupEntTy_, slot, 1, "valp"),
+                "val");
+            auto* dropfn = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(cleanupEntTy_, slot, 2, "dropp"),
+                "dropfn");
+            auto* dropTy =
+                llvm::FunctionType::get(voidTy, {i8PtrTy}, false);
+            b.CreateCall(dropTy, dropfn, {val});
+            b.CreateBr(next);
+            b.SetInsertPoint(next);
+            b.CreateBr(hdr);
+            b.SetInsertPoint(done);
+            b.CreateRetVoid();
+            unwindTo = fn;
+        }
+
+        // i8* __kd_catch_push(): snapshot the current cleanup depth into a new
+        // catch entry and return a pointer to its jmp_buf (which the caller
+        // passes to _setjmp). depth++.
+        {
+            auto* fn = llvm::Function::Create(
+                llvm::FunctionType::get(i8PtrTy, {}, false),
+                llvm::Function::InternalLinkage, "__kd_catch_push",
+                module_.get());
+            auto* b0 = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(b0);
+            auto* entries = ensureCap(b, catchG, catchEntTy_);
+            auto* depthP = b.CreateStructGEP(stackTy, catchG, 1, "depthp");
+            auto* depth = b.CreateLoad(i64Ty, depthP, "depth");
+            auto* slot = b.CreateGEP(catchEntTy_, entries, depth, "slot");
+            // saved cleanup depth
+            auto* cd = b.CreateCall(cleanupDepthFn_, {}, "cd");
+            b.CreateStore(cd,
+                          b.CreateStructGEP(catchEntTy_, slot, 1, "savedp"));
+            b.CreateStore(
+                b.CreateAdd(depth, llvm::ConstantInt::get(i64Ty, 1), "d1"),
+                depthP);
+            auto* jb = b.CreateStructGEP(catchEntTy_, slot, 0, "jbp");
+            b.CreateRet(jb);
+            catchPushFn_ = fn;
+        }
+
+        // void __kd_catch_pop(): pop the top catch entry (normal completion or
+        // after a caught panic). depth--.
+        {
+            auto* fn = llvm::Function::Create(
+                llvm::FunctionType::get(voidTy, {}, false),
+                llvm::Function::InternalLinkage, "__kd_catch_pop",
+                module_.get());
+            auto* b0 = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(b0);
+            auto* depthP = b.CreateStructGEP(stackTy, catchG, 1, "depthp");
+            auto* depth = b.CreateLoad(i64Ty, depthP, "depth");
+            b.CreateStore(
+                b.CreateSub(depth, llvm::ConstantInt::get(i64Ty, 1), "dm"),
+                depthP);
+            b.CreateRetVoid();
+            catchPopFn_ = fn;
+        }
+
+        // Internal: void __kd_do_panic() — the shared tail of panic + OOB. The
+        // message has already been written to stderr. If there's no enclosing
+        // catch, print "thread panicked" and exit(101). Otherwise unwind the
+        // cleanup stack down to the top catch's saved depth, then longjmp into
+        // it (its _setjmp returns 1, and that catch returns the recovery value).
+        llvm::Function* doPanic;
+        {
+            auto* fn = llvm::Function::Create(
+                llvm::FunctionType::get(voidTy, {}, false),
+                llvm::Function::InternalLinkage, "__kd_do_panic",
+                module_.get());
+            fn->addFnAttr(llvm::Attribute::NoReturn);
+            auto* b0 = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* noCatch = llvm::BasicBlock::Create(ctx, "nocatch", fn);
+            auto* hasCatch = llvm::BasicBlock::Create(ctx, "hascatch", fn);
+            llvm::IRBuilder<> b(b0);
+            auto* depthP = b.CreateStructGEP(stackTy, catchG, 1, "depthp");
+            auto* depth = b.CreateLoad(i64Ty, depthP, "depth");
+            auto* none = b.CreateICmpSLE(
+                depth, llvm::ConstantInt::get(i64Ty, 0), "nocatch?");
+            b.CreateCondBr(none, noCatch, hasCatch);
+            // No catch: unwind ALL frames (running their Drop cleanups, like
+            // Rust's default unwinding panic does as it tears down the thread),
+            // print the abort notice, then terminate with Rust's 101 exit code.
+            b.SetInsertPoint(noCatch);
+            b.CreateCall(unwindTo, {llvm::ConstantInt::get(i64Ty, 0)});
+            auto* term =
+                b.CreateGlobalString("thread panicked, aborting\n",
+                                     "kd_panic_term", 0, module_.get());
+            auto* termLen = llvm::ConstantInt::get(i64Ty, 26);
+            b.CreateCall(writeFn, {llvm::ConstantInt::get(i32Ty, 2), term,
+                                   termLen});
+            b.CreateCall(exitFn_, {llvm::ConstantInt::get(i32Ty, 101)});
+            b.CreateUnreachable();
+            // Have catch: peek top entry, unwind to its saved cleanup depth,
+            // then longjmp into its jmp_buf.
+            b.SetInsertPoint(hasCatch);
+            auto* dataP = b.CreateStructGEP(stackTy, catchG, 0, "datap");
+            auto* entries = b.CreateLoad(i8PtrTy, dataP, "entries");
+            auto* top =
+                b.CreateSub(depth, llvm::ConstantInt::get(i64Ty, 1), "top");
+            auto* slot = b.CreateGEP(catchEntTy_, entries, top, "slot");
+            auto* saved = b.CreateLoad(
+                i64Ty, b.CreateStructGEP(catchEntTy_, slot, 1, "savedp"),
+                "saved");
+            b.CreateCall(unwindTo, {saved});
+            auto* jb = b.CreateStructGEP(catchEntTy_, slot, 0, "jbp");
+            b.CreateCall(longjmpFn_, {jb, llvm::ConstantInt::get(i32Ty, 1)});
+            b.CreateUnreachable();
+            doPanic = fn;
+        }
+
+        // i64 panic(String msg): write the message + newline to stderr, then
+        // panic. `msg` is a String aggregate by value ({i8* data, i64 len, i64
+        // cap}) so a string literal passes directly. Returns i64 only so it
+        // composes in expression position; it never actually returns.
+        {
+            auto* fn = llvm::Function::Create(
+                llvm::FunctionType::get(i64Ty, {strTy}, false),
+                llvm::Function::ExternalLinkage, "panic", module_.get());
+            fn->getArg(0)->setName("msg");
+            fn->addFnAttr(llvm::Attribute::NoReturn);
+            auto* b0 = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(b0);
+            auto* pfx = b.CreateGlobalString("panic: ", "kd_panic_pfx", 0,
+                                             module_.get());
+            b.CreateCall(writeFn, {llvm::ConstantInt::get(i32Ty, 2), pfx,
+                                   llvm::ConstantInt::get(i64Ty, 7)});
+            auto* data = b.CreateExtractValue(fn->getArg(0), {0}, "data");
+            auto* len = b.CreateExtractValue(fn->getArg(0), {1}, "len");
+            b.CreateCall(writeFn,
+                         {llvm::ConstantInt::get(i32Ty, 2), data, len});
+            auto* nl = b.CreateGlobalString("\n", "kd_panic_nl", 0,
+                                            module_.get());
+            b.CreateCall(writeFn, {llvm::ConstantInt::get(i32Ty, 2), nl,
+                                   llvm::ConstantInt::get(i64Ty, 1)});
+            b.CreateCall(doPanic, {});
+            b.CreateUnreachable();
+            panicFn_ = fn;
+            declaredFns_["panic"] = fn;
+        }
+
+        // void __kd_panic_oob(i64 idx, i64 len): the bounds-check panic. Writes
+        // an "index out of bounds" diagnostic (with idx/len via a small libc
+        // printf to stderr — actually fprintf-free: we format into a stack
+        // buffer is overkill, so we just print a fixed message + the two
+        // numbers via the existing printf to stderr is unavailable; instead we
+        // emit the fixed prefix and rely on it being a real panic). Then panics.
+        {
+            auto* fn = llvm::Function::Create(
+                llvm::FunctionType::get(voidTy, {i64Ty, i64Ty}, false),
+                llvm::Function::InternalLinkage, "__kd_panic_oob",
+                module_.get());
+            fn->getArg(0)->setName("idx");
+            fn->getArg(1)->setName("len");
+            fn->addFnAttr(llvm::Attribute::NoReturn);
+            auto* b0 = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(b0);
+            // Write "panic: index out of bounds: the len is <len> but the index
+            // is <idx>\n" straight to fd 2 via `dprintf(int fd, fmt, ...)` —
+            // POSIX.1-2008, present on both glibc and macOS — so the diagnostic
+            // carries the actual index and length without needing a stderr
+            // FILE* global.
+            auto* dprintfFn = llvm::cast<llvm::Function>(
+                module_
+                    ->getOrInsertFunction(
+                        "dprintf",
+                        llvm::FunctionType::get(i32Ty, {i32Ty, i8PtrTy}, true))
+                    .getCallee());
+            auto* fmt = b.CreateGlobalString(
+                "panic: index out of bounds: the len is %lld but the index is "
+                "%lld\n",
+                "kd_oob_fmt", 0, module_.get());
+            b.CreateCall(dprintfFn, {llvm::ConstantInt::get(i32Ty, 2), fmt,
+                                     fn->getArg(1), fn->getArg(0)});
+            b.CreateCall(doPanic, {});
+            b.CreateUnreachable();
+            panicOobFn_ = fn;
+        }
+
+        // i64 catch({i8* fn, i8* env} f, i64 recover): run f() under a catch
+        // boundary. On normal completion returns f()'s value; if f (or anything
+        // it calls) panics, the unwinder runs the intervening Drop cleanups,
+        // longjmps back here, and we return `recover`. This is the recovery
+        // surface — `catch` CLEARS the `panic` effect of f for its caller (see
+        // the typechecker), so a fn that only panics inside a catch need not
+        // itself declare `panic`.
+        {
+            auto* fnValTy = fnValTy_; // { i8* fn, i8* env }
+            auto* fnTy = llvm::FunctionType::get(
+                i64Ty, {fnValTy, i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "catch", module_.get());
+            fn->getArg(0)->setName("f");
+            fn->getArg(1)->setName("recover");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* callBB = llvm::BasicBlock::Create(ctx, "run", fn);
+            auto* recoverBB = llvm::BasicBlock::Create(ctx, "recovered", fn);
+            llvm::IRBuilder<> b(entry);
+            // Spill the two arguments to allocas BEFORE _setjmp and reload them
+            // after — _setjmp returns twice, and the C rule is that only
+            // memory (not registers) is guaranteed live across the longjmp
+            // return. The allocas make `f`/`recover` survive the second return.
+            auto* fSlot = b.CreateAlloca(fnValTy, nullptr, "f.slot");
+            auto* rSlot = b.CreateAlloca(i64Ty, nullptr, "recover.slot");
+            b.CreateStore(fn->getArg(0), fSlot);
+            b.CreateStore(fn->getArg(1), rSlot);
+            auto* jb = b.CreateCall(catchPushFn_, {}, "jb");
+            auto* sj = b.CreateCall(setjmpFn_, {jb}, "sj");
+            auto* first = b.CreateICmpEQ(
+                sj, llvm::ConstantInt::get(i32Ty, 0), "first");
+            b.CreateCondBr(first, callBB, recoverBB);
+            // First return (sj==0): actually run the callback.
+            b.SetInsertPoint(callBB);
+            auto* fval = b.CreateLoad(fnValTy, fSlot, "fval");
+            auto* fnPtr = b.CreateExtractValue(fval, {0}, "f.fn");
+            auto* envPtr = b.CreateExtractValue(fval, {1}, "f.env");
+            auto* callTy =
+                llvm::FunctionType::get(i64Ty, {i8PtrTy}, false);
+            auto* v = b.CreateCall(callTy, fnPtr, {envPtr}, "v");
+            b.CreateCall(catchPopFn_, {});
+            b.CreateRet(v);
+            // Second return (sj!=0, i.e. a panic longjmp'd back): cleanups have
+            // already run (the unwinder ran them before longjmp). Pop our catch
+            // context and return the recovery value.
+            b.SetInsertPoint(recoverBB);
+            b.CreateCall(catchPopFn_, {});
+            auto* rv = b.CreateLoad(i64Ty, rSlot, "rv");
+            b.CreateRet(rv);
+            declaredFns_["catch"] = fn;
+        }
+        (void)writeFn;
+    }
+
+    // Phase 23: get-or-create a `void __kd_drop_<mangled>(i8* p)` thunk that
+    // wraps emitDropGlue for type `t`, so a cleanup-stack entry can name a
+    // uniform `void(i8*)` drop function. Cached by mangled type name. Emitted
+    // on demand from registerDroppableLocal (only in may-panic programs).
+    llvm::Function* getOrEmitDropThunk(const TypePtr& t) {
+        TypePtr r = resolveInInstance(t);
+        std::string key = mangleType(r);
+        auto it = dropThunks_.find(key);
+        if (it != dropThunks_.end()) return it->second;
+        auto& ctx = *ctx_;
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* voidTy = llvm::Type::getVoidTy(ctx);
+        auto* fn = llvm::Function::Create(
+            llvm::FunctionType::get(voidTy, {i8PtrTy}, false),
+            llvm::Function::InternalLinkage, "__kd_drop_" + key, module_.get());
+        fn->getArg(0)->setName("p");
+        // Save + restore the builder's insert point and currentFn_ — drop glue
+        // creates basic blocks against currentFn_, which must be THIS thunk
+        // while we lower the glue, then restored for the caller.
+        auto* savedFn = currentFn_;
+        auto savedIP = builder_->saveIP();
+        currentFn_ = fn;
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        builder_->SetInsertPoint(entry);
+        emitDropGlue(fn->getArg(0), r);
+        if (!currentBlockTerminated()) builder_->CreateRetVoid();
+        currentFn_ = savedFn;
+        builder_->restoreIP(savedIP);
+        dropThunks_[key] = fn;
+        return fn;
     }
 
     // Phase 17b: the per-result-type `Poll<T> = { i1 ready, T value }`. Built
@@ -4721,8 +5370,20 @@ private:
         // local declared inside a loop body, which is exactly what we want:
         // the previous iteration's value was already dropped at block exit).
         builder_->CreateStore(llvm::ConstantInt::getTrue(*ctx_), flag);
-        dropScopes_.back().push_back({name, storage, flag,
-                                      resolveInInstance(ty)});
+        TypePtr rty = resolveInInstance(ty);
+        bool pushedCleanup = false;
+        // Phase 23: in a may-panic program, also push a cleanup-stack entry so
+        // the unwinder can run this value's Drop glue while unwinding past this
+        // frame. The entry records the SAME drop flag (so a moved-out value is
+        // skipped) + the storage pointer + a per-type drop thunk. On normal
+        // scope exit we pop these (see emitScopeDrops); the inline drop there
+        // does the actual work and clears the flag.
+        if (programMayPanic_ && cleanupPushFn_) {
+            llvm::Function* thunk = getOrEmitDropThunk(rty);
+            builder_->CreateCall(cleanupPushFn_, {flag, storage, thunk});
+            pushedCleanup = true;
+        }
+        dropScopes_.back().push_back({name, storage, flag, rty, pushedCleanup});
     }
 
     // Emit drops for one scope's locals in reverse declaration order, each
@@ -4747,6 +5408,28 @@ private:
             if (!currentBlockTerminated()) builder_->CreateBr(afterBB);
             builder_->SetInsertPoint(afterBB);
         }
+        // Phase 23: this is a NORMAL scope exit — the inline drops above already
+        // ran (and cleared each flag). Discard this scope's cleanup-stack
+        // entries so a later panic in an OUTER frame doesn't re-run them. We pop
+        // exactly the number this scope pushed; the entries' flags are already
+        // false, so even an interleaving wouldn't double-drop, but popping keeps
+        // the stack depth honest for the enclosing catch's saved-depth snapshot.
+        emitCleanupPopForScope(scope);
+    }
+
+    // Phase 23: emit `__kd_cleanup_pop(count)` for the number of cleanup-stack
+    // entries `scope` pushed (its DropLocals with pushedCleanup). No-op unless
+    // the program can panic. Caller guarantees the block is not terminated.
+    void emitCleanupPopForScope(const std::vector<DropLocal>& scope) {
+        if (!programMayPanic_ || !cleanupPopFn_) return;
+        if (currentBlockTerminated()) return;
+        std::size_t n = 0;
+        for (const auto& d : scope)
+            if (d.pushedCleanup) ++n;
+        if (n == 0) return;
+        builder_->CreateCall(
+            cleanupPopFn_,
+            {llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), n)});
     }
 
     // Pop the innermost scope and drop its locals (normal block fall-through).
@@ -5483,9 +6166,11 @@ private:
 
     // Phase 22: array index `arr[i]` -> read element i. We spill the array
     // value to a temp alloca, GEP `[0, i]`, and load — uniform for both a
-    // constant and a dynamic index, and for any object expression. No runtime
-    // bounds check in the MVP (matches the unchecked vec_get/slice_get); a
-    // constant out-of-range index was already rejected at typecheck.
+    // constant and a dynamic index, and for any object expression. A
+    // constant out-of-range index is rejected at typecheck.
+    // Phase 23: a DYNAMIC out-of-range index now PANICS (a real unwind via
+    // `__kd_panic_oob`) instead of reading out of bounds — `if (idx<0 ||
+    // idx>=N) panic`. The array length N is statically known from the type.
     llvm::Value* emitIndex(const ast::IndexExpr& ix) {
         TypePtr objTy = lookupExprType(*ix.object);
         if (objTy) objTy = resolveInInstance(objTy);
@@ -5503,6 +6188,29 @@ private:
         llvm::Type* arrLlvm = mapKardashevType(objTy);
         llvm::Type* elemLlvm = mapKardashevType(objTy->arrayElem);
         llvm::Value* idx = emitExpr(*ix.index);
+
+        // Phase 23: runtime bounds check. `programMayPanic_` is always true here
+        // (an IndexExpr makes the whole program may-panic), so panicOobFn_ is
+        // emitted. Branch to the panic helper when idx is negative or >= len.
+        if (programMayPanic_ && panicOobFn_) {
+            auto* i64Ty = llvm::Type::getInt64Ty(*ctx_);
+            auto* len = llvm::ConstantInt::get(i64Ty, objTy->arrayLen);
+            auto* idx64 = idx->getType()->isIntegerTy(64)
+                              ? idx
+                              : builder_->CreateSExtOrTrunc(idx, i64Ty, "idx64");
+            auto* lo = builder_->CreateICmpSLT(
+                idx64, llvm::ConstantInt::get(i64Ty, 0), "idx.lt0");
+            auto* hi = builder_->CreateICmpSGE(idx64, len, "idx.gelen");
+            auto* oob = builder_->CreateOr(lo, hi, "idx.oob");
+            auto* panicBB =
+                llvm::BasicBlock::Create(*ctx_, "idx.panic", currentFn_);
+            auto* okBB = llvm::BasicBlock::Create(*ctx_, "idx.ok", currentFn_);
+            builder_->CreateCondBr(oob, panicBB, okBB);
+            builder_->SetInsertPoint(panicBB);
+            builder_->CreateCall(panicOobFn_, {idx64, len});
+            builder_->CreateUnreachable();
+            builder_->SetInsertPoint(okBB);
+        }
 
         llvm::Value* arrPtr = nullptr;
         if (refDepth > 0) {

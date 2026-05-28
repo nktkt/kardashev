@@ -208,6 +208,17 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 23: real panic + unwinding (setjmp/longjmp + a runtime cleanup stack) —
+# Drop runs on unwind (reverse order), `catch` recovers, an uncaught panic
+# exits 101 with a stderr message, exactly-once drops on the normal AND panic
+# paths (no double-free / leak, incl. a 100k-unwind heap-Vec loop), array `[T;N]`
+# OOB indexing panics, and panic/catch effect-checking is consistent; JIT + AOT.
+sh_test(
+    name = "smoke_test_panic",
+    srcs = ["smoke_test_panic.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

@@ -2222,6 +2222,55 @@ void test_mutex_new_requires_alloc_effect() {
         "mutex_new_requires_alloc_effect");
 }
 
+// --- Phase 23: panic + catch effect checking. ---
+
+void test_panic_carries_panic_effect_ok() {
+    // A fn that calls `panic` and DECLARES `! { panic }` is accepted.
+    expectOk("fn f() -> i64 ! { panic } { panic(\"x\"); 0 }",
+             "panic_carries_panic_effect_ok");
+}
+
+void test_panic_undeclared_effect_errors() {
+    // Calling `panic` without declaring the `panic` effect is rejected.
+    expectErr("fn f() -> i64 { panic(\"x\"); 0 }",
+              "panic_undeclared_effect_errors");
+}
+
+void test_panic_propagates_through_caller() {
+    // `panic` flows through an ordinary call: a caller of a panicking fn must
+    // itself declare `panic` (or catch it).
+    expectErr(
+        "fn boom() -> i64 ! { panic } { panic(\"x\"); 0 }\n"
+        "fn caller() -> i64 { boom() }",
+        "panic_propagates_through_caller");
+}
+
+void test_catch_clears_panic_effect_ok() {
+    // `catch` handles the panic, so a fn that only panics INSIDE a catch need
+    // not declare `panic` itself.
+    expectOk(
+        "fn boom() -> i64 ! { panic } { panic(\"x\"); 0 }\n"
+        "fn main() -> i64 { catch(boom, 0) }",
+        "catch_clears_panic_effect_ok");
+}
+
+void test_catch_still_propagates_io_effect() {
+    // catch only catches `panic` — other effects of the callback (here `io`)
+    // still propagate, so an undeclaring caller is rejected.
+    expectErr(
+        "fn ioFn() -> i64 ! { io } { print(1); 0 }\n"
+        "fn main() -> i64 { catch(ioFn, 0) }",
+        "catch_still_propagates_io_effect");
+}
+
+void test_catch_propagates_io_effect_declared_ok() {
+    // ...and when the caller DOES declare that effect, it's accepted.
+    expectOk(
+        "fn ioFn() -> i64 ! { io } { print(1); 0 }\n"
+        "fn main() -> i64 ! { io } { catch(ioFn, 0) }",
+        "catch_propagates_io_effect_declared_ok");
+}
+
 } // namespace
 
 int main() {
@@ -2462,6 +2511,12 @@ int main() {
     test_thread_spawn_propagates_closure_io_effect();
     test_mutex_ops_typecheck_ok();
     test_mutex_new_requires_alloc_effect();
-    std::cout << "All typecheck tests passed (217 cases)\n";
+    test_panic_carries_panic_effect_ok();
+    test_panic_undeclared_effect_errors();
+    test_panic_propagates_through_caller();
+    test_catch_clears_panic_effect_ok();
+    test_catch_still_propagates_io_effect();
+    test_catch_propagates_io_effect_declared_ok();
+    std::cout << "All typecheck tests passed (223 cases)\n";
     return 0;
 }

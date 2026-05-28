@@ -409,6 +409,45 @@ public:
             sch.declaredEffects.add("io");
             fnSchemas_["mutex_set"] = std::move(sch);
         }
+
+        // Phase 23 built-in: real panic + unwinding.
+        //
+        //   panic(msg: String) -> i64 ! { panic }
+        // Prints `msg` to stderr and unwinds (running Drop cleanups) to the
+        // nearest enclosing `catch`, or terminates the process with exit code
+        // 101 if there is none. Carries the `panic` effect, so any caller must
+        // either declare `! { panic }` or wrap the call in `catch`. `msg` is
+        // taken BY VALUE so a string LITERAL (`panic("boom")`) — itself a
+        // `String` value `{ptr,len,0}` — passes directly without an explicit
+        // `&` (mirrors `string_push_str`'s by-value `other`). The i64 return
+        // type lets it sit in expression position (`if c { a } else {
+        // panic("..") }`); it never actually returns.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({stringTy}, makeInt());
+            sch.declaredEffects.add("panic");
+            fnSchemas_["panic"] = std::move(sch);
+        }
+        //   catch(f: fn() -> i64 ! {e}, recover: i64) -> i64 ! { e \ panic }
+        // Runs `f()` under a recovery boundary: returns its value on normal
+        // completion, or `recover` if `f` (or anything it transitively calls)
+        // panics — after the unwinder has run the Drop cleanups of the frames
+        // between the panic and here. `catch` is the panic HANDLER, so it
+        // CLEARS the `panic` effect of `f` for its own caller (checkCall strips
+        // `panic` from this call's recorded effect contribution); all OTHER
+        // effects of `f` (io/alloc/...) still flow through, via the effect-row
+        // var `e` — exactly like `thread_spawn`. A non-panicking `f` is
+        // perfectly legal too (the boundary is simply never triggered).
+        {
+            TypePtr rowVar = makeFreshVar();
+            TypePtr fnParam = makeFunction({}, makeInt(),
+                                           /*effectLabels=*/{}, rowVar);
+            FnSchema sch;
+            sch.signature = makeFunction({fnParam, makeInt()}, makeInt());
+            sch.declaredEffects.add("e"); // flows f's effects MINUS panic
+            sch.effectRowVars.emplace_back("e", rowVar);
+            fnSchemas_["catch"] = std::move(sch);
+        }
 #if defined(__linux__)
         // Phase 18 stretch (Linux/epoll ONLY): real fd-readiness primitives.
         // Registered only on Linux — the codegen reactor is epoll-based and
@@ -4000,6 +4039,18 @@ private:
                     auto it = subst.find(resolve(schemaVar)->varId);
                     if (it == subst.end()) continue;
                     addRowVarContribution(it->second, contrib);
+                }
+                // Phase 23: `catch` is the panic HANDLER. Whatever effects the
+                // callback `f` performs flow through via the row var `e`, but
+                // its `panic` effect is CAUGHT here, so it must NOT propagate to
+                // catch's caller — strip it from the recorded contribution.
+                // (A fn whose only `panic` is inside a `catch` therefore need
+                // not declare `panic` itself.)
+                if (call.callee == "catch") {
+                    contrib.labels.erase(
+                        std::remove(contrib.labels.begin(),
+                                    contrib.labels.end(), "panic"),
+                        contrib.labels.end());
                 }
                 if (!contrib.labels.empty()) exprEffects_[&call] = contrib;
             }
