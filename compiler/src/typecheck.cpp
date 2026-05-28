@@ -993,6 +993,7 @@ private:
     // Phase 9: parallel to scopes_; names of `let mut` (reassignable)
     // bindings in each scope. A name absent here is immutable.
     std::vector<std::unordered_set<std::string>> mutScopes_;
+    std::vector<std::unordered_map<std::string, bool>> byRefClosureScopes_;
     // Phase 9: loop context stack. One entry per enclosing loop, innermost
     // last. `isValueLoop` is true for `loop` (where `break <value>` is
     // allowed); `while`/`for` are unit loops. `breakType` accumulates the
@@ -1718,10 +1719,12 @@ private:
     void pushScope() {
         scopes_.push_back({});
         mutScopes_.push_back({});
+        byRefClosureScopes_.push_back({});
     }
     void popScope() {
         scopes_.pop_back();
         if (!mutScopes_.empty()) mutScopes_.pop_back();
+        if (!byRefClosureScopes_.empty()) byRefClosureScopes_.pop_back();
     }
     void markMut(const std::string& name) {
         if (!mutScopes_.empty()) mutScopes_.back().insert(name);
@@ -1738,6 +1741,19 @@ private:
         }
         return false;
     }
+
+    void markByRefClosureLocal(const std::string& name, bool byRef) {
+        if (!byRefClosureScopes_.empty()) byRefClosureScopes_.back()[name] = byRef;
+    }
+
+    bool isByRefClosureLocal(const std::string& name) const {
+        for (std::size_t i = byRefClosureScopes_.size(); i-- > 0;) {
+            auto it = byRefClosureScopes_[i].find(name);
+            if (it != byRefClosureScopes_[i].end()) return it->second;
+        }
+        return false;
+    }
+
 
     // Look up a variant by name. Returns a fresh enum-instance Type
     // (typeArgs filled with fresh Vars) plus an index into that instance's
@@ -3009,6 +3025,22 @@ private:
         if (auto* cl = dynamic_cast<const ast::ClosureExpr*>(&e)) {
             for (const auto& cap : cl->captures)
                 if (cap.byRef) return true;
+            return false;
+        }
+        if (auto* id = dynamic_cast<const ast::IdentExpr*>(&e))
+            return isByRefClosureLocal(id->name);
+        if (auto* block = dynamic_cast<const ast::BlockExpr*>(&e)) {
+            if (block->tail) return closureEscapesByRef(*block->tail);
+            return false;
+        }
+        if (auto* ie = dynamic_cast<const ast::IfExpr*>(&e)) {
+            return closureEscapesByRef(*ie->thenBranch) ||
+                   closureEscapesByRef(*ie->elseBranch);
+        }
+        if (auto* sl = dynamic_cast<const ast::StructLitExpr*>(&e)) {
+            for (const auto& [_n, v] : sl->fields)
+                if (closureEscapesByRef(*v)) return true;
+            return false;
         }
         return false;
     }
@@ -3969,10 +4001,14 @@ private:
                 scopes_.back()[let->name] = valT;
             }
             if (let->isMut) markMut(let->name);
+            markByRefClosureLocal(let->name, closureEscapesByRef(*let->value));
             return;
         }
         if (auto* as = dynamic_cast<const ast::AssignStmt*>(&s)) {
             checkAssign(*as);
+            if (auto* id = dynamic_cast<const ast::IdentExpr*>(as->target.get())) {
+                markByRefClosureLocal(id->name, closureEscapesByRef(*as->value));
+            }
             return;
         }
         if (auto* ret = dynamic_cast<const ast::ReturnStmt*>(&s)) {
