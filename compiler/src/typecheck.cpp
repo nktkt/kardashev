@@ -1403,6 +1403,18 @@ private:
             scopes_.back()[p.name] = resolveTypeRef(p.type);
         }
         currentReturnType_ = resolveTypeRef(fn.returnType);
+        // PR#25: reject `-> &T` reference return types. kardashev has no
+        // lifetime system, so a returned reference can only ever borrow a
+        // parameter or a local — and the latter is a guaranteed
+        // use-after-free once the frame unwinds. Until lifetimes exist,
+        // functions must return owned values. (`&[T]` slices are a separate
+        // Struct kind and are not caught here.)
+        if (resolve(currentReturnType_)->kind == TypeKind::Ref) {
+            error("function '" + fn.name +
+                      "' cannot return a reference (no lifetime system yet); "
+                      "return an owned value instead",
+                  fn.returnType.line, fn.returnType.column);
+        }
         TypePtr bodyType = checkBlock(*fn.body);
         if (fn.body->tail) {
             if (closureEscapesByRef(*fn.body->tail)) {
@@ -2551,6 +2563,17 @@ private:
             for (const auto& f : sl.fields) checkExpr(*f.second);
             return freshInstantiateStruct(it->second);
         }
+        // PR#21: `String` is an opaque built-in (heap {ptr,len,cap}); a
+        // source-level `String { ... }` literal would let a user forge an
+        // invalid buffer/length pair and trigger out-of-bounds reads in
+        // print_str / str_len. Reject it like Future.
+        if (sl.structName == "String") {
+            error("cannot construct built-in opaque struct 'String' with a "
+                  "struct literal; use string_new()",
+                  sl.line, sl.column);
+            for (const auto& f : sl.fields) checkExpr(*f.second);
+            return freshInstantiateStruct(it->second);
+        }
         // For generic structs, build a fresh instantiation so field-type
         // unification with each literal expr leaves the instance's
         // typeArgs in a fully-solved state.
@@ -3355,6 +3378,17 @@ private:
                               "Copy value, or share via a Mutex handle) instead",
                           call.args[0]->line, call.args[0]->column);
                 }
+            }
+            // PR#20: reject a unit element type for the Vec builtins. The
+            // codegen vec_* specialization sizes the element via DataLayout;
+            // a zero-sized unit element makes the stride 0 and crashes the
+            // LLVM lowering. typeArgs[0] is now solved to the element type.
+            if ((call.callee == "vec_new" || call.callee == "vec_push" ||
+                 call.callee == "vec_get" || call.callee == "vec_len") &&
+                !typeArgs.empty() &&
+                resolve(typeArgs[0])->kind == TypeKind::Unit) {
+                error("Vec element type cannot be unit", call.line,
+                      call.column);
             }
             if (!schema.genericVars.empty()) {
                 callInstantiations_[&call] = std::move(typeArgs);
