@@ -195,6 +195,33 @@ language's thesis ("effects are part of the type") demands.
 | 13 | **Growable stdlib**: mutable `String`, `HashMap<K,V>`, `&[T]` slices, iterator adaptors (`map`/`filter`/`fold`), `Option`/`Result` combinators | ✅ Method receivers autoref-borrow (`&self`/`&mut self`) so stateful methods work; heap-backed growable `String` (`push_str`), `HashMap<i64,i64>` (linear-probing + rehash) returning `Option`, `&v[a..b]` slices; `fold`/`map`/`filter` as generic closure-driven library fns; prelude `Option`/`Result` combinators — all effect-row aware. |
 | 14 | **Tooling + ecosystem**: `kard fmt`, richer LSP (completion/hover/go-to-def), incremental build cache, dependency resolution via the Bazel module registry, DWARF debug info | ✅ (14a) `kardfmt` idempotent source formatter + DWARF debug info behind `-g`. ✅ (14b) `kard-lsp` serves hover (signature **with the effect row**), scope-aware completion, and go-to-definition on top of diagnostics; `kardc -o` has a content-addressed incremental compile cache (`${XDG_CACHE_HOME:-~/.cache}/kardashev`, keyed on resolved source + flags + format version; `--no-cache` to bypass). **Deferred (1 item):** cross-project dependency resolution via the Bazel module registry — intra-project deps work via `mod foo;` + the `kardashev_library`/`kardashev_binary` rules, but a third-party package registry isn't implemented (it can't be verified in this build environment, so it was intentionally not stubbed). |
 
+## Roadmap v3 — from "runs toy programs" to a real systems language
+
+v2 made the language expressive — closures, trait objects, real async, a growable
+stdlib, tooling. The headline effect-polymorphic `map<T, U, e>(xs: Vec<T>, f)` now
+compiles and runs end to end. But pushing real programs through it surfaces two
+honest truths: **nothing is ever freed** (every `Vec`/`String`/`HashMap`/`Box`/
+closure-env/async-frame `malloc`s and leaks — `free` appears zero times in
+codegen), and the **expression surface is surprisingly thin** (you can't write
+`true`, `-x`, `!done`, or `else if` — conditions must be spelled as comparisons).
+v3 closes the gap to a language you can run in production. The **north star**: a
+program that allocates in a loop runs in *constant memory* (Drop works), and you
+can write idiomatic code (`if flag`, `else if`, `!done`) without contortions.
+
+| Phase | Goal | What's missing today / why it's next |
+|-------|------|--------------------------------------|
+| 15 | **Expression & item completeness**: boolean literals `true`/`false`, unary `-x` (neg) and `!x` (logical not), `else if` chains, inherent impls `impl Type { … }`, `pub` on all item kinds | Verified gaps: `true` is an "unknown identifier", `-5` / `!b` are parse errors, `else if` doesn't parse (you must nest `else { if … }`), and only `impl Trait for Type` parses (no inherent impls). These are everyday ergonomics — right now you can't even write `if done {…}`. Lowest-risk, highest-frequency wins. |
+| 16 | **Deterministic memory management (Drop / RAII)**: a `Drop` trait + compiler-inserted drops at scope exit, driven by the existing NLL ownership/move analysis | The headline systems-language gap. Every heap allocation leaks today (`free` is called nowhere). The borrow checker already tracks moves/liveness — use it to insert deterministic `free`/destructor calls when a value goes out of scope. This is what separates a toy from a systems language. |
+| 17 | **Fully generic stdlib + closures**: de-`i64`-ify `Iterator`/`Future<T>`/`HashMap<K,V>`/adaptors; `FnMut` + capture-by-reference; calling a field-held fn value | `Iterator`'s element type, `Future`, `HashMap`, and `fold`/`map`/`filter` are all hardcoded to `i64` (the generic `Vec<T>` machinery already works, so the path is proven). Closures are `Fn`-only, can't capture by reference, and a struct-stored closure can't be invoked (`(s.f)(x)` doesn't parse) — which is why lazy iterator adaptors aren't possible yet. |
+| 18 | **Real async I/O + multitask executor**: an epoll/kqueue reactor, timer + I/O-readiness leaf futures, `spawn` + `join`/`select` | Phase 12's executor is a single-task busy-poll loop with a `yield_now` toy primitive — there's no real I/O, no timers, and no way to run more than one task. Needs generic `Future<T>` from 17. Turns async from a demo into something useful for I/O-bound work. |
+| 19 | **Threads + compile-time data-race freedom**: OS threads, `Send`/`Sync` marker traits enforced by the type system, channels, `Mutex`/atomics | The language is single-threaded today. Ownership + Drop (16) + the effect/trait machinery are an ideal substrate for statically rejecting data races — `Send`/`Sync` fall out naturally, the way `io`/`alloc` effects already do. |
+| 20 | **Production toolchain & ecosystem**: cross-project dependency resolution via the Bazel module registry (the v2 deferral), a package manifest, `kard test`, `-O0/-O2/-O3` opt-level flags, LSP rename/find-references — capped by building a real non-trivial program end to end | The one item v2 left deferred (third-party packages) lands here, plus the toolchain maturity that proves the stdlib is sufficient: the capstone is shipping a real CLI/tool written in kardashev. The jump from "a toolchain" to "an ecosystem". |
+
+Dependencies: 17 (generic `Future<T>`) unblocks 18; 16 (Drop) underpins 19's
+safe sharing; 15 and 20 are largely independent. Suggested order: **15 → 16 → 17
+→ 18 / 19 → 20**, with 15's quick wins landing first since they're low-risk and
+unblock natural test programs for everything after.
+
 ## Why "kardashev"?
 
 The [Kardashev scale](https://en.wikipedia.org/wiki/Kardashev_scale) ranks civilizations by how much energy they can harness. A systems language, in its own small way, is about controlling resources at scale — a fitting name for one that aims to be precise about effects, ownership, and computation.
