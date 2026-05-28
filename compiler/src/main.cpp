@@ -648,6 +648,36 @@ bool compileToObject(const std::string& srcRaw, const std::string& srcDir,
     return emitObject(*cgr.module, objPath);
 }
 
+// Phase 14a: run the front-end and print the module's textual LLVM IR to
+// stdout (honoring `-g`, so debug metadata like !llvm.dbg.cu / DISubprogram
+// is visible). Platform-independent way to inspect codegen — no external
+// dwarf tooling required. Returns a process exit code.
+int emitLlvmIr(const std::string& srcRaw, const std::string& srcDir,
+               bool emitDebug, const std::string& sourceFile) {
+    auto progOpt = buildProgram(srcRaw, srcDir);
+    if (!progOpt) return 1;
+    auto& program = *progOpt;
+    auto tcr = kardashev::typecheck(program);
+    if (!tcr.ok()) {
+        reportTypeErrors(tcr);
+        return 1;
+    }
+    auto bcr = kardashev::borrow_check(program, tcr);
+    if (!bcr.ok()) {
+        reportBorrowErrors(bcr);
+        return 1;
+    }
+    auto cgr = kardashev::codegen(program, tcr, emitDebug, sourceFile);
+    if (!cgr.ok()) {
+        for (const auto& msg : cgr.errors) {
+            std::cerr << "codegen error: " << msg << '\n';
+        }
+        return 1;
+    }
+    cgr.module->print(llvm::outs(), nullptr);
+    return 0;
+}
+
 // Compile + link `src` into a native executable at `outExePath`. When
 // `useCache` is set we content-address the emitted object: a cache hit skips
 // the whole compile and links the cached object; a miss compiles, deposits
@@ -728,6 +758,9 @@ int main(int argc, char** argv) {
     // Phase 14b: `--no-cache` bypasses the incremental compile cache (always
     // recompiles + relinks; never reads or writes the cache dir).
     bool useCache = true;
+    // Phase 14a: `--emit-llvm` prints textual LLVM IR (with debug metadata
+    // when `-g` is also given) instead of JITing or emitting an object.
+    bool emitIr = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "-o" && i + 1 < argc) {
@@ -736,11 +769,14 @@ int main(int argc, char** argv) {
             emitDebug = true;
         } else if (a == "--no-cache") {
             useCache = false;
+        } else if (a == "--emit-llvm") {
+            emitIr = true;
         } else if (a == "-h" || a == "--help") {
             std::cout << "usage: kardc                     # interactive REPL\n"
                          "       kardc <file.kd>            # JIT-run main()\n"
                          "       kardc -o <out> <file.kd>   # AOT-compile to native exe\n"
                          "       kardc -g ...               # emit DWARF debug info\n"
+                         "       kardc --emit-llvm <file.kd> # print LLVM IR to stdout\n"
                          "       kardc --no-cache ...       # bypass the AOT compile cache\n";
             return 0;
         } else if (!a.empty() && a[0] == '-') {
@@ -755,6 +791,18 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (emitIr) {
+        if (inputPath.empty()) {
+            std::cerr << "kardc: --emit-llvm requires an input file\n";
+            return 2;
+        }
+        auto src = readFile(inputPath);
+        if (!src) {
+            std::cerr << "kardc: cannot open file: " << inputPath << '\n';
+            return 1;
+        }
+        return emitLlvmIr(*src, dirOf(inputPath), emitDebug, inputPath);
+    }
     if (!outPath.empty()) {
         if (inputPath.empty()) {
             std::cerr << "kardc: -o requires an input file\n";
