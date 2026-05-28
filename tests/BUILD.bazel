@@ -44,6 +44,12 @@ sh_test(
 )
 
 sh_test(
+    name = "smoke_test_async_runtime",
+    srcs = ["smoke_test_async_runtime.sh"],
+    data = ["//compiler:kardc"],
+)
+
+sh_test(
     name = "smoke_test_fnptr",
     srcs = ["smoke_test_fnptr.sh"],
     data = ["//compiler:kardc"],

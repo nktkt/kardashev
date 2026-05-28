@@ -1452,6 +1452,69 @@ void test_nested_loops_ok() {
         "nested_loops_ok");
 }
 
+// --- Phase 12 real async runtime ---
+
+// `.await` is legal inside an async fn; yield_now returns a Future.
+void test_async_await_in_async_fn_ok() {
+    expectOk(
+        "async fn work() -> i64 {\n"
+        "    let a = yield_now(1).await;\n"
+        "    let b = yield_now(2).await;\n"
+        "    a + b\n"
+        "}",
+        "async_await_in_async_fn_ok");
+}
+
+// `.await` outside an async fn is rejected (it suspends the enclosing future).
+void test_async_await_outside_async_fn_errors() {
+    expectErr(
+        "fn main() -> i64 { yield_now(1).await }",
+        "async_await_outside_async_fn_errors");
+}
+
+// A synchronous `main` may run async work via block_on WITHOUT itself being
+// async — constructing/driving a Future is not the `async` effect.
+void test_async_block_on_in_sync_main_ok() {
+    expectOk(
+        "async fn work() -> i64 { let a = yield_now(1).await; a }\n"
+        "fn main() -> i64 { block_on(work()) }",
+        "async_block_on_in_sync_main_ok");
+}
+
+// An async fn implicitly carries `async`; awaiting satisfies that declaration
+// (no explicit `! { async }` needed).
+void test_async_implicit_effect_ok() {
+    expectOk(
+        "async fn work() -> i64 { yield_now(5).await }",
+        "async_implicit_effect_ok");
+}
+
+// `.await` requires a Future operand.
+void test_async_await_non_future_errors() {
+    expectErr(
+        "async fn work() -> i64 { let x = 5; x.await }",
+        "async_await_non_future_errors");
+}
+
+// Calling an async fn yields a Future, not the inner type: it cannot be used
+// directly as i64.
+void test_async_call_returns_future_not_int() {
+    expectErr(
+        "async fn work() -> i64 { yield_now(1).await }\n"
+        "fn main() -> i64 { work() }",
+        "async_call_returns_future_not_int");
+}
+
+// A NON-async fn that awaits is rejected even if it otherwise looks async-ish;
+// `.await` demands the enclosing fn be async (and a sync fn awaiting an async
+// callee leaks `async` it cannot declare). Belt-and-suspenders on the rule.
+void test_async_sync_fn_awaiting_errors() {
+    expectErr(
+        "async fn inner() -> i64 { yield_now(1).await }\n"
+        "fn outer() -> i64 { inner().await }",
+        "async_sync_fn_awaiting_errors");
+}
+
 } // namespace
 
 int main() {
@@ -1615,6 +1678,14 @@ int main() {
     test_range_endpoints_must_be_int();
     test_loop_io_effect_propagates();
     test_nested_loops_ok();
-    std::cout << "All typecheck tests passed (148 cases)\n";
+    // Phase 12 real async runtime
+    test_async_await_in_async_fn_ok();
+    test_async_await_outside_async_fn_errors();
+    test_async_block_on_in_sync_main_ok();
+    test_async_implicit_effect_ok();
+    test_async_await_non_future_errors();
+    test_async_call_returns_future_not_int();
+    test_async_sync_fn_awaiting_errors();
+    std::cout << "All typecheck tests passed (155 cases)\n";
     return 0;
 }

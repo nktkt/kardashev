@@ -55,16 +55,18 @@ public:
         }
         TypePtr stringTy = structSchemas_["String"].type;
 
-        // Phase 6.1 built-in: `Future` — opaque handle returned by every
-        // async fn. Codegen lays it out as { i64 state, i64 result }
-        // (MVP only handles `async fn () -> i64`; richer wrapped types
-        // wait for generic Future<T>). The struct stays nameable but
+        // Phase 12 built-in: `Future` — a poll-function/frame pair. Codegen
+        // lays it out as { i8* poll, i8* frame } where `poll(frame, &Poll)`
+        // advances the future and reports Ready(value) / Pending via the
+        // out-param. (MVP only handles `Future` of `i64`; richer wrapped
+        // types wait for generic Future<T>.) The struct stays nameable but
         // opaque to user dot-access.
         {
             StructSchema sch;
             sch.type = makeStruct("Future", {});
             structSchemas_["Future"] = std::move(sch);
         }
+        TypePtr futureTy = structSchemas_["Future"].type;
 
         // Phase 9 built-in: `Range` — the iterable produced by `a..b` and
         // `a..=b`. Fields: current `start`, `end` bound, and `inclusive`
@@ -136,6 +138,37 @@ public:
                 {makeRef(vecFnInst, /*isMut=*/false)}, makeInt());
             sch.genericVars.push_back(vecFnGenericVar);
             fnSchemas_["vec_len"] = std::move(sch);
+        }
+
+        // Phase 12 built-in: `yield_now(v: i64) -> Future ! { async }`. The
+        // leaf suspending primitive. Its Future returns Pending on the first
+        // poll and Ready(v) on the second, so awaiting it genuinely suspends
+        // the enclosing async fn exactly once. Carries the `async` effect so
+        // any fn that awaits it must declare `async` (which `async fn`s do
+        // implicitly).
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeInt()}, futureTy);
+            sch.declaredEffects.add("async");
+            fnSchemas_["yield_now"] = std::move(sch);
+        }
+        // Phase 12 built-in: `block_on(f: Future) -> i64`. The single-threaded
+        // executor: busy-polls `f` until it reports Ready, returning the
+        // value. Used by `main` (and any synchronous fn) to run async code to
+        // completion. block_on itself is synchronous (no `async` effect): it
+        // drives the future rather than suspending on it.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({futureTy}, makeInt());
+            fnSchemas_["block_on"] = std::move(sch);
+        }
+        // Phase 12 built-in: `poll_count() -> i64`. Reads the global poll
+        // counter incremented on every future poll. Lets tests observe that
+        // the Pending path is actually taken (criterion b).
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({}, makeInt());
+            fnSchemas_["poll_count"] = std::move(sch);
         }
 
         // Pass 1a: register every struct and enum decl. To allow free
@@ -650,6 +683,11 @@ private:
     };
     std::vector<LoopCtx> loopStack_;
     TypePtr currentReturnType_;
+    // Phase 12: true while checking the body of an `async fn`. `.await` is
+    // only legal inside an async fn (it suspends the enclosing future, which
+    // only exists if that fn IS a future). Set in checkFunction /
+    // checkImplMethod, read by the AwaitExpr check.
+    bool currentFnIsAsync_ = false;
     // Generic-param-name -> Type Var, scoped to the current fn declaration.
     // Set during Pass 1b sig resolution and during Pass 2 body checking
     // (with a fresh-instantiation copy for body checking, so accidental
@@ -771,7 +809,14 @@ private:
                 auto fnIt = fnSchemas_.find(call->callee);
                 if (fnIt != fnSchemas_.end() &&
                     fnIt->second.effectRowVars.empty()) {
-                    out.unionWith(fnIt->second.declaredEffects);
+                    // Phase 12: calling an `async fn` constructs an inert
+                    // Future and does not perform `async` in the caller (only
+                    // `.await`/`block_on` realize it). Union the callee's
+                    // declared effects but strip `async` for async fns.
+                    for (const auto& l : fnIt->second.declaredEffects.labels) {
+                        if (l == "async" && fnIt->second.isAsync) continue;
+                        out.add(l);
+                    }
                 }
             }
             // Constructor calls don't go through fnSchemas_; they're
@@ -876,6 +921,10 @@ private:
             return;
         }
         if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e)) {
+            // Phase 12: awaiting a future is itself an `async` effect (it may
+            // suspend the enclosing future), in addition to whatever effects
+            // the awaited future-producing operand performs.
+            out.add("async");
             collectEffects(*ae->operand, out);
             return;
         }
@@ -987,6 +1036,7 @@ private:
         }
         currentGenericEnv_ = &genEnv;
         currentEffectRowVarNames_ = &rowVarNames;
+        currentFnIsAsync_ = fn.isAsync;
         pushScope();
         for (const auto& p : fn.params) {
             scopes_.back()[p.name] = resolveTypeRef(p.type);
@@ -1004,6 +1054,7 @@ private:
         }
         popScope();
         currentReturnType_.reset();
+        currentFnIsAsync_ = false;
         currentGenericEnv_ = nullptr;
         currentEffectRowVarNames_ = nullptr;
         currentEffectRowVarById_.clear();
@@ -1357,6 +1408,7 @@ private:
         }
         currentGenericEnv_ = &genEnv;
         currentEffectRowVarNames_ = &rowVarNames;
+        currentFnIsAsync_ = fn.isAsync;
 
         pushScope();
         for (const auto& p : fn.params) {
@@ -1381,6 +1433,7 @@ private:
         }
         popScope();
         currentReturnType_.reset();
+        currentFnIsAsync_ = false;
         currentGenericEnv_ = nullptr;
         currentEffectRowVarNames_ = nullptr;
         currentEffectRowVarById_.clear();
@@ -1496,11 +1549,13 @@ private:
             return makeRef(inner, re->isMut);
         }
         if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e)) {
-            // Phase 6.1: `expr.await` requires its operand to be a
-            // `Future`, which the type system uses as the opaque
-            // wrapper async fns return. Phase 6.1 MVP only supports
-            // `async fn () -> i64`, so await is hard-coded to yield
-            // i64; generic Future<T> arrives alongside generic Vec<T>.
+            // Phase 12: `expr.await` requires its operand to be a `Future`
+            // (the poll/frame pair async fns and `yield_now` produce). Phase
+            // 12 MVP only supports `Future` of `i64`, so await is hard-coded
+            // to yield i64; generic Future<T> arrives alongside generic
+            // Vec<T>. `.await` is only legal inside an `async fn`: it suspends
+            // the enclosing future by returning Pending to the caller, which
+            // only exists if the enclosing fn IS a future.
             TypePtr opTy = checkExpr(*ae->operand);
             TypePtr r = resolve(opTy);
             if (r->kind != TypeKind::Struct || r->structName != "Future") {
@@ -1508,6 +1563,10 @@ private:
                           typeToString(opTy),
                       ae->line, ae->column);
                 return makeInt();
+            }
+            if (!currentFnIsAsync_) {
+                error("`.await` is only allowed inside an `async fn`",
+                      ae->line, ae->column);
             }
             return makeInt();
         }
@@ -2583,6 +2642,14 @@ private:
             {
                 EffectSet contrib;
                 for (const auto& l : schema.declaredEffects.labels) {
+                    // Phase 12: calling an `async fn` only CONSTRUCTS its
+                    // Future (inert until polled), so it does not perform the
+                    // `async` effect in the caller — `.await` (or `block_on`)
+                    // does. This lets a synchronous `main` call
+                    // `block_on(work())` without itself being async, while an
+                    // `async fn` that `.await`s still gets `async` from the
+                    // AwaitExpr collection.
+                    if (l == "async" && schema.isAsync) continue;
                     if (isBuiltinEffect(l)) { contrib.add(l); continue; }
                     TypePtr schemaVar;
                     for (const auto& [n, v] : schema.effectRowVars)

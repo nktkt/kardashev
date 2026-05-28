@@ -982,6 +982,87 @@ void test_dyn_heterogeneous_sum() {
     expectEquals(v, 37, "dyn_heterogeneous_sum");
 }
 
+// --- Phase 12 real async runtime ---
+
+// (a) Multi-state resume: two suspensions, result from locals across them.
+void test_async_two_awaits_locals() {
+    auto v = compileAndRun(
+        "async fn work() -> i64 {\n"
+        "    let a = yield_now(10).await;\n"
+        "    let b = yield_now(20).await;\n"
+        "    a + b\n"
+        "}\n"
+        "fn main() -> i64 { block_on(work()) }",
+        "main", "async_two_awaits_locals");
+    expectEquals(v, 30, "async_two_awaits_locals");
+}
+
+// A local bound BEFORE the first await and read only AFTER the second await
+// must be preserved across both suspensions (frame-promoted).
+void test_async_local_live_across_two_suspends() {
+    auto v = compileAndRun(
+        "async fn work() -> i64 {\n"
+        "    let base = 100;\n"
+        "    let a = yield_now(10).await;\n"
+        "    let b = yield_now(20).await;\n"
+        "    base + a + b\n"
+        "}\n"
+        "fn main() -> i64 { block_on(work()) }",
+        "main", "async_local_live_across_two_suspends");
+    expectEquals(v, 130, "async_local_live_across_two_suspends");
+}
+
+// (b) The Pending path is taken: two yields suspend once each, so the future
+// is polled 4 times (Pending+Ready per yield) — strictly more than the 2
+// awaits. poll_count() observes it.
+void test_async_poll_count_observes_pending() {
+    auto v = compileAndRun(
+        "async fn work() -> i64 {\n"
+        "    let a = yield_now(1).await;\n"
+        "    let b = yield_now(2).await;\n"
+        "    a + b\n"
+        "}\n"
+        "fn main() -> i64 { let _r = block_on(work()); poll_count() }",
+        "main", "async_poll_count_observes_pending");
+    expectEquals(v, 4, "async_poll_count_observes_pending");
+}
+
+// Single-await async fn still works under the new state-machine model.
+void test_async_single_await() {
+    auto v = compileAndRun(
+        "async fn one(n: i64) -> i64 {\n"
+        "    let x = yield_now(n).await;\n"
+        "    x + 1\n"
+        "}\n"
+        "fn main() -> i64 { block_on(one(41)) }",
+        "main", "async_single_await");
+    expectEquals(v, 42, "async_single_await");
+}
+
+// Zero-await async fn finishes Ready on the first poll (and is awaitable by
+// another async fn — the Phase 6 nested-async chain shape).
+void test_async_zero_await_chain() {
+    auto v = compileAndRun(
+        "async fn add(a: i64, b: i64) -> i64 { a + b }\n"
+        "async fn double(n: i64) -> i64 { add(n, n).await }\n"
+        "fn main() -> i64 { block_on(double(21)) }",
+        "main", "async_zero_await_chain");
+    expectEquals(v, 42, "async_zero_await_chain");
+}
+
+// Params are stored in the frame and survive suspension (used after awaits).
+void test_async_param_survives_suspension() {
+    auto v = compileAndRun(
+        "async fn work(n: i64) -> i64 {\n"
+        "    let a = yield_now(5).await;\n"
+        "    let b = yield_now(6).await;\n"
+        "    n + a + b\n"
+        "}\n"
+        "fn main() -> i64 { block_on(work(7)) }",
+        "main", "async_param_survives_suspension");
+    expectEquals(v, 18, "async_param_survives_suspension");
+}
+
 } // namespace
 
 int main() {
@@ -1062,6 +1143,13 @@ int main() {
     test_dyn_method_with_arg();
     test_self_ref_static_dispatch();
     test_dyn_heterogeneous_sum();
-    std::cout << "All codegen tests passed (70 cases) — Phase 11 dyn trait objects\n";
+    // Phase 12 real async runtime (state-machine suspend/resume)
+    test_async_two_awaits_locals();
+    test_async_local_live_across_two_suspends();
+    test_async_poll_count_observes_pending();
+    test_async_single_await();
+    test_async_zero_await_chain();
+    test_async_param_survives_suspension();
+    std::cout << "All codegen tests passed (76 cases) — Phase 12 real async runtime\n";
     return 0;
 }

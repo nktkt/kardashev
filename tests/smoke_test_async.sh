@@ -27,11 +27,17 @@ echo "Using kardc at: $KARDC"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
+# Phase 12: under the real cooperative-future model `.await` is only legal
+# INSIDE an async fn (it suspends the enclosing future). `main` is not a
+# future, so it drives the async chain with the `block_on` executor instead
+# of awaiting directly (the Phase 6 fake-await-in-main no longer type-checks,
+# by design). The chain is still: `double` awaits the nested async fn `add`,
+# producing 42 through real Future -> .await -> Ready unwrapping.
 cat > "$TMP/async.kd" <<'EOF'
 async fn add(a: i64, b: i64) -> i64 { a + b }
 async fn double(n: i64) -> i64 { add(n, n).await }
-fn main() -> i64 ! { async, io } {
-    let v = double(21).await;
+fn main() -> i64 ! { io } {
+    let v = block_on(double(21));
     print(v);
     0
 }

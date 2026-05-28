@@ -265,6 +265,36 @@ private:
     // global's name, so re-using a fn value many times emits one thunk.
     std::unordered_map<std::string, llvm::Function*> fnvalThunks_;
 
+    // --- Phase 12 real async runtime ---
+    // Poll = { i1 ready, i64 value }; the poll-fn type void(i8* frame,
+    // kd.poll* out); the global poll counter; and the leaf yield poll fn.
+    llvm::StructType* pollTy_ = nullptr;
+    llvm::FunctionType* pollFnTy_ = nullptr;
+    llvm::GlobalVariable* kdPollCount_ = nullptr;
+    llvm::Function* yieldPollFn_ = nullptr;       // __kd_yield_poll
+    unsigned nextAsyncId_ = 0;                     // unique frame/poll names
+
+    // State threaded through the body of the async fn currently being lowered
+    // into a resumable poll function. Empty/null when not emitting an async
+    // body. `asyncFrameTy_` is the heap frame struct `{ i64 state, params...,
+    // promoted-locals..., Future cur_subfut }`; `asyncFramePtr_` is the i8*
+    // frame argument GEPs are taken against; `asyncPollOut_` is the kd.poll*
+    // out-param; `asyncSwitch_` is the entry switch that resumes at the saved
+    // state (await points add cases to it); `asyncFrameIndex_` maps a
+    // promoted-local / param name to its frame field index; `asyncStateIdx_`,
+    // `asyncSubfutIdx_` are the fixed frame field indices for the state word
+    // and the current sub-future. `asyncNextState_` hands out resume-state ids.
+    bool inAsyncFn_ = false;
+    llvm::StructType* asyncFrameTy_ = nullptr;
+    llvm::Value* asyncFramePtr_ = nullptr;
+    llvm::Value* asyncPollOut_ = nullptr;
+    llvm::SwitchInst* asyncSwitch_ = nullptr;
+    std::unordered_map<std::string, unsigned> asyncFrameIndex_;
+    std::vector<std::string> asyncPromotedLocals_; // spill/reload order
+    unsigned asyncStateIdx_ = 0;
+    unsigned asyncSubfutIdx_ = 0;
+    int asyncNextState_ = 1; // 0 is the entry/start state
+
     // Phase 6.0 built-in: emit a `print` function that wraps libc's
     // `printf` to write one i64 + newline. The typechecker registered a
     // matching schema so user calls type-check; we materialize the body
@@ -280,6 +310,7 @@ private:
         auto& ctx = *ctx_;
         auto* i64Ty = llvm::Type::getInt64Ty(ctx);
         auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i1Ty = llvm::Type::getInt1Ty(ctx);
         auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
 
         // --- libc externals ---
@@ -327,15 +358,33 @@ private:
             ctx, {i8PtrTy, i64Ty}, "String");
         structTypes_["String"] = strTy;
 
-        // --- Future struct layout: { i64 state, i64 result }.
-        // Phase 6.1 MVP only supports `async fn () -> i64`, so the
-        // result slot is hard-coded i64. Async fns return Future at the
-        // user-visible LLVM signature; their actual body lives in a
-        // sibling `__async_body_<name>` fn whose wrapper builds the
-        // Future at every return point.
+        // --- Phase 12 real async runtime ---
+        // Poll = { i1 ready, i64 value }: the result of polling a future.
+        // `ready` false means Pending (value ignored); true means Ready(value).
+        pollTy_ = llvm::StructType::create(ctx, {i1Ty, i64Ty}, "kd.poll");
+        // Future = { i8* poll, i8* frame }. `poll` is a function pointer of
+        // type `void(i8* frame, kd.poll* out)`; calling it advances the
+        // future by one step and writes Ready/Pending into `out`. `frame` is
+        // the future's heap-allocated state (a counter for yield_now, or the
+        // async-fn state-machine frame). Replaces the Phase 6 fake
+        // {state,result} pair — futures are now genuinely pollable/resumable.
         auto* futureTy = llvm::StructType::create(
-            ctx, {i64Ty, i64Ty}, "Future");
+            ctx, {i8PtrTy, i8PtrTy}, "Future");
         structTypes_["Future"] = futureTy;
+        // The poll-function type shared by every future: void(i8*, kd.poll*).
+        pollFnTy_ = llvm::FunctionType::get(
+            llvm::Type::getVoidTy(ctx), {i8PtrTy, llvm::PointerType::get(ctx, 0)},
+            /*isVarArg=*/false);
+
+        // Global poll counter — incremented on every future poll (by
+        // yield_now's poll fn). Lets tests observe that the Pending path is
+        // taken (criterion b): poll count exceeds the number of awaits iff at
+        // least one Pending was returned and re-polled. The `poll_count()`
+        // builtin reads it.
+        kdPollCount_ = new llvm::GlobalVariable(
+            *module_, i64Ty, /*isConstant=*/false,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantInt::get(i64Ty, 0), "__kd_poll_count");
 
         // --- print(i64) -> i64 ---
         {
@@ -402,6 +451,138 @@ private:
             auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
             b.CreateRet(len);
             declaredFns_["str_len"] = fn;
+        }
+
+        // --- Phase 12 async runtime ---
+        declareAsyncRuntime();
+    }
+
+    // Phase 12: materialize the cooperative-future runtime — the leaf
+    // suspending future `yield_now`, the executor `block_on`, and the
+    // `poll_count` observability hook. The async-fn state-machine poll
+    // functions (one per async fn) are emitted later, in emitFunctionAs.
+    void declareAsyncRuntime() {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+        auto* futureTy = structTypes_["Future"];
+
+        // The yield frame: { i64 count, i64 value }. `count` starts 0; the
+        // first poll bumps it to 1 and returns Pending, the second returns
+        // Ready(value). One genuine suspension per yield_now.
+        auto* yieldFrameTy =
+            llvm::StructType::create(ctx, {i64Ty, i64Ty}, "kd.yield_frame");
+
+        // void __kd_yield_poll(i8* frame, kd.poll* out)
+        {
+            auto* fn = llvm::Function::Create(
+                pollFnTy_, llvm::Function::InternalLinkage, "__kd_yield_poll",
+                module_.get());
+            fn->getArg(0)->setName("frame");
+            fn->getArg(1)->setName("out");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* frame = fn->getArg(0);
+            auto* out = fn->getArg(1);
+            // Observe the poll globally so tests can prove suspension.
+            auto* pc = b.CreateLoad(i64Ty, kdPollCount_, "poll_count");
+            b.CreateStore(
+                b.CreateAdd(pc, llvm::ConstantInt::get(i64Ty, 1)),
+                kdPollCount_);
+            auto* countPtr =
+                b.CreateStructGEP(yieldFrameTy, frame, 0, "count_ptr");
+            auto* count = b.CreateLoad(i64Ty, countPtr, "count");
+            auto* firstPoll = b.CreateICmpEQ(
+                count, llvm::ConstantInt::get(i64Ty, 0), "is_first_poll");
+            auto* pendingBB = llvm::BasicBlock::Create(ctx, "pending", fn);
+            auto* readyBB = llvm::BasicBlock::Create(ctx, "ready", fn);
+            b.CreateCondBr(firstPoll, pendingBB, readyBB);
+            // First poll: record we've suspended once, report Pending.
+            b.SetInsertPoint(pendingBB);
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, 1), countPtr);
+            auto* rdyP = b.CreateStructGEP(pollTy_, out, 0, "ready_ptr");
+            b.CreateStore(llvm::ConstantInt::getFalse(ctx), rdyP);
+            b.CreateRetVoid();
+            // Second+ poll: report Ready(value).
+            b.SetInsertPoint(readyBB);
+            auto* valPtr =
+                b.CreateStructGEP(yieldFrameTy, frame, 1, "value_ptr");
+            auto* val = b.CreateLoad(i64Ty, valPtr, "value");
+            auto* rdyP2 = b.CreateStructGEP(pollTy_, out, 0, "ready_ptr");
+            b.CreateStore(llvm::ConstantInt::getTrue(ctx), rdyP2);
+            auto* outValP = b.CreateStructGEP(pollTy_, out, 1, "out_val_ptr");
+            b.CreateStore(val, outValP);
+            b.CreateRetVoid();
+            yieldPollFn_ = fn;
+        }
+
+        // Future yield_now(i64 v): malloc a yield frame { count=0, value=v }
+        // and return Future { __kd_yield_poll, frame }.
+        {
+            auto* fnTy = llvm::FunctionType::get(futureTy, {i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "yield_now",
+                module_.get());
+            fn->getArg(0)->setName("v");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            uint64_t sz =
+                module_->getDataLayout().getTypeAllocSize(yieldFrameTy);
+            auto* frame = b.CreateCall(
+                mallocFn_, {llvm::ConstantInt::get(i64Ty, sz)}, "yield_frame");
+            auto* countPtr =
+                b.CreateStructGEP(yieldFrameTy, frame, 0, "count_ptr");
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, 0), countPtr);
+            auto* valPtr =
+                b.CreateStructGEP(yieldFrameTy, frame, 1, "value_ptr");
+            b.CreateStore(fn->getArg(0), valPtr);
+            llvm::Value* fut = llvm::UndefValue::get(futureTy);
+            fut = b.CreateInsertValue(fut, yieldPollFn_, {0}, "fut.poll");
+            fut = b.CreateInsertValue(fut, frame, {1}, "fut.frame");
+            b.CreateRet(fut);
+            declaredFns_["yield_now"] = fn;
+        }
+
+        // i64 block_on(Future f): the single-threaded executor. Busy-poll
+        // f.poll(f.frame, &poll) until Ready, then return the value.
+        {
+            auto* fnTy = llvm::FunctionType::get(i64Ty, {futureTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "block_on",
+                module_.get());
+            fn->getArg(0)->setName("f");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* fut = fn->getArg(0);
+            auto* pollPtr = b.CreateExtractValue(fut, {0}, "f.poll");
+            auto* framePtr = b.CreateExtractValue(fut, {1}, "f.frame");
+            auto* pollSlot = b.CreateAlloca(pollTy_, nullptr, "poll_slot");
+            auto* loopBB = llvm::BasicBlock::Create(ctx, "block_on.loop", fn);
+            auto* doneBB = llvm::BasicBlock::Create(ctx, "block_on.done", fn);
+            b.CreateBr(loopBB);
+            b.SetInsertPoint(loopBB);
+            // poll(frame, &poll_slot)
+            b.CreateCall(pollFnTy_, pollPtr, {framePtr, pollSlot});
+            auto* rdyP = b.CreateStructGEP(pollTy_, pollSlot, 0, "ready_ptr");
+            auto* rdy = b.CreateLoad(i1Ty, rdyP, "ready");
+            b.CreateCondBr(rdy, doneBB, loopBB);
+            b.SetInsertPoint(doneBB);
+            auto* valP = b.CreateStructGEP(pollTy_, pollSlot, 1, "val_ptr");
+            auto* val = b.CreateLoad(i64Ty, valP, "result");
+            b.CreateRet(val);
+            declaredFns_["block_on"] = fn;
+        }
+
+        // i64 poll_count(): read the global poll counter (observability).
+        {
+            auto* fnTy = llvm::FunctionType::get(i64Ty, {}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "poll_count",
+                module_.get());
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            b.CreateRet(b.CreateLoad(i64Ty, kdPollCount_, "pc"));
+            declaredFns_["poll_count"] = fn;
         }
     }
 
@@ -936,38 +1117,36 @@ private:
             currentInstanceTypeMap_["Self"] = selfIt->second;
         }
         if (fn.isAsync) {
-            // Phase 6.1: async fn — declare two LLVM functions. The
-            // user-visible `name` returns Future and is a wrapper; the
-            // sibling `__async_body_<name>` carries the actual body
-            // and returns the declared inner type. fnTypeFromDecl uses
-            // fn.returnType which is the declared T, so the body
-            // signature falls out naturally.
+            // Phase 12: async fn — declare two LLVM functions. The
+            // user-visible `name` is a CONSTRUCTOR returning `Future`: it
+            // heap-allocates the state-machine frame, seeds state=0 + the
+            // params, and returns `{ __async_poll_<name>, frame }`. The
+            // sibling `__async_poll_<name>` is the resumable poll function
+            // `void(i8* frame, kd.poll* out)` that runs the body across
+            // suspension points (emitted in emitFunctionAs). Nothing runs
+            // eagerly: calling `name` only builds the future.
             auto* futureTy = structTypes_["Future"];
             std::vector<llvm::Type*> argTs;
             argTs.reserve(fn.params.size());
             for (const auto& p : fn.params) argTs.push_back(mapTypeRef(p.type));
-            auto* wrapperFty = llvm::FunctionType::get(
+            auto* ctorFty = llvm::FunctionType::get(
                 futureTy, argTs, /*isVarArg=*/false);
-            auto* wrapper = llvm::Function::Create(
-                wrapperFty, llvm::Function::ExternalLinkage, name,
+            auto* ctor = llvm::Function::Create(
+                ctorFty, llvm::Function::ExternalLinkage, name,
                 module_.get());
             unsigned i = 0;
-            for (auto& arg : wrapper->args()) {
+            for (auto& arg : ctor->args()) {
                 if (i < fn.params.size()) arg.setName(fn.params[i].name);
                 ++i;
             }
-            declaredFns_[name] = wrapper;
+            declaredFns_[name] = ctor;
 
-            llvm::FunctionType* bodyFty = fnTypeFromDecl(fn);
-            auto* bodyFn = llvm::Function::Create(
-                bodyFty, llvm::Function::InternalLinkage,
-                "__async_body_" + name, module_.get());
-            i = 0;
-            for (auto& arg : bodyFn->args()) {
-                if (i < fn.params.size()) arg.setName(fn.params[i].name);
-                ++i;
-            }
-            declaredFns_["__async_body_" + name] = bodyFn;
+            auto* pollFn = llvm::Function::Create(
+                pollFnTy_, llvm::Function::InternalLinkage,
+                "__async_poll_" + name, module_.get());
+            pollFn->getArg(0)->setName("frame");
+            pollFn->getArg(1)->setName("out");
+            declaredFns_["__async_poll_" + name] = pollFn;
             currentInstanceTypeMap_ = std::move(savedMap);
             return;
         }
@@ -1027,15 +1206,13 @@ private:
         if (selfIt != implMethodSelf_.end()) {
             currentInstanceTypeMap_["Self"] = selfIt->second;
         }
-        // Phase 6.1: async fns emit the body INTO the
-        // `__async_body_<name>` sibling we declared. Then we generate
-        // the Future-wrapping body of the user-visible name.
-        std::string mangled;
+        // Phase 12: async fns lower to a state-machine poll function + a
+        // future-constructing entry fn (no eager body execution).
         if (fn.isAsync) {
-            mangled = "__async_body_" + baseName;
-        } else {
-            mangled = mangleInstance(baseName, typeArgs);
+            emitAsyncFn(fn, baseName);
+            return;
         }
+        std::string mangled = mangleInstance(baseName, typeArgs);
         auto fnIt = declaredFns_.find(mangled);
         if (fnIt == declaredFns_.end()) {
             // Generic instance not yet declared: declare it now so
@@ -1084,38 +1261,500 @@ private:
                 builder_->CreateRetVoid();
             }
         }
+    }
 
-        // Phase 6.1: for async fns, also emit the Future-wrapping
-        // wrapper that the user-visible name points at. The body we
-        // just emitted lives in `__async_body_<name>`; the wrapper
-        // calls it and packages the result into Future { 1, result }.
-        if (fn.isAsync) {
-            auto wrapperIt = declaredFns_.find(baseName);
-            if (wrapperIt == declaredFns_.end()) {
-                errors_.push_back(
-                    "codegen: async wrapper not declared for " + baseName);
-                return;
+    // Collect every `let`-bound local in an async fn body (source order, first
+    // binding wins on shadowing) paired with its resolved Kardashev type, read
+    // from the typechecker's recorded RHS types. Used to lay out the frame and
+    // to map promoted-local LLVM field types.
+    std::vector<std::pair<std::string, TypePtr>> asyncLocalTypes(
+        const ast::FnDecl& fn) {
+        std::vector<std::pair<std::string, TypePtr>> out;
+        std::unordered_set<std::string> seen;
+        collectAsyncLocalTypes(*fn.body, out, seen);
+        return out;
+    }
+    void collectAsyncLocalTypes(
+        const ast::Expr& e,
+        std::vector<std::pair<std::string, TypePtr>>& out,
+        std::unordered_set<std::string>& seen) {
+        if (auto* be = dynamic_cast<const ast::BlockExpr*>(&e)) {
+            for (const auto& s : be->stmts) {
+                if (auto* let = dynamic_cast<const ast::LetStmt*>(s.get())) {
+                    collectAsyncLocalTypes(*let->value, out, seen);
+                    if (seen.insert(let->name).second) {
+                        auto it = tc_.exprTypes.find(let->value.get());
+                        TypePtr ty = it != tc_.exprTypes.end() ? it->second
+                                                               : makeInt();
+                        out.emplace_back(let->name, ty);
+                    }
+                } else if (auto* es =
+                               dynamic_cast<const ast::ExprStmt*>(s.get())) {
+                    collectAsyncLocalTypes(*es->expr, out, seen);
+                } else if (auto* rs =
+                               dynamic_cast<const ast::ReturnStmt*>(s.get())) {
+                    if (rs->value) collectAsyncLocalTypes(*rs->value, out, seen);
+                } else if (auto* as =
+                               dynamic_cast<const ast::AssignStmt*>(s.get())) {
+                    collectAsyncLocalTypes(*as->value, out, seen);
+                }
             }
-            auto* wrapper = wrapperIt->second;
-            auto* bodyFn = currentFn_; // the __async_body_<name> we just filled
-            auto& ctx = *ctx_;
-            auto* i64Ty = llvm::Type::getInt64Ty(ctx);
-            auto* futureTy = structTypes_["Future"];
-            auto* wEntry =
-                llvm::BasicBlock::Create(ctx, "entry", wrapper);
-            llvm::IRBuilder<> b(wEntry);
-            std::vector<llvm::Value*> args;
-            args.reserve(wrapper->arg_size());
-            for (auto& arg : wrapper->args()) args.push_back(&arg);
-            auto* result =
-                b.CreateCall(bodyFn, args, "async_inner_result");
+            if (be->tail) collectAsyncLocalTypes(*be->tail, out, seen);
+            return;
+        }
+        if (auto* ie = dynamic_cast<const ast::IfExpr*>(&e)) {
+            collectAsyncLocalTypes(*ie->cond, out, seen);
+            collectAsyncLocalTypes(*ie->thenBranch, out, seen);
+            if (ie->elseBranch) collectAsyncLocalTypes(*ie->elseBranch, out, seen);
+            return;
+        }
+        if (auto* we = dynamic_cast<const ast::WhileExpr*>(&e)) {
+            collectAsyncLocalTypes(*we->cond, out, seen);
+            collectAsyncLocalTypes(*we->body, out, seen);
+            return;
+        }
+        if (auto* le = dynamic_cast<const ast::LoopExpr*>(&e)) {
+            collectAsyncLocalTypes(*le->body, out, seen);
+            return;
+        }
+        if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e)) {
+            collectAsyncLocalTypes(*ae->operand, out, seen);
+            return;
+        }
+        if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+            collectAsyncLocalTypes(*bin->lhs, out, seen);
+            collectAsyncLocalTypes(*bin->rhs, out, seen);
+            return;
+        }
+        if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+            for (const auto& a : call->args) collectAsyncLocalTypes(*a, out, seen);
+            return;
+        }
+        // Other expression kinds bind no locals reachable in the MVP async
+        // surface; their sub-expressions can't introduce `let`s.
+    }
+
+    // Phase 12: compute the set of locals (params + `let` bindings) that are
+    // LIVE ACROSS an await — i.e. bound before some await and read at/after
+    // that await — and therefore must live in the heap frame to survive
+    // suspension. Locals used only within a single await-free straight-line
+    // segment stay as ordinary stack allocas.
+    //
+    // Analysis: a single walk in evaluation order maintains an `awaitCounter`
+    // (incremented at each await) and `boundAt[v]` (the counter value when v
+    // was bound). A read of v promotes v iff `awaitCounter > boundAt[v]`.
+    // Params are bound at counter 0. Control flow is handled conservatively
+    // (never under-approximating, which would miscompile): if/match branches
+    // are walked in sequence; loop bodies are walked TWICE so a value defined
+    // after an await in the body and read at the top on the next iteration is
+    // caught. Over-approximation only widens the frame; it never drops a
+    // genuinely-live local.
+    std::unordered_set<std::string> computeAsyncFrameLocals(
+        const ast::FnDecl& fn) {
+        std::unordered_set<std::string> promoted;
+        std::unordered_map<std::string, int> boundAt;
+        int awaitCounter = 0;
+        for (const auto& p : fn.params) boundAt[p.name] = 0;
+        asyncLivenessWalk(*fn.body, boundAt, awaitCounter, promoted);
+        return promoted;
+    }
+    void asyncLivenessWalk(const ast::Expr& e,
+                           std::unordered_map<std::string, int>& boundAt,
+                           int& awaitCounter,
+                           std::unordered_set<std::string>& promoted) {
+        if (auto* id = dynamic_cast<const ast::IdentExpr*>(&e)) {
+            auto it = boundAt.find(id->name);
+            if (it != boundAt.end() && awaitCounter > it->second)
+                promoted.insert(id->name);
+            return;
+        }
+        if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e)) {
+            asyncLivenessWalk(*ae->operand, boundAt, awaitCounter, promoted);
+            ++awaitCounter; // the suspension happens after the operand evaluates
+            return;
+        }
+        if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+            asyncLivenessWalk(*bin->lhs, boundAt, awaitCounter, promoted);
+            asyncLivenessWalk(*bin->rhs, boundAt, awaitCounter, promoted);
+            return;
+        }
+        if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+            for (const auto& a : call->args)
+                asyncLivenessWalk(*a, boundAt, awaitCounter, promoted);
+            return;
+        }
+        if (auto* fe = dynamic_cast<const ast::FieldExpr*>(&e)) {
+            asyncLivenessWalk(*fe->object, boundAt, awaitCounter, promoted);
+            return;
+        }
+        if (auto* re = dynamic_cast<const ast::RefExpr*>(&e)) {
+            asyncLivenessWalk(*re->operand, boundAt, awaitCounter, promoted);
+            return;
+        }
+        if (auto* ie = dynamic_cast<const ast::IfExpr*>(&e)) {
+            asyncLivenessWalk(*ie->cond, boundAt, awaitCounter, promoted);
+            asyncLivenessWalk(*ie->thenBranch, boundAt, awaitCounter, promoted);
+            if (ie->elseBranch)
+                asyncLivenessWalk(*ie->elseBranch, boundAt, awaitCounter,
+                                  promoted);
+            return;
+        }
+        if (auto* we = dynamic_cast<const ast::WhileExpr*>(&e)) {
+            // Walk twice so loop-carried liveness across an in-body await is
+            // captured on the conceptual back-edge.
+            for (int rep = 0; rep < 2; ++rep) {
+                asyncLivenessWalk(*we->cond, boundAt, awaitCounter, promoted);
+                asyncLivenessWalk(*we->body, boundAt, awaitCounter, promoted);
+            }
+            return;
+        }
+        if (auto* le = dynamic_cast<const ast::LoopExpr*>(&e)) {
+            for (int rep = 0; rep < 2; ++rep)
+                asyncLivenessWalk(*le->body, boundAt, awaitCounter, promoted);
+            return;
+        }
+        if (auto* be = dynamic_cast<const ast::BlockExpr*>(&e)) {
+            for (const auto& s : be->stmts) {
+                if (auto* let = dynamic_cast<const ast::LetStmt*>(s.get())) {
+                    asyncLivenessWalk(*let->value, boundAt, awaitCounter,
+                                      promoted);
+                    boundAt[let->name] = awaitCounter; // bound after RHS
+                } else if (auto* es =
+                               dynamic_cast<const ast::ExprStmt*>(s.get())) {
+                    asyncLivenessWalk(*es->expr, boundAt, awaitCounter, promoted);
+                } else if (auto* rs =
+                               dynamic_cast<const ast::ReturnStmt*>(s.get())) {
+                    if (rs->value)
+                        asyncLivenessWalk(*rs->value, boundAt, awaitCounter,
+                                          promoted);
+                } else if (auto* as =
+                               dynamic_cast<const ast::AssignStmt*>(s.get())) {
+                    // RHS reads count; the target write keeps the existing
+                    // boundAt (conservative: a reassigned var stays promoted
+                    // if it ever crosses an await).
+                    asyncLivenessWalk(*as->value, boundAt, awaitCounter,
+                                      promoted);
+                }
+            }
+            if (be->tail)
+                asyncLivenessWalk(*be->tail, boundAt, awaitCounter, promoted);
+            return;
+        }
+        // IntLit / StringLit / Break / Continue / closures etc.: no locals of
+        // ours to read (closures capture by value at definition; their bodies
+        // run later and don't extend our frame liveness).
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 12: lower an `async fn` to a real cooperative-future state
+    // machine. Two functions result:
+    //   * the user-visible `baseName` CONSTRUCTOR — heap-allocates the frame,
+    //     stores state=0 and the params, returns Future{ poll, frame }.
+    //   * `__async_poll_<baseName>` — the resumable POLL function. It reloads
+    //     params + frame-promoted locals, `switch`es on the saved state to
+    //     resume at the last suspension point, and runs the body. Each
+    //     `.await` polls its sub-future: Pending => spill live locals + save
+    //     state + return Pending (genuine suspension); Ready(x) => bind x and
+    //     fall through. The final value is written to the Poll out-param as
+    //     Ready.
+    //
+    // Frame layout: { i64 state, <params...>, <promoted locals...>,
+    // Future cur_subfut }. "Promoted locals" are exactly those LIVE ACROSS an
+    // await (computed by computeAsyncFrameLocals); locals not live across any
+    // await stay as ordinary stack allocas re-created on the state-0 path.
+    void emitAsyncFn(const ast::FnDecl& fn, const std::string& baseName) {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* futureTy = structTypes_["Future"];
+
+        auto ctorIt = declaredFns_.find(baseName);
+        auto pollIt = declaredFns_.find("__async_poll_" + baseName);
+        if (ctorIt == declaredFns_.end() || pollIt == declaredFns_.end()) {
+            errors_.push_back("codegen: async fn not declared: " + baseName);
+            return;
+        }
+        llvm::Function* ctor = ctorIt->second;
+        llvm::Function* pollFn = pollIt->second;
+
+        // --- Decide which locals must survive suspension. ---
+        std::unordered_set<std::string> promoted =
+            computeAsyncFrameLocals(fn);
+
+        // --- Build the frame struct type. ---
+        // Field order: [0] state (i64); params; promoted locals; cur_subfut.
+        std::vector<llvm::Type*> frameFields;
+        std::unordered_map<std::string, unsigned> frameIndex;
+        std::vector<std::string> promotedOrder; // deterministic spill order
+        frameFields.push_back(i64Ty); // state @ 0
+        unsigned stateIdx = 0;
+        for (const auto& p : fn.params) {
+            frameIndex[p.name] = static_cast<unsigned>(frameFields.size());
+            frameFields.push_back(mapTypeRef(p.type));
+            if (promoted.count(p.name)) promotedOrder.push_back(p.name);
+        }
+        for (const auto& [name, ty] : asyncLocalTypes(fn)) {
+            if (!promoted.count(name)) continue;
+            if (frameIndex.count(name)) continue; // a promoted param already
+            frameIndex[name] = static_cast<unsigned>(frameFields.size());
+            frameFields.push_back(mapKardashevType(ty));
+            promotedOrder.push_back(name);
+        }
+        unsigned subfutIdx = static_cast<unsigned>(frameFields.size());
+        frameFields.push_back(futureTy); // cur_subfut
+        std::string frameName = "kd.async_frame." + baseName + "." +
+                                std::to_string(nextAsyncId_++);
+        auto* frameTy = llvm::StructType::create(ctx, frameFields, frameName);
+
+        // --- Emit the constructor (user-visible name). ---
+        {
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", ctor);
+            llvm::IRBuilder<> b(entry);
+            uint64_t sz = module_->getDataLayout().getTypeAllocSize(frameTy);
+            auto* frame = b.CreateCall(
+                mallocFn_, {llvm::ConstantInt::get(i64Ty, sz)}, "async_frame");
+            // state = 0
+            auto* stateP = b.CreateStructGEP(frameTy, frame, stateIdx,
+                                             "state_ptr");
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, 0), stateP);
+            // store params into their frame slots
+            unsigned ai = 0;
+            for (auto& arg : ctor->args()) {
+                const std::string& pn = fn.params[ai].name;
+                auto* slot = b.CreateStructGEP(frameTy, frame,
+                                               frameIndex[pn], pn + "_slot");
+                b.CreateStore(&arg, slot);
+                ++ai;
+            }
             llvm::Value* fut = llvm::UndefValue::get(futureTy);
-            fut = b.CreateInsertValue(
-                fut, llvm::ConstantInt::get(i64Ty, 1), {0},
-                "future_state");
-            fut = b.CreateInsertValue(fut, result, {1}, "future_result");
+            fut = b.CreateInsertValue(fut, pollFn, {0}, "fut.poll");
+            fut = b.CreateInsertValue(fut, frame, {1}, "fut.frame");
             b.CreateRet(fut);
         }
+
+        // --- Emit the poll function body. ---
+        // Save the outer emission context (we may be nested via a generic
+        // instance worklist; same save/restore discipline as emitClosure).
+        auto* savedFn = currentFn_;
+        auto savedLocals = std::move(locals_);
+        auto savedLocalTypes = std::move(localTypes_);
+        auto savedLoopFrames = std::move(loopFrames_);
+        TypePtr savedRetTy = currentFnReturnType_;
+        bool savedInAsync = inAsyncFn_;
+        auto savedFrameTy = asyncFrameTy_;
+        auto savedFramePtr = asyncFramePtr_;
+        auto savedPollOut = asyncPollOut_;
+        auto savedSwitch = asyncSwitch_;
+        auto savedFrameIndex = std::move(asyncFrameIndex_);
+        auto savedPromoted = std::move(asyncPromotedLocals_);
+        auto savedStateIdx = asyncStateIdx_;
+        auto savedSubfutIdx = asyncSubfutIdx_;
+        auto savedNextState = asyncNextState_;
+
+        locals_.clear();
+        localTypes_.clear();
+        loopFrames_.clear();
+        currentFn_ = pollFn;
+        currentFnReturnType_ = astTypeRefToConcrete(fn.returnType);
+        inAsyncFn_ = true;
+        asyncFrameTy_ = frameTy;
+        asyncFramePtr_ = pollFn->getArg(0);
+        asyncPollOut_ = pollFn->getArg(1);
+        asyncFrameIndex_ = std::move(frameIndex);
+        asyncPromotedLocals_ = std::move(promotedOrder);
+        asyncStateIdx_ = stateIdx;
+        asyncSubfutIdx_ = subfutIdx;
+        asyncNextState_ = 1;
+
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", pollFn);
+        builder_->SetInsertPoint(entry);
+        // Reload params + promoted locals from the frame into fresh stack
+        // slots. On state 0 the promoted slots are uninitialised, but the
+        // state-0 path writes each before any await reads it; on a resume the
+        // slots hold the values spilled at the last suspension.
+        for (const auto& p : fn.params) {
+            llvm::Type* lt = mapTypeRef(p.type);
+            auto* slot = asyncFrameSlot(p.name);
+            auto* val = builder_->CreateLoad(lt, slot, p.name + ".reload");
+            auto* a = builder_->CreateAlloca(lt, nullptr, p.name);
+            builder_->CreateStore(val, a);
+            locals_[p.name] = a;
+            TypePtr pty = astTypeRefToConcrete(p.type);
+            if (resolve(pty)->kind == TypeKind::Function) localTypes_[p.name] = pty;
+        }
+        for (const auto& [name, ty] : asyncLocalTypes(fn)) {
+            if (!asyncFrameIndex_.count(name)) continue;
+            if (locals_.count(name)) continue; // promoted param already loaded
+            llvm::Type* lt = mapKardashevType(ty);
+            auto* slot = asyncFrameSlot(name);
+            auto* val = builder_->CreateLoad(lt, slot, name + ".reload");
+            auto* a = builder_->CreateAlloca(lt, nullptr, name);
+            builder_->CreateStore(val, a);
+            locals_[name] = a;
+            if (resolve(ty)->kind == TypeKind::Function) localTypes_[name] = ty;
+        }
+        // switch (state) { 0 -> body0; N -> (added per await) }
+        auto* stateSlot = asyncFrameSlot("");  // state @ stateIdx
+        auto* stateVal = builder_->CreateLoad(i64Ty, stateSlot, "state");
+        auto* body0 = llvm::BasicBlock::Create(ctx, "async.body", pollFn);
+        asyncSwitch_ = builder_->CreateSwitch(stateVal, body0, 4);
+        builder_->SetInsertPoint(body0);
+
+        // Emit the body. `.await` inside drives the state machine; `return`s
+        // and the tail value finish the future via finishAsyncReady.
+        llvm::Value* bodyVal = emitBlock(*fn.body);
+        if (!currentBlockTerminated()) {
+            finishAsyncReady(bodyVal);
+        }
+
+        // Restore outer context.
+        currentFn_ = savedFn;
+        locals_ = std::move(savedLocals);
+        localTypes_ = std::move(savedLocalTypes);
+        loopFrames_ = std::move(savedLoopFrames);
+        currentFnReturnType_ = savedRetTy;
+        inAsyncFn_ = savedInAsync;
+        asyncFrameTy_ = savedFrameTy;
+        asyncFramePtr_ = savedFramePtr;
+        asyncPollOut_ = savedPollOut;
+        asyncSwitch_ = savedSwitch;
+        asyncFrameIndex_ = std::move(savedFrameIndex);
+        asyncPromotedLocals_ = std::move(savedPromoted);
+        asyncStateIdx_ = savedStateIdx;
+        asyncSubfutIdx_ = savedSubfutIdx;
+        asyncNextState_ = savedNextState;
+        (void)i1Ty;
+        (void)i8PtrTy;
+    }
+
+    // GEP a field of the current async frame. The empty name addresses the
+    // state word (field `asyncStateIdx_`); otherwise the named param/local's
+    // promoted slot.
+    llvm::Value* asyncFrameSlot(const std::string& name) {
+        unsigned idx = name.empty() ? asyncStateIdx_ : asyncFrameIndex_.at(name);
+        return builder_->CreateStructGEP(asyncFrameTy_, asyncFramePtr_, idx,
+                                         (name.empty() ? "state" : name) +
+                                             ".frameslot");
+    }
+
+    // Spill every promoted local from its stack slot into the frame, so its
+    // value survives a suspension. Called right before saving state + polling
+    // a sub-future at an await point.
+    void spillAsyncLocals() {
+        for (const auto& name : asyncPromotedLocals_) {
+            auto lit = locals_.find(name);
+            if (lit == locals_.end()) continue;
+            auto* val = builder_->CreateLoad(
+                lit->second->getAllocatedType(), lit->second, name + ".spill");
+            builder_->CreateStore(val, asyncFrameSlot(name));
+        }
+    }
+
+    // Finish the current async fn: write Ready(value) into the Poll out-param
+    // and return from the poll function. `value` may be null for a unit body
+    // (we report Ready(0) — only `-> i64` async fns exist in the MVP).
+    void finishAsyncReady(llvm::Value* value) {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        if (!value) value = llvm::ConstantInt::get(i64Ty, 0);
+        auto* rdyP =
+            builder_->CreateStructGEP(pollTy_, asyncPollOut_, 0, "ready_ptr");
+        builder_->CreateStore(llvm::ConstantInt::getTrue(ctx), rdyP);
+        auto* valP =
+            builder_->CreateStructGEP(pollTy_, asyncPollOut_, 1, "out_val_ptr");
+        builder_->CreateStore(value, valP);
+        builder_->CreateRetVoid();
+    }
+
+    // Phase 12: lower `<fut>.await` inside an async fn's poll function to a
+    // genuine suspension point. We allocate a fresh resume-state id N, store
+    // the awaited sub-future into the frame, and emit:
+    //
+    //     <eval operand into cur_subfut>     (first arrival only)
+    //     store state = N; spill live locals  (first arrival only)
+    //     br poll_N
+    //   resume_N:  (switch target for state==N — reached on re-poll)
+    //     br poll_N
+    //   poll_N:
+    //     subfut = load frame.cur_subfut
+    //     call subfut.poll(subfut.frame, &local_poll)
+    //     if !ready { copy local_poll into out; ret }   ; PENDING: suspend
+    //     result = local_poll.value                       ; READY: continue
+    //
+    // Returning Pending hands control back to the caller (the executor or an
+    // outer poll fn); the next poll re-enters via the entry switch at
+    // resume_N, having reloaded the spilled locals, and re-polls the same
+    // sub-future. This is the real cooperative suspend/resume.
+    llvm::Value* emitAwait(const ast::AwaitExpr& ae) {
+        if (!inAsyncFn_) {
+            // Guarded by the typechecker (`.await` only in async fn); defensive.
+            errors_.push_back("codegen: .await outside an async fn");
+            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
+        }
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* futureTy = structTypes_["Future"];
+
+        int state = asyncNextState_++;
+
+        // Evaluate the sub-future operand and store it into the frame so it
+        // survives suspension (only happens on the first arrival; on resume we
+        // jump straight to poll_N). The frame GEP is recomputed at each use
+        // site so it dominates both the body0 store and the (switch-reachable)
+        // pollBB load.
+        llvm::Value* subfut = emitExpr(*ae.operand);
+        builder_->CreateStore(
+            subfut,
+            builder_->CreateStructGEP(asyncFrameTy_, asyncFramePtr_,
+                                      asyncSubfutIdx_, "cur_subfut_ptr"));
+        // Save resume state + spill locals live across this suspension.
+        builder_->CreateStore(llvm::ConstantInt::get(i64Ty, state),
+                              asyncFrameSlot(""));
+        spillAsyncLocals();
+
+        auto* resumeBB = llvm::BasicBlock::Create(
+            ctx, "async.resume" + std::to_string(state), currentFn_);
+        auto* pollBB = llvm::BasicBlock::Create(
+            ctx, "async.poll" + std::to_string(state), currentFn_);
+        auto* pendingBB = llvm::BasicBlock::Create(
+            ctx, "async.pending" + std::to_string(state), currentFn_);
+        auto* readyBB = llvm::BasicBlock::Create(
+            ctx, "async.ready" + std::to_string(state), currentFn_);
+
+        // Register the resume target on the entry switch.
+        asyncSwitch_->addCase(llvm::ConstantInt::get(i64Ty, state), resumeBB);
+
+        builder_->CreateBr(pollBB);
+        builder_->SetInsertPoint(resumeBB);
+        builder_->CreateBr(pollBB);
+
+        builder_->SetInsertPoint(pollBB);
+        auto* subfutSlot = builder_->CreateStructGEP(
+            asyncFrameTy_, asyncFramePtr_, asyncSubfutIdx_, "cur_subfut_ptr");
+        auto* fut = builder_->CreateLoad(futureTy, subfutSlot, "subfut");
+        auto* subPoll = builder_->CreateExtractValue(fut, {0}, "subfut.poll");
+        auto* subFrame = builder_->CreateExtractValue(fut, {1}, "subfut.frame");
+        auto* pollSlot = builder_->CreateAlloca(pollTy_, nullptr, "subpoll");
+        builder_->CreateCall(pollFnTy_, subPoll, {subFrame, pollSlot});
+        auto* rdyP = builder_->CreateStructGEP(pollTy_, pollSlot, 0, "ready_ptr");
+        auto* rdy = builder_->CreateLoad(i1Ty, rdyP, "ready");
+        builder_->CreateCondBr(rdy, readyBB, pendingBB);
+
+        // PENDING: propagate Pending to our caller and return (suspend).
+        builder_->SetInsertPoint(pendingBB);
+        auto* outRdyP =
+            builder_->CreateStructGEP(pollTy_, asyncPollOut_, 0, "out_ready_ptr");
+        builder_->CreateStore(llvm::ConstantInt::getFalse(ctx), outRdyP);
+        builder_->CreateRetVoid();
+
+        // READY: extract the value and continue with it as the await result.
+        builder_->SetInsertPoint(readyBB);
+        auto* valP = builder_->CreateStructGEP(pollTy_, pollSlot, 1, "val_ptr");
+        (void)i8PtrTy;
+        return builder_->CreateLoad(i64Ty, valP, "await_result");
     }
 
     llvm::Value* emitBlock(const ast::BlockExpr& block) {
@@ -1132,8 +1771,19 @@ private:
     void emitStmt(const ast::Stmt& s) {
         if (auto* let = dynamic_cast<const ast::LetStmt*>(&s)) {
             llvm::Value* v = emitExpr(*let->value);
-            auto* alloca =
-                builder_->CreateAlloca(v->getType(), nullptr, let->name);
+            // Phase 12: if this local is frame-promoted (live across an await),
+            // its single stack slot was already alloca'd in the poll fn's entry
+            // block (so the resume path's reload and the let's store target the
+            // SAME slot). Reuse it; otherwise create a fresh alloca as usual.
+            llvm::AllocaInst* alloca = nullptr;
+            if (inAsyncFn_ && asyncFrameIndex_.count(let->name)) {
+                auto existing = locals_.find(let->name);
+                if (existing != locals_.end()) alloca = existing->second;
+            }
+            if (!alloca) {
+                alloca = builder_->CreateAlloca(v->getType(), nullptr,
+                                                let->name);
+            }
             builder_->CreateStore(v, alloca);
             locals_[let->name] = alloca;
             // Phase 4.3: remember the kardashev type so emitCall can
@@ -1145,8 +1795,12 @@ private:
             return;
         }
         if (auto* ret = dynamic_cast<const ast::ReturnStmt*>(&s)) {
-            if (ret->value) {
-                llvm::Value* v = emitExpr(*ret->value);
+            llvm::Value* v = ret->value ? emitExpr(*ret->value) : nullptr;
+            if (inAsyncFn_) {
+                // Phase 12: `return x` from an async fn finishes the future
+                // with Ready(x) (the poll fn itself returns void).
+                finishAsyncReady(v);
+            } else if (v) {
                 builder_->CreateRet(v);
             } else {
                 builder_->CreateRetVoid();
@@ -1355,58 +2009,7 @@ private:
             return emitRef(*re);
         }
         if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e)) {
-            // Phase 6.2: `.await` lowers to an inline poll loop — the
-            // synchronous "executor" baked into the call site. Future
-            // is spilled to a stack alloca so a future suspension
-            // primitive can swap state across iterations; today every
-            // Future is built with state == READY (1), so the loop
-            // exits on the first check. The IR shape is the textbook
-            // state-machine + executor pairing:
-            //
-            //   alloca Future fut_slot
-            //   store <operand result>, fut_slot
-            //   br .poll
-            // .poll:
-            //   state = load fut_slot.state
-            //   br state == READY, .done, .pending
-            // .pending:
-            //   ; future: yield to scheduler, advance state via poll()
-            //   br .poll
-            // .done:
-            //   result = load fut_slot.result
-            auto& ctx = *ctx_;
-            auto* i64Ty = llvm::Type::getInt64Ty(ctx);
-            auto* futureTy = structTypes_["Future"];
-            llvm::Value* fut = emitExpr(*ae->operand);
-            auto* slot = builder_->CreateAlloca(
-                futureTy, nullptr, "fut_slot");
-            builder_->CreateStore(fut, slot);
-            auto* pollBB = llvm::BasicBlock::Create(ctx, "await.poll",
-                                                     currentFn_);
-            auto* pendingBB = llvm::BasicBlock::Create(ctx, "await.pending",
-                                                        currentFn_);
-            auto* doneBB = llvm::BasicBlock::Create(ctx, "await.done",
-                                                     currentFn_);
-            builder_->CreateBr(pollBB);
-            builder_->SetInsertPoint(pollBB);
-            auto* statePtr = builder_->CreateStructGEP(
-                futureTy, slot, 0, "fut_state_ptr");
-            auto* state = builder_->CreateLoad(i64Ty, statePtr, "fut_state");
-            auto* isReady = builder_->CreateICmpEQ(
-                state, llvm::ConstantInt::get(i64Ty, 1),
-                "await.is_ready");
-            builder_->CreateCondBr(isReady, doneBB, pendingBB);
-            builder_->SetInsertPoint(pendingBB);
-            // No scheduler primitive yet — spin back to poll. This
-            // branch is unreachable for any Future our codegen builds
-            // today (they all initialise to state=READY), but the IR
-            // is shaped so a future `kd_yield`-style intrinsic plugs
-            // in here.
-            builder_->CreateBr(pollBB);
-            builder_->SetInsertPoint(doneBB);
-            auto* resultPtr = builder_->CreateStructGEP(
-                futureTy, slot, 1, "fut_result_ptr");
-            return builder_->CreateLoad(i64Ty, resultPtr, "await_result");
+            return emitAwait(*ae);
         }
         errors_.push_back("codegen: unknown expression kind");
         return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
