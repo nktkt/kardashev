@@ -543,6 +543,23 @@ void test_break_value_walked_ok() {
              "break_value_walked_ok");
 }
 
+void test_named_slice_blocks_mutation_errors() {
+    expectErr("fn main() -> i64 {
+"
+              "  let mut v = vec_new();
+"
+              "  vec_push(&mut v, 1);
+"
+              "  let s = &v[0..1];
+"
+              "  vec_push(&mut v, 2);
+"
+              "  slice_get(s, 0)
+"
+              "}",
+              "named_slice_blocks_mutation_errors");
+}
+
 } // namespace
 
 int main() {
@@ -587,7 +604,8 @@ int main() {
     test_for_loop_body_ok();
     test_move_inside_loop_body_detected();
     test_break_value_walked_ok();
-    std::cout << "All borrow_check tests passed (39 cases) — Phase 2.4c "
+    test_named_slice_blocks_mutation_errors();
+    std::cout << "All borrow_check tests passed (40 cases) — Phase 2.4c "
                  "NLL + mutable references; Phase 9 loops; Phase 13a "
                  "method-receiver autoref\n";
     return 0;
