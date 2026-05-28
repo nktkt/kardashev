@@ -1838,6 +1838,16 @@ private:
             scopes_.back()[p.name] = resolveTypeRef(p.type);
         }
         currentReturnType_ = resolveTypeRef(fn.returnType);
+        // PR#25: reject `-> &T` reference return types (top-level fns). No
+        // lifetime system, so a returned reference borrows a param or a
+        // local — the latter being a guaranteed use-after-free. Slices
+        // (`&[T]`, a Struct kind) are not caught here.
+        if (resolve(currentReturnType_)->kind == TypeKind::Ref) {
+            error("function '" + fn.name +
+                      "' cannot return a reference (no lifetime system yet); "
+                      "return an owned value instead",
+                  fn.returnType.line, fn.returnType.column);
+        }
 
         TypePtr bodyType = checkBlock(*fn.body);
         // If the block has a tail expression, it must match the declared
