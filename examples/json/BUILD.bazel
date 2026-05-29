@@ -8,10 +8,13 @@ exports_files(
     visibility = ["//visibility:public"],
 )
 
-# Phase 31 (v5) capstone: a JSON object parser written in kardashev. Scans a
-# JSON source string with str_char_at, slices keys with str_substring, and
-# builds a HashMap<String, i64> (the Phase 28 String-keyed map), then answers
-# lookups and prints a summary. AOT-compiled via //compiler:kardc.
+# Phase 38 (v6) capstone: a FULL nested-JSON parser + serializer in kardashev.
+# Parses null/bool/int/string/array/object with arbitrary nesting into a
+# recursive `enum Json { ... JArr(Vec<Json>), JObj(HashMap<String,Json>) }`,
+# traverses it by reference, re-serializes through a `Display` impl, and
+# round-trips by deep (order-independent) equality. AOT-compiled via
+# //compiler:kardc. Exercised by //tests:smoke_test_json (correctness +
+# a constant-memory leak gate).
 kardashev_binary(
     name = "json",
     src = "main.kd",

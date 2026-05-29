@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
-# Phase 31 smoke test: the two v5 capstones — real tools written in kardashev,
-# built by the real kardc, exercising the v5 stdlib end to end.
+# Capstone smoke test for the kdlex example — a real tool written in kardashev,
+# built by the real kardc, exercising the stdlib end to end.
 #
-#   1. examples/json/main.kd — a JSON object parser. Scans bytes with
-#      str_char_at, slices keys with str_substring, builds a
-#      HashMap<String, i64> (the Phase 28 String-keyed map), and answers
-#      lookups. For {"width":800,"height":600,"depth":-3,"scale":2} it prints
-#      "members = 4" / "width*height = 480000" and returns 800+600-3+2 = 1399.
+# (The JSON capstone was promoted to the full nested-JSON parser+serializer in
+# Phase 38; it now has its own dedicated test, //tests:smoke_test_json, which
+# also build-checks examples/json/main.kd — so it is not re-run here.)
 #
-#   2. examples/kdlex/main.kd — a lexer for a kardashev subset. Tokenizes
+#   1. examples/kdlex/main.kd — a lexer for a kardashev subset. Tokenizes
 #      source into a Vec<Tok> (keyword vs identifier via str_substring+str_eq),
 #      counts `fn NAME` declarations, and checks brace balance. For a 2-fn
 #      source it prints "tokens = 32" / "fn decls = 2" / "balanced = 1" and
@@ -41,9 +39,8 @@ find_src() {
     done
     echo ""
 }
-JSON_SRC=$(find_src "examples/json/main.kd")
 KDLEX_SRC=$(find_src "examples/kdlex/main.kd")
-[[ -z "$JSON_SRC" || -z "$KDLEX_SRC" ]] && { echo "FAIL: capstone sources not found"; exit 1; }
+[[ -z "$KDLEX_SRC" ]] && { echo "FAIL: capstone source not found"; exit 1; }
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -67,10 +64,7 @@ run() {
     echo "PASS [$name]: JIT output + AOT exit ($rc_want)"
 }
 
-run json "$JSON_SRC" \
-    $'json: members = 4\njson: width*height = 480000\n1399' 119  # 1399 % 256
-
 run kdlex "$KDLEX_SRC" \
     $'kdlex: tokens = 32\nkdlex: fn decls = 2\nkdlex: braces balanced = 1\n211' 211
 
-echo "PASS: both v5 capstones (JSON parser + kardashev-subset lexer) build and run in JIT + AOT"
+echo "PASS: kdlex capstone (kardashev-subset lexer) builds and runs in JIT + AOT"

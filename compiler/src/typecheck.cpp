@@ -422,6 +422,21 @@ public:
             sch.genericVars.push_back(hmValVar);
             fnSchemas_["hashmap_len"] = std::move(sch);
         }
+        // Phase 38: hashmap_keys<K,V>(m: &HashMap<K,V>) -> Vec<K> ! { alloc } —
+        // a freshly-allocated Vec of the live keys (each deep-cloned, so the
+        // Vec owns them). Bucket-order. The way to enumerate a map's entries
+        // (e.g. to serialize a JSON object).
+        {
+            FnSchema sch;
+            TypePtr vecOfKey = makeStruct("Vec", {});
+            vecOfKey->typeArgs = {hmKeyVar};
+            sch.signature = makeFunction(
+                {makeRef(hashMapInst, /*isMut=*/false)}, vecOfKey);
+            sch.genericVars.push_back(hmKeyVar);
+            sch.genericVars.push_back(hmValVar);
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["hashmap_keys"] = std::move(sch);
+        }
 
         // Phase 28: `HashSet<T>` — a set over a hashable element T. Codegen
         // reuses the HashMap table machinery with a dummy i64 value, so T must

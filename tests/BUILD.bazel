@@ -303,7 +303,6 @@ sh_test(
     srcs = ["smoke_test_capstones.sh"],
     data = [
         "//compiler:kardc",
-        "//examples/json:main.kd",
         "//examples/kdlex:main.kd",
     ],
 )
@@ -364,6 +363,18 @@ sh_test(
     name = "smoke_test_phase37",
     srcs = ["smoke_test_phase37.sh"],
     data = ["//compiler:kardc"],
+)
+
+# Phase 38 capstone: the full nested-JSON example — parse + serialize, round-trip
+# by deep-equality, leak-free under a constant-memory loop. Builds the SHIPPED
+# example source (//examples/json:main.kd) so the test doubles as a build check.
+sh_test(
+    name = "smoke_test_json",
+    srcs = ["smoke_test_json.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/json:main.kd",
+    ],
 )
 
 cc_test(

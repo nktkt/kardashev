@@ -2030,7 +2030,21 @@ void test_no_drop_glue_for_scalars() {
         "    p.x + p.y + b\n"
         "}",
         "no_drop_glue_for_scalars");
-    expectAbsent(ir, "@free", "no_drop_glue_for_scalars");
+    // Drop glue for a Copy scalar/struct would appear in the USER function
+    // (`@main`): a per-value `@free` and a `droplive` drop flag. An unused
+    // always-emitted builtin's internal `@free` (e.g. string_push_str frees the
+    // String arg it consumes, Phase 38) is unrelated, so scope the @free check
+    // to main; `droplive` is a user-scope-exit construct, never in a builtin,
+    // so it stays module-wide.
+    // Match `@main(` (not the full `define i64 @main(`): the optimizer adds
+    // return-type attributes like `noundef`, so the signature is e.g.
+    // `define noundef i64 @main()`.
+    auto mStart = ir.find("@main(");
+    std::string mainIr =
+        mStart == std::string::npos
+            ? ir
+            : ir.substr(mStart, ir.find("\n}", mStart) - mStart);
+    expectAbsent(mainIr, "@free", "no_drop_glue_for_scalars");
     expectAbsent(ir, "droplive", "no_drop_glue_for_scalars");
 }
 

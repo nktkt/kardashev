@@ -1290,6 +1290,19 @@ private:
             auto* dst = b.CreateGEP(i8Ty, curData, sLen, "dst");
             b.CreateCall(memcpyFn_, {dst, oData, oLen}, "append");
             b.CreateStore(newLen, sLenP);
+            // Phase 38: `other` is MOVED in (consumed by value) — free its heap
+            // buffer now that its bytes are copied, else every pushed owned
+            // String (e.g. a serializer's sub-result) leaks. A cap==0 literal
+            // view owns nothing, so the free is guarded on cap != 0.
+            auto* oCap = b.CreateExtractValue(oVal, {2}, "o_cap");
+            auto* oHeap = b.CreateICmpNE(oCap, zeroI64, "o_heap");
+            auto* ofreeBB = llvm::BasicBlock::Create(ctx, "ofree", fn);
+            auto* odoneBB = llvm::BasicBlock::Create(ctx, "odone", fn);
+            b.CreateCondBr(oHeap, ofreeBB, odoneBB);
+            b.SetInsertPoint(ofreeBB);
+            b.CreateCall(freeFn_, {oData});
+            b.CreateBr(odoneBB);
+            b.SetInsertPoint(odoneBB);
             b.CreateRet(zeroI64);
             declaredFns_["string_push_str"] = fn;
         }
@@ -1970,6 +1983,15 @@ private:
             }
             return b.CreateCall(eqFn, {kSlot, keyPtr}, "keyEq");
         };
+        // Phase 38: a lookup op (get / get_ref / contains) receives its key BY
+        // VALUE but does NOT store it — so it must DROP that key before every
+        // return, else a heap key (e.g. a String) leaks once per lookup. i64
+        // keys own nothing (no kSlot); the drop thunk frees a String / runs a
+        // user Drop. Call this immediately before each CreateRet in those ops.
+        auto dropConsumedKey = [&](llvm::IRBuilder<>& bb, llvm::Value* kSlot) {
+            if (!keyIsInt && kSlot)
+                bb.CreateCall(getOrEmitDropThunk(K), {kSlot});
+        };
 
         // __hm_raw_insert__<V>(buckets: i8*, cap: i64, k: i64, v: V) -> i64.
         // Linear-probe from k % cap; if it finds the key, overwrite value and
@@ -2254,6 +2276,7 @@ private:
             b.CreateCondBr(isEmpty, noneBB, checkBB);
 
             b.SetInsertPoint(noneBB);
+            dropConsumedKey(b, kSlot);
             b.CreateRet(buildNone(b));
 
             b.SetInsertPoint(checkBB);
@@ -2268,6 +2291,7 @@ private:
             someAgg = b.CreateInsertValue(
                 someAgg, llvm::ConstantInt::get(i32Ty, someIdx), {0}, "some");
             someAgg = b.CreateInsertValue(someAgg, val, {someSlot}, "someV");
+            dropConsumedKey(b, kSlot);
             b.CreateRet(someAgg);
 
             b.SetInsertPoint(stepBB);
@@ -2340,6 +2364,7 @@ private:
                 b.CreateCondBr(b.CreateICmpEQ(state, zero, "isEmpty"), noneBB,
                                checkBB);
                 b.SetInsertPoint(noneBB);
+                dropConsumedKey(b, kSlot);
                 b.CreateRet(buildNone(b));
                 b.SetInsertPoint(checkBB);
                 auto* keyP = b.CreateStructGEP(entryTy, eptr, 1, "keyP");
@@ -2352,6 +2377,7 @@ private:
                     "some");
                 someAgg = b.CreateInsertValue(someAgg, valP, {someSlot},
                                               "someRef"); // the BORROW
+                dropConsumedKey(b, kSlot);
                 b.CreateRet(someAgg);
                 b.SetInsertPoint(stepBB);
                 b.CreateStore(b.CreateURem(b.CreateAdd(idx, one, "inc"), cap,
@@ -2377,7 +2403,59 @@ private:
             declaredFns_["hashmap_len__" + vMangle] = fn;
         }
 
-        // All five are now emitted for this V; return the requested one.
+        // Phase 38: hashmap_keys__<K,V>(m: &HashMap) -> Vec<K> — a fresh Vec of
+        // the live keys, each DEEP-CLONED (so the Vec owns them independently of
+        // the map; dropping the Vec frees its copies, the map keeps its own).
+        // Bucket-order (unordered); the only way to enumerate a map's entries.
+        {
+            auto* vecTy = structTypes_["Vec"];
+            auto* fnTy = llvm::FunctionType::get(vecTy, {i8PtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage,
+                "hashmap_keys__" + vMangle, module_.get());
+            fn->getArg(0)->setName("m");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            llvm::Function* vecNew = getOrEmitVecOp("vec_new", K);
+            llvm::Function* vecPush = getOrEmitVecOp("vec_push", K);
+            llvm::Function* keyClone = getOrEmitCloneFn(K);
+            auto* resSlot = b.CreateAlloca(vecTy, nullptr, "keys");
+            b.CreateStore(b.CreateCall(vecNew, {}, "kv"), resSlot);
+            auto* buckets = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(hmTy, fn->getArg(0), 0, "bP"),
+                "buckets");
+            auto* cap = b.CreateLoad(
+                i64Ty, b.CreateStructGEP(hmTy, fn->getArg(0), 2, "cP"), "cap");
+            auto* jSlot = b.CreateAlloca(i64Ty, nullptr, "j");
+            b.CreateStore(zero, jSlot);
+            auto* hdr = llvm::BasicBlock::Create(ctx, "k.hdr", fn);
+            auto* body = llvm::BasicBlock::Create(ctx, "k.body", fn);
+            auto* occ = llvm::BasicBlock::Create(ctx, "k.occ", fn);
+            auto* step = llvm::BasicBlock::Create(ctx, "k.step", fn);
+            auto* done = llvm::BasicBlock::Create(ctx, "k.done", fn);
+            b.CreateBr(hdr);
+            b.SetInsertPoint(hdr);
+            auto* j = b.CreateLoad(i64Ty, jSlot, "j");
+            b.CreateCondBr(b.CreateICmpSLT(j, cap, "more"), body, done);
+            b.SetInsertPoint(body);
+            auto* eptr = b.CreateGEP(entryTy, buckets, j, "eptr");
+            auto* state = b.CreateLoad(
+                i64Ty, b.CreateStructGEP(entryTy, eptr, 0, "stP"), "state");
+            b.CreateCondBr(b.CreateICmpEQ(state, one, "isocc"), occ, step);
+            b.SetInsertPoint(occ);
+            auto* keyPtr = b.CreateStructGEP(entryTy, eptr, 1, "kP");
+            auto* ck = b.CreateCall(keyClone, {keyPtr}, "ck");
+            b.CreateCall(vecPush, {resSlot, ck});
+            b.CreateBr(step);
+            b.SetInsertPoint(step);
+            b.CreateStore(b.CreateAdd(j, one, "jn"), jSlot);
+            b.CreateBr(hdr);
+            b.SetInsertPoint(done);
+            b.CreateRet(b.CreateLoad(vecTy, resSlot, "keysv"));
+            declaredFns_["hashmap_keys__" + vMangle] = fn;
+        }
+
+        // All ops are now emitted for this (K,V); return the requested one.
         auto it = declaredFns_.find(want);
         return it != declaredFns_.end() ? it->second : nullptr;
     }
@@ -8418,6 +8496,7 @@ private:
                  call.callee == "hashmap_insert" ||
                  call.callee == "hashmap_get" ||
                  call.callee == "hashmap_get_ref" ||
+                 call.callee == "hashmap_keys" ||
                  call.callee == "hashmap_len") &&
                 concreteTypeArgs.size() >= 2) {
                 llvm::Function* fn = getOrEmitHashMapOp(
@@ -9004,7 +9083,12 @@ private:
             clearDropFlagIfMoved(*a);
             args.push_back(av);
         }
-        return builder_->CreateCall(fn, args, "mcall_" + mc.methodName);
+        // A void-returning method (a unit `&mut self` mutator like `skip_ws`)
+        // must NOT name its call — LLVM rejects a name on a void value.
+        std::string nm = fn->getReturnType()->isVoidTy()
+                             ? std::string()
+                             : ("mcall_" + mc.methodName);
+        return builder_->CreateCall(fn, args, nm);
     }
 
     // Phase 11: lower a dynamic-dispatch method call through a trait object's
@@ -9513,9 +9597,11 @@ private:
                 // Phase 16: a `move`-style capture takes the value by value
                 // into the heap env. If the captured local is droppable, treat
                 // the capture as a move so the enclosing scope does not also
-                // free it (which would dangle the env's copy). The env itself
-                // is not freed today — a documented leak, but never a UAF or
-                // double-free.
+                // free it (which would dangle the env's copy). The env buffer
+                // itself IS freed at scope exit since Phase 29 (a fn-value is
+                // droppable; its drop glue frees the env — see emitDropGlue's
+                // Function arm); captures are Copy scalars (PR#18), so freeing
+                // the buffer reclaims everything the closure owns.
                 ast::IdentExpr capId;
                 capId.name = name;
                 clearDropFlagIfMoved(capId);
@@ -9572,9 +9658,10 @@ private:
 
         // Prologue: reload captures from env into locals. We bitcast the
         // i8* env arg to the env struct pointer (opaque pointers make this a
-        // no-op, but the GEPs use envTy). Captures are by-value copies living
-        // in the (leaked) env; we do NOT drop them in the closure body, so
-        // they aren't registered as owning locals.
+        // no-op, but the GEPs use envTy). Captures are by-value Copy scalars
+        // living in the heap env (freed at scope exit since Phase 29); we do
+        // NOT drop them per-capture in the closure body — freeing the env
+        // buffer reclaims them — so they aren't registered as owning locals.
         llvm::Value* envArg = closureFn->getArg(0);
         for (unsigned i = 0; i < cl.captures.size(); ++i) {
             const std::string& name = cl.captures[i].name;

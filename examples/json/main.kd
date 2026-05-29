@@ -1,129 +1,347 @@
 // =====================================================================
-// json — a JSON object parser written entirely in kardashev, compiled by
-// kardc. A Phase 31 (v5) capstone.
+// json — a FULL nested-JSON parser + serializer written entirely in
+// kardashev, compiled by kardc. The Roadmap v6 capstone (Phase 38).
 // =====================================================================
 //
-// It scans a JSON source string byte-by-byte and parses a top-level OBJECT
-// of `"key": integer` members into a `HashMap<String, i64>`, then answers
-// lookups and prints a summary — a real "numeric config" reader.
+// The headline of v6 is "make the heap recursive": a JSON value is a real
+// recursive heap-owning enum
 //
-// It is a cross-section of the v5 stdlib, the whole point of the capstone:
-//   * str_char_at (Phase 26)            — scanning the source bytes.
-//   * str_substring (Phase 27)          — slicing each "key" out of the
-//                                          source as an owned String.
-//   * HashMap<String, i64> (Phase 28)   — the parsed object; STRING KEYS
-//                                          are the headline v5 feature.
-//   * int_to_string / print_no_nl /
-//     println (Phase 27)                — the printed summary line.
-//   * str_eq is exercised inside the map (lookups compare stored keys).
+//     enum Json { JNull, JBool, JInt, JStr(String),
+//                 JArr(Vec<Json>), JObj(HashMap<String, Json>) }
 //
-// SOUNDNESS NOTE (honest): each key is created ONCE via str_substring and
-// MOVED into the map; lookups compare stored keys by reference inside the
-// HashMap (str_eq on pointers), so no String is ever copied-out-and-dropped.
-// The parse loop lives in `main`, which OWNS the map — so `&mut m` is a
-// fresh borrow at each insert call site (this language passes a `&mut`
-// PARAMETER by move and won't reborrow it, so threading it through a parser
-// fn is avoided, exactly as the calc capstone notes).
+// and this program parses arbitrarily-nested input into one, traverses it
+// BY REFERENCE, re-serializes it through a `Display` impl, and proves the
+// whole pipeline is sound — round-trip lossless AND leak-free under a
+// constant-memory parse-and-drop loop. It is the integration test for every
+// v6 phase:
+//   * P34 read-without-move : `match &self` + vec_get_ref / hashmap_get_ref
+//                             traverse the tree without copying a node out.
+//   * P35 recursive enums + : a Json owns Vec<Json> / HashMap<String,Json>;
+//        clone / sound drop    its drop + clone recurse over the real tree.
+//   * P36 enum/owning fields : the Parser struct carries owning state.
+//   * P37 Display           : the recursive serializer is a `Display` impl;
+//                             string building via string_new/string_push_str.
+//   * hashmap_keys (P38)    : enumerate a JObj's members to serialize / compare.
 //
-// SUBSET (documented): a top-level object with integer values (incl. a
-// leading '-'); whitespace anywhere. Nested objects/arrays and
-// string/bool/null values are out of scope — the grammar is the common
-// numeric-config shape that exercises the String-keyed map end to end.
+// SUBSET (documented, not stubbed): integer numbers only (no floats/exponents)
+// and no string-escape decoding (`"\n"` etc. are taken literally) — the
+// grammar otherwise covers null / bool / int / string / array / object with
+// arbitrary nesting and whitespace. JObj uses a HashMap, so a serialized
+// object's MEMBER ORDER is bucket-order, not input order; round-trip is
+// therefore proven by DEEP-EQUALITY (order-independent), the correct notion
+// for an unordered map, not by byte-identical text.
+//
+// (A literal like "[" is a cap==0 String VIEW; string_push_str's grow path
+// allocates a fresh heap buffer on the first push, so accumulating onto a
+// literal is sound — no string_from helper needed.)
 
-// --- character classification (written in kardashev, no compiler builtins) ---
-fn is_ws(c: i64) -> bool {
-    if c == 32 { true }       // ' '
-    else if c == 9 { true }   // '\t'
-    else if c == 10 { true }  // '\n'
-    else if c == 13 { true }  // '\r'
-    else { false }
-}
-fn is_digit(c: i64) -> bool {
-    if c < 48 { false } else if c > 57 { false } else { true }
-}
-fn skip_ws(src: &String, pos: i64) -> i64 {
-    let mut p = pos;
-    let n = str_len(src);
-    while p < n {
-        if is_ws(str_char_at(src, p)) { p = p + 1; } else { break; }
-    }
-    p
-}
-// parse_number := '-'? DIGIT+  ->  (value, new_pos)
-fn parse_number(src: &String, pos: i64) -> (i64, i64) {
-    let mut p = pos;
-    let mut neg = false;
-    if str_char_at(src, p) == 45 { neg = true; p = p + 1; } else {}  // '-'
-    let mut v = 0;
-    let n = str_len(src);
-    while p < n {
-        let c = str_char_at(src, p);
-        if is_digit(c) { v = v * 10 + (c - 48); p = p + 1; } else { break; }
-    }
-    if neg { (0 - v, p) } else { (v, p) }
+enum Json {
+    JNull,
+    JBool(bool),
+    JInt(i64),
+    JStr(String),
+    JArr(Vec<Json>),
+    JObj(HashMap<String, Json>),
 }
 
-fn main() -> i64 ! { io, alloc } {
-    let json = "{ \"width\": 800, \"height\": 600, \"depth\": -3, \"scale\": 2 }";
-    let n = str_len(&json);
-    let mut m = hashmap_new();
-    let mut err = 0;
-    let mut p = skip_ws(&json, 0);
-    // expect '{'
-    if str_char_at(&json, p) != 123 { err = 1; } else { p = p + 1; }
-    let mut done = false;
-    // empty object short-circuit
-    let mut after = skip_ws(&json, p);
-    if str_char_at(&json, after) == 125 { p = after + 1; done = true; } else {}
-    while !done {
-        if err != 0 { break; } else {}
-        p = skip_ws(&json, p);
-        if str_char_at(&json, p) != 34 { err = 2; break; }   // expect '"'
-        else {
-            // scan the key bytes up to the closing quote.
-            let kstart = p + 1;
-            let mut q = kstart;
-            while q < n {
-                if str_char_at(&json, q) == 34 { break; } else { q = q + 1; }
-            }
-            let key = str_substring(&json, kstart, q - kstart);
-            p = skip_ws(&json, q + 1);
-            if str_char_at(&json, p) != 58 { err = 3; break; }   // expect ':'
-            else {
-                p = skip_ws(&json, p + 1);
-                let pair = parse_number(&json, p);
-                p = skip_ws(&json, pair.1);
-                hashmap_insert(&mut m, key, pair.0);   // key MOVED into the map
-                let c = str_char_at(&json, p);
-                if c == 44 { p = p + 1; }              // ',' -> next member
-                else if c == 125 { p = p + 1; done = true; }  // '}'
-                else { err = 4; done = true; }
-            }
+// --- the recursive-descent parser. A &mut self cursor over the source. ---
+struct Parser { s: String, pos: i64, ok: bool }
+
+impl Parser {
+    // Current byte, or -1 past the end (str_char_at returns -1 out of range).
+    fn cur(&self) -> i64 { str_char_at(&self.s, self.pos) }
+
+    fn skip_ws(&mut self) {
+        let mut go = true;
+        while go {
+            let c = self.cur();
+            if c == 32 { self.pos = self.pos + 1; }       // ' '
+            else if c == 9 { self.pos = self.pos + 1; }   // '\t'
+            else if c == 10 { self.pos = self.pos + 1; }  // '\n'
+            else if c == 13 { self.pos = self.pos + 1; }  // '\r'
+            else { go = false; }
         }
     }
 
-    if err != 0 {
-        let bad = "json: parse error";
-        println(&bad);
-        0 - err
-    } else {
-        let w = match hashmap_get(&m, "width")   { Some(x) => x, None => 0 };
-        let h = match hashmap_get(&m, "height")  { Some(x) => x, None => 0 };
-        let d = match hashmap_get(&m, "depth")   { Some(x) => x, None => 0 };
-        let s = match hashmap_get(&m, "scale")   { Some(x) => x, None => 0 };
-        let miss = match hashmap_get(&m, "missing") { Some(x) => x, None => 0 - 1 };
-        // summary: "json: N members, width*height = AREA"
-        let l1 = "json: members = ";
-        print_no_nl(&l1);
-        let nm = int_to_string(hashmap_len(&m));
-        println(&nm);
-        let l2 = "json: width*height = ";
-        print_no_nl(&l2);
-        let area = int_to_string(w * h);
-        println(&area);
-        // verifiable result: w + h + d + s + (missing absent ? 0 : 999)
-        // = 800 + 600 - 3 + 2 + 0 = 1399
-        let misspart = if miss == 0 - 1 { 0 } else { 999 };
-        w + h + d + s + misspart
+    // A string token: cur() is the opening '"'. Returns the raw content as an
+    // owned String (no escape decoding) and advances past the closing '"'.
+    fn parse_string_raw(&mut self) -> String ! { alloc } {
+        self.pos = self.pos + 1;             // skip opening '"'
+        let start = self.pos;
+        let mut go = true;
+        while go {
+            let c = self.cur();
+            if c == 34 { go = false; }       // closing '"'
+            else if c < 0 { self.ok = false; go = false; }  // unterminated
+            else { self.pos = self.pos + 1; }
+        }
+        let content = str_substring(&self.s, start, self.pos - start);
+        self.pos = self.pos + 1;             // skip closing '"'
+        content
+    }
+
+    // '-'? DIGIT+  ->  JInt
+    fn parse_number(&mut self) -> Json {
+        let mut neg = false;
+        if self.cur() == 45 { neg = true; self.pos = self.pos + 1; } else {}  // '-'
+        let mut v = 0;
+        let mut go = true;
+        while go {
+            let c = self.cur();
+            if c < 48 { go = false; }
+            else if c > 57 { go = false; }
+            else { v = v * 10 + (c - 48); self.pos = self.pos + 1; }
+        }
+        if neg { JInt(0 - v) } else { JInt(v) }
+    }
+
+    // '[' ( value ( ',' value )* )? ']'
+    fn parse_array(&mut self) -> Json ! { alloc } {
+        self.pos = self.pos + 1;             // skip '['
+        let mut items = vec_new();
+        self.skip_ws();
+        if self.cur() == 93 {                // ']' empty array
+            self.pos = self.pos + 1;
+        } else {
+            let mut go = true;
+            while go {
+                let v = self.parse_value();
+                vec_push(&mut items, v);
+                self.skip_ws();
+                let c = self.cur();
+                if c == 44 { self.pos = self.pos + 1; self.skip_ws(); }  // ','
+                else if c == 93 { self.pos = self.pos + 1; go = false; } // ']'
+                else { self.ok = false; go = false; }
+            }
+        }
+        JArr(items)
+    }
+
+    // '{' ( string ':' value ( ',' ... )* )? '}'
+    fn parse_object(&mut self) -> Json ! { alloc } {
+        self.pos = self.pos + 1;             // skip '{'
+        let mut m = hashmap_new();
+        self.skip_ws();
+        if self.cur() == 125 {               // '}' empty object
+            self.pos = self.pos + 1;
+        } else {
+            let mut go = true;
+            while go {
+                self.skip_ws();
+                if self.cur() != 34 { self.ok = false; go = false; }  // expect '"'
+                else {
+                    let key = self.parse_string_raw();
+                    self.skip_ws();
+                    if self.cur() != 58 { self.ok = false; go = false; }  // ':'
+                    else {
+                        self.pos = self.pos + 1;        // skip ':'
+                        self.skip_ws();
+                        let v = self.parse_value();
+                        hashmap_insert(&mut m, key, v); // key + value MOVED in
+                        self.skip_ws();
+                        let c = self.cur();
+                        if c == 44 { self.pos = self.pos + 1; }            // ','
+                        else if c == 125 { self.pos = self.pos + 1; go = false; }
+                        else { self.ok = false; go = false; }
+                    }
+                }
+            }
+        }
+        JObj(m)
+    }
+
+    fn parse_value(&mut self) -> Json ! { alloc } {
+        self.skip_ws();
+        let c = self.cur();
+        if c == 123 { self.parse_object() }               // '{'
+        else if c == 91 { self.parse_array() }            // '['
+        else if c == 34 { JStr(self.parse_string_raw()) } // '"'
+        else if c == 110 { self.pos = self.pos + 4; JNull }          // null
+        else if c == 116 { self.pos = self.pos + 4; JBool(true) }    // true
+        else if c == 102 { self.pos = self.pos + 5; JBool(false) }   // false
+        else if c == 45 { self.parse_number() }           // '-'
+        else if c >= 48 {
+            if c <= 57 { self.parse_number() } else { self.ok = false; JNull }
+        }
+        else { self.ok = false; JNull }
+    }
+}
+
+// Top-level parse: Result<Json, ParseError>. Err if the grammar didn't hold.
+enum ParseError { Malformed }
+
+fn parse(src: String) -> Result<Json, ParseError> ! { alloc } {
+    let mut p = Parser { s: src, pos: 0, ok: true };
+    let v = p.parse_value();
+    p.skip_ws();
+    if p.ok { Ok(v) } else { Err(Malformed) }
+}
+
+// --- the serializer: a recursive Display impl producing canonical text. ---
+impl Display for Json {
+    fn to_string(&self) -> String ! { alloc } {
+        match self {
+            JNull => "null",
+            JBool(b) => if *b { "true" } else { "false" },
+            JInt(n) => int_to_string(*n),
+            JStr(s) => {
+                let mut out = "\"";
+                string_push_str(&mut out, clone(s));
+                string_push_str(&mut out, "\"");
+                out
+            },
+            JArr(items) => {
+                let mut out = "[";
+                let mut i = 0;
+                let len = vec_len(items);
+                while i < len {
+                    if i > 0 { string_push_str(&mut out, ","); } else {}
+                    let s = vec_get_ref(items, i).to_string();
+                    string_push_str(&mut out, s);
+                    i = i + 1;
+                }
+                string_push_str(&mut out, "]");
+                out
+            },
+            JObj(m) => {
+                let keys = hashmap_keys(m);
+                let mut out = "{";
+                let mut i = 0;
+                let len = vec_len(&keys);
+                while i < len {
+                    if i > 0 { string_push_str(&mut out, ","); } else {}
+                    let k = vec_get_ref(&keys, i);
+                    string_push_str(&mut out, "\"");
+                    string_push_str(&mut out, clone(k));
+                    string_push_str(&mut out, "\":");
+                    let vs = match hashmap_get_ref(m, clone(k)) {
+                        Some(v) => v.to_string(),
+                        None => "null",
+                    };
+                    string_push_str(&mut out, vs);
+                    i = i + 1;
+                }
+                string_push_str(&mut out, "}");
+                out
+            },
+        }
+    }
+}
+
+// --- deep, order-INDEPENDENT structural equality (the round-trip oracle). ---
+fn json_eq(a: &Json, b: &Json) -> bool ! { alloc } {
+    match a {
+        JNull => match b { JNull => true, _ => false },
+        JBool(x) => match b { JBool(y) => if *x { *y } else { !*y }, _ => false },
+        JInt(x) => match b { JInt(y) => *x == *y, _ => false },
+        JStr(x) => match b { JStr(y) => str_eq(x, y), _ => false },
+        JArr(xs) => match b {
+            JArr(ys) => {
+                let nx = vec_len(xs);
+                if nx != vec_len(ys) { false }
+                else {
+                    let mut i = 0;
+                    let mut same = true;
+                    while i < nx {
+                        if !json_eq(vec_get_ref(xs, i), vec_get_ref(ys, i)) {
+                            same = false;
+                        } else {}
+                        i = i + 1;
+                    }
+                    same
+                }
+            },
+            _ => false,
+        },
+        JObj(xm) => match b {
+            JObj(ym) => {
+                if hashmap_len(xm) != hashmap_len(ym) { false }
+                else {
+                    let keys = hashmap_keys(xm);
+                    let mut i = 0;
+                    let mut same = true;
+                    let n = vec_len(&keys);
+                    while i < n {
+                        let k = vec_get_ref(&keys, i);
+                        let eq1 = match hashmap_get_ref(xm, clone(k)) {
+                            Some(va) => match hashmap_get_ref(ym, clone(k)) {
+                                Some(vb) => json_eq(va, vb),
+                                None => false,
+                            },
+                            None => false,
+                        };
+                        if !eq1 { same = false; } else {}
+                        i = i + 1;
+                    }
+                    same
+                }
+            },
+            _ => false,
+        },
+    }
+}
+
+// Read the contribution of one member `m[key]` by reference, given a small
+// predicate per JSON shape. Kept tiny + flat to dodge `&`-of-temporary.
+fn obj_signal(m: &HashMap<String, Json>) -> i64 ! { alloc } {
+    // a -> [1, {"b":true}, "x"]  => 1 (a[0]) + 1000 (a[1].b == true)
+    let a_part = match hashmap_get_ref(m, "a") {
+        Some(av) => match av {
+            JArr(items) => {
+                let first = match vec_get_ref(items, 0) { JInt(x) => *x, _ => 0 };
+                let second = match vec_get_ref(items, 1) {
+                    JObj(inner) => match hashmap_get_ref(inner, "b") {
+                        Some(bv) => match bv {
+                            JBool(t) => if *t { 1000 } else { 0 },
+                            _ => 0,
+                        },
+                        None => 0,
+                    },
+                    _ => 0,
+                };
+                first + second
+            },
+            _ => 0,
+        },
+        None => 0,
+    };
+    let k_part = match hashmap_get_ref(m, "k") {
+        Some(kv) => match kv { JInt(x) => *x, _ => 0 },
+        None => 0,
+    };
+    let n_part = match hashmap_get_ref(m, "n") {
+        Some(nv) => match nv { JNull => 7, _ => 0 },
+        None => 0,
+    };
+    a_part + k_part + n_part
+}
+
+fn main() -> i64 ! { io, alloc } {
+    let input = "{ \"a\": [1, { \"b\": true }, \"x\"], \"n\": null, \"k\": -42 }";
+
+    match parse(clone(&input)) {
+        Err(e) => { let m = "json: parse error"; println(&m); 0 - 1 },
+        Ok(j) => {
+            // serialize, re-parse, DEEP-COMPARE (order-independent round trip).
+            let text = j.to_string();
+            let roundtrips = match parse(clone(&text)) {
+                Ok(rp) => json_eq(&j, &rp),
+                Err(e) => false,
+            };
+
+            // traverse BY REFERENCE to extract a verifiable signal.
+            let sig = match &j { JObj(m) => obj_signal(m), _ => 0 };
+
+            let l1 = "json: serialized = ";
+            print_no_nl(&l1);
+            println(&text);
+            let l2 = "json: round-trips = ";
+            print_no_nl(&l2);
+            let yn = if roundtrips { let y = "yes"; y } else { let n = "no"; n };
+            println(&yn);
+
+            // sig = 1 + 1000 + (-42) + 7 = 966, gated on a successful round trip.
+            if roundtrips { sig } else { 0 - 100 }
+        }
     }
 }
