@@ -8690,6 +8690,27 @@ private:
     }
 
     llvm::Value* emitCall(const ast::CallExpr& call) {
+        // Phase 48: a qualified static call `Type::method(args)` resolved by the
+        // typechecker to a concrete impl method (an associated / no-self trait
+        // method like `P::default()`). Emit a direct call to the mangled impl
+        // function; its body is codegen'd via the normal impl-method path.
+        if (auto sit = tc_.staticCallMangled.find(&call);
+            sit != tc_.staticCallMangled.end()) {
+            auto fit = declaredFns_.find(sit->second);
+            if (fit == declaredFns_.end()) {
+                errors_.push_back("codegen: static method body not emitted: " +
+                                  sit->second);
+                return llvm::ConstantInt::get(
+                    llvm::Type::getInt64Ty(*ctx_), 0);
+            }
+            llvm::Function* fn = fit->second;
+            std::vector<llvm::Value*> args;
+            args.reserve(call.args.size());
+            for (const auto& a : call.args) args.push_back(emitConsume(*a));
+            return builder_->CreateCall(
+                fn, args,
+                fn->getReturnType()->isVoidTy() ? "" : "call_static");
+        }
         // Phase 19: lazily declare the OS-thread + Mutex runtime (pthread
         // externs + trampoline + thread_*/mutex_* bodies) the first time any
         // of those builtins is called, then fall through to the normal

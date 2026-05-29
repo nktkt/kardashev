@@ -1541,9 +1541,11 @@ private:
             // path-qualified references.
             Token first = consume();
             Token tok = first;
+            Token prevSeg = first; // Phase 48: the segment just before `tok`
             bool wasPath = false;
             while (check(TokenKind::DoubleColon)) {
                 consume();
+                prevSeg = tok;
                 tok = expect(TokenKind::Identifier,
                               "identifier after `::`");
                 wasPath = true;
@@ -1574,6 +1576,7 @@ private:
                 call->column = tok.column;
                 call->callee = tok.lexeme;
                 call->wasPath = wasPath;
+                if (wasPath) call->pathQualifier = prevSeg.lexeme; // Phase 48
                 bool prevCallRestrict = restrictStructLit_;
                 restrictStructLit_ = false;
                 if (!check(TokenKind::RParen)) {

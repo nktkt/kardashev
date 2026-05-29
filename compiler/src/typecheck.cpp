@@ -1021,10 +1021,17 @@ public:
                           m.line, m.column);
                     continue;
                 }
-                if (m.params.empty() || m.params[0].name != "self" ||
-                    m.params[0].type.name != "Self") {
-                    error("trait method '" + m.name + "' must take `self` "
-                          "as its first parameter",
+                // Phase 48: a method whose first param is NOT `self` is a
+                // STATIC (associated) method — e.g. `fn default() -> Self`.
+                // Allowed; it is called as `Type::method(args)` (no receiver),
+                // resolved against the implementing type, not a value. Only a
+                // method that DOES start with a param literally named `self`
+                // must spell its type `Self` (the receiver convention).
+                bool hasSelf =
+                    !m.params.empty() && m.params[0].name == "self";
+                if (hasSelf && m.params[0].type.name != "Self") {
+                    error("trait method '" + m.name + "' receiver must be "
+                          "`self` of type `Self`",
                           m.line, m.column);
                 }
                 uniqueMethods.push_back(m);
@@ -1613,6 +1620,7 @@ public:
         result.usesFileIo = usesFileIo_;
         result.fnSchemas = std::move(fnSchemas_);
         result.callInstantiations = std::move(callInstantiations_);
+        result.staticCallMangled = std::move(staticCallMangled_);
         result.methodResolutions = std::move(methodResolutions_);
         result.dynCoercions = std::move(dynCoercions_);
         result.dynVtablesNeeded = std::move(dynVtablesNeeded_);
@@ -1762,6 +1770,8 @@ private:
     // Per-MethodCallExpr resolution (Concrete, BoundedGeneric, or Dyn).
     std::unordered_map<const ast::MethodCallExpr*, ResolvedMethod>
         methodResolutions_;
+    // Phase 48: qualified static call `Type::method()` -> mangled impl method.
+    std::unordered_map<const ast::CallExpr*, std::string> staticCallMangled_;
     // Phase 11: per-Expr `&T`->`&dyn`/`Box<T>`->`Box<dyn>` coercions and the
     // set of (trait,type) vtables those coercions require.
     std::unordered_map<const ast::Expr*, DynCoercion> dynCoercions_;
@@ -5037,6 +5047,60 @@ private:
             call.callee == "fs_exists" || call.callee == "arg_count" ||
             call.callee == "arg_get") {
             usesFileIo_ = true;
+        }
+        // Phase 48: a qualified static call `Type::method(args)` — an
+        // associated (no-self) trait method such as `P::default()`. Resolve it
+        // against the named type's impl rather than a value receiver. Only
+        // fires when `pathQualifier` names a type that actually has a method
+        // `callee`; otherwise this is an ordinary (flat-merged) module path and
+        // falls through to the bare-name lookup below.
+        if (!call.pathQualifier.empty()) {
+            auto tIt = methodImplLookup_.find(call.pathQualifier);
+            if (tIt != methodImplLookup_.end()) {
+                auto mIt = tIt->second.find(call.callee);
+                if (mIt != tIt->second.end() && mIt->second.second) {
+                    auto mangIt = implMethodMangled_.find(mIt->second.second);
+                    if (mangIt != implMethodMangled_.end()) {
+                        auto sIt = fnSchemas_.find(mangIt->second);
+                        if (sIt != fnSchemas_.end()) {
+                            const FnSchema& sch = sIt->second;
+                            // Concrete impl: no generic vars to bind (generic
+                            // static methods are deferred). Instantiate with an
+                            // empty subst so any stray Var is freshened.
+                            std::unordered_map<int, TypePtr> subst;
+                            TypePtr instSig = instantiate(sch.signature, subst);
+                            if (instSig->args.size() != call.args.size()) {
+                                error("static method '" + call.pathQualifier +
+                                          "::" + call.callee + "' expects " +
+                                          std::to_string(instSig->args.size()) +
+                                          " arg(s), got " +
+                                          std::to_string(call.args.size()),
+                                      call.line, call.column);
+                            }
+                            const std::size_t n = std::min(
+                                instSig->args.size(), call.args.size());
+                            for (std::size_t i = 0; i < n; ++i) {
+                                TypePtr at = checkExpr(*call.args[i]);
+                                if (!coerceOrUnify(*call.args[i], at,
+                                                   instSig->args[i])) {
+                                    error("argument " + std::to_string(i + 1) +
+                                              " to '" + call.pathQualifier +
+                                              "::" + call.callee +
+                                              "' has type " + typeToString(at) +
+                                              ", expected " +
+                                              typeToString(instSig->args[i]),
+                                          call.args[i]->line,
+                                          call.args[i]->column);
+                                }
+                            }
+                            // Attribute the method's effects to this call site.
+                            exprEffects_[&call] = sch.declaredEffects;
+                            staticCallMangled_[&call] = mangIt->second;
+                            return resolve(instSig->ret);
+                        }
+                    }
+                }
+            }
         }
         // Phase 4.3: first-class fn values. If the call's callee name
         // resolves to a local binding with a Function type, this is an

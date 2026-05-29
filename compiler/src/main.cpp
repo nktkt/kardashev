@@ -119,7 +119,14 @@ std::string applyPrelude(const std::string& userSrc) {
             "trait Hash { fn hash(&self) -> i64; }\n"
             "impl Hash for i64 { fn hash(&self) -> i64 { hash_i64(self) } }\n"
             "impl Hash for String"
-            " { fn hash(&self) -> i64 { hash_string(self) } }\n";
+            " { fn hash(&self) -> i64 { hash_string(self) } }\n"
+            // Phase 48: bool / f64 Hash, so #[derive(Hash)] covers those fields.
+            // bool -> 0/1; f64 -> hash of its truncated-to-i64 value (lossy but
+            // valid — Eq disambiguates collisions; float map keys are rare).
+            "impl Hash for bool"
+            " { fn hash(&self) -> i64 { if *self { 1 } else { 0 } } }\n"
+            "impl Hash for f64"
+            " { fn hash(&self) -> i64 { let v = float_to_int(*self); hash_i64(&v) } }\n";
     }
     if (userSrc.find("trait Eq") == std::string::npos) {
         prelude +=
@@ -324,6 +331,21 @@ std::string applyPrelude(const std::string& userSrc) {
             "        i = i + 1;\n"
             "    }\n"
             "}\n";
+    }
+    // Phase 48 (v8): the `Default` trait — a STATIC (no-self) associated method
+    // `default() -> Self`, called as `Type::default()`. Built-in impls for the
+    // primitives + String + Vec<T>. Declared `! { alloc }` since constructing a
+    // default may allocate (String/Vec); a derived struct default builds its
+    // value field-wise (#[derive(Default)] — see deriveImplSource). Guarded so a
+    // user-defined `Default` wins.
+    if (userSrc.find("trait Default") == std::string::npos) {
+        prelude +=
+            "trait Default { fn default() -> Self ! { alloc }; }\n"
+            "impl Default for i64 { fn default() -> i64 ! { alloc } { 0 } }\n"
+            "impl Default for bool { fn default() -> bool ! { alloc } { false } }\n"
+            "impl Default for f64 { fn default() -> f64 ! { alloc } { 0.0 } }\n"
+            "impl Default for String { fn default() -> String ! { alloc } { \"\" } }\n"
+            "impl<T> Default for Vec<T> { fn default() -> Vec<T> ! { alloc } { vec_new() } }\n";
     }
     // Phase 43: runtime string escape decode/encode for JSON-style strings,
     // written in kardashev over str_push_byte / str_char_at. `\\uXXXX` decodes
@@ -584,6 +606,22 @@ std::string deriveImplSource(const kardashev::ast::Program& prog) {
         }
         return s + ">";
     };
+    // Phase 48: the default-value expression for a field of the given type in a
+    // derived `default()`. Leaf primitives + containers are inlined (no static
+    // call needed); a concrete nested user type defers to its own
+    // `Type::default()`. A generic-param field would need a generic static
+    // call (deferred), so derive(Default) is emitted only for non-generic
+    // structs below.
+    auto defaultExprFor =
+        [](const kardashev::ast::TypeRef& tr) -> std::string {
+        if (tr.name == "i64") return "0";
+        if (tr.name == "bool") return "false";
+        if (tr.name == "f64") return "0.0";
+        if (tr.name == "String") return "\"\"";
+        if (tr.name == "Vec") return "vec_new()";
+        if (tr.name == "HashMap") return "hashmap_new()";
+        return tr.name + "::default()"; // concrete nested user type
+    };
     std::string out;
     for (const auto& s : prog.structs) {
         const std::string TN = tyName(s.name, s.genericParams);
@@ -619,6 +657,38 @@ std::string deriveImplSource(const kardashev::ast::Program& prog) {
                            s.fields[i].name + ".to_string());";
                 }
                 out += " string_push_str(&mut out, \" }\"); out } }\n";
+            } else if (d == "Hash") {
+                // Phase 48: combine field hashes left-to-right (h = h*31 + fi).
+                out += "impl" + header(s.genericParams, "Hash") + " Hash for " +
+                       TN + " { fn hash(&self) -> i64 { let mut h = 17;";
+                for (const auto& f : s.fields)
+                    out += " h = h * 31 + self." + f.name + ".hash();";
+                out += " h } }\n";
+            } else if (d == "Ord") {
+                // Phase 48: lexicographic field compare — first non-equal field
+                // decides; all-equal => 0. Built as a nested if/else so each
+                // `cmp` is evaluated only until one differs.
+                out += "impl" + header(s.genericParams, "Ord") + " Ord for " +
+                       TN + " { fn cmp(&self, other: &" + TN + ") -> i64 { ";
+                std::string tail;
+                for (const auto& f : s.fields) {
+                    out += "let c = self." + f.name + ".cmp(&other." + f.name +
+                           "); if c != 0 { c } else { ";
+                    tail += " }";
+                }
+                out += "0" + tail + " } }\n";
+            } else if (d == "Default" && s.genericParams.empty()) {
+                // Phase 48: field-wise default. Leaf/container fields inline
+                // their default; a concrete nested user type uses its own
+                // Type::default() (a static call). Non-generic structs only —
+                // a generic field would need a generic static call (deferred).
+                out += "impl Default for " + TN +
+                       " { fn default() -> " + TN + " ! { alloc } { " + s.name +
+                       " {";
+                for (std::size_t i = 0; i < s.fields.size(); ++i)
+                    out += (i ? "," : "") + (" " + s.fields[i].name + ": " +
+                                             defaultExprFor(s.fields[i].type));
+                out += " } } }\n";
             }
         }
     }
@@ -709,6 +779,84 @@ std::string deriveImplSource(const kardashev::ast::Program& prog) {
                     }
                 }
                 out += " } } }\n";
+            } else if (d == "Hash") {
+                // Phase 48: hash = combine(variant ordinal, payload hashes).
+                out += "impl" + header(e.genericParams, "Hash") + " Hash for " +
+                       TN + " { fn hash(&self) -> i64 { match self {";
+                for (std::size_t v = 0; v < e.variants.size(); ++v) {
+                    const auto& var = e.variants[v];
+                    const std::string seed = std::to_string(527 + v); // 17*31+v
+                    out += " " + var.name;
+                    if (!var.payloadTypes.empty()) {
+                        out += "(";
+                        for (std::size_t i = 0; i < var.payloadTypes.size(); ++i)
+                            out += (i ? ", " : "") + ("x" + std::to_string(i));
+                        out += ")";
+                    }
+                    if (var.payloadTypes.empty()) {
+                        out += " => " + seed + ",";
+                    } else {
+                        out += " => { let mut h = " + seed + ";";
+                        for (std::size_t i = 0; i < var.payloadTypes.size(); ++i)
+                            out += " h = h * 31 + x" + std::to_string(i) +
+                                   ".hash();";
+                        out += " h },";
+                    }
+                }
+                out += " } } }\n";
+            } else if (d == "Ord") {
+                // Phase 48: lexicographic — compare variant ordinals first, then
+                // (for the same variant) payloads field-by-field. The two
+                // ordinal matches use `_` payload wildcards.
+                out += "impl" + header(e.genericParams, "Ord") + " Ord for " +
+                       TN + " { fn cmp(&self, other: &" + TN + ") -> i64 {";
+                auto ordinalMatch = [&](const char* scrut) {
+                    std::string m = std::string(" match ") + scrut + " {";
+                    for (std::size_t v = 0; v < e.variants.size(); ++v) {
+                        const auto& var = e.variants[v];
+                        m += " " + var.name;
+                        if (!var.payloadTypes.empty()) {
+                            m += "(";
+                            for (std::size_t i = 0;
+                                 i < var.payloadTypes.size(); ++i)
+                                m += (i ? ", " : "") + std::string("_");
+                            m += ")";
+                        }
+                        m += " => " + std::to_string(v) + ",";
+                    }
+                    return m + " }";
+                };
+                out += " let so =" + ordinalMatch("self") + ";";
+                out += " let oo =" + ordinalMatch("other") + ";";
+                out += " if so != oo { if so < oo { 0 - 1 } else { 1 } } else {";
+                out += " match self {";
+                for (const auto& var : e.variants) {
+                    out += " " + var.name;
+                    if (!var.payloadTypes.empty()) {
+                        out += "(";
+                        for (std::size_t i = 0; i < var.payloadTypes.size(); ++i)
+                            out += (i ? ", " : "") + ("a" + std::to_string(i));
+                        out += ")";
+                    }
+                    if (var.payloadTypes.empty()) {
+                        out += " => 0,";
+                    } else {
+                        out += " => match other { " + var.name + "(";
+                        for (std::size_t i = 0; i < var.payloadTypes.size(); ++i)
+                            out += (i ? ", " : "") + ("b" + std::to_string(i));
+                        out += ") => { ";
+                        std::string tail;
+                        for (std::size_t i = 0; i < var.payloadTypes.size();
+                             ++i) {
+                            out += "let c = a" + std::to_string(i) + ".cmp(b" +
+                                   std::to_string(i) + "); if c != 0 { c } else { ";
+                            tail += " }";
+                        }
+                        out += "0" + tail;
+                        out += " }, _ => 0 },";
+                    }
+                }
+                out += " } } } }\n";
             }
         }
     }
