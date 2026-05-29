@@ -428,6 +428,16 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 46 (v8): generic Clone/Eq TRAIT impls for HashMap (the v7 deferral) —
+# direct map.clone()/map.eq() (order-independent), #[derive(Clone, Eq)] over a
+# struct with a HashMap field, and a no-regression check that a map-free derived
+# eq stays pure. JIT + AOT.
+sh_test(
+    name = "smoke_test_phase46",
+    srcs = ["smoke_test_phase46.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

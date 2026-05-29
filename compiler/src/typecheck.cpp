@@ -1060,7 +1060,12 @@ public:
             GenericEnv implEnv0 = implParamEnv(impl);
             const GenericEnv* savedEnv0 = currentGenericEnv_;
             currentGenericEnv_ = &implEnv0;
+            currentVarBound_.clear();
+            currentVarAllBounds_.clear();
+            exposeImplGenericBounds(impl, implEnv0);
             TypePtr forTy = resolveTypeRef(impl.forType);
+            currentVarBound_.clear();
+            currentVarAllBounds_.clear();
             currentGenericEnv_ = savedEnv0;
             TypePtr rfor = resolve(forTy);
             std::string typeName;
@@ -1449,6 +1454,12 @@ public:
                 // already holds the impl's generic params (Phase 40), so
                 // `Pair<T>` resolves T to its Var — set it active first.
                 currentGenericEnv_ = &genEnv;
+                // Phase 46: expose the impl's bounds before resolving forType so
+                // an `impl<K: Hash + Eq, V> .. for HashMap<K,V>` method schema
+                // passes the key gate on `Self = HashMap<K,V>`.
+                currentVarBound_.clear();
+                currentVarAllBounds_.clear();
+                exposeImplGenericBounds(impl, genEnv);
                 TypePtr selfTy = resolveTypeRef(impl.forType);
                 genEnv["Self"] = selfTy;
                 // Phase 21a: bind the trait's generic params to this impl's
@@ -1543,7 +1554,12 @@ public:
             GenericEnv implEnv2 = implParamEnv(impl);
             const GenericEnv* savedEnv2 = currentGenericEnv_;
             currentGenericEnv_ = &implEnv2;
+            currentVarBound_.clear();
+            currentVarAllBounds_.clear();
+            exposeImplGenericBounds(impl, implEnv2);
             TypePtr selfTy = resolveTypeRef(impl.forType);
+            currentVarBound_.clear();
+            currentVarAllBounds_.clear();
             currentGenericEnv_ = savedEnv2;
             for (const auto& fn : impl.methods) {
                 checkImplMethod(fn, impl, selfTy);
@@ -1694,6 +1710,20 @@ private:
         }
         for (const auto& e : extras)
             if (!e.empty()) currentVarAllBounds_[varId].insert(e);
+    }
+    // Phase 45/46: expose an impl's generic-param bounds (looked up by name in
+    // `env`) into the bound maps. Must run BEFORE resolving `impl.forType` so an
+    // `impl<K: Hash + Eq, V> .. for HashMap<K,V>` passes the key-hashable gate
+    // on its own forType — otherwise the impl can't even be registered.
+    void exposeImplGenericBounds(const ast::ImplDecl& impl,
+                                 const GenericEnv& env) {
+        for (const auto& gp : impl.genericParams) {
+            auto it = env.find(gp.name);
+            if (it == env.end()) continue;
+            TypePtr v = resolve(it->second);
+            if (v->kind == TypeKind::Var)
+                recordVarBounds(v->varId, gp.bound, gp.extraBounds);
+        }
     }
     // Phase 21b: placeholder-Var id -> how to resolve that `C::Item` projection
     // at codegen. Survives into the TypeCheckResult.
@@ -2216,6 +2246,24 @@ private:
             if (gvi < schema.genericVars.size())
                 genEnv[gp.name] = schema.genericVars[gvi++];
         }
+        // Phase 45/46: expose every generic param's bounds (impl params, then fn
+        // params) BEFORE resolving forType / the body, so the method's container
+        // ops — and the `Self = HashMap<K,V>` resolution itself — see a
+        // `K: Hash + Eq` promise. This is why a generic-impl method may build,
+        // query, or be defined `for HashMap<K,V>`.
+        currentVarBound_.clear();
+        currentVarAllBounds_.clear();
+        {
+            auto expose = [&](const ast::TypeParam& gp) {
+                auto git = genEnv.find(gp.name);
+                if (git == genEnv.end()) return;
+                TypePtr v = resolve(git->second);
+                if (v->kind == TypeKind::Var)
+                    recordVarBounds(v->varId, gp.bound, gp.extraBounds);
+            };
+            for (const auto& gp : impl.genericParams) expose(gp);
+            for (const auto& gp : fn.genericParams) expose(gp);
+        }
         // Phase 40: for a generic impl, recompute Self from THIS env so it uses
         // the schema's impl-param Vars (the passed selfTy was resolved with
         // throwaway Vars). For a non-generic impl this is identical to selfTy.
@@ -2243,23 +2291,6 @@ private:
         currentGenericEnv_ = &genEnv;
         currentEffectRowVarNames_ = &rowVarNames;
         currentFnIsAsync_ = fn.isAsync;
-        // Phase 45: expose every generic param's bounds (impl params, then fn
-        // params — the same order they were bound into genEnv above) so the
-        // method body's container ops can see a `K: Hash + Eq` promise. This is
-        // why a generic-impl method may build/query a `HashMap<K,V>`.
-        currentVarBound_.clear();
-        currentVarAllBounds_.clear();
-        {
-            auto expose = [&](const ast::TypeParam& gp) {
-                auto git = genEnv.find(gp.name);
-                if (git == genEnv.end()) return;
-                TypePtr v = resolve(git->second);
-                if (v->kind == TypeKind::Var)
-                    recordVarBounds(v->varId, gp.bound, gp.extraBounds);
-            };
-            for (const auto& gp : impl.genericParams) expose(gp);
-            for (const auto& gp : fn.genericParams) expose(gp);
-        }
         pushScope();
         for (const auto& p : fn.params) {
             scopes_.back()[p.name] = resolveTypeRef(p.type);

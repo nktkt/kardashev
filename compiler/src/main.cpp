@@ -189,13 +189,33 @@ std::string applyPrelude(const std::string& userSrc) {
             "        out\n"
             "    }\n"
             "}\n"
-            // Phase 44: f64 Clone (scalar). (A generic HashMap Clone trait impl
-            // is NOT shipped: a generic `impl<K, V> .. for HashMap<K,V>` body
-            // can't yet satisfy the HashMap-op K: Hash+Eq requirement from a
-            // bounded type param — deferred. The `clone(&x)` intrinsic already
-            // deep-clones a HashMap structurally, so map cloning works via it.)
             "impl Clone for f64"
-            " { fn clone(&self) -> f64 ! { alloc } { *self } }\n";
+            " { fn clone(&self) -> f64 ! { alloc } { *self } }\n"
+            // Phase 46 (v8): the generic HashMap Clone trait impl — the v7
+            // deferral, unblocked by Phase 45 (a `K: Hash + Eq` bound now
+            // satisfies the container key gate from inside a generic body). A
+            // deep copy: enumerate keys (bucket-order), clone each key + value
+            // through their own Clone impls, rebuild. Requires K: Clone too
+            // (the keys are copied into the new map). This makes `#[derive(Clone)]`
+            // apply to a struct/enum with a HashMap field, and `map.clone()`
+            // dispatch through the trait. (The `clone(&x)` intrinsic still
+            // deep-clones structurally as the no-impl fallback.)
+            "impl<K: Hash + Eq + Clone, V: Clone> Clone for HashMap<K, V> {\n"
+            "    fn clone(&self) -> HashMap<K, V> ! { alloc } {\n"
+            "        let mut out = hashmap_new();\n"
+            "        let ks = hashmap_keys(self);\n"
+            "        let mut i = 0;\n"
+            "        while i < vec_len(&ks) {\n"
+            "            let kref = vec_get_ref(&ks, i);\n"
+            "            match hashmap_get_ref(self, kref.clone()) {\n"
+            "                Some(vref) => { hashmap_insert(&mut out, kref.clone(), vref.clone()); },\n"
+            "                None => {},\n"
+            "            }\n"
+            "            i = i + 1;\n"
+            "        }\n"
+            "        out\n"
+            "    }\n"
+            "}\n";
     }
     // Phase 41: a generic `impl<T: Eq> Eq for Vec<T>` (the `Eq` trait + its
     // i64/String impls are injected below) — element-wise deep equality, the
@@ -211,6 +231,37 @@ std::string applyPrelude(const std::string& userSrc) {
             "            while i < vec_len(self) {\n"
             "                if !vec_get_ref(self, i).eq(vec_get_ref(other, i))"
             " { same = false; } else {}\n"
+            "                i = i + 1;\n"
+            "            }\n"
+            "            same\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+            // Phase 46 (v8): the generic HashMap Eq trait impl — order-
+            // INDEPENDENT key-set + per-key value equality (the right notion
+            // for a map). Same length, then every key of `self` must be present
+            // in `other` with an equal value. The body allocates (it enumerates
+            // keys via hashmap_keys and clones keys for the by-value lookups), so
+            // the method is declared `! { alloc }` even though the `Eq` trait's
+            // `eq` is pure — a trait-impl method may carry MORE effects than the
+            // trait declares; static dispatch attributes the impl's real effects
+            // at the call site. Requires K: Clone (keys are cloned per lookup).
+            "impl<K: Hash + Eq + Clone, V: Eq> Eq for HashMap<K, V> {\n"
+            "    fn eq(&self, other: &HashMap<K, V>) -> bool ! { alloc } {\n"
+            "        if hashmap_len(self) != hashmap_len(other) { false }\n"
+            "        else {\n"
+            "            let ks = hashmap_keys(self);\n"
+            "            let mut i = 0;\n"
+            "            let mut same = true;\n"
+            "            while i < vec_len(&ks) {\n"
+            "                let kref = vec_get_ref(&ks, i);\n"
+            "                match hashmap_get_ref(self, kref.clone()) {\n"
+            "                    Some(sv) => match hashmap_get_ref(other, kref.clone()) {\n"
+            "                        Some(ov) => { if !sv.eq(ov) { same = false; } else {} },\n"
+            "                        None => { same = false; },\n"
+            "                    },\n"
+            "                    None => {},\n"
+            "                }\n"
             "                i = i + 1;\n"
             "            }\n"
             "            same\n"
@@ -390,7 +441,71 @@ std::string applyPrelude(const std::string& userSrc) {
 // (field-/payload-wise Clone, Eq, Display), then re-parse + append. Reuses the
 // real impl machinery (incl. generic impls, Phase 40) instead of hand-building
 // AST. A generic type's params each gain the derived trait as a bound.
+// Phase 46: does a DERIVED `eq` over this field/payload type allocate? True iff
+// the type is — or transitively contains — a HashMap/HashSet, whose Eq impl
+// enumerates keys (an `alloc`). `allocEqUserTypes` names the user struct/enums
+// already known (via the fixpoint below) to derive an allocating `eq`.
+static bool typeRefAllocEq(
+    const kardashev::ast::TypeRef& tr,
+    const std::unordered_set<std::string>& allocEqUserTypes) {
+    if (tr.name == "HashMap" || tr.name == "HashSet") return true;
+    if (allocEqUserTypes.count(tr.name)) return true;
+    for (const auto& a : tr.typeArgs)
+        if (typeRefAllocEq(a, allocEqUserTypes)) return true;
+    return false;
+}
+
 std::string deriveImplSource(const kardashev::ast::Program& prog) {
+    auto hasDerive = [](const std::vector<std::string>& ds,
+                        const char* d) -> bool {
+        for (const auto& x : ds)
+            if (x == d) return true;
+        return false;
+    };
+    // Phase 46: the set of derived types whose generated `eq` ALLOCATES, by
+    // least-fixpoint: a type allocates if it derives Eq and has a field/payload
+    // that is (or transitively contains) a map, OR another already-allocating
+    // derived type. Only such an `eq` is annotated `! { alloc }`; a map-free
+    // derived `eq` stays pure (so comparing pure structs needs no alloc
+    // context). Propagation is restricted to types that derive Eq — the only
+    // ones whose `eq` we know to be the generated, allocating form.
+    std::unordered_set<std::string> allocEq;
+    {
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (const auto& s : prog.structs) {
+                if (allocEq.count(s.name) || !hasDerive(s.derives, "Eq"))
+                    continue;
+                for (const auto& f : s.fields)
+                    if (typeRefAllocEq(f.type, allocEq)) {
+                        allocEq.insert(s.name);
+                        changed = true;
+                        break;
+                    }
+            }
+            for (const auto& e : prog.enums) {
+                if (allocEq.count(e.name) || !hasDerive(e.derives, "Eq"))
+                    continue;
+                bool hit = false;
+                for (const auto& v : e.variants) {
+                    for (const auto& pt : v.payloadTypes)
+                        if (typeRefAllocEq(pt, allocEq)) {
+                            hit = true;
+                            break;
+                        }
+                    if (hit) break;
+                }
+                if (hit) {
+                    allocEq.insert(e.name);
+                    changed = true;
+                }
+            }
+        }
+    }
+    auto eqEffect = [&](const std::string& name) -> const char* {
+        return allocEq.count(name) ? " ! { alloc }" : "";
+    };
     auto header = [](const std::vector<kardashev::ast::TypeParam>& ps,
                      const char* bound) -> std::string {
         if (ps.empty()) return "";
@@ -427,7 +542,8 @@ std::string deriveImplSource(const kardashev::ast::Program& prog) {
                 out += " } } }\n";
             } else if (d == "Eq") {
                 out += "impl" + header(s.genericParams, "Eq") + " Eq for " + TN +
-                       " { fn eq(&self, other: &" + TN + ") -> bool { ";
+                       " { fn eq(&self, other: &" + TN + ") -> bool" +
+                       eqEffect(s.name) + " { ";
                 if (s.fields.empty()) out += "true";
                 for (std::size_t i = 0; i < s.fields.size(); ++i)
                     out += (i ? " && " : "") + ("self." + s.fields[i].name +
@@ -480,8 +596,8 @@ std::string deriveImplSource(const kardashev::ast::Program& prog) {
                 out += " } } }\n";
             } else if (d == "Eq") {
                 out += "impl" + header(e.genericParams, "Eq") + " Eq for " + TN +
-                       " { fn eq(&self, other: &" + TN +
-                       ") -> bool { match self {";
+                       " { fn eq(&self, other: &" + TN + ") -> bool" +
+                       eqEffect(e.name) + " { match self {";
                 for (const auto& var : e.variants) {
                     out += " " + var.name;
                     if (!var.payloadTypes.empty()) {
