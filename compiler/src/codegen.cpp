@@ -53,7 +53,37 @@ public:
         if (emitDebugInfo_) initDebugInfo(sourceFile);
     }
 
+    // Phase 34 fix: the canonical built-in container struct TYPES must exist
+    // BEFORE any user struct/enum that references them (String / Vec<T> /
+    // HashMap / ... as a field or variant payload) is laid out — otherwise the
+    // user layout creates its own `%String` which `declareBuiltins` then
+    // shadows with a second `%String.0`, and an enum-with-String-payload ctor
+    // gets an InsertValue type mismatch. Create them once here, idempotently;
+    // declareBuiltins / declareHashMapRuntime reuse these entries.
+    void ensureCoreStructTypes() {
+        if (structTypes_.count("String")) return;
+        auto& ctx = *ctx_;
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        structTypes_["Vec"] =
+            llvm::StructType::create(ctx, {i8PtrTy, i64Ty, i64Ty}, "Vec");
+        structTypes_["String"] =
+            llvm::StructType::create(ctx, {i8PtrTy, i64Ty, i64Ty}, "String");
+        structTypes_["Slice"] =
+            llvm::StructType::create(ctx, {i8PtrTy, i64Ty}, "Slice");
+        structTypes_["Future"] =
+            llvm::StructType::create(ctx, {i8PtrTy, i8PtrTy}, "Future");
+        auto* hm =
+            llvm::StructType::create(ctx, {i8PtrTy, i64Ty, i64Ty}, "HashMap");
+        structTypes_["HashMap"] = hm;
+        structTypes_["HashSet"] = hm; // HashSet shares the HashMap layout
+    }
+
     void run(const ast::Program& program) {
+        // Phase 34: register the built-in container struct layouts first (see
+        // ensureCoreStructTypes) so user types referencing them get the
+        // canonical instances.
+        ensureCoreStructTypes();
         // Phase 23: decide up front whether this program can panic. A program
         // that never panics gets ZERO panic-runtime / cleanup-stack machinery
         // (byte-identical IR to pre-Phase-23). "Can panic" = it calls
@@ -948,9 +978,9 @@ private:
             ctx, {i8PtrTy, i8PtrTy}, "kd.dynptr");
 
         // --- Vec struct layout: { i8* data, i64 len, i64 cap } ---
-        auto* vecTy = llvm::StructType::create(
-            ctx, {i8PtrTy, i64Ty, i64Ty}, "Vec");
-        structTypes_["Vec"] = vecTy;
+        // Created once in ensureCoreStructTypes (so user types referencing Vec
+        // get this exact instance); reuse it here.
+        auto* vecTy = structTypes_["Vec"];
 
         // --- String struct layout: { i8* data, i64 len, i64 cap }.
         // Phase 13b made String growable (mirroring Vec's {ptr,len,cap}).
@@ -961,16 +991,13 @@ private:
         // it copies the literal's bytes in on first append so the original
         // global is never mutated. `print_str` / `str_len` only read
         // data+len, so they work uniformly over literals and grown strings.
-        auto* strTy = llvm::StructType::create(
-            ctx, {i8PtrTy, i64Ty, i64Ty}, "String");
-        structTypes_["String"] = strTy;
+        auto* strTy = structTypes_["String"]; // see ensureCoreStructTypes
 
         // --- Phase 13b: slice fat pointer { i8* ptr, i64 len }. Like Vec /
         // String, every `&[T]` lowers to this single layout regardless of T
         // (the element stride is computed separately at slice_get sites).
-        auto* sliceTy = llvm::StructType::create(
-            ctx, {i8PtrTy, i64Ty}, "Slice");
-        structTypes_["Slice"] = sliceTy;
+        auto* sliceTy = structTypes_["Slice"]; // see ensureCoreStructTypes
+        (void)sliceTy;
 
         // --- Phase 12 real async runtime ---
         // Poll = { i1 ready, i64 value }: the result of polling a future.
@@ -982,9 +1009,7 @@ private:
         // the future's heap-allocated state (a counter for yield_now, or the
         // async-fn state-machine frame). Replaces the Phase 6 fake
         // {state,result} pair — futures are now genuinely pollable/resumable.
-        auto* futureTy = llvm::StructType::create(
-            ctx, {i8PtrTy, i8PtrTy}, "Future");
-        structTypes_["Future"] = futureTy;
+        auto* futureTy = structTypes_["Future"]; // see ensureCoreStructTypes
         // The poll-function type shared by every future: void(i8*, kd.poll*).
         pollFnTy_ = llvm::FunctionType::get(
             llvm::Type::getVoidTy(ctx), {i8PtrTy, llvm::PointerType::get(ctx, 0)},
@@ -1805,19 +1830,9 @@ private:
     // per-V bucket-entry struct + the five ops are emitted lazily by
     // getOrEmitHashMapOp (mirrors getOrEmitVecOp).
     void declareHashMapRuntime() {
-        auto& ctx = *ctx_;
-        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
-        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
-        // %HashMap = { i8* buckets, i64 len, i64 cap }
-        auto* hmTy = llvm::StructType::create(
-            ctx, {i8PtrTy, i64Ty, i64Ty}, "HashMap");
-        structTypes_["HashMap"] = hmTy;
-        // Phase 28: HashSet IS a HashMap-with-a-dummy-value at runtime, so it
-        // shares the identical LLVM type (the two stay nominally distinct only
-        // in the kardashev type system, which drives dispatch via the callee
-        // name). Sharing the LLVM type keeps `hashset_new` returning the same
-        // struct the underlying `hashmap_new` produces.
-        structTypes_["HashSet"] = hmTy;
+        // %HashMap = { i8* buckets, i64 len, i64 cap } — created once in
+        // ensureCoreStructTypes (HashSet shares it); reuse here.
+        (void)structTypes_["HashMap"];
     }
 
     // Phase 17b: build the concrete `Option<V>` Kardashev TypePtr by
@@ -2239,6 +2254,90 @@ private:
             b.CreateStore(wrapped, idxSlot);
             b.CreateBr(loopBB);
             declaredFns_["hashmap_get__" + vMangle] = fn;
+        }
+
+        // Phase 34: hashmap_get_ref__<K,V>(m, k) -> Option<&V> — identical
+        // probe to hashmap_get, but the `Some` payload is a BORROW (the value
+        // slot pointer) rather than a copy (read-without-move for maps).
+        {
+            TypePtr optTy = optionType(makeRef(V, /*isMut=*/false));
+            if (optTy) {
+                mapKardashevType(optTy);
+                const std::string optMangled =
+                    mangleStructInstance(optTy->enumName, optTy->typeArgs);
+                auto* optLlvm = enumTypes_[optMangled];
+                unsigned someIdx = variantIndexInEnum(optTy, "Some");
+                unsigned noneIdx = variantIndexInEnum(optTy, "None");
+                unsigned someSlot = enumPayloadIndices_[optMangled][someIdx][0];
+                auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+                auto* fnTy =
+                    llvm::FunctionType::get(optLlvm, {i8PtrTy, keyTy}, false);
+                auto* fn = llvm::Function::Create(
+                    fnTy, llvm::Function::ExternalLinkage,
+                    "hashmap_get_ref__" + vMangle, module_.get());
+                fn->getArg(0)->setName("m");
+                fn->getArg(1)->setName("k");
+                auto* mPtr = fn->getArg(0);
+                auto* k = fn->getArg(1);
+                auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+                auto* loopBB = llvm::BasicBlock::Create(ctx, "probe", fn);
+                auto* checkBB = llvm::BasicBlock::Create(ctx, "check", fn);
+                auto* noneBB = llvm::BasicBlock::Create(ctx, "none", fn);
+                auto* hitBB = llvm::BasicBlock::Create(ctx, "hit", fn);
+                auto* stepBB = llvm::BasicBlock::Create(ctx, "step", fn);
+                auto buildNone = [&](llvm::IRBuilder<>& bb) {
+                    llvm::Value* agg = llvm::UndefValue::get(optLlvm);
+                    return bb.CreateInsertValue(
+                        agg, llvm::ConstantInt::get(i32Ty, noneIdx), {0},
+                        "none");
+                };
+                llvm::IRBuilder<> b(entry);
+                auto* idxSlot = b.CreateAlloca(i64Ty, nullptr, "idx");
+                llvm::Value* kSlot = nullptr;
+                if (!keyIsInt) {
+                    kSlot = b.CreateAlloca(keyTy, nullptr, "kslot");
+                    b.CreateStore(k, kSlot);
+                }
+                auto* cap = b.CreateLoad(
+                    i64Ty, b.CreateStructGEP(hmTy, mPtr, 2, "capP"), "cap");
+                auto* buckets = b.CreateLoad(
+                    i8PtrTy, b.CreateStructGEP(hmTy, mPtr, 0, "bucketsP"),
+                    "buckets");
+                auto* nonZeroBB = llvm::BasicBlock::Create(ctx, "nonzero", fn);
+                b.CreateCondBr(b.CreateICmpEQ(cap, zero, "capZero"), noneBB,
+                               nonZeroBB);
+                b.SetInsertPoint(nonZeroBB);
+                b.CreateStore(emitStart(b, k, kSlot, cap), idxSlot);
+                b.CreateBr(loopBB);
+                b.SetInsertPoint(loopBB);
+                auto* idx = b.CreateLoad(i64Ty, idxSlot, "i");
+                auto* eptr = b.CreateGEP(entryTy, buckets, idx, "eptr");
+                auto* state = b.CreateLoad(
+                    i64Ty, b.CreateStructGEP(entryTy, eptr, 0, "stateP"),
+                    "state");
+                b.CreateCondBr(b.CreateICmpEQ(state, zero, "isEmpty"), noneBB,
+                               checkBB);
+                b.SetInsertPoint(noneBB);
+                b.CreateRet(buildNone(b));
+                b.SetInsertPoint(checkBB);
+                auto* keyP = b.CreateStructGEP(entryTy, eptr, 1, "keyP");
+                b.CreateCondBr(emitEq(b, k, kSlot, keyP), hitBB, stepBB);
+                b.SetInsertPoint(hitBB);
+                auto* valP = b.CreateStructGEP(entryTy, eptr, 2, "valP");
+                llvm::Value* someAgg = llvm::UndefValue::get(optLlvm);
+                someAgg = b.CreateInsertValue(
+                    someAgg, llvm::ConstantInt::get(i32Ty, someIdx), {0},
+                    "some");
+                someAgg = b.CreateInsertValue(someAgg, valP, {someSlot},
+                                              "someRef"); // the BORROW
+                b.CreateRet(someAgg);
+                b.SetInsertPoint(stepBB);
+                b.CreateStore(b.CreateURem(b.CreateAdd(idx, one, "inc"), cap,
+                                           "wrap"),
+                              idxSlot);
+                b.CreateBr(loopBB);
+                declaredFns_["hashmap_get_ref__" + vMangle] = fn;
+            }
         }
 
         // hashmap_len__<V>(m: &HashMap) -> i64 (value-agnostic, but emitted
@@ -4447,6 +4546,43 @@ private:
             declaredFns_[mangled] = fn;
             return fn;
         }
+        if (op == "vec_get_ref") {
+            // Phase 34: like vec_get, but returns a BORROW (&T) into the
+            // buffer rather than a by-value copy — the read-without-move
+            // primitive. Same bounds guard; an out-of-range index yields a
+            // null `&T` (callers index within `vec_len`, like vec_get).
+            auto* fnTy =
+                llvm::FunctionType::get(i8PtrTy, {vecPtrTy, i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+            fn->getArg(0)->setName("v");
+            fn->getArg(1)->setName("i");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* inBoundsBB = llvm::BasicBlock::Create(ctx, "in_bounds", fn);
+            auto* oobBB = llvm::BasicBlock::Create(ctx, "oob", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* zero64 = llvm::ConstantInt::get(i64Ty, 0);
+            auto* data = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(vecTy, fn->getArg(0), 0, "data_ptr"),
+                "data");
+            auto* len = b.CreateLoad(
+                i64Ty, b.CreateStructGEP(vecTy, fn->getArg(0), 1, "len_ptr"),
+                "len");
+            auto* idx = fn->getArg(1);
+            auto* canRead = b.CreateAnd(
+                b.CreateAnd(b.CreateICmpSGE(idx, zero64, "nn"),
+                            b.CreateICmpSLT(idx, len, "ir"), "bounds_ok"),
+                b.CreateICmpNE(data, llvm::Constant::getNullValue(i8PtrTy),
+                               "data_nn"),
+                "can_read");
+            b.CreateCondBr(canRead, inBoundsBB, oobBB);
+            b.SetInsertPoint(inBoundsBB);
+            b.CreateRet(b.CreateGEP(elemLlvmTy, data, idx, "elem_ptr"));
+            b.SetInsertPoint(oobBB);
+            b.CreateRet(llvm::Constant::getNullValue(i8PtrTy));
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
         if (op == "vec_len") {
             auto* fnTy = llvm::FunctionType::get(i64Ty, {vecPtrTy}, false);
             auto* fn = llvm::Function::Create(
@@ -4468,10 +4604,18 @@ private:
     void declareAllStructs() {
         for (const auto& [name, schema] : tc_.structs) {
             if (!schema.genericVars.empty()) continue;
+            // Phase 34: a built-in container (e.g. String) already has its real
+            // LLVM layout from ensureCoreStructTypes; do NOT re-create it here
+            // from its (intentionally fieldless / opaque) schema, which would
+            // overwrite the real `{ptr,len,cap}` body with an empty struct.
+            if (structTypes_.count(name)) continue;
             structTypes_[name] = llvm::StructType::create(*ctx_, name);
         }
         for (const auto& [name, schema] : tc_.structs) {
             if (!schema.genericVars.empty()) continue;
+            if (name == "String" || name == "Vec" || name == "HashMap" ||
+                name == "HashSet" || name == "Future" || name == "Slice")
+                continue; // body owned by ensureCoreStructTypes / declareBuiltins
             std::vector<llvm::Type*> elems;
             elems.reserve(schema.type->structFields.size());
             for (const auto& [_fname, fty] : schema.type->structFields) {
@@ -6512,8 +6656,8 @@ private:
                     llvm::Value* elt = builder_->CreateExtractValue(
                         tup, {static_cast<unsigned>(i)},
                         "destr." + let->tupleNames[i]);
-                    auto* alloca = builder_->CreateAlloca(
-                        elt->getType(), nullptr, let->tupleNames[i]);
+                    auto* alloca = entryAlloca(elt->getType(),
+                                               let->tupleNames[i]); // hoisted
                     builder_->CreateStore(elt, alloca);
                     locals_[let->tupleNames[i]] = alloca;
                     if (tupTy && tupTy->kind == TypeKind::Tuple &&
@@ -6538,8 +6682,12 @@ private:
                 if (existing != locals_.end()) alloca = existing->second;
             }
             if (!alloca) {
-                alloca = builder_->CreateAlloca(v->getType(), nullptr,
-                                                let->name);
+                // Phase 34 fix: hoist the binding's storage to the function
+                // entry block. A `let` inside a loop must NOT alloca per
+                // iteration — an address-taken (un-promotable) binding, e.g. a
+                // droppable enum/struct whose drop reads it, would otherwise
+                // accumulate one stack slot per iteration and overflow.
+                alloca = entryAlloca(v->getType(), let->name);
             }
             builder_->CreateStore(v, alloca);
             locals_[let->name] = alloca;
@@ -7306,6 +7454,15 @@ private:
             return builder_->CreateNeg(v, "neg");
         case ast::UnaryOp::Not:
             return builder_->CreateNot(v, "not");
+        case ast::UnaryOp::Deref: {
+            // Phase 34: `*r` — `v` is the pointer (a `&T`/Box value); load the
+            // pointee, whose type the typechecker recorded for this expr.
+            TypePtr resTy = lookupExprType(un);
+            llvm::Type* llvmTy =
+                resTy ? mapKardashevType(resTy)
+                      : llvm::Type::getInt64Ty(*ctx_);
+            return builder_->CreateLoad(llvmTy, v, "deref");
+        }
         }
         return v; // unreachable
     }
@@ -7587,7 +7744,8 @@ private:
             // Phase 5.z: vec_* built-ins are generic but have no AST
             // body — synthesize their specialization directly.
             if ((call.callee == "vec_new" || call.callee == "vec_push" ||
-                 call.callee == "vec_get" || call.callee == "vec_len") &&
+                 call.callee == "vec_get" || call.callee == "vec_get_ref" ||
+                 call.callee == "vec_len") &&
                 !concreteTypeArgs.empty()) {
                 llvm::Function* fn =
                     getOrEmitVecOp(call.callee, concreteTypeArgs[0]);
@@ -7642,6 +7800,7 @@ private:
             if ((call.callee == "hashmap_new" ||
                  call.callee == "hashmap_insert" ||
                  call.callee == "hashmap_get" ||
+                 call.callee == "hashmap_get_ref" ||
                  call.callee == "hashmap_len") &&
                 concreteTypeArgs.size() >= 2) {
                 llvm::Function* fn = getOrEmitHashMapOp(
@@ -7849,7 +8008,9 @@ private:
             llvm::Value* scrutinee,
             llvm::BasicBlock* mergeBB,
             std::vector<std::pair<llvm::BasicBlock*, llvm::Value*>>& incoming,
-            const ast::MatchExpr& me) {
+            const ast::MatchExpr& me,
+            bool refMatch = false, llvm::Value* origPtr = nullptr,
+            llvm::Type* enumLlvmTy = nullptr) {
         using DT = pattern_match::DecisionTree;
         switch (dt.kind) {
             case DT::Fail: {
@@ -7866,9 +8027,32 @@ private:
                     dt.armIndex < me.arms.size() ? &me.arms[dt.armIndex]
                                                  : nullptr;
                 for (const auto& [name, path] : dt.bindings) {
-                    llvm::Value* sub = walkOccurrence(scrutinee, path);
-                    auto* alloca = builder_->CreateAlloca(sub->getType(),
-                                                          nullptr, name);
+                    // Phase 34: in a by-reference match, a payload binding is a
+                    // BORROW — a pointer GEP'd into the original scrutinee
+                    // (origPtr), not a by-value copy out of the loaded
+                    // aggregate. path [] binds the whole &Enum; [slot] a
+                    // payload field. (Deeper nesting through a ref would need a
+                    // GEP-chain with intermediate types — not supported yet.)
+                    llvm::Value* sub;
+                    if (refMatch) {
+                        if (path.empty()) {
+                            sub = origPtr;
+                        } else if (path.size() == 1) {
+                            sub = builder_->CreateStructGEP(enumLlvmTy, origPtr,
+                                                            path[0],
+                                                            name + ".ref");
+                        } else {
+                            errors_.push_back(
+                                "codegen: nested pattern through a reference "
+                                "is not yet supported");
+                            sub = origPtr;
+                        }
+                    } else {
+                        sub = walkOccurrence(scrutinee, path);
+                    }
+                    // Hoisted to entry (Phase 34 fix): a match inside a loop
+                    // must not alloca per iteration.
+                    auto* alloca = entryAlloca(sub->getType(), name);
                     builder_->CreateStore(sub, alloca);
                     locals_[name] = alloca;
                     if (arm) {
@@ -7943,7 +8127,8 @@ private:
                     builder_->SetInsertPoint(hitBB);
                     if (c.child) {
                         emitDecisionTree(*c.child, scrutinee, mergeBB,
-                                         incoming, me);
+                                         incoming, me, refMatch, origPtr,
+                                         enumLlvmTy);
                     } else {
                         builder_->CreateUnreachable();
                     }
@@ -7955,7 +8140,8 @@ private:
                 // default).
                 if (dt.defaultCase) {
                     emitDecisionTree(*dt.defaultCase, scrutinee, mergeBB,
-                                     incoming, me);
+                                     incoming, me, refMatch, origPtr,
+                                     enumLlvmTy);
                 } else {
                     builder_->CreateUnreachable();
                 }
@@ -8253,12 +8439,37 @@ private:
     }
 
     llvm::Value* emitMatch(const ast::MatchExpr& me) {
-        llvm::Value* scrutinee = emitExpr(*me.scrutinee);
-        // Phase 16: matching consumes (destructures) the scrutinee — a bare
-        // binding is moved into the match, so the enclosing scope must not drop
-        // it. (Payload bindings introduced by patterns are not yet tracked for
-        // drop; matching on droppable-payload enums is a documented limitation.)
-        clearDropFlagIfMoved(*me.scrutinee);
+        // Phase 34: match-through-reference — if the scrutinee is `&Enum`, the
+        // decision tree was built against the pointee enum; we load the enum
+        // value ONCE for the discriminant reads (the tag is Copy), but bind
+        // payloads as borrows GEP'd into the original pointer (origPtr) so
+        // nothing is moved/copied out (see emitDecisionTree's Leaf).
+        bool refMatch = false;
+        llvm::Type* enumLlvmTy = nullptr;
+        if (TypePtr sty = lookupExprType(*me.scrutinee)) {
+            TypePtr r = resolve(sty);
+            if (r->kind == TypeKind::Ref) {
+                TypePtr inner = resolveInInstance(r->refInner);
+                if (inner->kind == TypeKind::Enum) {
+                    refMatch = true;
+                    enumLlvmTy = mapKardashevType(inner);
+                }
+            }
+        }
+        llvm::Value* scrutinee;
+        llvm::Value* origPtr = nullptr;
+        if (refMatch) {
+            origPtr = emitExpr(*me.scrutinee); // the &Enum pointer (a borrow)
+            scrutinee =
+                builder_->CreateLoad(enumLlvmTy, origPtr, "refmatch.val");
+            // `&x` borrows x — it is NOT moved, so no drop-flag clearing.
+        } else {
+            scrutinee = emitExpr(*me.scrutinee);
+            // Phase 16: a by-value match consumes (destructures) the scrutinee
+            // — a bare binding is moved in, so the enclosing scope must not
+            // drop it.
+            clearDropFlagIfMoved(*me.scrutinee);
+        }
         auto* mergeBB = llvm::BasicBlock::Create(*ctx_, "matchmerge",
                                                   currentFn_);
         std::vector<std::pair<llvm::BasicBlock*, llvm::Value*>> incoming;
@@ -8270,7 +8481,8 @@ private:
             builder_->SetInsertPoint(mergeBB);
             return llvm::UndefValue::get(llvm::Type::getInt64Ty(*ctx_));
         }
-        emitDecisionTree(*it->second, scrutinee, mergeBB, incoming, me);
+        emitDecisionTree(*it->second, scrutinee, mergeBB, incoming, me,
+                         refMatch, origPtr, enumLlvmTy);
 
         builder_->SetInsertPoint(mergeBB);
         if (incoming.empty()) {

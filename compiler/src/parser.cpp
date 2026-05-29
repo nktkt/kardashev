@@ -1223,14 +1223,19 @@ private:
     // and the closure `|` are still handled by parsePrimary, so `-&x` and
     // `&-x` both flow through correctly.
     ast::ExprPtr parseUnary() {
-        if (check(TokenKind::Minus) || check(TokenKind::Bang)) {
+        // Phase 34: a leading `*` is the deref operator (an infix `*` is
+        // multiplication, handled in the precedence parser — position
+        // disambiguates, the standard prefix/infix split).
+        if (check(TokenKind::Minus) || check(TokenKind::Bang) ||
+            check(TokenKind::Star)) {
             Token opTok = consume();
             auto operand = parseUnary();
             auto ue = std::make_unique<ast::UnaryExpr>();
             ue->line = opTok.line;
             ue->column = opTok.column;
-            ue->op = opTok.kind == TokenKind::Minus ? ast::UnaryOp::Neg
-                                                     : ast::UnaryOp::Not;
+            ue->op = opTok.kind == TokenKind::Minus  ? ast::UnaryOp::Neg
+                     : opTok.kind == TokenKind::Bang ? ast::UnaryOp::Not
+                                                     : ast::UnaryOp::Deref;
             ue->operand = std::move(operand);
             return ue;
         }

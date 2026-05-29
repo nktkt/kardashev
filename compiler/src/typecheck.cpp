@@ -328,6 +328,16 @@ public:
             sch.genericVars.push_back(vecFnGenericVar);
             fnSchemas_["vec_get"] = std::move(sch);
         }
+        // Phase 34: vec_get_ref<T>(v: &Vec<T>, i: i64) -> &T — a BORROW into
+        // the buffer (read without moving/copying the element out).
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(vecFnInst, /*isMut=*/false), makeInt()},
+                makeRef(vecFnGenericVar, /*isMut=*/false));
+            sch.genericVars.push_back(vecFnGenericVar);
+            fnSchemas_["vec_get_ref"] = std::move(sch);
+        }
         // vec_len<T>(v: &Vec<T>) -> i64
         {
             FnSchema sch;
@@ -824,6 +834,22 @@ public:
             sch.genericVars.push_back(hmKeyVar);
             sch.genericVars.push_back(hmValVar);
             fnSchemas_["hashmap_get"] = std::move(sch);
+
+            // Phase 34: hashmap_get_ref<K,V>(m: &HashMap<K,V>, k: K)
+            // -> Option<&V> — a borrow into the value slot (read-without-move).
+            if (!optSchema.genericVars.empty()) {
+                TypePtr refV = makeRef(hmValVar, /*isMut=*/false);
+                std::unordered_map<int, TypePtr> subst;
+                subst[optSchema.genericVars[0]->varId] = refV;
+                TypePtr optRefV = instantiate(optSchema.type, subst);
+                optRefV->typeArgs = {refV};
+                FnSchema rsch;
+                rsch.signature = makeFunction(
+                    {makeRef(hashMapInst, /*isMut=*/false), hmKeyVar}, optRefV);
+                rsch.genericVars.push_back(hmKeyVar);
+                rsch.genericVars.push_back(hmValVar);
+                fnSchemas_["hashmap_get_ref"] = std::move(rsch);
+            }
         }
 
         // Pass 1c: register trait declarations. Each trait gets a global
@@ -5030,6 +5056,16 @@ private:
                       un.operand->line, un.operand->column);
             }
             return makeBool();
+        case ast::UnaryOp::Deref: {
+            // Phase 34: `*r` reads the pointee of a `&T` / `&mut T` / Box<T>.
+            TypePtr r = resolve(operand);
+            if (r->kind == TypeKind::Ref) return resolve(r->refInner);
+            if (r->kind == TypeKind::Box) return resolve(r->refInner);
+            error("unary `*` requires a reference or Box operand, got " +
+                      typeToString(operand),
+                  un.operand->line, un.operand->column);
+            return makeInt();
+        }
         }
         return makeInt(); // unreachable
     }
@@ -5512,6 +5548,23 @@ private:
 
     TypePtr checkMatch(const ast::MatchExpr& me) {
         TypePtr scrutT = checkExpr(*me.scrutinee);
+        // Phase 34: match-through-reference. When the scrutinee is `&Enum`
+        // (one layer of `&`/`&mut`), match the pointee enum and bind every
+        // payload as a borrow `&T` — so a recursive heap value can be
+        // traversed without moving/copying it out (codegen reads through the
+        // pointer; the scrutinee `&x` borrows x rather than consuming it).
+        TypePtr patExpected = scrutT;
+        bool refMatch = false;
+        {
+            TypePtr rs = resolve(scrutT);
+            if (rs->kind == TypeKind::Ref) {
+                TypePtr inner = resolve(rs->refInner);
+                if (inner->kind == TypeKind::Enum) {
+                    refMatch = true;
+                    patExpected = inner;
+                }
+            }
+        }
         if (me.arms.empty()) {
             error("match expression must have at least one arm",
                   me.line, me.column);
@@ -5534,7 +5587,7 @@ private:
             // recorded inline; we still process the body so secondary
             // type errors surface.
             Scope bindings;
-            checkPattern(*arm.pattern, scrutT, bindings);
+            checkPattern(*arm.pattern, patExpected, bindings, refMatch);
             for (auto& kv : bindings) {
                 scopes_.back()[kv.first] = kv.second;
                 // Phase 29: record the binding's type so codegen can drop a
@@ -5559,7 +5612,7 @@ private:
         enumsForPm.reserve(enumSchemas_.size());
         for (const auto& [n, s] : enumSchemas_) enumsForPm[n] = s.type;
         if (auto w = pattern_match::checkExhaustiveness(
-                scrutT, me.arms, enumsForPm, variantIndex_)) {
+                patExpected, me.arms, enumsForPm, variantIndex_)) {
             error("non-exhaustive match: missing pattern `" + w->text + "`",
                   me.line, me.column);
         }
@@ -5567,7 +5620,7 @@ private:
         if (armsClean) {
             // Redundancy: report each arm unreachable given the arms before it.
             auto redundant = pattern_match::findRedundantArms(
-                scrutT, me.arms, enumsForPm, variantIndex_);
+                patExpected, me.arms, enumsForPm, variantIndex_);
             for (unsigned idx : redundant) {
                 if (idx >= me.arms.size()) continue;
                 const auto& arm = me.arms[idx];
@@ -5579,7 +5632,7 @@ private:
             // (even when non-exhaustive — the tree bottoms out at Fail
             // nodes), as long as arm patterns were well-typed.
             matchTrees_[&me] = pattern_match::compileDecisionTree(
-                scrutT, me.arms, enumsForPm, variantIndex_);
+                patExpected, me.arms, enumsForPm, variantIndex_);
         }
         return unified;
     }
@@ -5592,8 +5645,12 @@ private:
     // as a unit-CtorPat (matches the variant, no binding). Names that
     // collide with non-unit variants are likely a forgotten parenthesis
     // and are flagged as an arity error rather than silently binding.
+    // Phase 34: `refMatch` is true when the scrutinee is `&Enum` (a
+    // match-through-reference). Then a bound name binds a BORROW `&T` of the
+    // matched location rather than an owned/copied `T`, so traversing a
+    // recursive heap value never moves/double-frees it.
     void checkPattern(const ast::Pattern& pat, const TypePtr& expected,
-                      Scope& bindings) {
+                      Scope& bindings, bool refMatch = false) {
         if (dynamic_cast<const ast::LitIntPat*>(&pat)) {
             if (!unify(expected, makeInt())) {
                 error("integer pattern requires i64, scrutinee is " +
@@ -5630,7 +5687,9 @@ private:
                       pat.line, pat.column);
                 return;
             }
-            bindings[vp->name] = expected;
+            // Phase 34: in a match-through-reference, bind a borrow `&T`.
+            bindings[vp->name] =
+                refMatch ? makeRef(expected, /*isMut=*/false) : expected;
             return;
         }
         if (auto* cp = dynamic_cast<const ast::CtorPat*>(&pat)) {
@@ -5641,7 +5700,7 @@ private:
                 // Still walk subpatterns so nested errors / bindings surface
                 // against fresh vars.
                 for (const auto& sp : cp->subpatterns) {
-                    checkPattern(*sp, makeFreshVar(), bindings);
+                    checkPattern(*sp, makeFreshVar(), bindings, refMatch);
                 }
                 return;
             }
@@ -5663,11 +5722,12 @@ private:
                 std::min(cp->subpatterns.size(), variant.payloadTypes.size());
             for (std::size_t i = 0; i < n; ++i) {
                 checkPattern(*cp->subpatterns[i], variant.payloadTypes[i],
-                             bindings);
+                             bindings, refMatch);
             }
             // Walk any extras against fresh vars to surface their bindings/errors.
             for (std::size_t i = n; i < cp->subpatterns.size(); ++i) {
-                checkPattern(*cp->subpatterns[i], makeFreshVar(), bindings);
+                checkPattern(*cp->subpatterns[i], makeFreshVar(), bindings,
+                             refMatch);
             }
             return;
         }

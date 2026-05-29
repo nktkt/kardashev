@@ -73,8 +73,9 @@ enum class BinOp {
 // i64 -> i64); `Not` is logical not (`!x`, bool -> bool). Both bind
 // tighter than every binary operator.
 enum class UnaryOp {
-    Neg, // -x
-    Not, // !x
+    Neg,   // -x
+    Not,   // !x
+    Deref, // *r — Phase 34: read the pointee of a `&T` / `Box<T>` (yields T)
 };
 
 // Base expression. Polymorphic by design — use `dynamic_cast<...*>` in

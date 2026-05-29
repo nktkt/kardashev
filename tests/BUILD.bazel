@@ -331,6 +331,15 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 34: read-without-move — vec_get_ref / hashmap_get_ref (Option<&V>) /
+# the `*r` deref operator / match-through-&Enum (binding payloads as borrows),
+# with a constant-memory by-reference traversal loop. JIT + AOT.
+sh_test(
+    name = "smoke_test_refread",
+    srcs = ["smoke_test_refread.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],
