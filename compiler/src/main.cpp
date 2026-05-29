@@ -128,7 +128,16 @@ std::string applyPrelude(const std::string& userSrc) {
             " { fn eq(&self, other: &i64) -> bool { int_eq(self, other) } }\n"
             "impl Eq for String"
             " { fn eq(&self, other: &String) -> bool"
-            " { str_eq(self, other) } }\n";
+            " { str_eq(self, other) } }\n"
+            // Phase 44: bool / f64 Eq (scalars). (A generic HashMap Eq trait
+            // impl is deferred for the same reason as HashMap Clone above; a
+            // hand-written order-independent compare is straightforward where
+            // needed.)
+            "impl Eq for bool"
+            " { fn eq(&self, other: &bool) -> bool"
+            " { if *self { *other } else { !*other } } }\n"
+            "impl Eq for f64"
+            " { fn eq(&self, other: &f64) -> bool { *self == *other } }\n";
     }
     // Phase 37: the `Display` trait — `to_string(&self) -> String` — with
     // built-in impls for the scalar/heap primitives, so a generic can be
@@ -151,6 +160,130 @@ std::string applyPrelude(const std::string& userSrc) {
             "impl Display for bool"
             " { fn to_string(&self) -> String"
             " { if *self { \"true\" } else { \"false\" } } }\n";
+    }
+    // Phase 41: the `Clone` trait — `clone(&self) -> Self` — a DEEP copy that
+    // dispatches through each element's own impl. Built-in impls for scalars +
+    // String (String copies via str_substring); a generic `impl<T: Clone> Clone
+    // for Vec<T>` clones element-wise via the now-working generic-impl + nested
+    // bounded-generic dispatch (Phase 40). The `clone(&x)` intrinsic (Phase 35)
+    // remains the structural workhorse / fallback for types with no impl. (The
+    // method is `x.clone()`; the intrinsic is the free call `clone(&x)` — they
+    // coexist.) Guarded so a user-defined `Clone` wins.
+    if (userSrc.find("trait Clone") == std::string::npos) {
+        prelude +=
+            "trait Clone { fn clone(&self) -> Self ! { alloc }; }\n"
+            "impl Clone for i64"
+            " { fn clone(&self) -> i64 ! { alloc } { *self } }\n"
+            "impl Clone for bool"
+            " { fn clone(&self) -> bool ! { alloc } { *self } }\n"
+            "impl Clone for String { fn clone(&self) -> String ! { alloc }"
+            " { str_substring(self, 0, str_len(self)) } }\n"
+            "impl<T: Clone> Clone for Vec<T> {\n"
+            "    fn clone(&self) -> Vec<T> ! { alloc } {\n"
+            "        let mut out = vec_new();\n"
+            "        let mut i = 0;\n"
+            "        while i < vec_len(self) {\n"
+            "            vec_push(&mut out, vec_get_ref(self, i).clone());\n"
+            "            i = i + 1;\n"
+            "        }\n"
+            "        out\n"
+            "    }\n"
+            "}\n"
+            // Phase 44: f64 Clone (scalar). (A generic HashMap Clone trait impl
+            // is NOT shipped: a generic `impl<K, V> .. for HashMap<K,V>` body
+            // can't yet satisfy the HashMap-op K: Hash+Eq requirement from a
+            // bounded type param — deferred. The `clone(&x)` intrinsic already
+            // deep-clones a HashMap structurally, so map cloning works via it.)
+            "impl Clone for f64"
+            " { fn clone(&self) -> f64 ! { alloc } { *self } }\n";
+    }
+    // Phase 41: a generic `impl<T: Eq> Eq for Vec<T>` (the `Eq` trait + its
+    // i64/String impls are injected below) — element-wise deep equality, the
+    // order-sensitive comparison for sequences. Guarded together with `Eq`.
+    if (userSrc.find("trait Eq") == std::string::npos) {
+        prelude +=
+            "impl<T: Eq> Eq for Vec<T> {\n"
+            "    fn eq(&self, other: &Vec<T>) -> bool {\n"
+            "        if vec_len(self) != vec_len(other) { false }\n"
+            "        else {\n"
+            "            let mut i = 0;\n"
+            "            let mut same = true;\n"
+            "            while i < vec_len(self) {\n"
+            "                if !vec_get_ref(self, i).eq(vec_get_ref(other, i))"
+            " { same = false; } else {}\n"
+            "                i = i + 1;\n"
+            "            }\n"
+            "            same\n"
+            "        }\n"
+            "    }\n"
+            "}\n";
+    }
+    // Phase 43: runtime string escape decode/encode for JSON-style strings,
+    // written in kardashev over str_push_byte / str_char_at. `\\uXXXX` decodes
+    // the Latin-1 subset (cp < 256); higher code points become '?' (documented).
+    // Guarded so a user-defined `str_unescape` suppresses the whole block.
+    if (userSrc.find("fn str_unescape") == std::string::npos) {
+        prelude +=
+            "fn __kd_hex_alpha(c: i64) -> i64 {\n"
+            "    if c >= 97 { if c <= 102 { c - 87 } else { 0 } }\n"
+            "    else { if c >= 65 { if c <= 70 { c - 55 } else { 0 } } else { 0 } }\n"
+            "}\n"
+            "fn __kd_hex_digit(c: i64) -> i64 {\n"
+            "    if c >= 48 { if c <= 57 { c - 48 } else { __kd_hex_alpha(c) } }\n"
+            "    else { __kd_hex_alpha(c) }\n"
+            "}\n"
+            "fn str_unescape(s: &String) -> String ! { alloc } {\n"
+            "    let mut out = string_new();\n"
+            "    let n = str_len(s);\n"
+            "    let mut i = 0;\n"
+            "    while i < n {\n"
+            "        let c = str_char_at(s, i);\n"
+            "        if c == 92 {\n"
+            "            i = i + 1;\n"
+            "            if i < n {\n"
+            "                let d = str_char_at(s, i);\n"
+            "                if d == 110 { str_push_byte(&mut out, 10); }\n"
+            "                else if d == 116 { str_push_byte(&mut out, 9); }\n"
+            "                else if d == 114 { str_push_byte(&mut out, 13); }\n"
+            "                else if d == 34 { str_push_byte(&mut out, 34); }\n"
+            "                else if d == 92 { str_push_byte(&mut out, 92); }\n"
+            "                else if d == 47 { str_push_byte(&mut out, 47); }\n"
+            "                else if d == 117 {\n"
+            "                    let h0 = __kd_hex_digit(str_char_at(s, i + 1));\n"
+            "                    let h1 = __kd_hex_digit(str_char_at(s, i + 2));\n"
+            "                    let h2 = __kd_hex_digit(str_char_at(s, i + 3));\n"
+            "                    let h3 = __kd_hex_digit(str_char_at(s, i + 4));\n"
+            "                    let cp = ((h0 * 16 + h1) * 16 + h2) * 16 + h3;\n"
+            "                    i = i + 4;\n"
+            "                    if cp < 256 { str_push_byte(&mut out, cp); }\n"
+            "                    else { str_push_byte(&mut out, 63); }\n"
+            "                }\n"
+            "                else { str_push_byte(&mut out, d); }\n"
+            "                i = i + 1;\n"
+            "            } else {}\n"
+            "        } else {\n"
+            "            str_push_byte(&mut out, c);\n"
+            "            i = i + 1;\n"
+            "        }\n"
+            "    }\n"
+            "    out\n"
+            "}\n"
+            "fn str_escape(s: &String) -> String ! { alloc } {\n"
+            "    let mut out = string_new();\n"
+            "    let n = str_len(s);\n"
+            "    let mut i = 0;\n"
+            "    while i < n {\n"
+            "        let c = str_char_at(s, i);\n"
+            "        if c == 10 { str_push_byte(&mut out, 92); str_push_byte(&mut out, 110); }\n"
+            "        else if c == 9 { str_push_byte(&mut out, 92); str_push_byte(&mut out, 116); }\n"
+            "        else if c == 13 { str_push_byte(&mut out, 92); str_push_byte(&mut out, 114); }\n"
+            "        else if c == 34 { str_push_byte(&mut out, 92); str_push_byte(&mut out, 34); }\n"
+            "        else if c == 92 { str_push_byte(&mut out, 92); str_push_byte(&mut out, 92); }\n"
+            "        else { str_push_byte(&mut out, c); }\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    out\n"
+            "}\n";
     }
     // Phase 30: file I/O + CLI args. The low-level builtins (fs_read_into /
     // fs_write_raw / fs_exists / arg_count / arg_get) return a status category
@@ -251,6 +384,172 @@ std::string applyPrelude(const std::string& userSrc) {
             "}\n";
     }
     return prelude + userSrc;
+}
+
+// Phase 42: synthesize `impl` SOURCE for each `#[derive(...)]` on a struct/enum
+// (field-/payload-wise Clone, Eq, Display), then re-parse + append. Reuses the
+// real impl machinery (incl. generic impls, Phase 40) instead of hand-building
+// AST. A generic type's params each gain the derived trait as a bound.
+std::string deriveImplSource(const kardashev::ast::Program& prog) {
+    auto header = [](const std::vector<kardashev::ast::TypeParam>& ps,
+                     const char* bound) -> std::string {
+        if (ps.empty()) return "";
+        std::string s = "<";
+        for (std::size_t i = 0; i < ps.size(); ++i) {
+            if (i) s += ", ";
+            s += ps[i].name;
+            s += ": ";
+            s += bound;
+        }
+        return s + ">";
+    };
+    auto tyName = [](const std::string& name,
+                     const std::vector<kardashev::ast::TypeParam>& ps) -> std::string {
+        if (ps.empty()) return name;
+        std::string s = name + "<";
+        for (std::size_t i = 0; i < ps.size(); ++i) {
+            if (i) s += ", ";
+            s += ps[i].name;
+        }
+        return s + ">";
+    };
+    std::string out;
+    for (const auto& s : prog.structs) {
+        const std::string TN = tyName(s.name, s.genericParams);
+        for (const auto& d : s.derives) {
+            if (d == "Clone") {
+                out += "impl" + header(s.genericParams, "Clone") + " Clone for " +
+                       TN + " { fn clone(&self) -> " + TN + " ! { alloc } { " +
+                       s.name + " {";
+                for (std::size_t i = 0; i < s.fields.size(); ++i)
+                    out += (i ? "," : "") + (" " + s.fields[i].name + ": self." +
+                                             s.fields[i].name + ".clone()");
+                out += " } } }\n";
+            } else if (d == "Eq") {
+                out += "impl" + header(s.genericParams, "Eq") + " Eq for " + TN +
+                       " { fn eq(&self, other: &" + TN + ") -> bool { ";
+                if (s.fields.empty()) out += "true";
+                for (std::size_t i = 0; i < s.fields.size(); ++i)
+                    out += (i ? " && " : "") + ("self." + s.fields[i].name +
+                                                ".eq(&other." +
+                                                s.fields[i].name + ")");
+                out += " } }\n";
+            } else if (d == "Display") {
+                out += "impl" + header(s.genericParams, "Display") +
+                       " Display for " + TN +
+                       " { fn to_string(&self) -> String ! { alloc } { let mut "
+                       "out = \"" + s.name + " { \";";
+                for (std::size_t i = 0; i < s.fields.size(); ++i) {
+                    if (i)
+                        out += " string_push_str(&mut out, \", \");";
+                    out += " string_push_str(&mut out, \"" + s.fields[i].name +
+                           ": \"); string_push_str(&mut out, self." +
+                           s.fields[i].name + ".to_string());";
+                }
+                out += " string_push_str(&mut out, \" }\"); out } }\n";
+            }
+        }
+    }
+    for (const auto& e : prog.enums) {
+        const std::string TN = tyName(e.name, e.genericParams);
+        const bool multi = e.variants.size() > 1;
+        for (const auto& d : e.derives) {
+            if (d == "Clone") {
+                out += "impl" + header(e.genericParams, "Clone") + " Clone for " +
+                       TN + " { fn clone(&self) -> " + TN +
+                       " ! { alloc } { match self {";
+                for (std::size_t v = 0; v < e.variants.size(); ++v) {
+                    const auto& var = e.variants[v];
+                    out += " " + var.name;
+                    if (!var.payloadTypes.empty()) {
+                        out += "(";
+                        for (std::size_t i = 0; i < var.payloadTypes.size(); ++i)
+                            out += (i ? ", " : "") + ("x" + std::to_string(i));
+                        out += ")";
+                    }
+                    out += " => " + var.name;
+                    if (!var.payloadTypes.empty()) {
+                        out += "(";
+                        for (std::size_t i = 0; i < var.payloadTypes.size(); ++i)
+                            out += (i ? ", " : "") +
+                                   ("x" + std::to_string(i) + ".clone()");
+                        out += ")";
+                    }
+                    out += ",";
+                }
+                out += " } } }\n";
+            } else if (d == "Eq") {
+                out += "impl" + header(e.genericParams, "Eq") + " Eq for " + TN +
+                       " { fn eq(&self, other: &" + TN +
+                       ") -> bool { match self {";
+                for (const auto& var : e.variants) {
+                    out += " " + var.name;
+                    if (!var.payloadTypes.empty()) {
+                        out += "(";
+                        for (std::size_t i = 0; i < var.payloadTypes.size(); ++i)
+                            out += (i ? ", " : "") + ("a" + std::to_string(i));
+                        out += ")";
+                    }
+                    out += " => match other { " + var.name;
+                    std::string body;
+                    if (!var.payloadTypes.empty()) {
+                        out += "(";
+                        for (std::size_t i = 0; i < var.payloadTypes.size(); ++i) {
+                            out += (i ? ", " : "") + ("b" + std::to_string(i));
+                            body += (i ? " && " : "") +
+                                    ("a" + std::to_string(i) + ".eq(b" +
+                                     std::to_string(i) + ")");
+                        }
+                        out += ")";
+                    } else {
+                        body = "true";
+                    }
+                    out += " => " + body + ",";
+                    if (multi) out += " _ => false,";
+                    out += " },";
+                }
+                out += " } } }\n";
+            } else if (d == "Display") {
+                out += "impl" + header(e.genericParams, "Display") +
+                       " Display for " + TN +
+                       " { fn to_string(&self) -> String ! { alloc } { match "
+                       "self {";
+                for (const auto& var : e.variants) {
+                    out += " " + var.name;
+                    if (!var.payloadTypes.empty()) {
+                        out += "(";
+                        for (std::size_t i = 0; i < var.payloadTypes.size(); ++i)
+                            out += (i ? ", " : "") + ("x" + std::to_string(i));
+                        out += ")";
+                    }
+                    if (var.payloadTypes.empty()) {
+                        out += " => \"" + var.name + "\",";
+                    } else {
+                        out += " => { let mut out = \"" + var.name + "(\";";
+                        for (std::size_t i = 0; i < var.payloadTypes.size();
+                             ++i) {
+                            if (i)
+                                out += " string_push_str(&mut out, \", \");";
+                            out += " string_push_str(&mut out, x" +
+                                   std::to_string(i) + ".to_string());";
+                        }
+                        out += " string_push_str(&mut out, \")\"); out },";
+                    }
+                }
+                out += " } } }\n";
+            }
+        }
+    }
+    return out;
+}
+
+// Generate + parse the derive impls and append them to the program.
+void expandDerives(kardashev::ast::Program& prog) {
+    std::string gen = deriveImplSource(prog);
+    if (gen.empty()) return;
+    auto pr = kardashev::parse(gen);
+    for (auto& impl : pr.program.impls)
+        prog.impls.push_back(std::move(impl));
 }
 
 // Phase 7.1: resolve `mod foo;` directives by reading sibling `.kd`
@@ -397,6 +696,7 @@ std::optional<std::int64_t> compileAndRun(const std::string& srcRaw,
     auto progOpt = buildProgram(srcRaw, srcDir);
     if (!progOpt) return std::nullopt;
     auto& program = *progOpt;
+    expandDerives(program); // Phase 42: synthesize #[derive(...)] impls
     // PR#26 (ABI safety): the JIT calls `entry` through an i64()-typed
     // function pointer, so reject any entry whose signature doesn't match —
     // a non-empty parameter list or a non-integer return would corrupt the
@@ -828,6 +1128,7 @@ bool compileToObject(const std::string& srcRaw, const std::string& srcDir,
     auto progOpt = buildProgram(srcRaw, srcDir);
     if (!progOpt) return false;
     auto& program = *progOpt;
+    expandDerives(program); // Phase 42: synthesize #[derive(...)] impls
     auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
         reportTypeErrors(tcr);
@@ -860,6 +1161,7 @@ int emitLlvmIr(const std::string& srcRaw, const std::string& srcDir,
     auto progOpt = buildProgram(srcRaw, srcDir);
     if (!progOpt) return 1;
     auto& program = *progOpt;
+    expandDerives(program); // Phase 42: synthesize #[derive(...)] impls
     auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
         reportTypeErrors(tcr);
@@ -991,6 +1293,7 @@ int runTests(const std::string& srcRaw, const std::string& srcDir,
     auto progOpt = buildProgram(srcRaw, srcDir);
     if (!progOpt) return 1;
     auto& program = *progOpt;
+    expandDerives(program); // Phase 42: synthesize #[derive(...)] impls
     auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
         reportTypeErrors(tcr);

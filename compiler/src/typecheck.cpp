@@ -25,6 +25,26 @@ public:
             sch.declaredEffects.add("io");
             fnSchemas_["print"] = std::move(sch);
         }
+        // Phase 39: f64 conversions + printing.
+        // to_f64(n: i64) -> f64        (signed widen, SIToFP)
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeInt()}, makeFloat());
+            fnSchemas_["to_f64"] = std::move(sch);
+        }
+        // float_to_int(x: f64) -> i64  (truncation toward zero, FPToSI)
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeFloat()}, makeInt());
+            fnSchemas_["float_to_int"] = std::move(sch);
+        }
+        // print_f64(x: f64) -> i64 ! { io }
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeFloat()}, makeInt());
+            sch.declaredEffects.add("io");
+            fnSchemas_["print_f64"] = std::move(sch);
+        }
 
         // Phase 5.z built-in: `Vec<T>` — a growable buffer with one
         // type parameter. typeArgs at use sites tell codegen which
@@ -140,6 +160,16 @@ public:
             sch.declaredEffects.add("alloc");
             fnSchemas_["string_push_str"] = std::move(sch);
         }
+        // Phase 43: str_push_byte(s: &mut String, b: i64) -> i64 ! { alloc } —
+        // append one byte (low 8 bits of b) to a String, growing as needed.
+        // The low-level builder the str_escape / str_unescape prelude fns use.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(stringTy, /*isMut=*/true), makeInt()}, makeInt());
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["str_push_byte"] = std::move(sch);
+        }
         // string_len(s: &String) -> i64
         {
             FnSchema sch;
@@ -188,6 +218,9 @@ public:
             sch.declaredEffects.add("alloc");
             fnSchemas_["str_substring"] = std::move(sch);
         }
+        // Phase 43: str_unescape / str_escape are kardashev PRELUDE functions
+        // (defined over str_push_byte), not builtins — so they are NOT
+        // registered here (that would collide with the prelude `fn`).
         // int_to_string(n: i64) -> String ! { alloc } — decimal formatting of
         // an i64 into a fresh heap String (snprintf "%lld").
         {
@@ -195,6 +228,15 @@ public:
             sch.signature = makeFunction({makeInt()}, stringTy);
             sch.declaredEffects.add("alloc");
             fnSchemas_["int_to_string"] = std::move(sch);
+        }
+        // Phase 44: f64_to_string(x: f64) -> String ! { alloc } — format an f64
+        // into a fresh heap String (snprintf "%g"). The dual of int_to_string,
+        // used to serialize JSON numbers.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeFloat()}, stringTy);
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["f64_to_string"] = std::move(sch);
         }
         // print_no_nl(s: &String) -> i64 ! { io } — writes s with NO trailing
         // newline (print_str / print_string / println all force one), so
@@ -1012,12 +1054,20 @@ public:
                           impl.line, impl.column);
                 }
             }
+            // Phase 40: resolve forType with the impl's generic params in
+            // scope so `impl<T> .. for Pair<T>` yields Pair<Var> (typeName
+            // "Pair") instead of erroring on unknown `T`.
+            GenericEnv implEnv0 = implParamEnv(impl);
+            const GenericEnv* savedEnv0 = currentGenericEnv_;
+            currentGenericEnv_ = &implEnv0;
             TypePtr forTy = resolveTypeRef(impl.forType);
+            currentGenericEnv_ = savedEnv0;
             TypePtr rfor = resolve(forTy);
             std::string typeName;
             if (rfor->kind == TypeKind::Struct) typeName = rfor->structName;
             else if (rfor->kind == TypeKind::Enum) typeName = rfor->enumName;
             else if (rfor->kind == TypeKind::Int) typeName = "i64";
+            else if (rfor->kind == TypeKind::Float) typeName = "f64";  // Phase 44
             else if (rfor->kind == TypeKind::Bool) typeName = "bool";
             else {
                 error("impl for unsupported type " + typeToString(forTy),
@@ -1366,6 +1416,19 @@ public:
                 std::vector<std::string> genBounds;
                 std::vector<std::vector<std::string>> genExtraBounds;
                 std::vector<const ast::TypeParam*> genBoundParam;
+                // Phase 40: the IMPL's own generic params come FIRST in the
+                // method's effective generic vars (the convention checkImplMethod
+                // + codegen rely on), so `impl<T: Clone> .. for Pair<T>` makes
+                // each method generic over T, with T's bound in force in the
+                // body and T inferred from the receiver at a call.
+                for (const auto& gp : impl.genericParams) {
+                    TypePtr v = makeFreshVar();
+                    genEnv[gp.name] = v;
+                    genVars.push_back(v);
+                    genBounds.push_back(gp.bound);
+                    genExtraBounds.push_back(gp.extraBounds);
+                    genBoundParam.push_back(&gp);
+                }
                 for (const auto& gp : fn.genericParams) {
                     TypePtr v = makeFreshVar();
                     genEnv[gp.name] = v;
@@ -1376,7 +1439,10 @@ public:
                 }
                 // Bind Self to the impl's forType while resolving params /
                 // return. This lets the impl write `self: Self -> i64`
-                // and have it land as `self: ConcreteType -> i64`.
+                // and have it land as `self: ConcreteType -> i64`. genEnv
+                // already holds the impl's generic params (Phase 40), so
+                // `Pair<T>` resolves T to its Var — set it active first.
+                currentGenericEnv_ = &genEnv;
                 TypePtr selfTy = resolveTypeRef(impl.forType);
                 genEnv["Self"] = selfTy;
                 // Phase 21a: bind the trait's generic params to this impl's
@@ -1448,9 +1514,16 @@ public:
             checkFunction(fn);
         }
         // Pass 2 (impl methods): same, with Self bound to the impl's
-        // forType.
+        // forType. (Phase 40: checkImplMethod recomputes selfTy from its own
+        // env so a generic impl's `Self` uses the schema's impl-param Vars;
+        // this `selfTy` is the concrete/non-generic fallback. Resolve it with
+        // the impl params in scope so `Pair<T>` doesn't error here.)
         for (const auto& impl : program.impls) {
+            GenericEnv implEnv2 = implParamEnv(impl);
+            const GenericEnv* savedEnv2 = currentGenericEnv_;
+            currentGenericEnv_ = &implEnv2;
             TypePtr selfTy = resolveTypeRef(impl.forType);
+            currentGenericEnv_ = savedEnv2;
             for (const auto& fn : impl.methods) {
                 checkImplMethod(fn, impl, selfTy);
             }
@@ -1773,6 +1846,7 @@ private:
     // unknown callees (the typechecker already errored on them) we skip.
     void collectEffects(const ast::Expr& e, EffectSet& out) {
         if (dynamic_cast<const ast::IntLitExpr*>(&e)) return;
+        if (dynamic_cast<const ast::FloatLitExpr*>(&e)) return;
         if (dynamic_cast<const ast::BoolLitExpr*>(&e)) return;
         if (dynamic_cast<const ast::StringLitExpr*>(&e)) return;
         if (dynamic_cast<const ast::IdentExpr*>(&e)) return;
@@ -2048,6 +2122,17 @@ private:
     // trait-args are resolved in that same env. No-op for inherent /
     // non-generic-trait impls (their traitTypeArgs are empty). Trait-param
     // names never clash with `Self` (validated at trait registration).
+    // Phase 40: a generic env mapping the impl's own generic params to fresh
+    // Vars, so `resolveTypeRef(impl.forType)` (e.g. `Pair<T>`) resolves T
+    // instead of erroring on an unknown type. Used where we only need the
+    // forType's NAME / shape (registration, pass-2 selfTy).
+    GenericEnv implParamEnv(const ast::ImplDecl& impl) {
+        GenericEnv env;
+        for (const auto& gp : impl.genericParams)
+            env[gp.name] = makeFreshVar();
+        return env;
+    }
+
     void bindTraitParamsForImpl(const ast::ImplDecl& impl, GenericEnv& env) {
         if (impl.traitName.empty()) return;
         auto pit = traitGenericParams_.find(impl.traitName);
@@ -2080,12 +2165,27 @@ private:
         if (sit == fnSchemas_.end()) return;
         const FnSchema& schema = sit->second;
         GenericEnv genEnv;
-        for (std::size_t i = 0;
-             i < fn.genericParams.size() && i < schema.genericVars.size();
-             ++i) {
-            genEnv[fn.genericParams[i].name] = schema.genericVars[i];
+        // Phase 40: schema.genericVars is [impl params] ++ [fn params] (the
+        // sig-resolution order) — bind both positionally so an impl param `T`
+        // (with its bound) is in scope in the method body.
+        std::size_t gvi = 0;
+        for (const auto& gp : impl.genericParams) {
+            if (gvi < schema.genericVars.size())
+                genEnv[gp.name] = schema.genericVars[gvi++];
         }
-        genEnv["Self"] = selfTy;
+        for (const auto& gp : fn.genericParams) {
+            if (gvi < schema.genericVars.size())
+                genEnv[gp.name] = schema.genericVars[gvi++];
+        }
+        // Phase 40: for a generic impl, recompute Self from THIS env so it uses
+        // the schema's impl-param Vars (the passed selfTy was resolved with
+        // throwaway Vars). For a non-generic impl this is identical to selfTy.
+        TypePtr selfTyLocal = selfTy;
+        if (!impl.genericParams.empty()) {
+            currentGenericEnv_ = &genEnv;
+            selfTyLocal = resolveTypeRef(impl.forType);
+        }
+        genEnv["Self"] = selfTyLocal;
         // Phase 21a: bind the trait's generic params to this impl's concrete
         // trait-args (matches the schema-registration env), so a method body
         // referencing `T` checks against the impl's element type.
@@ -2323,6 +2423,7 @@ private:
         if (rb->kind == TypeKind::Struct) typeName = rb->structName;
         else if (rb->kind == TypeKind::Enum) typeName = rb->enumName;
         else if (rb->kind == TypeKind::Int) typeName = "i64";
+        else if (rb->kind == TypeKind::Float) typeName = "f64";  // Phase 44
         else if (rb->kind == TypeKind::Bool) typeName = "bool";
         else {
             error("associated type projection on unsupported base type " +
@@ -2644,6 +2745,11 @@ private:
             if (!tr.typeArgs.empty())
                 error("i64 takes no type arguments", tr.line, tr.column);
             return makeInt();
+        }
+        if (tr.name == "f64") {
+            if (!tr.typeArgs.empty())
+                error("f64 takes no type arguments", tr.line, tr.column);
+            return makeFloat();
         }
         // Phase 16: `unit` is the type of a function with no `-> T` return
         // annotation (the parser synthesizes a "unit" TypeRef there). Maps to
@@ -3214,6 +3320,9 @@ private:
         if (dynamic_cast<const ast::IntLitExpr*>(&e)) {
             return makeInt();
         }
+        if (dynamic_cast<const ast::FloatLitExpr*>(&e)) {
+            return makeFloat();
+        }
         if (dynamic_cast<const ast::BoolLitExpr*>(&e)) {
             return makeBool();
         }
@@ -3517,6 +3626,7 @@ private:
         if (r->kind == TypeKind::Struct) return r->structName;
         if (r->kind == TypeKind::Enum) return r->enumName;
         if (r->kind == TypeKind::Int) return "i64";
+        else if (r->kind == TypeKind::Float) return "f64";  // Phase 44
         if (r->kind == TypeKind::Bool) return "bool";
         return {};
     }
@@ -3653,6 +3763,7 @@ private:
         if (r->kind == TypeKind::Struct) typeName = r->structName;
         else if (r->kind == TypeKind::Enum) typeName = r->enumName;
         else if (r->kind == TypeKind::Int) typeName = "i64";
+        else if (r->kind == TypeKind::Float) typeName = "f64";  // Phase 44
         else if (r->kind == TypeKind::Bool) typeName = "bool";
         else {
             error("method call on unsupported receiver type " +
@@ -4085,6 +4196,27 @@ private:
                                   (bin.op == ast::BinOp::Eq) ||
                                   (bin.op == ast::BinOp::NotEq);
         const char* what = isComparison ? "comparison" : "arithmetic";
+        // Phase 39: f64 arithmetic / comparison. If a side is already f64, both
+        // sides must be f64 — there is NO implicit i64<->f64 coercion (use
+        // to_f64 / float_to_int). `%` is integer-only.
+        if (resolve(lhs)->kind == TypeKind::Float ||
+            resolve(rhs)->kind == TypeKind::Float) {
+            if (bin.op == ast::BinOp::Mod) {
+                error("`%` (modulo) is not defined for f64", bin.line,
+                      bin.column);
+            }
+            if (!unify(lhs, makeFloat())) {
+                error(std::string(what) + " op expects f64 on lhs, got " +
+                          typeToString(lhs),
+                      bin.lhs->line, bin.lhs->column);
+            }
+            if (!unify(rhs, makeFloat())) {
+                error(std::string(what) + " op expects f64 on rhs, got " +
+                          typeToString(rhs),
+                      bin.rhs->line, bin.rhs->column);
+            }
+            return isComparison ? makeBool() : makeFloat();
+        }
         if (!unify(lhs, makeInt())) {
             error(std::string(what) + " op expects i64 on lhs, got " +
                       typeToString(lhs),
@@ -4924,6 +5056,7 @@ private:
                 else if (concrete->kind == TypeKind::Enum)
                     typeName = concrete->enumName;
                 else if (concrete->kind == TypeKind::Int) typeName = "i64";
+                else if (concrete->kind == TypeKind::Float) typeName = "f64";  // Phase 44
                 else if (concrete->kind == TypeKind::Bool) typeName = "bool";
                 else continue; // still a Var / unsupported — leave unbound
                 auto tyIt = implAssocTypes_.find(typeName);
@@ -5098,8 +5231,10 @@ private:
         TypePtr operand = checkExpr(*un.operand);
         switch (un.op) {
         case ast::UnaryOp::Neg:
+            // Phase 39: `-x` negates an i64 OR an f64.
+            if (resolve(operand)->kind == TypeKind::Float) return makeFloat();
             if (!unify(operand, makeInt())) {
-                error("unary `-` requires an i64 operand, got " +
+                error("unary `-` requires an i64 or f64 operand, got " +
                           typeToString(operand),
                       un.operand->line, un.operand->column);
             }
@@ -5364,6 +5499,7 @@ private:
         TypePtr r = resolve(t);
         switch (r->kind) {
         case TypeKind::Int:
+        case TypeKind::Float: // Phase 39: f64 is Copy
         case TypeKind::Bool:
         case TypeKind::Unit:
             return true;

@@ -17,6 +17,9 @@ public:
         ast::Program prog;
         while (!check(TokenKind::EndOfInput)) {
             if (errors_.size() > 20) break;
+            // Phase 42: `#[derive(...)]` attributes precede a struct/enum; the
+            // parsed list is stashed and consumed by the next struct/enum decl.
+            if (check(TokenKind::Pound)) parseAttributes();
             if (check(TokenKind::KwFn) ||
                 (peek().kind == TokenKind::Identifier &&
                  peek().lexeme == "async" &&
@@ -391,6 +394,8 @@ private:
 
         Token nameTok = expect(TokenKind::Identifier, "struct name");
         decl.name = nameTok.lexeme;
+        decl.derives = std::move(pendingDerives_); // Phase 42
+        pendingDerives_.clear();
         decl.genericParams = parseOptionalGenericParams();
 
         expect(TokenKind::LBrace, "{");
@@ -413,6 +418,8 @@ private:
 
         Token nameTok = expect(TokenKind::Identifier, "enum name");
         decl.name = nameTok.lexeme;
+        decl.derives = std::move(pendingDerives_); // Phase 42
+        pendingDerives_.clear();
         decl.genericParams = parseOptionalGenericParams();
 
         expect(TokenKind::LBrace, "{");
@@ -881,11 +888,44 @@ private:
         return parseParam();
     }
 
+    // Phase 42: parse one-or-more `#[derive(Trait, ...)]` attributes into
+    // pendingDerives_, which the next struct/enum decl consumes. Unknown
+    // attributes are tolerated (skipped to the closing `]`).
+    std::vector<std::string> pendingDerives_;
+    void parseAttributes() {
+        while (check(TokenKind::Pound)) {
+            consume(); // '#'
+            expect(TokenKind::LBracket, "[");
+            Token attr = expect(TokenKind::Identifier, "attribute name");
+            if (attr.lexeme == "derive") {
+                expect(TokenKind::LParen, "(");
+                if (!check(TokenKind::RParen)) {
+                    while (true) {
+                        Token t = expect(TokenKind::Identifier, "trait name");
+                        pendingDerives_.push_back(t.lexeme);
+                        if (!accept(TokenKind::Comma)) break;
+                        if (check(TokenKind::RParen)) break; // trailing comma
+                    }
+                }
+                expect(TokenKind::RParen, ")");
+            } else {
+                while (!check(TokenKind::RBracket) &&
+                       !check(TokenKind::EndOfInput))
+                    consume();
+            }
+            expect(TokenKind::RBracket, "]");
+        }
+    }
+
     ast::ImplDecl parseImplDecl() {
         Token implTok = expect(TokenKind::KwImpl, "impl");
         ast::ImplDecl decl;
         decl.line = implTok.line;
         decl.column = implTok.column;
+        // Phase 40: the impl's own generic params, `impl<T: Bound> ...`. The
+        // `<` here is unambiguous (it directly follows `impl`). These are in
+        // scope for forType + every method.
+        decl.genericParams = parseOptionalGenericParams();
         // Three forms:
         //   impl Trait for Type { ... }        -- trait impl (since Phase 3.3)
         //   impl Trait<Args...> for Type { ... } -- generic trait impl (21a)
@@ -924,6 +964,8 @@ private:
             tr.typeArgs = std::move(leadingArgs);
             decl.forType = std::move(tr);
         }
+        // Phase 40: a `where` clause adds bounds onto the impl's generic params.
+        parseOptionalWhereClause(decl.genericParams);
         expect(TokenKind::LBrace, "{");
         while (!check(TokenKind::RBrace) && !check(TokenKind::EndOfInput)) {
             if (errors_.size() > 20) break;
@@ -1452,6 +1494,22 @@ private:
             } catch (const std::exception&) {
                 errorHere("integer literal out of range: " + tok.lexeme);
                 e->value = 0;
+            }
+            return e;
+        }
+
+        // Phase 39: f64 literal.
+        if (t.kind == TokenKind::Float) {
+            Token tok = consume();
+            auto e = std::make_unique<ast::FloatLitExpr>();
+            e->line = tok.line;
+            e->column = tok.column;
+            e->lexeme = tok.lexeme;
+            try {
+                e->value = std::stod(tok.lexeme);
+            } catch (const std::exception&) {
+                errorHere("float literal out of range: " + tok.lexeme);
+                e->value = 0.0;
             }
             return e;
         }

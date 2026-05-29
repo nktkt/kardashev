@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Phase 38 capstone smoke test: the full nested-JSON example
-# (examples/json/main.kd) — the v6 north star.
-#   1. It parses `{"a":[1,{"b":true},"x"],"n":null,"k":-42}` into a recursive
-#      `enum Json` (Vec<Json> arrays, HashMap<String,Json> objects), serializes
-#      it back through a `Display` impl, RE-PARSES, and asserts DEEP (order-
-#      independent) equality — round-trips => the program returns 966.
-#   2. A constant-memory gate: a 200k-iteration parse+serialize+drop loop over a
-#      deeply-nested document holds peak RSS flat (recursive Drop frees the whole
-#      tree; string_push_str / hashmap get-ops free the values they consume).
+# JSON capstone smoke test: the full nested-JSON example (examples/json/main.kd).
+# Roadmap v7 (Phase 44) — JSON 2.0: floats + string escapes + #[derive(Clone, Eq)].
+#   1. It parses `{"pi":3.14159,"msg":"a\nb","xs":[1.5,-2.0,true,null]}` into a
+#      recursive `#[derive(Clone, Eq)] enum Json` with `JNum(f64)`, decodes the
+#      runtime string escape, serializes back through a `Display` impl, RE-PARSES,
+#      and confirms a round trip via the DERIVED `Eq` (no hand-written json_eq).
+#      Returns the serialized byte length (51) on a successful round trip.
+#   2. A constant-memory gate: a 200k-iteration parse+serialize+drop loop holds
+#      peak RSS flat (recursive Drop frees the whole tree; the string builders
+#      free what they consume).
 # JIT + AOT.
 set -euo pipefail
 
@@ -23,7 +24,6 @@ done
 [[ -z "$KARDC" ]] && { echo "FAIL: kardc binary not found"; exit 1; }
 echo "Using kardc at: $KARDC"
 
-# Locate the example source (Bazel runfiles or the source tree).
 SRC=""
 for cand in \
     "${TEST_SRCDIR:-}/_main/examples/json/main.kd" \
@@ -38,21 +38,24 @@ done
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-# 1. correctness: JIT prints the round-trip line + returns 966; AOT exits 966&255.
+# 1. correctness: round-trips via derived Eq; signal = serialized length (51).
 jit=$("$KARDC" "$SRC")
 echo "$jit"
 echo "$jit" | grep -q "round-trips = yes" || { echo "FAIL: round-trip not confirmed"; exit 1; }
-echo "$jit" | tail -1 | grep -qx "966" || { echo "FAIL: expected signal 966, got $(echo "$jit" | tail -1)"; exit 1; }
+echo "$jit" | grep -q 'serialized = {"pi":3.14159,"msg":"a\\nb","xs":\[1.5,-2,true,null\]}' \
+    || { echo "FAIL: serialized form unexpected"; exit 1; }
+sig=$(echo "$jit" | tail -1)
+echo "$jit" | tail -1 | grep -qx "51" || { echo "FAIL: expected signal 51, got $sig"; exit 1; }
 "$KARDC" --no-cache -o "$TMP/json" "$SRC" >/dev/null
 set +e; "$TMP/json" >/dev/null; rc=$?; set -e
-[[ "$rc" -ne $((966 % 256)) ]] && { echo "FAIL [aot]: exit $rc expected $((966 % 256))"; exit 1; }
-echo "PASS [parse/serialize/round-trip]: JIT signal 966, AOT exit $rc"
+[[ "$rc" -ne $((51 % 256)) ]] && { echo "FAIL [aot]: exit $rc expected $((51 % 256))"; exit 1; }
+echo "PASS [parse/serialize/derived-Eq round-trip]: JIT signal 51, AOT exit $rc"
 
-# 2. constant memory over a deeply-nested parse+serialize+drop loop.
+# 2. constant memory over a parse+serialize+drop loop (floats + escapes + nesting).
 cat > "$TMP/loop.kd" <<EOF
 $(sed '/^fn main()/,$d' "$SRC")
 fn main() -> i64 ! { io, alloc } {
-    let input = "{ \"a\": [1, { \"b\": true }, \"x\"], \"n\": null, \"k\": -42, \"deep\": [[[1,2],[3]],{\"z\":[true,false,null]}] }";
+    let input = "{ \"pi\": 3.14159, \"msg\": \"a\\\\nb\\\\tc\", \"xs\": [1.5, -2.0, true, null, {\"k\": 7.25}] }";
     let mut i = 0;
     let mut acc = 0;
     while i < 200000 {
@@ -66,10 +69,10 @@ fn main() -> i64 ! { io, alloc } {
 EOF
 "$KARDC" --no-cache -o "$TMP/loop" "$TMP/loop.kd" >/dev/null
 rss=$( /usr/bin/time -v "$TMP/loop" 2>&1 | awk '/Maximum resident/ {print $NF}' )
-echo "INFO [loop]: peak RSS over 200k nested parse+serialize+drop = ${rss} KB"
+echo "INFO [loop]: peak RSS over 200k JSON-2.0 parse+serialize+drop = ${rss} KB"
 if [[ -n "$rss" && "$rss" -gt 32768 ]]; then
     echo "FAIL [loop]: RSS ${rss} KB > 32 MB — the JSON pipeline leaks"; exit 1
 fi
-echo "PASS [loop]: nested JSON parse+serialize+drop — RSS flat (<= 32 MB)"
+echo "PASS [loop]: JSON-2.0 parse+serialize+drop — RSS flat (<= 32 MB)"
 
-echo "PASS: Phase 38 — full nested JSON (parse + serialize, leak-free) JIT + AOT"
+echo "PASS: Phase 44 — JSON 2.0 (floats + escapes + #[derive(Clone, Eq)]) JIT + AOT"

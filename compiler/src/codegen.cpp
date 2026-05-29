@@ -118,14 +118,21 @@ public:
         // (resolved through astTypeRefToConcrete) so emit / declare
         // passes can bind `Self`.
         for (const auto& impl : program.impls) {
-            TypePtr selfTy = astTypeRefToConcrete(impl.forType);
+            // Phase 40: a generic impl's forType (`Pair<T>`) can't be resolved
+            // to a concrete Self up front — T is bound per call. Such methods
+            // are monomorphized on demand (genericImplOf_), so Self is set
+            // per-instance in setInstanceContext, not here.
+            const bool genericImpl = !impl.genericParams.empty();
+            TypePtr selfTy = genericImpl ? nullptr
+                                         : astTypeRefToConcrete(impl.forType);
             for (const auto& fn : impl.methods) {
                 std::string mangled = implMethodMangle(impl.traitName,
                                                         impl.forType,
                                                         fn.name);
                 fnAst_[mangled] = &fn;
                 implMethodMangle_[&fn] = mangled;
-                implMethodSelf_[&fn] = selfTy;
+                if (genericImpl) genericImplOf_[&fn] = &impl;
+                else implMethodSelf_[&fn] = selfTy;
             }
             // Phase 16: record `impl Drop for T` so drop glue can invoke the
             // user destructor when a value of type T goes out of scope. Keyed
@@ -181,7 +188,8 @@ public:
         }
         for (const auto& impl : program.impls) {
             for (const auto& fn : impl.methods) {
-                if (fn.genericParams.empty()) {
+                // Phase 40: generic-impl methods are monomorphized on demand.
+                if (fn.genericParams.empty() && !genericImplOf_.count(&fn)) {
                     declareMonoFnAs(fn, implMethodMangle_[&fn]);
                 }
             }
@@ -200,7 +208,7 @@ public:
         }
         for (const auto& impl : program.impls) {
             for (const auto& fn : impl.methods) {
-                if (fn.genericParams.empty()) {
+                if (fn.genericParams.empty() && !genericImplOf_.count(&fn)) {
                     emitFunctionAs(fn, implMethodMangle_[&fn], {});
                 }
             }
@@ -583,6 +591,11 @@ private:
     // mentions map to the impl's forType.
     std::unordered_map<const ast::FnDecl*, TypePtr> implMethodSelf_;
 
+    // Phase 40: methods of a GENERIC impl (`impl<T> .. for Pair<T>`). Maps the
+    // method's AST to its impl, so the method is monomorphized per concrete T
+    // (like a generic fn) instead of emitted once with `T` unbound.
+    std::unordered_map<const ast::FnDecl*, const ast::ImplDecl*> genericImplOf_;
+
     // Active during emission of a generic fn instance. Maps the source's
     // generic-param name (`T`) to the concrete TypePtr for this instance,
     // so `mapTypeRef` can resolve type names in fn signatures / bodies.
@@ -721,6 +734,7 @@ private:
     llvm::Function* execEnsureFn_ = nullptr;   // __kd_exec_ensure
     llvm::Function* execPushFn_ = nullptr;     // __kd_exec_push
     llvm::Function* execStepFn_ = nullptr;     // __kd_exec_step
+    llvm::Function* execReapFn_ = nullptr;     // __kd_exec_reap_if_idle (P43)
     llvm::Function* execWaitFn_ = nullptr;     // __kd_exec_wait (reactor sleep)
     llvm::Function* execDriveFn_ = nullptr;    // __kd_exec_drive_until
     llvm::Function* execSlotFn_ = nullptr;     // __kd_exec_task_slot
@@ -1096,6 +1110,47 @@ private:
             declaredFns_["print"] = printFn;
         }
 
+        // Phase 39: f64 conversions + print. Trivial casts + a %g print.
+        {
+            auto* dblTy = llvm::Type::getDoubleTy(ctx);
+            // to_f64(i64) -> f64 (SIToFP)
+            {
+                auto* fnTy = llvm::FunctionType::get(dblTy, {i64Ty}, false);
+                auto* fn = llvm::Function::Create(
+                    fnTy, llvm::Function::ExternalLinkage, "to_f64",
+                    module_.get());
+                fn->getArg(0)->setName("n");
+                llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+                b.CreateRet(b.CreateSIToFP(fn->getArg(0), dblTy, "f"));
+                declaredFns_["to_f64"] = fn;
+            }
+            // float_to_int(f64) -> i64 (FPToSI — truncates toward zero)
+            {
+                auto* fnTy = llvm::FunctionType::get(i64Ty, {dblTy}, false);
+                auto* fn = llvm::Function::Create(
+                    fnTy, llvm::Function::ExternalLinkage, "float_to_int",
+                    module_.get());
+                fn->getArg(0)->setName("x");
+                llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+                b.CreateRet(b.CreateFPToSI(fn->getArg(0), i64Ty, "i"));
+                declaredFns_["float_to_int"] = fn;
+            }
+            // print_f64(f64) -> i64 ! { io } : printf("%g\n", x)
+            {
+                auto* fnTy = llvm::FunctionType::get(i64Ty, {dblTy}, false);
+                auto* fn = llvm::Function::Create(
+                    fnTy, llvm::Function::ExternalLinkage, "print_f64",
+                    module_.get());
+                fn->getArg(0)->setName("x");
+                llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+                auto* fmt = b.CreateGlobalString("%g\n", "kd_printf_fmt", 0,
+                                                 module_.get());
+                b.CreateCall(printfFn, {fmt, fn->getArg(0)});
+                b.CreateRet(llvm::ConstantInt::get(i64Ty, 0));
+                declaredFns_["print_f64"] = fn;
+            }
+        }
+
         // Phase 5.z: vec_* are now generic over T; their bodies are
         // emitted lazily per-T via `getOrEmitVecOp` when a call site
         // demands them. Nothing eager to emit here for vec_*.
@@ -1205,6 +1260,68 @@ private:
             v = b.CreateInsertValue(v, zeroI64, {2}, "cap");
             b.CreateRet(v);
             declaredFns_["string_new"] = fn;
+        }
+
+        // Phase 43: str_push_byte(s: &mut String, b: i64) -> i64 — append the
+        // low 8 bits of `b`, growing s's buffer (same policy as string_push_str:
+        // realloc a heap buffer, malloc+copy a borrowed literal).
+        {
+            auto* fnTy =
+                llvm::FunctionType::get(i64Ty, {i8PtrTy, i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "str_push_byte",
+                module_.get());
+            fn->getArg(0)->setName("s");
+            fn->getArg(1)->setName("b");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* growBB = llvm::BasicBlock::Create(ctx, "grow", fn);
+            auto* freshBB = llvm::BasicBlock::Create(ctx, "fresh", fn);
+            auto* reuseBB = llvm::BasicBlock::Create(ctx, "reuse", fn);
+            auto* writeBB = llvm::BasicBlock::Create(ctx, "write", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* sPtr = fn->getArg(0);
+            auto* sDataP = b.CreateStructGEP(strTy, sPtr, 0, "s_data_p");
+            auto* sLenP = b.CreateStructGEP(strTy, sPtr, 1, "s_len_p");
+            auto* sCapP = b.CreateStructGEP(strTy, sPtr, 2, "s_cap_p");
+            auto* sLen = b.CreateLoad(i64Ty, sLenP, "s_len");
+            auto* sCap = b.CreateLoad(i64Ty, sCapP, "s_cap");
+            auto* sData = b.CreateLoad(i8PtrTy, sDataP, "s_data");
+            auto* newLen = b.CreateAdd(sLen, llvm::ConstantInt::get(i64Ty, 1),
+                                       "new_len");
+            b.CreateCondBr(b.CreateICmpULT(sCap, newLen, "need_grow"), growBB,
+                           writeBB);
+            b.SetInsertPoint(growBB);
+            auto* eight = llvm::ConstantInt::get(i64Ty, 8);
+            auto* doubled =
+                b.CreateMul(sCap, llvm::ConstantInt::get(i64Ty, 2), "dbl");
+            auto* atLeast8 = b.CreateSelect(
+                b.CreateICmpULT(doubled, eight, "lt8"), eight, doubled, "a8");
+            auto* newCap = b.CreateSelect(
+                b.CreateICmpULT(atLeast8, newLen, "ltnew"), newLen, atLeast8,
+                "new_cap");
+            b.CreateCondBr(b.CreateICmpNE(sCap, zeroI64, "was_heap"), reuseBB,
+                           freshBB);
+            b.SetInsertPoint(reuseBB);
+            b.CreateStore(b.CreateCall(reallocFn_, {sData, newCap}, "re"),
+                          sDataP);
+            b.CreateStore(newCap, sCapP);
+            b.CreateBr(writeBB);
+            b.SetInsertPoint(freshBB);
+            auto* nb = b.CreateCall(mallocFn_, {newCap}, "fresh_buf");
+            b.CreateCall(memcpyFn_, {nb, sData, sLen});
+            b.CreateStore(nb, sDataP);
+            b.CreateStore(newCap, sCapP);
+            b.CreateBr(writeBB);
+            b.SetInsertPoint(writeBB);
+            auto* curData = b.CreateLoad(i8PtrTy, sDataP, "cur_data");
+            auto* dst = b.CreateGEP(llvm::Type::getInt8Ty(ctx), curData, sLen,
+                                    "dst");
+            b.CreateStore(b.CreateTrunc(fn->getArg(1),
+                                        llvm::Type::getInt8Ty(ctx), "b8"),
+                          dst);
+            b.CreateStore(newLen, sLenP);
+            b.CreateRet(zeroI64);
+            declaredFns_["str_push_byte"] = fn;
         }
 
         // string_push_str(s: &mut String, other: String) -> i64 : append
@@ -1471,6 +1588,37 @@ private:
             v = b.CreateInsertValue(v, cap, {2}, "its_cap");
             b.CreateRet(v);
             declaredFns_["int_to_string"] = fn;
+        }
+
+        // Phase 44: f64_to_string(x: f64) -> String — snprintf "%g" into a
+        // fresh 32-byte heap String (the dual of int_to_string; %g gives a
+        // compact round-trippable form).
+        {
+            auto* dblTy = llvm::Type::getDoubleTy(ctx);
+            auto* fnTy = llvm::FunctionType::get(strTy, {dblTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "f64_to_string",
+                module_.get());
+            fn->getArg(0)->setName("x");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* cap = llvm::ConstantInt::get(i64Ty, 32);
+            auto* buf = b.CreateCall(mallocFn_, {cap}, "fts_buf");
+            auto* snprintfTy = llvm::FunctionType::get(
+                i32Ty, {i8PtrTy, i64Ty, i8PtrTy}, /*isVarArg=*/true);
+            auto snprintfFn =
+                module_->getOrInsertFunction("snprintf", snprintfTy);
+            auto* fmt =
+                b.CreateGlobalString("%g", "kd_ftos_fmt", 0, module_.get());
+            auto* written = b.CreateCall(
+                snprintfFn, {buf, cap, fmt, fn->getArg(0)}, "fts_written");
+            auto* len = b.CreateSExt(written, i64Ty, "fts_len");
+            llvm::Value* v = llvm::UndefValue::get(strTy);
+            v = b.CreateInsertValue(v, buf, {0}, "fts_data");
+            v = b.CreateInsertValue(v, len, {1}, "fts_len_f");
+            v = b.CreateInsertValue(v, cap, {2}, "fts_cap");
+            b.CreateRet(v);
+            declaredFns_["f64_to_string"] = fn;
         }
 
         // --- Phase 27: print_no_nl(s: &String) -> i64 (no trailing newline) ---
@@ -1902,6 +2050,7 @@ private:
         if (k->kind == TypeKind::Struct) return k->structName;
         if (k->kind == TypeKind::Enum) return k->enumName;
         if (k->kind == TypeKind::Int) return "i64";
+        else if (k->kind == TypeKind::Float) return "f64";  // Phase 44
         if (k->kind == TypeKind::Bool) return "bool";
         return "";
     }
@@ -4088,6 +4237,79 @@ private:
             execStepFn_ = fn;
         }
 
+        // ---- void __kd_exec_reap_if_idle() (Phase 43): if NO task is still
+        // live (all done), free every task's heap frame + poll slot and reset
+        // the task count to 0. Only acting when nothing is live makes this
+        // safe — no live task's frame is freed, and no surviving index is
+        // invalidated. block_on calls it after its target completes, so a
+        // block_on-in-a-loop reclaims each completed future's frame (constant
+        // memory) without disturbing the spawn/join handle space.
+        {
+            auto* fnTy = llvm::FunctionType::get(voidTy, {}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::InternalLinkage,
+                "__kd_exec_reap_if_idle", module_.get());
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* scan = llvm::BasicBlock::Create(ctx, "scan", fn);
+            auto* scanBody = llvm::BasicBlock::Create(ctx, "scan.body", fn);
+            auto* scanNext = llvm::BasicBlock::Create(ctx, "scan.next", fn);
+            auto* freeLoop = llvm::BasicBlock::Create(ctx, "free", fn);
+            auto* freeBody = llvm::BasicBlock::Create(ctx, "free.body", fn);
+            auto* bail = llvm::BasicBlock::Create(ctx, "bail", fn);
+            auto* doneReap = llvm::BasicBlock::Create(ctx, "done.reap", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* zero = llvm::ConstantInt::get(i64Ty, 0);
+            auto* one = llvm::ConstantInt::get(i64Ty, 1);
+            auto* cntP =
+                b.CreateStructGEP(execTy_, execGlobal_, EXEC_COUNT, "cntP");
+            auto* count = b.CreateLoad(i64Ty, cntP, "count");
+            auto* iP = b.CreateAlloca(i64Ty, nullptr, "i");
+            b.CreateStore(zero, iP);
+            b.CreateBr(scan);
+            // scan: if any task has done==0, a future is still live -> bail.
+            b.SetInsertPoint(scan);
+            auto* i1 = b.CreateLoad(i64Ty, iP, "i1");
+            b.CreateCondBr(b.CreateICmpULT(i1, count, "more1"), scanBody,
+                           freeLoop);
+            b.SetInsertPoint(scanBody);
+            auto* s1 = b.CreateCall(execSlotFn_, {i1}, "s1");
+            auto* d1 = b.CreateLoad(
+                i64Ty, b.CreateStructGEP(taskTy_, s1, TASK_DONE, "d1p"), "d1");
+            // done==0 -> a future is live -> bail WITHOUT reaping; else scan on.
+            b.CreateCondBr(b.CreateICmpEQ(d1, zero, "is_live"), bail, scanNext);
+            b.SetInsertPoint(scanNext);
+            b.CreateStore(b.CreateAdd(i1, one, "i1n"), iP);
+            b.CreateBr(scan);
+            // free: all tasks done -> free each frame + poll slot.
+            b.SetInsertPoint(freeLoop);
+            b.CreateStore(zero, iP); // reuse i for the free pass
+            b.CreateBr(freeBody);
+            b.SetInsertPoint(freeBody);
+            auto* i2 = b.CreateLoad(i64Ty, iP, "i2");
+            auto* freeOne = llvm::BasicBlock::Create(ctx, "free.one", fn);
+            b.CreateCondBr(b.CreateICmpULT(i2, count, "more2"), freeOne,
+                           doneReap);
+            b.SetInsertPoint(freeOne);
+            auto* s2 = b.CreateCall(execSlotFn_, {i2}, "s2");
+            auto* fr = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(taskTy_, s2, TASK_FRAME, "frp"),
+                "fr");
+            b.CreateCall(freeFn_, {fr});
+            auto* sl = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(taskTy_, s2, TASK_SLOT, "slp"), "sl");
+            b.CreateCall(freeFn_, {sl});
+            b.CreateStore(b.CreateAdd(i2, one, "i2n"), iP);
+            b.CreateBr(freeBody);
+            // reaped everything -> the executor is empty again.
+            b.SetInsertPoint(doneReap);
+            b.CreateStore(zero, cntP);
+            b.CreateRetVoid();
+            // a live task remained -> leave the executor untouched.
+            b.SetInsertPoint(bail);
+            b.CreateRetVoid();
+            execReapFn_ = fn;
+        }
+
         declareExecSetDeadline();
         declareExecWait();
         declareExecDrive(execPtrTy);
@@ -4389,9 +4611,15 @@ private:
         auto* typeTag = llvm::ConstantInt::get(i64Ty, std::hash<std::string>{}(mangleType(T)));
         auto* h = b.CreateCall(execPushFn_, {pollPtr, framePtr, slot, typeTag}, "handle");
         b.CreateCall(execDriveFn_, {h});
-        // result = Poll<T>.value from the task's slot.
+        // result = Poll<T>.value from the task's slot — read it BEFORE reaping
+        // (the reap may free the slot). `val` is a value copy; any heap it owns
+        // (e.g. a returned String's buffer) lives outside the frame/slot.
         auto* valP = b.CreateStructGEP(pollT, slot, 1, "val_ptr");
         auto* val = b.CreateLoad(valTy, valP, "result");
+        // Phase 43: reclaim this completed future's frame + poll slot (and any
+        // other now-done tasks) when the executor is idle — constant memory
+        // across a block_on loop. Safe: only acts when nothing is live.
+        if (execReapFn_) b.CreateCall(execReapFn_, {});
         (void)i8PtrTy;
         b.CreateRet(val);
         return fn;
@@ -5237,6 +5465,7 @@ private:
         TypePtr r = resolveInInstance(t);
         switch (r->kind) {
             case TypeKind::Int:  return llvm::Type::getInt64Ty(*ctx_);
+            case TypeKind::Float: return llvm::Type::getDoubleTy(*ctx_);
             case TypeKind::Bool: return llvm::Type::getInt1Ty(*ctx_);
             case TypeKind::Unit: return llvm::Type::getVoidTy(*ctx_);
             case TypeKind::Ref: {
@@ -5355,6 +5584,7 @@ private:
         if (rb->kind == TypeKind::Struct) typeName = rb->structName;
         else if (rb->kind == TypeKind::Enum) typeName = rb->enumName;
         else if (rb->kind == TypeKind::Int) typeName = "i64";
+        else if (rb->kind == TypeKind::Float) typeName = "f64";  // Phase 44
         else if (rb->kind == TypeKind::Bool) typeName = "bool";
         else {
             errors_.push_back("codegen: associated type projection '" +
@@ -5449,6 +5679,7 @@ private:
             return it->second;
         }
         if (tr.name == "i64") return makeInt();
+        if (tr.name == "f64") return makeFloat(); // Phase 39/44
         if (tr.name == "bool") return makeBool();
         // Phase 16: a fn with no `-> T` annotation returns unit (parser
         // synthesizes a "unit" TypeRef). Mirrors typecheck's resolveTypeRef.
@@ -5524,6 +5755,7 @@ private:
         TypePtr r = resolve(astTypeRefToConcrete(tr));
         switch (r->kind) {
             case TypeKind::Int:  return llvm::Type::getInt64Ty(*ctx_);
+            case TypeKind::Float: return llvm::Type::getDoubleTy(*ctx_);
             case TypeKind::Bool: return llvm::Type::getInt1Ty(*ctx_);
             case TypeKind::Unit: return llvm::Type::getVoidTy(*ctx_);
             case TypeKind::Ref:
@@ -5682,6 +5914,7 @@ private:
         };
         switch (r->kind) {
         case TypeKind::Int:    return "i64";
+        case TypeKind::Float:  return "f64";
         case TypeKind::Bool:   return "bool";
         case TypeKind::Unit:   return "unit";
         case TypeKind::Struct: return r->structName + mangleTypeArgs(r->typeArgs);
@@ -5766,6 +5999,7 @@ private:
                     else if (base->kind == TypeKind::Enum)
                         typeName = base->enumName;
                     else if (base->kind == TypeKind::Int) typeName = "i64";
+                    else if (base->kind == TypeKind::Float) typeName = "f64";  // Phase 44
                     else if (base->kind == TypeKind::Bool) typeName = "bool";
                     if (!typeName.empty()) {
                         auto tyIt = tc_.implAssocTypes.find(typeName);
@@ -5871,6 +6105,34 @@ private:
                             const std::vector<TypePtr>& typeArgs) {
         currentInstanceTypeMap_.clear();
         currentSchemaVarSubst_.clear();
+        // Phase 40: a method of a GENERIC impl. typeArgs are the impl's own
+        // generic params (= the receiver's type args). Bind them by name +
+        // their schema Vars (the schema, keyed by the mangled base, lists the
+        // impl params FIRST), then compute Self = forType<typeArgs>.
+        auto gimplIt = genericImplOf_.find(&fn);
+        if (gimplIt != genericImplOf_.end()) {
+            const ast::ImplDecl* impl = gimplIt->second;
+            auto baseIt = implMethodMangle_.find(&fn);
+            const FnSchema* sch =
+                baseIt != implMethodMangle_.end()
+                    ? (tc_.fnSchemas.count(baseIt->second)
+                           ? &tc_.fnSchemas.at(baseIt->second)
+                           : nullptr)
+                    : nullptr;
+            for (std::size_t i = 0;
+                 i < impl->genericParams.size() && i < typeArgs.size(); ++i) {
+                currentInstanceTypeMap_[impl->genericParams[i].name] =
+                    typeArgs[i];
+                if (sch && i < sch->genericVars.size()) {
+                    TypePtr gv = resolve(sch->genericVars[i]);
+                    if (gv->kind == TypeKind::Var)
+                        currentSchemaVarSubst_[gv->varId] = typeArgs[i];
+                }
+            }
+            // Self = the impl's forType with the params now bound.
+            currentInstanceTypeMap_["Self"] = astTypeRefToConcrete(impl->forType);
+            return;
+        }
         auto schemaIt = tc_.fnSchemas.find(fn.name);
         for (std::size_t i = 0;
              i < fn.genericParams.size() && i < typeArgs.size(); ++i) {
@@ -5970,7 +6232,13 @@ private:
 
     void emitFunction(const ast::FnDecl& fn,
                       const std::vector<TypePtr>& typeArgs) {
-        emitFunctionAs(fn, fn.name, typeArgs);
+        // Phase 40: an impl method emits under its mangled base, so a queued
+        // generic-impl-method instance mangles as base + typeArgs (not the
+        // bare method name). mangleInstance(base, {}) == base, so non-generic
+        // impl methods are unaffected.
+        auto it = implMethodMangle_.find(&fn);
+        emitFunctionAs(fn, it != implMethodMangle_.end() ? it->second : fn.name,
+                       typeArgs);
     }
 
     void emitFunctionAs(const ast::FnDecl& fn, const std::string& baseName,
@@ -6673,8 +6941,12 @@ private:
         builder_->CreateRetVoid();
 
         // READY: extract the value (as the sub-future's result type) and
-        // continue with it as the await result.
+        // continue with it as the await result. Phase 43: the sub-future is
+        // complete and never polled again, so free its heap frame here (the
+        // value lives in `pollSlot`, a local — not in subFrame; a null frame
+        // makes the free a safe no-op). Closes the awaited-frame leak.
         builder_->SetInsertPoint(readyBB);
+        builder_->CreateCall(freeFn_, {subFrame});
         auto* valP = builder_->CreateStructGEP(subPollTy, pollSlot, 1, "val_ptr");
         (void)i8PtrTy;
         (void)i64Ty;
@@ -7613,6 +7885,11 @@ private:
                 llvm::Type::getInt64Ty(*ctx_),
                 static_cast<uint64_t>(lit->value), /*isSigned=*/true);
         }
+        // Phase 39: f64 literal -> double ConstantFP.
+        if (auto* fl = dynamic_cast<const ast::FloatLitExpr*>(&e)) {
+            return llvm::ConstantFP::get(llvm::Type::getDoubleTy(*ctx_),
+                                         fl->value);
+        }
         // Phase 15: boolean literal -> i1 constant (1/0).
         if (auto* bl = dynamic_cast<const ast::BoolLitExpr*>(&e)) {
             return llvm::ConstantInt::get(llvm::Type::getInt1Ty(*ctx_),
@@ -8121,7 +8398,9 @@ private:
         llvm::Value* v = emitExpr(*un.operand);
         switch (un.op) {
         case ast::UnaryOp::Neg:
-            return builder_->CreateNeg(v, "neg");
+            // Phase 39: `-x` on an f64 negates with FNeg.
+            return v->getType()->isDoubleTy() ? builder_->CreateFNeg(v, "fneg")
+                                              : builder_->CreateNeg(v, "neg");
         case ast::UnaryOp::Not:
             return builder_->CreateNot(v, "not");
         case ast::UnaryOp::Deref: {
@@ -8162,6 +8441,24 @@ private:
         }
         llvm::Value* L = emitExpr(*bin.lhs);
         llvm::Value* R = emitExpr(*bin.rhs);
+        // Phase 39: f64 operands use floating-point ops (ordered comparisons —
+        // a NaN compares false). `%` never reaches here for f64 (typecheck).
+        if (L->getType()->isDoubleTy()) {
+            switch (bin.op) {
+            case ast::BinOp::Add: return builder_->CreateFAdd(L, R, "fadd");
+            case ast::BinOp::Sub: return builder_->CreateFSub(L, R, "fsub");
+            case ast::BinOp::Mul: return builder_->CreateFMul(L, R, "fmul");
+            case ast::BinOp::Div: return builder_->CreateFDiv(L, R, "fdiv");
+            case ast::BinOp::Lt:  return builder_->CreateFCmpOLT(L, R, "flt");
+            case ast::BinOp::Le:  return builder_->CreateFCmpOLE(L, R, "fle");
+            case ast::BinOp::Gt:  return builder_->CreateFCmpOGT(L, R, "fgt");
+            case ast::BinOp::Ge:  return builder_->CreateFCmpOGE(L, R, "fge");
+            case ast::BinOp::Eq:  return builder_->CreateFCmpOEQ(L, R, "feq");
+            case ast::BinOp::NotEq: return builder_->CreateFCmpUNE(L, R, "fne");
+            case ast::BinOp::Mod:
+            case ast::BinOp::And: return nullptr; // not valid for f64
+            }
+        }
         switch (bin.op) {
         case ast::BinOp::Add: return builder_->CreateAdd(L, R, "add");
         case ast::BinOp::Sub: return builder_->CreateSub(L, R, "sub");
@@ -8971,8 +9268,15 @@ private:
         }
 
         std::string targetTypeName;
+        // Phase 40/41: the receiver's concrete type args — used to monomorphize
+        // a generic-impl method. For a Concrete receiver these are the
+        // recorded receiverTypeArgs; for a BoundedGeneric receiver `T` they are
+        // the type args of T's concrete binding at this instance (so a
+        // container method calling `elem.method()` threads the inner args).
+        std::vector<TypePtr> recvConcreteArgs;
         if (res.kind == ResolvedMethod::Concrete) {
             targetTypeName = res.concreteTypeName;
+            recvConcreteArgs = res.receiverTypeArgs;
         } else {
             // BoundedGeneric: the receiver Var should map (via the current
             // instance's substitution) to a concrete type at this
@@ -8986,6 +9290,7 @@ private:
                     llvm::Type::getInt64Ty(*ctx_), 0);
             }
             TypePtr concrete = resolveInInstance(sit->second);
+            recvConcreteArgs = concrete->typeArgs;
             if (concrete->kind == TypeKind::Struct)
                 targetTypeName = concrete->structName;
             else if (concrete->kind == TypeKind::Enum)
@@ -9006,8 +9311,30 @@ private:
         // Function declared in `run()`.
         ast::TypeRef forTyRef;
         forTyRef.name = targetTypeName;
-        const std::string mangled =
+        std::string mangled =
             implMethodMangle(res.traitName, forTyRef, res.methodName);
+        // The base (un-instantiated) mangling keys the FnSchema (self-kind etc.)
+        // even after `mangled` is swapped to a generic instance below.
+        const std::string schemaKey = mangled;
+        // Phase 40: a method of a GENERIC impl is monomorphized per the impl's
+        // type args — which, for `impl<T..> .. for C<T..>`, are exactly the
+        // receiver's type args. Mangle/declare/queue the instance like a
+        // generic fn call, then call that instance.
+        const ast::FnDecl* methodAst =
+            fnAst_.count(mangled) ? fnAst_[mangled] : nullptr;
+        if (methodAst && genericImplOf_.count(methodAst)) {
+            std::vector<TypePtr> implArgs;
+            implArgs.reserve(recvConcreteArgs.size());
+            for (const auto& a : recvConcreteArgs)
+                implArgs.push_back(resolveInInstance(a));
+            std::string instMangled = mangleInstance(mangled, implArgs);
+            if (!declaredFns_.count(instMangled)) {
+                declareInstance(*methodAst, implArgs, instMangled);
+                if (!emittedInstances_.count(instMangled))
+                    pendingInstances_.push_back({mangled, implArgs});
+            }
+            mangled = std::move(instMangled);
+        }
         auto fnIt = declaredFns_.find(mangled);
         if (fnIt == declaredFns_.end()) {
             errors_.push_back("codegen: impl method not declared: " +
@@ -9021,7 +9348,8 @@ private:
         // (`&self`, Phase 11) or by value (`self`), so we pass the receiver
         // accordingly. The FnSchema's first arg type is the source of truth.
         bool selfByRef = false;
-        if (auto sIt = tc_.fnSchemas.find(mangled); sIt != tc_.fnSchemas.end()) {
+        if (auto sIt = tc_.fnSchemas.find(schemaKey);
+            sIt != tc_.fnSchemas.end()) {
             const TypePtr& sig = sIt->second.signature;
             if (!sig->args.empty() &&
                 resolve(sig->args[0])->kind == TypeKind::Ref) {

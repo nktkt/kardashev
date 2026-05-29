@@ -22,6 +22,7 @@ namespace kardashev {
 enum class TokenKind {
     // Literals & identifiers
     Integer,
+    Float, // Phase 39: f64 literal — DIGIT+ ('.' DIGIT+)? ([eE][+-]?DIGIT+)?
     StringLit, // Phase 5.y: "..." string literal
     Identifier,
 
@@ -88,6 +89,7 @@ enum class TokenKind {
     LBrace,
     RBrace,
     LBracket, // Phase 13b: `[` (slice types `&[T]` + slice exprs `&v[a..b]`)
+    Pound,    // Phase 42: `#` — attribute lead-in for `#[derive(...)]`
     RBracket, // Phase 13b: `]`
     Comma,
     Semi,

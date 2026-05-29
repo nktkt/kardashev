@@ -13,6 +13,12 @@ TypePtr makeInt() {
     return t;
 }
 
+TypePtr makeFloat() {
+    auto t = std::make_shared<Type>();
+    t->kind = TypeKind::Float;
+    return t;
+}
+
 TypePtr makeBool() {
     auto t = std::make_shared<Type>();
     t->kind = TypeKind::Bool;

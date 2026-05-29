@@ -120,7 +120,11 @@ std::vector<Token> lex(std::string_view source) {
             continue;
         }
 
-        // Integer literal.
+        // Integer or float literal (Phase 39). Scan the integer part, then
+        // promote to a float iff a `.` is FOLLOWED BY A DIGIT (so `1.5` is a
+        // float, but `1..5` stays the int `1` + the `..` range op) or an
+        // exponent `e`/`E` follows. A float is `DIGIT+ ('.' DIGIT+)? ([eE]
+        // [+-]? DIGIT+)?` with at least one of the fractional/exponent parts.
         if (std::isdigit(static_cast<unsigned char>(c))) {
             std::size_t start = i;
             while (i < source.size() &&
@@ -128,7 +132,37 @@ std::vector<Token> lex(std::string_view source) {
                 ++i;
                 ++col;
             }
-            tokens.push_back({TokenKind::Integer,
+            bool isFloat = false;
+            // Fractional part: `.` then a digit (NOT `..`, the range op).
+            if (i + 1 < source.size() && source[i] == '.' &&
+                std::isdigit(static_cast<unsigned char>(source[i + 1]))) {
+                isFloat = true;
+                ++i;
+                ++col; // consume '.'
+                while (i < source.size() &&
+                       std::isdigit(static_cast<unsigned char>(source[i]))) {
+                    ++i;
+                    ++col;
+                }
+            }
+            // Exponent: `e`/`E` [+-]? DIGIT+.
+            if (i < source.size() && (source[i] == 'e' || source[i] == 'E')) {
+                std::size_t j = i + 1;
+                if (j < source.size() && (source[j] == '+' || source[j] == '-'))
+                    ++j;
+                if (j < source.size() &&
+                    std::isdigit(static_cast<unsigned char>(source[j]))) {
+                    isFloat = true;
+                    col += static_cast<int>(j - i);
+                    i = j;
+                    while (i < source.size() &&
+                           std::isdigit(static_cast<unsigned char>(source[i]))) {
+                        ++i;
+                        ++col;
+                    }
+                }
+            }
+            tokens.push_back({isFloat ? TokenKind::Float : TokenKind::Integer,
                               std::string(source.substr(start, i - start)),
                               line, startCol});
             continue;
@@ -219,6 +253,7 @@ std::vector<Token> lex(std::string_view source) {
         case '}': push1(TokenKind::RBrace, startCol); continue;
         case '[': push1(TokenKind::LBracket, startCol); continue;
         case ']': push1(TokenKind::RBracket, startCol); continue;
+        case '#': push1(TokenKind::Pound, startCol); continue; // Phase 42 attrs
         case ',': push1(TokenKind::Comma, startCol); continue;
         case ';': push1(TokenKind::Semi, startCol); continue;
         case ':': push1(TokenKind::Colon, startCol); continue;
@@ -243,6 +278,7 @@ std::vector<Token> lex(std::string_view source) {
 std::string_view tokenKindName(TokenKind kind) {
     switch (kind) {
     case TokenKind::Integer: return "Integer";
+    case TokenKind::Float: return "Float";
     case TokenKind::StringLit: return "StringLit";
     case TokenKind::Identifier: return "Identifier";
     case TokenKind::KwFn: return "KwFn";
@@ -289,6 +325,7 @@ std::string_view tokenKindName(TokenKind kind) {
     case TokenKind::LBrace: return "LBrace";
     case TokenKind::RBrace: return "RBrace";
     case TokenKind::LBracket: return "LBracket";
+    case TokenKind::Pound: return "Pound";
     case TokenKind::RBracket: return "RBracket";
     case TokenKind::Comma: return "Comma";
     case TokenKind::Semi: return "Semi";

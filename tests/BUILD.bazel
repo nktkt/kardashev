@@ -377,6 +377,47 @@ sh_test(
     ],
 )
 
+# Phase 39: f64 floating-point — literals, arithmetic/comparison, conversions
+# (to_f64 / float_to_int), Vec<f64>, print_f64. JIT + AOT.
+sh_test(
+    name = "smoke_test_phase39",
+    srcs = ["smoke_test_phase39.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 40: generic `impl<T: Bound> Trait for Container<T>` blocks — per-T
+# monomorphization, on user structs + built-in containers, bound-enforced.
+sh_test(
+    name = "smoke_test_phase40",
+    srcs = ["smoke_test_phase40.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 41: generic Clone/Eq over containers — `.clone()` / `.eq()` dispatch
+# through each element's own impl (Vec<Pair<String>> -> Pair -> String).
+sh_test(
+    name = "smoke_test_phase41",
+    srcs = ["smoke_test_phase41.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 42: #[derive(Clone, Eq, Display)] — synthesized field/payload-wise impls
+# on structs + enums (incl. recursive + generic), via re-parsed impl source.
+sh_test(
+    name = "smoke_test_phase42",
+    srcs = ["smoke_test_phase42.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 43: runtime string escapes (str_escape / str_unescape over
+# str_push_byte) + async-frame reclaim (block_on reaps idle frames/slots; an
+# .await frees the completed sub-future's frame). JIT + AOT.
+sh_test(
+    name = "smoke_test_phase43",
+    srcs = ["smoke_test_phase43.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

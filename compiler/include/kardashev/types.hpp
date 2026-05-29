@@ -28,6 +28,7 @@ namespace kardashev {
 
 enum class TypeKind {
     Int,
+    Float, // Phase 39: f64, lowering to LLVM `double`
     Bool,
     Unit,
     Function,
@@ -134,6 +135,7 @@ struct Type {
 };
 
 TypePtr makeInt();
+TypePtr makeFloat();
 TypePtr makeBool();
 TypePtr makeUnit();
 // Build a function type. The 2-arg form yields a pure (empty) effect row;

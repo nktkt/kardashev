@@ -8,13 +8,12 @@ exports_files(
     visibility = ["//visibility:public"],
 )
 
-# Phase 38 (v6) capstone: a FULL nested-JSON parser + serializer in kardashev.
-# Parses null/bool/int/string/array/object with arbitrary nesting into a
-# recursive `enum Json { ... JArr(Vec<Json>), JObj(HashMap<String,Json>) }`,
-# traverses it by reference, re-serializes through a `Display` impl, and
-# round-trips by deep (order-independent) equality. AOT-compiled via
-# //compiler:kardc. Exercised by //tests:smoke_test_json (correctness +
-# a constant-memory leak gate).
+# Phase 44 (v7) capstone — JSON 2.0: a FULL nested-JSON parser + serializer in
+# kardashev with `JNum(f64)` floats, string-escape decode/encode, and
+# `#[derive(Clone, Eq)]` on the recursive `enum Json` (objects are an
+# order-preserving Vec<Entry>). Parses, re-serializes through a `Display` impl,
+# and round-trips via the DERIVED `Eq`. AOT-compiled via //compiler:kardc.
+# Exercised by //tests:smoke_test_json (correctness + a constant-memory gate).
 kardashev_binary(
     name = "json",
     src = "main.kd",

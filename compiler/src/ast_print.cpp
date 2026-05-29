@@ -240,7 +240,19 @@ private:
         out_ += ";\n";
     }
 
+    // Phase 42: emit a `#[derive(A, B)]` line so fmt round-trips the attribute.
+    void printDerives(const std::vector<std::string>& derives) {
+        if (derives.empty()) return;
+        out_ += "#[derive(";
+        for (std::size_t i = 0; i < derives.size(); ++i) {
+            if (i) out_ += ", ";
+            out_ += derives[i];
+        }
+        out_ += ")]\n";
+    }
+
     void printStruct(const StructDecl& s) {
+        printDerives(s.derives);
         if (s.isPub) out_ += "pub ";
         out_ += "struct " + s.name + genericParamsToString(s.genericParams);
         if (s.fields.empty()) {
@@ -257,6 +269,7 @@ private:
     }
 
     void printEnum(const EnumDecl& e) {
+        printDerives(e.derives);
         if (e.isPub) out_ += "pub ";
         out_ += "enum " + e.name + genericParamsToString(e.genericParams);
         if (e.variants.empty()) {
@@ -505,6 +518,11 @@ private:
     void printExpr(const Expr& e, int depth, int parentPrec) {
         if (auto* lit = dynamic_cast<const IntLitExpr*>(&e)) {
             out_ += std::to_string(lit->value);
+            return;
+        }
+        // Phase 39: f64 literal — emit the original lexeme verbatim.
+        if (auto* fl = dynamic_cast<const FloatLitExpr*>(&e)) {
+            out_ += fl->lexeme;
             return;
         }
         // Phase 15: boolean literal.

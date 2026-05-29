@@ -144,6 +144,13 @@ struct IntLitExpr : Expr {
     std::int64_t value = 0;
 };
 
+// Phase 39: an `f64` floating-point literal (e.g. `1.5`, `-2.0`, `3e8`). The
+// lexeme is kept verbatim; codegen parses it to a `double` ConstantFP.
+struct FloatLitExpr : Expr {
+    std::string lexeme;
+    double value = 0.0;
+};
+
 // Phase 15: `true` / `false` boolean literal. Codegen lowers to an i1
 // constant (1/0); typechecks to `bool`. Mirrors IntLitExpr.
 struct BoolLitExpr : Expr {
@@ -632,6 +639,7 @@ struct StructDecl {
     std::string name;
     std::vector<TypeParam> genericParams; // empty = monomorphic struct
     std::vector<Param> fields;
+    std::vector<std::string> derives; // Phase 42: `#[derive(Clone, Eq, ...)]`
     bool isPub = false; // Phase 15: `pub struct` — parsed + stored.
     std::size_t line = 1;
     std::size_t column = 1;
@@ -648,6 +656,7 @@ struct EnumDecl {
     std::string name;
     std::vector<TypeParam> genericParams; // empty = monomorphic enum
     std::vector<EnumVariant> variants;
+    std::vector<std::string> derives; // Phase 42: `#[derive(Clone, Eq, ...)]`
     bool isPub = false; // Phase 15: `pub enum` — parsed + stored.
     std::size_t line = 1;
     std::size_t column = 1;
@@ -717,6 +726,12 @@ struct TraitDecl {
 // them with a fixed sentinel trait token so the existing static-dispatch
 // path applies unchanged.
 struct ImplDecl {
+    // Phase 40: the impl's OWN generic params, e.g. the `T: Clone` in
+    // `impl<T: Clone> Display for Pair<T>`. Distinct from traitTypeArgs (the
+    // concrete args supplied to a parameterized trait). Each is in scope while
+    // resolving forType + every method's signature/body, and behaves like an
+    // extra generic param on each method, inferred from the receiver at a call.
+    std::vector<TypeParam> genericParams;
     std::string traitName; // empty => inherent impl (Phase 15)
     // Phase 21a: the concrete type arguments this impl supplies to a
     // parameterized trait, e.g. the `i64` in `impl Iterator<i64> for Range`.
