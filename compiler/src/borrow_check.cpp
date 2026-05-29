@@ -856,8 +856,16 @@ private:
                 // treating it as a use; a FieldExpr target reads its root
                 // place (handled by consume's FieldExpr arm).
                 int p = consume(*as->value, /*expectExpire=*/-1);
-                if (dynamic_cast<const ast::IdentExpr*>(as->target.get())) {
+                if (auto* tid =
+                        dynamic_cast<const ast::IdentExpr*>(as->target.get())) {
                     ++pos_; // matches prePass's single tick for the Ident
+                    // The assignment RE-INITIALIZES the target: it now holds a
+                    // valid value, so it is Owned again — even if the RHS moved
+                    // the old value out (e.g. `acc = f(acc, x)`). Without this,
+                    // a move-and-reassign in a loop tripped the loop-backedge
+                    // move check (the value looked moved at the back edge).
+                    if (Binding* tb = lookupBinding(tid->name))
+                        tb->state = OwnState::Owned;
                 } else {
                     p = std::max(p, consume(*as->target, /*expectExpire=*/-1));
                 }

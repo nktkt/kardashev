@@ -486,6 +486,15 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 53 (v9): generic Vec higher-order combinators (vec_map / vec_filter /
+# vec_fold) over closures, effect-polymorphic in the closure's effect row,
+# returning fresh owned Vecs. JIT + AOT + a constant-memory gate.
+sh_test(
+    name = "smoke_test_phase53",
+    srcs = ["smoke_test_phase53.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

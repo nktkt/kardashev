@@ -499,6 +499,54 @@ std::string applyPrelude(const std::string& userSrc) {
             "    match o { Some(x) => Some(f(x)), None => None }\n"
             "}\n";
     }
+    // Phase 53 (v9): generic Vec higher-order combinators over closures, each
+    // effect-polymorphic in the closure's effect row `e` (so a pure mapper
+    // keeps the caller pure, an allocating one adds `alloc`). The closure
+    // receives each element BY REFERENCE (`&T`); map/filter return fresh owned
+    // Vecs (filter deep-clones the kept elements — the source is only
+    // borrowed). NOTE: a closure passed here needs its param type annotated
+    // (`|x: &i64| ..`) — closure-param inference from a generic fn-typed param
+    // is not yet wired. Guarded per-fn so a user definition wins.
+    if (userSrc.find("fn vec_map") == std::string::npos) {
+        prelude +=
+            "fn vec_map<T, U, e>(v: &Vec<T>, f: fn(&T) -> U ! {e})"
+            " -> Vec<U> ! { alloc, e } {\n"
+            "    let mut out = vec_new();\n"
+            "    let mut i = 0;\n"
+            "    while i < vec_len(v) {\n"
+            "        vec_push(&mut out, f(vec_get_ref(v, i)));\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    out\n"
+            "}\n";
+    }
+    if (userSrc.find("fn vec_filter") == std::string::npos) {
+        prelude +=
+            "fn vec_filter<T, e>(v: &Vec<T>, pred: fn(&T) -> bool ! {e})"
+            " -> Vec<T> ! { alloc, e } {\n"
+            "    let mut out = vec_new();\n"
+            "    let mut i = 0;\n"
+            "    while i < vec_len(v) {\n"
+            "        let x = vec_get_ref(v, i);\n"
+            "        if pred(x) { vec_push(&mut out, clone(x)); } else {}\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    out\n"
+            "}\n";
+    }
+    if (userSrc.find("fn vec_fold") == std::string::npos) {
+        prelude +=
+            "fn vec_fold<T, A, e>(v: &Vec<T>, init: A, f: fn(A, &T) -> A ! {e})"
+            " -> A ! {e} {\n"
+            "    let mut acc = init;\n"
+            "    let mut i = 0;\n"
+            "    while i < vec_len(v) {\n"
+            "        acc = f(acc, vec_get_ref(v, i));\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    acc\n"
+            "}\n";
+    }
     if (userSrc.find("fn option_unwrap_or") == std::string::npos) {
         prelude +=
             "fn option_unwrap_or(o: Option<i64>, default: i64) -> i64 {\n"
