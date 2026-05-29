@@ -1,0 +1,20 @@
+load("//bazel/rules_kardashev:defs.bzl", "kardashev_binary")
+
+# Make the capstone source readable by //tests:smoke_test_wordfreq, which builds
+# the real file (rather than an inlined copy) so the test doubles as a build
+# check of the shipped example.
+exports_files(
+    ["main.kd"],
+    visibility = ["//visibility:public"],
+)
+
+# Phase 56 (v9) capstone — word-frequency histogram: a real DATA PIPELINE in
+# kardashev. Tokenizes text (str_split/str_trim), counts words in a
+# HashMap<String, i64>, turns the map into a ranked Vec<Count> via a
+# #[derive(Ord, Eq)] wrapper (frequency desc, word asc) + sort, and prints the
+# top entries deterministically. AOT-compiled via //compiler:kardc. Exercised by
+# //tests:smoke_test_wordfreq (correct top-3 + a constant-memory gate).
+kardashev_binary(
+    name = "wordfreq",
+    src = "main.kd",
+)

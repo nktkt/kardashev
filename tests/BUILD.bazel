@@ -512,6 +512,19 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
+# (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
+# real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the
+# duplicate-key-insert leak fix keeps RSS flat).
+sh_test(
+    name = "smoke_test_wordfreq",
+    srcs = ["smoke_test_wordfreq.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/wordfreq:main.kd",
+    ],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

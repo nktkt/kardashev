@@ -2202,6 +2202,15 @@ private:
 
             b.SetInsertPoint(hitBB);
             auto* valP2 = b.CreateStructGEP(entryTy, eptr, 2, "valP2");
+            // Phase 56: a duplicate-key insert REPLACES the value and DISCARDS
+            // the passed key (the slot keeps its existing key). Drop the old
+            // value (it is being overwritten) and free the redundant key —
+            // otherwise a counter (repeated same-key inserts, e.g. word
+            // frequencies) leaks the cloned key and each replaced value. The
+            // drop thunk is a no-op for trivial types (i64), so this is free for
+            // the common HashMap<_, i64> case.
+            b.CreateCall(getOrEmitDropThunk(V), {valP2});
+            dropConsumedKey(b, kSlot);
             b.CreateStore(v, valP2);
             b.CreateRet(zero);
 
