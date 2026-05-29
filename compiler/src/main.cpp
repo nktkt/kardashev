@@ -152,6 +152,56 @@ std::string applyPrelude(const std::string& userSrc) {
             " { fn to_string(&self) -> String"
             " { if *self { \"true\" } else { \"false\" } } }\n";
     }
+    // Phase 41: the `Clone` trait — `clone(&self) -> Self` — a DEEP copy that
+    // dispatches through each element's own impl. Built-in impls for scalars +
+    // String (String copies via str_substring); a generic `impl<T: Clone> Clone
+    // for Vec<T>` clones element-wise via the now-working generic-impl + nested
+    // bounded-generic dispatch (Phase 40). The `clone(&x)` intrinsic (Phase 35)
+    // remains the structural workhorse / fallback for types with no impl. (The
+    // method is `x.clone()`; the intrinsic is the free call `clone(&x)` — they
+    // coexist.) Guarded so a user-defined `Clone` wins.
+    if (userSrc.find("trait Clone") == std::string::npos) {
+        prelude +=
+            "trait Clone { fn clone(&self) -> Self ! { alloc }; }\n"
+            "impl Clone for i64"
+            " { fn clone(&self) -> i64 ! { alloc } { *self } }\n"
+            "impl Clone for bool"
+            " { fn clone(&self) -> bool ! { alloc } { *self } }\n"
+            "impl Clone for String { fn clone(&self) -> String ! { alloc }"
+            " { str_substring(self, 0, str_len(self)) } }\n"
+            "impl<T: Clone> Clone for Vec<T> {\n"
+            "    fn clone(&self) -> Vec<T> ! { alloc } {\n"
+            "        let mut out = vec_new();\n"
+            "        let mut i = 0;\n"
+            "        while i < vec_len(self) {\n"
+            "            vec_push(&mut out, vec_get_ref(self, i).clone());\n"
+            "            i = i + 1;\n"
+            "        }\n"
+            "        out\n"
+            "    }\n"
+            "}\n";
+    }
+    // Phase 41: a generic `impl<T: Eq> Eq for Vec<T>` (the `Eq` trait + its
+    // i64/String impls are injected below) — element-wise deep equality, the
+    // order-sensitive comparison for sequences. Guarded together with `Eq`.
+    if (userSrc.find("trait Eq") == std::string::npos) {
+        prelude +=
+            "impl<T: Eq> Eq for Vec<T> {\n"
+            "    fn eq(&self, other: &Vec<T>) -> bool {\n"
+            "        if vec_len(self) != vec_len(other) { false }\n"
+            "        else {\n"
+            "            let mut i = 0;\n"
+            "            let mut same = true;\n"
+            "            while i < vec_len(self) {\n"
+            "                if !vec_get_ref(self, i).eq(vec_get_ref(other, i))"
+            " { same = false; } else {}\n"
+            "                i = i + 1;\n"
+            "            }\n"
+            "            same\n"
+            "        }\n"
+            "    }\n"
+            "}\n";
+    }
     // Phase 30: file I/O + CLI args. The low-level builtins (fs_read_into /
     // fs_write_raw / fs_exists / arg_count / arg_get) return a status category
     // (0=ok, 1=not-found, 2=permission, 4=other); these wrappers present the

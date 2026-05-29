@@ -9087,8 +9087,15 @@ private:
         }
 
         std::string targetTypeName;
+        // Phase 40/41: the receiver's concrete type args — used to monomorphize
+        // a generic-impl method. For a Concrete receiver these are the
+        // recorded receiverTypeArgs; for a BoundedGeneric receiver `T` they are
+        // the type args of T's concrete binding at this instance (so a
+        // container method calling `elem.method()` threads the inner args).
+        std::vector<TypePtr> recvConcreteArgs;
         if (res.kind == ResolvedMethod::Concrete) {
             targetTypeName = res.concreteTypeName;
+            recvConcreteArgs = res.receiverTypeArgs;
         } else {
             // BoundedGeneric: the receiver Var should map (via the current
             // instance's substitution) to a concrete type at this
@@ -9102,6 +9109,7 @@ private:
                     llvm::Type::getInt64Ty(*ctx_), 0);
             }
             TypePtr concrete = resolveInInstance(sit->second);
+            recvConcreteArgs = concrete->typeArgs;
             if (concrete->kind == TypeKind::Struct)
                 targetTypeName = concrete->structName;
             else if (concrete->kind == TypeKind::Enum)
@@ -9135,8 +9143,8 @@ private:
             fnAst_.count(mangled) ? fnAst_[mangled] : nullptr;
         if (methodAst && genericImplOf_.count(methodAst)) {
             std::vector<TypePtr> implArgs;
-            implArgs.reserve(res.receiverTypeArgs.size());
-            for (const auto& a : res.receiverTypeArgs)
+            implArgs.reserve(recvConcreteArgs.size());
+            for (const auto& a : recvConcreteArgs)
                 implArgs.push_back(resolveInInstance(a));
             std::string instMangled = mangleInstance(mangled, implArgs);
             if (!declaredFns_.count(instMangled)) {

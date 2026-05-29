@@ -393,6 +393,14 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 41: generic Clone/Eq over containers — `.clone()` / `.eq()` dispatch
+# through each element's own impl (Vec<Pair<String>> -> Pair -> String).
+sh_test(
+    name = "smoke_test_phase41",
+    srcs = ["smoke_test_phase41.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],
