@@ -127,6 +127,13 @@ struct CtorPat : Pattern {
     std::vector<PatternPtr> subpatterns;
 };
 
+// Phase 36: a tuple destructuring pattern `(p0, p1, ...)`. Irrefutable (a
+// tuple has exactly one shape); binds each sub-pattern to the corresponding
+// element. Modeled in the match compiler as a single-constructor type.
+struct TuplePat : Pattern {
+    std::vector<PatternPtr> elements;
+};
+
 // --- Expressions ---
 
 // Forward decl: TypeRef is defined in the "Top-level" section below, but

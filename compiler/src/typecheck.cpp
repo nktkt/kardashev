@@ -4346,6 +4346,11 @@ private:
                 collectPatternBindings(*sp, bound, added);
             return;
         }
+        if (auto* tp = dynamic_cast<const ast::TuplePat*>(&pat)) {
+            for (const auto& sp : tp->elements)
+                collectPatternBindings(*sp, bound, added);
+            return;
+        }
         // LitIntPat / WildPat: no bindings.
     }
 
@@ -5403,21 +5408,22 @@ private:
         return objTy->arrayElem;
     }
 
-    // Phase 22: tuple literal `(a, b, ...)`. The empty `()` is unit; otherwise
-    // the type is the tuple of the element types.
+    // Phase 22 / 36: tuple literal `(a, b, ...)`. The empty `()` is unit;
+    // otherwise the type is the tuple of the element types. Phase 36 lifts the
+    // Copy-only restriction: a tuple may now hold non-Copy (heap-owning)
+    // elements like `(String, i64)` or `(Json, i64)`. Such a tuple is itself
+    // droppable (codegen drops each droppable element) and is move-tracked as a
+    // whole by the borrow checker — moving the tuple moves its elements; tuple
+    // field READS of a non-Copy element are rejected by the borrow checker
+    // unless the element is Copy (no partial move-out via `.0` in this MVP —
+    // destructure with a tuple pattern instead). Arrays stay Copy-only (their
+    // dynamic index makes element-granular move tracking unsound here).
     TypePtr checkTupleLit(const ast::TupleLitExpr& tl) {
         if (tl.elements.empty()) return makeUnit(); // 0-tuple == unit
         std::vector<TypePtr> elems;
         elems.reserve(tl.elements.size());
         for (const auto& el : tl.elements) {
-            TypePtr et = checkExpr(*el);
-            if (!isCopyAggregateElem(et)) {
-                error("tuple elements must be Copy types (i64, bool, or nested "
-                      "arrays/tuples of those) in this version, got " +
-                          typeToString(et),
-                      el->line, el->column);
-            }
-            elems.push_back(et);
+            elems.push_back(checkExpr(*el));
         }
         return makeTuple(std::move(elems));
     }
@@ -5748,6 +5754,39 @@ private:
                 checkPattern(*cp->subpatterns[i], makeFreshVar(), bindings,
                              refMatch);
             }
+            return;
+        }
+        // Phase 36: a tuple destructure `(p0, p1, ...)` — the scrutinee must be
+        // a tuple of matching arity; bind each element sub-pattern to its type.
+        if (auto* tp = dynamic_cast<const ast::TuplePat*>(&pat)) {
+            TypePtr exp = resolve(expected);
+            if (exp->kind != TypeKind::Tuple) {
+                std::vector<TypePtr> fresh;
+                fresh.reserve(tp->elements.size());
+                for (std::size_t i = 0; i < tp->elements.size(); ++i)
+                    fresh.push_back(makeFreshVar());
+                if (!unify(expected, makeTuple(fresh))) {
+                    error("tuple pattern, but scrutinee is " +
+                              typeToString(expected),
+                          pat.line, pat.column);
+                    for (const auto& sp : tp->elements)
+                        checkPattern(*sp, makeFreshVar(), bindings, refMatch);
+                    return;
+                }
+                exp = resolve(expected);
+            }
+            if (exp->tupleElems.size() != tp->elements.size()) {
+                error("tuple pattern has " +
+                          std::to_string(tp->elements.size()) +
+                          " element(s), scrutinee tuple has " +
+                          std::to_string(exp->tupleElems.size()),
+                      pat.line, pat.column);
+            }
+            const std::size_t n =
+                std::min(tp->elements.size(), exp->tupleElems.size());
+            for (std::size_t i = 0; i < n; ++i)
+                checkPattern(*tp->elements[i], exp->tupleElems[i], bindings,
+                             refMatch);
             return;
         }
         error("unknown pattern kind", pat.line, pat.column);

@@ -349,6 +349,14 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 36: enum-typed struct fields (mutual struct/enum layout) + non-Copy
+# tuple elements (drop) + tuple `match` patterns + Result error propagation.
+sh_test(
+    name = "smoke_test_phase36",
+    srcs = ["smoke_test_phase36.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

@@ -799,6 +799,15 @@ private:
             }
             return;
         }
+        if (auto* tp = dynamic_cast<const TuplePat*>(&p)) {
+            out_ += "(";
+            for (std::size_t i = 0; i < tp->elements.size(); ++i) {
+                if (i) out_ += ", ";
+                printPattern(*tp->elements[i]);
+            }
+            out_ += ")";
+            return;
+        }
         out_ += "/* <unknown pattern> */";
     }
 };

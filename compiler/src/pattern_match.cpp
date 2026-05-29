@@ -94,6 +94,17 @@ PatViewPtr view(
         }
         return mkCtor(cp->ctorName, std::move(subs));
     }
+    // Phase 36: a tuple pattern is a single-constructor (irrefutable) shape —
+    // model it as a reserved `(tuple)` ctor so specialize / useful treat it
+    // uniformly with enum constructors.
+    if (auto tp = dynamic_cast<const ast::TuplePat*>(&p)) {
+        std::vector<PatViewPtr> subs;
+        subs.reserve(tp->elements.size());
+        for (const auto& sub : tp->elements) {
+            subs.push_back(view(*sub, variantIndex));
+        }
+        return mkCtor("(tuple)", std::move(subs));
+    }
     // Should never happen for a well-formed AST.
     return mkWild();
 }
@@ -321,6 +332,11 @@ UsefulResult useful(const Matrix& P, const Row& q, const ColumnTypes& cols) {
                 // Unknown ctor for this enum — treat as wildcard payload.
                 payload.assign(qc->subs.size(), nullptr);
             }
+        } else if (col0 && col0->kind == TypeKind::Tuple) {
+            // Phase 36: the `(tuple)` ctor's payload types ARE the tuple's
+            // element types — using them (not nulls) keeps the recursive
+            // `useful` columns typed (a null column type crashes resolve()).
+            payload = col0->tupleElems;
         } else {
             payload.assign(qc->subs.size(), nullptr);
         }
@@ -387,6 +403,27 @@ UsefulResult useful(const Matrix& P, const Row& q, const ColumnTypes& cols) {
             // but an empty enum has no values, so this case is degenerate.
             out.push_back(mkWild());
         }
+        for (const auto& w : sub.witness) out.push_back(w);
+        return {true, std::move(out)};
+    }
+
+    // Phase 36: a tuple column has a SINGLE constructor `(tuple)` — a complete
+    // signature of one. If it is present in the heads, drive it through
+    // specialize (exhaustive iff the element sub-patterns are); otherwise the
+    // missing witness is `(_, _, ...)`.
+    if (col0 && col0->kind == TypeKind::Tuple) {
+        unsigned arity = static_cast<unsigned>(col0->tupleElems.size());
+        if (heads.ctorNames.count("(tuple)")) {
+            return usefulSpecialize(P, q, cols, "(tuple)", col0->tupleElems);
+        }
+        Matrix Pdef = defaultMatrix(P);
+        Row qrest(q.begin() + 1, q.end());
+        ColumnTypes colsRest = dropFirst(cols);
+        UsefulResult sub = useful(Pdef, qrest, colsRest);
+        if (!sub.useful) return {false, {}};
+        std::vector<PatViewPtr> subs(arity, mkWild());
+        Row out;
+        out.push_back(mkCtor("(tuple)", std::move(subs)));
         for (const auto& w : sub.witness) out.push_back(w);
         return {true, std::move(out)};
     }
@@ -613,6 +650,33 @@ std::unique_ptr<DecisionTree> dtCompile(
     // Pick a column to dispatch on.
     std::size_t col = pickColumn(firstRow);
     TypePtr colType = (col < cols.size()) ? resolve(cols[col]) : nullptr;
+
+    // Phase 36: a tuple column is irrefutable (one shape) — destructure it in
+    // place. Replace the column with its element occurrences/types and recurse
+    // WITHOUT emitting a Switch (there is no tag to test); codegen reads the
+    // elements by their field index along the occurrence path.
+    if (colType && colType->kind == TypeKind::Tuple) {
+        unsigned arity = static_cast<unsigned>(colType->tupleElems.size());
+        DTMatrix Pspec = dtSpecialize(P, col, "(tuple)", arity);
+        std::vector<std::vector<unsigned>> newOccs;
+        newOccs.reserve(occurrences.size() - 1 + arity);
+        for (std::size_t i = 0; i < col; ++i)
+            newOccs.push_back(occurrences[i]);
+        for (unsigned k = 0; k < arity; ++k) {
+            std::vector<unsigned> path = occurrences[col];
+            path.push_back(k); // tuple element k lives at LLVM field index k
+            newOccs.push_back(std::move(path));
+        }
+        for (std::size_t i = col + 1; i < occurrences.size(); ++i)
+            newOccs.push_back(occurrences[i]);
+        ColumnTypes newCols;
+        newCols.reserve(cols.size() - 1 + arity);
+        for (std::size_t i = 0; i < col; ++i) newCols.push_back(cols[i]);
+        for (const auto& et : colType->tupleElems) newCols.push_back(et);
+        for (std::size_t i = col + 1; i < cols.size(); ++i)
+            newCols.push_back(cols[i]);
+        return dtCompile(Pspec, newOccs, newCols, enums);
+    }
 
     if (colType && colType->kind == TypeKind::Enum) {
         auto tree = std::make_unique<DecisionTree>();

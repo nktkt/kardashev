@@ -1826,6 +1826,27 @@ private:
             p->column = tok.column;
             return p;
         }
+        // Phase 36: parenthesized / tuple pattern. `(p)` is just grouping;
+        // `(p0, p1, ...)` (and the empty `()`) is a tuple destructure.
+        if (t.kind == TokenKind::LParen) {
+            Token tok = consume();
+            std::vector<ast::PatternPtr> elems;
+            if (!check(TokenKind::RParen)) {
+                while (true) {
+                    elems.push_back(parsePattern());
+                    if (!accept(TokenKind::Comma)) break;
+                    if (check(TokenKind::RParen)) break; // trailing comma
+                }
+            }
+            expect(TokenKind::RParen, ")");
+            // A single element with no comma is a grouped pattern, not a tuple.
+            if (elems.size() == 1) return std::move(elems[0]);
+            auto p = std::make_unique<ast::TuplePat>();
+            p->line = tok.line;
+            p->column = tok.column;
+            p->elements = std::move(elems);
+            return p;
+        }
         if (t.kind == TokenKind::Identifier) {
             Token tok = consume();
             if (accept(TokenKind::LParen)) {

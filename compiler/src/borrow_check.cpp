@@ -1072,6 +1072,20 @@ private:
             }
             return;
         }
+        // Phase 36: a tuple destructure binds each element sub-pattern to its
+        // element type (so a non-Copy element binding is move-tracked).
+        if (auto* tp = dynamic_cast<const ast::TuplePat*>(&pat)) {
+            TypePtr re = expected ? resolve(expected) : nullptr;
+            for (std::size_t i = 0; i < tp->elements.size(); ++i) {
+                TypePtr sub =
+                    (re && re->kind == TypeKind::Tuple &&
+                     i < re->tupleElems.size())
+                        ? re->tupleElems[i]
+                        : TypePtr{};
+                bindPattern(*tp->elements[i], sub, prePass);
+            }
+            return;
+        }
     }
 };
 

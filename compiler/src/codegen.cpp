@@ -151,8 +151,13 @@ public:
         // existing lazy `Option<i64>` instantiation order the HashMap
         // built-ins depend on.
         ensureFnValTy();
+        // Phase 36: declare ALL struct + enum names (opaque) before filling any
+        // body, so a struct field of enum type (and vice-versa) resolves no
+        // matter the declaration order.
         declareAllStructs();
         declareAllEnums();
+        fillAllStructBodies();
+        fillAllEnumBodies();
         declareBuiltins();
         // Phase 24: declare every user `extern "C" fn` as an LLVM external
         // function with the C-ABI-mapped signature. The LLVM symbol name is
@@ -5015,6 +5020,12 @@ private:
         return nullptr;
     }
 
+    // Phase 36: struct and enum layout is split into a NAME pass (opaque
+    // StructTypes) and a BODY pass. run() declares ALL names (structs + enums)
+    // before filling ANY body, so a struct field of enum type — or an enum
+    // payload of struct type — resolves regardless of declaration order
+    // (structs and enums are mutually recursive). Filling bodies eagerly in one
+    // function would hit an as-yet-undeclared sibling ("unresolved enum").
     void declareAllStructs() {
         for (const auto& [name, schema] : tc_.structs) {
             if (!schema.genericVars.empty()) continue;
@@ -5025,6 +5036,9 @@ private:
             if (structTypes_.count(name)) continue;
             structTypes_[name] = llvm::StructType::create(*ctx_, name);
         }
+    }
+
+    void fillAllStructBodies() {
         for (const auto& [name, schema] : tc_.structs) {
             if (!schema.genericVars.empty()) continue;
             if (name == "String" || name == "Vec" || name == "HashMap" ||
@@ -5044,6 +5058,9 @@ private:
             if (!schema.genericVars.empty()) continue;
             enumTypes_[name] = llvm::StructType::create(*ctx_, name);
         }
+    }
+
+    void fillAllEnumBodies() {
         for (const auto& [name, schema] : tc_.enums) {
             if (!schema.genericVars.empty()) continue;
             buildEnumBody(name, schema.type);
@@ -6633,7 +6650,13 @@ private:
         // reclaims everything a closure owns.
         case TypeKind::Function:
             return true;
-        // Scalars, references, dyn objects: never owning.
+        // Phase 36: a tuple owns its elements, so it is droppable iff any
+        // element is. (Arrays stay Copy-only -> never droppable.)
+        case TypeKind::Tuple:
+            for (const auto& el : r->tupleElems)
+                if (isDroppableImpl(el, seen)) return true;
+            return false;
+        // Scalars, references, dyn objects, arrays: never owning.
         default:
             return false;
         }
@@ -6833,6 +6856,19 @@ private:
         if (r->kind == TypeKind::Enum) {
             emitUserDrop(valuePtr, r);
             emitDropEnum(valuePtr, r);
+            return;
+        }
+
+        // Phase 36: a tuple owns its elements — drop each droppable one in
+        // declaration order. The tuple's own storage is inline (no heap).
+        if (r->kind == TypeKind::Tuple) {
+            llvm::Type* llvmTy = mapKardashevType(r);
+            for (unsigned i = 0; i < r->tupleElems.size(); ++i) {
+                if (!isDroppable(r->tupleElems[i])) continue;
+                auto* ep = builder_->CreateStructGEP(llvmTy, valuePtr, i,
+                                                     "drop.tup");
+                emitDropGlue(ep, r->tupleElems[i]);
+            }
             return;
         }
         // Scalars / refs / fn values: nothing to free.
@@ -7745,8 +7781,16 @@ private:
     llvm::Value* emitRef(const ast::RefExpr& re) {
         auto* id = dynamic_cast<const ast::IdentExpr*>(re.operand.get());
         if (!id) {
+            // Phase 36: `&place` for a field / tuple-field / index access — the
+            // address of the place IS the borrow (a pointer into the
+            // aggregate's storage), mirroring vec_get_ref / match-by-reference.
+            // Enables reading a struct's enum-typed field by reference:
+            // `match &h.t { ... }`.
+            if (llvm::Value* addr = emitPlaceAddr(*re.operand))
+                return addr;
             errors_.push_back(
-                "codegen: `&` operand must be a binding (Phase 2.4b)");
+                "codegen: `&` operand must be a binding or a field/index/"
+                "tuple-field place");
             return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
         }
         // Phase 17a: `&x` / `&mut x` of a by-ref capture is the env pointer —
