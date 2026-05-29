@@ -276,6 +276,16 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 29: the documented closure-env and match-payload Drop leaks are
+# plugged — a loop creating + dropping capturing closures, and one matching +
+# dropping heap Strings, both run in constant memory; a payload binding moved
+# out of its arm survives (no UAF). Through JIT + AOT.
+sh_test(
+    name = "smoke_test_dropleaks",
+    srcs = ["smoke_test_dropleaks.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

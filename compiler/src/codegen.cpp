@@ -5802,7 +5802,15 @@ private:
             }
             return false;
         }
-        // Scalars, references, fn values, dyn objects: never owning.
+        // Phase 29: a fn-value owns its heap capture env when it is a
+        // capturing closure (a top-level fn / no-capture closure carries a
+        // null env). Treat all fn-values as droppable so the env is freed at
+        // scope exit; a null-env free is a guarded no-op. Captures are
+        // restricted to Copy scalars (PR#18), so freeing the env buffer
+        // reclaims everything a closure owns.
+        case TypeKind::Function:
+            return true;
+        // Scalars, references, dyn objects: never owning.
         default:
             return false;
         }
@@ -5832,6 +5840,28 @@ private:
                 emitDropGlue(boxPtr, inner);
             }
             builder_->CreateCall(freeFn_, {boxPtr});
+            return;
+        }
+
+        if (r->kind == TypeKind::Function) {
+            // Phase 29: free a closure's heap capture env. The fn-value is the
+            // fat pointer { i8* fn, i8* env } stored at valuePtr; a top-level
+            // fn / no-capture closure has a null env (the free is then a
+            // guarded no-op). Captures are Copy scalars (PR#18), so freeing the
+            // env buffer reclaims everything the closure owns — no per-capture
+            // recursion needed.
+            auto* fatVal = builder_->CreateLoad(fnValTy_, valuePtr, "fn.val");
+            auto* envPtr = builder_->CreateExtractValue(fatVal, {1}, "fn.env");
+            auto* curFn = builder_->GetInsertBlock()->getParent();
+            auto* freeBB = llvm::BasicBlock::Create(ctx, "env.free", curFn);
+            auto* contBB = llvm::BasicBlock::Create(ctx, "env.cont", curFn);
+            auto* notNull = builder_->CreateICmpNE(
+                envPtr, llvm::ConstantPointerNull::get(i8PtrTy), "env.nn");
+            builder_->CreateCondBr(notNull, freeBB, contBB);
+            builder_->SetInsertPoint(freeBB);
+            builder_->CreateCall(freeFn_, {envPtr});
+            builder_->CreateBr(contBB);
+            builder_->SetInsertPoint(contBB);
             return;
         }
 
@@ -7497,23 +7527,48 @@ private:
             }
             case DT::Leaf: {
                 auto savedLocals = locals_;
+                // Phase 29: an arm is a lexical scope. Open a drop scope so a
+                // droppable payload binding (e.g. `s` in `Some(s)`, s: String)
+                // is dropped at arm exit unless the arm moves it out.
+                pushDropScope();
+                const ast::MatchArm* arm =
+                    dt.armIndex < me.arms.size() ? &me.arms[dt.armIndex]
+                                                 : nullptr;
                 for (const auto& [name, path] : dt.bindings) {
                     llvm::Value* sub = walkOccurrence(scrutinee, path);
                     auto* alloca = builder_->CreateAlloca(sub->getType(),
                                                           nullptr, name);
                     builder_->CreateStore(sub, alloca);
                     locals_[name] = alloca;
+                    if (arm) {
+                        auto ait = tc_.matchBindingTypes.find(arm);
+                        if (ait != tc_.matchBindingTypes.end()) {
+                            auto tit = ait->second.find(name);
+                            if (tit != ait->second.end())
+                                registerDroppableLocal(name, alloca,
+                                                       tit->second);
+                        }
+                    }
                 }
                 if (dt.armIndex < me.arms.size()) {
                     llvm::Value* bodyVal = emitExpr(*me.arms[dt.armIndex].body);
-                    auto* bodyEnd = builder_->GetInsertBlock();
-                    if (!bodyEnd->getTerminator()) {
+                    if (!builder_->GetInsertBlock()->getTerminator()) {
+                        // The arm's value is moved OUT as the match result if
+                        // it is a bare droppable binding — clear its flag so
+                        // the scope drop below skips it.
+                        clearDropFlagIfMoved(*me.arms[dt.armIndex].body);
+                        emitScopeDrops(dropScopes_.back());
+                        // The block that actually reaches merge is the one
+                        // AFTER the drops (drop glue may add blocks).
+                        auto* predBB = builder_->GetInsertBlock();
                         builder_->CreateBr(mergeBB);
-                        if (bodyVal) incoming.push_back({bodyEnd, bodyVal});
+                        if (bodyVal) incoming.push_back({predBB, bodyVal});
                     }
+                    dropScopes_.pop_back();
                 } else {
                     errors_.push_back("codegen: leaf armIndex out of range");
                     builder_->CreateUnreachable();
+                    dropScopes_.pop_back();
                 }
                 locals_ = savedLocals;
                 return;

@@ -1362,6 +1362,7 @@ public:
         result.enums = std::move(enumSchemas_);
         result.variantIndex = std::move(variantIndex_);
         result.matchTrees = std::move(matchTrees_);
+        result.matchBindingTypes = std::move(matchBindingTypes_);
         result.fnSchemas = std::move(fnSchemas_);
         result.callInstantiations = std::move(callInstantiations_);
         result.methodResolutions = std::move(methodResolutions_);
@@ -1514,6 +1515,11 @@ private:
     std::unordered_map<const ast::MatchExpr*,
                        std::unique_ptr<pattern_match::DecisionTree>>
         matchTrees_;
+    // Phase 29: per match-arm pattern-binding types (name -> type), for
+    // codegen drop of droppable payload bindings.
+    std::unordered_map<const ast::MatchArm*,
+                       std::unordered_map<std::string, TypePtr>>
+        matchBindingTypes_;
     std::vector<TypeError> errors_;
     // Phase 13a: monotonic counter for fresh `for`-loop iterator slot names
     // (`__for_it_N`) when desugaring `for x in <Iterator>`.
@@ -5446,6 +5452,9 @@ private:
             checkPattern(*arm.pattern, scrutT, bindings);
             for (auto& kv : bindings) {
                 scopes_.back()[kv.first] = kv.second;
+                // Phase 29: record the binding's type so codegen can drop a
+                // droppable payload binding at arm-scope exit.
+                matchBindingTypes_[&arm][kv.first] = kv.second;
             }
             TypePtr bodyT = checkExpr(*arm.body);
             popScope();

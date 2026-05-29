@@ -259,6 +259,13 @@ struct TypeCheckResult {
     std::unordered_map<const ast::MatchExpr*,
                        std::unique_ptr<pattern_match::DecisionTree>>
         matchTrees;
+    // Phase 29: per match-arm, the resolved type of each pattern binding
+    // (name -> type), keyed by the arm's address. Codegen uses this to drop a
+    // droppable payload binding (e.g. the `s` in `Some(s)` where s: String) at
+    // arm-scope exit when the arm doesn't move it out.
+    std::unordered_map<const ast::MatchArm*,
+                       std::unordered_map<std::string, TypePtr>>
+        matchBindingTypes;
     bool ok() const { return errors.empty(); }
 
     // Special members declared out-of-line so the implicit dtor / move ops
