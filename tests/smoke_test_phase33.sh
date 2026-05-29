@@ -27,7 +27,12 @@ trap 'rm -rf "$TMP"' EXIT
 rss_kb() {
     if /usr/bin/time -v true >/dev/null 2>&1; then
         /usr/bin/time -v "$1" 2>&1 | awk '/Maximum resident/ {print $NF}'
-    else "$1" >/dev/null 2>&1 || true; echo 0; fi
+    else
+        # No GNU `/usr/bin/time -v`: cannot measure RSS, so the leak gate cannot
+        # run. FAIL LOUDLY rather than echo 0 (a silent false-green).
+        echo "FAIL: GNU /usr/bin/time -v unavailable; cannot run the memory gate" >&2
+        exit 1
+    fi
 }
 
 # --- 1. operators: %, &&, and short-circuit (10/0 in a dead && rhs must not trap) ---

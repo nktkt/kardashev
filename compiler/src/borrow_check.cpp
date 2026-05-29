@@ -205,6 +205,21 @@ private:
         return it->second;
     }
 
+    // Phase-5-fix: while true, consume()'s `*r` move-out-of-borrow check is
+    // suppressed. Set when descending a PLACE that is being borrowed/read
+    // rather than moved (the operand of `&`, a `&self` method receiver, a
+    // field-access base) — there a nested `*r` is a read, not a move.
+    bool derefMoveCheckSuppressed_ = false;
+    // consume() `e` as a borrowed/read PLACE (not a move): runs the normal walk
+    // for position/loan bookkeeping but disables the move-out-of-`*r` check.
+    int consumePlace(const ast::Expr& e, int expectExpire) {
+        bool saved = derefMoveCheckSuppressed_;
+        derefMoveCheckSuppressed_ = true;
+        int r = consume(e, expectExpire);
+        derefMoveCheckSuppressed_ = saved;
+        return r;
+    }
+
     // --- Pass 1: pre-pass that assigns positions and records the last
     // position at which each binding is referenced. Pass 1 mirrors Pass
     // 2's traversal order so positions agree.
@@ -455,16 +470,85 @@ private:
     // `&mut *r` reborrow other languages insert. Any other argument shape
     // (a `&place` borrow, a temporary, a literal, an owned value) consumes
     // exactly as before.
-    int consumeArg(const ast::Expr& a, int expectExpire) {
+    int consumeArg(const ast::Expr& a, int expectExpire,
+                   const TypePtr& targetTy = nullptr) {
         if (auto* id = dynamic_cast<const ast::IdentExpr*>(&a)) {
             Binding* b = lookupBinding(id->name);
             if (b && b->isMutRef) {
                 int p = pos_++;
                 checkRead(*id); // reborrow: errors only if the ref was moved
+                // Phase 47 reborrow + Phase-9-fix: a `&mut`-typed binding passed
+                // as an argument reborrows. Register a LOAN keyed on the target
+                // parameter's mutability so two `&mut` reborrows of the SAME
+                // binding in one call (e.g. `f(r, r)` with `&mut` params) are
+                // rejected — that would alias two `&mut` to one place — while
+                // multiple SHARED reborrows (e.g. `cmp(get_ref(v,i),
+                // get_ref(v,j))`) stay legal. Unknown target (no sig) => shared.
+                bool targetMut = false;
+                if (targetTy) {
+                    TypePtr t = resolve(targetTy);
+                    targetMut = (t->kind == TypeKind::Ref && t->refIsMut);
+                }
+                if (b->state != OwnState::Moved) {
+                    if (targetMut) {
+                        if (b->sharedLoans > 0 || b->mutLoanActive) {
+                            error("cannot reborrow `" + id->name +
+                                      "` mutably more than once at a time "
+                                      "(two `&mut` to the same place)",
+                                  id->line, id->column);
+                        } else {
+                            b->mutLoanActive = true;
+                        }
+                    } else if (b->mutLoanActive) {
+                        error("cannot reborrow `" + id->name +
+                                  "` while a mutable reborrow is active",
+                              id->line, id->column);
+                    } else {
+                        ++b->sharedLoans;
+                    }
+                    Loan loan;
+                    loan.borrowedDeclPos = b->declPos;
+                    loan.borrowerDeclPos = -1;
+                    loan.isMut = targetMut;
+                    loan.expirePos = p; // retired at end of statement
+                    loan.line = id->line;
+                    loan.column = id->column;
+                    activeLoans_.push_back(loan);
+                }
                 return p;
             }
         }
         return consume(a, expectExpire);
+    }
+
+    // Phase-8-fix: the i-th parameter type of a directly-named callee, if its
+    // schema is known (built-ins + user fns live in tc_.fnSchemas). Used to
+    // decide whether a `&mut`-binding argument reborrows mutably or shared.
+    TypePtr calleeParamType(const std::string& callee, std::size_t i) {
+        auto it = tc_.fnSchemas.find(callee);
+        if (it == tc_.fnSchemas.end()) return nullptr;
+        const TypePtr& sig = it->second.signature;
+        if (!sig || i >= sig->args.size()) return nullptr;
+        return sig->args[i];
+    }
+
+    // The resolved impl-method's function signature (arg 0 = self), for the
+    // reborrow-mutability decision on method arguments. Null for a non-concrete
+    // (bounded-generic / dyn) receiver — there the args fall back to a shared
+    // reborrow, which is conservative-safe (no aliasing introduced).
+    TypePtr methodSigOf(const ast::MethodCallExpr& mc) {
+        auto it = tc_.methodResolutions.find(&mc);
+        if (it == tc_.methodResolutions.end()) return nullptr;
+        const ResolvedMethod& r = it->second;
+        if (r.kind != ResolvedMethod::Concrete || r.concreteTypeName.empty())
+            return nullptr;
+        const std::string t =
+            r.traitName.empty() ? std::string("__kd_inherent_impl") : r.traitName;
+        std::string mangled =
+            "__impl_" + t + "_for_" + r.concreteTypeName + "__" + r.methodName;
+        auto sit = tc_.fnSchemas.find(mangled);
+        if (sit == tc_.fnSchemas.end()) return nullptr;
+        return sit->second.signature;
     }
 
     int consume(const ast::Expr& e, int expectExpire) {
@@ -492,33 +576,71 @@ private:
             return lastInSubtree;
         }
         if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+            // Phase-5-fix: `*r` in a MOVE position (this is consume()) where r
+            // is a reference (`&T`/`&mut T`) and the pointee is NOT Copy would
+            // move a non-Copy value out of a borrow — leaving the borrowed-from
+            // owner and the moved-out copy both owning the same heap (a later
+            // double-free). Reject it; reading (`*x` of a Copy type), borrowing
+            // (`&*r`), or cloning is fine, and a method receiver deref goes
+            // through consumeReceiver (a read), not here.
+            if (un->op == ast::UnaryOp::Deref && !derefMoveCheckSuppressed_) {
+                TypePtr opTy = typeOf(*un->operand);
+                TypePtr resTy = typeOf(e);
+                if (opTy && resolve(opTy)->kind == TypeKind::Ref && resTy &&
+                    !isCopyType(resTy)) {
+                    error("cannot move a non-Copy value out of a borrowed "
+                          "reference (`*r` where `r: &T`); clone it instead",
+                          e.line, e.column);
+                }
+            }
             return std::max(lastInSubtree,
                             consume(*un->operand, expectExpire));
         }
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
-            for (const auto& a : call->args) {
-                lastInSubtree = std::max(lastInSubtree,
-                                           consumeArg(*a, expectExpire));
+            for (std::size_t i = 0; i < call->args.size(); ++i) {
+                lastInSubtree = std::max(
+                    lastInSubtree,
+                    consumeArg(*call->args[i], expectExpire,
+                               calleeParamType(call->callee, i)));
             }
             return lastInSubtree;
         }
         if (auto* cv = dynamic_cast<const ast::CallValueExpr*>(&e)) {
             // Phase 17a: the callee expression is read (its fn value is used),
-            // then each arg is moved by value.
+            // then each arg is moved by value. The fn-value's own type carries
+            // the param types (for the reborrow-mutability decision).
             lastInSubtree = std::max(lastInSubtree,
                                        consume(*cv->callee, expectExpire));
-            for (const auto& a : cv->args) {
-                lastInSubtree = std::max(lastInSubtree,
-                                           consumeArg(*a, expectExpire));
+            TypePtr fnTy = typeOf(*cv->callee);
+            for (std::size_t i = 0; i < cv->args.size(); ++i) {
+                TypePtr pt = nullptr;
+                if (fnTy) {
+                    TypePtr ft = resolve(fnTy);
+                    if (ft->kind == TypeKind::Function && i < ft->args.size())
+                        pt = ft->args[i];
+                }
+                lastInSubtree = std::max(
+                    lastInSubtree, consumeArg(*cv->args[i], expectExpire, pt));
             }
             return lastInSubtree;
         }
         if (auto* mc = dynamic_cast<const ast::MethodCallExpr*>(&e)) {
             lastInSubtree = std::max(lastInSubtree,
                                        consumeReceiver(*mc));
-            for (const auto& a : mc->args) {
-                lastInSubtree = std::max(lastInSubtree,
-                                           consumeArg(*a, expectExpire));
+            // The resolved impl-method schema gives the (non-self) param types,
+            // so a `&mut` method arg reborrows mutably (rejecting aliasing).
+            TypePtr msig = methodSigOf(*mc);
+            for (std::size_t i = 0; i < mc->args.size(); ++i) {
+                TypePtr pt = nullptr;
+                if (msig) {
+                    TypePtr ms = resolve(msig);
+                    // arg 0 is the receiver `self`; method arg i is args[i+1].
+                    if (ms->kind == TypeKind::Function &&
+                        i + 1 < ms->args.size())
+                        pt = ms->args[i + 1];
+                }
+                lastInSubtree = std::max(
+                    lastInSubtree, consumeArg(*mc->args[i], expectExpire, pt));
             }
             return lastInSubtree;
         }
@@ -531,10 +653,49 @@ private:
         if (auto* ie = dynamic_cast<const ast::IfExpr*>(&e)) {
             lastInSubtree = std::max(lastInSubtree,
                                        consume(*ie->cond, expectExpire));
+            // The two branches are ALTERNATIVES, not sequential: each runs from
+            // the pre-`if` ownership state, and afterwards a binding is
+            // "maybe moved" if it was moved on EITHER branch. Snapshot, run
+            // THEN, capture, restore, run ELSE, then JOIN (moved-in-either =>
+            // Moved). This (a) stops a move in one branch from leaking into the
+            // other (over-rejection) and (b) stops a move in one branch + a
+            // reassignment in the other from masking the move (under-rejection,
+            // the double-free regression). `pos_` keeps advancing through both
+            // branches for loan bookkeeping; only OwnState is snapshot/joined.
+            struct MS {
+                Binding* b;
+                OwnState pre; std::size_t pml, pmc;
+                OwnState thenSt; std::size_t tml, tmc;
+            };
+            std::vector<MS> snap;
+            snap.reserve(bindings_.size());
+            for (auto& [dp, bnd] : bindings_) {
+                (void)dp;
+                snap.push_back({&bnd, bnd.state, bnd.moveLine, bnd.moveCol,
+                                OwnState::Owned, 0, 0});
+            }
             lastInSubtree = std::max(lastInSubtree,
                                        consume(*ie->thenBranch, expectExpire));
+            for (auto& s : snap) {
+                s.thenSt = s.b->state;
+                s.tml = s.b->moveLine;
+                s.tmc = s.b->moveCol;
+                // restore pre-`if` state so ELSE sees the unmoved bindings.
+                s.b->state = s.pre;
+                s.b->moveLine = s.pml;
+                s.b->moveCol = s.pmc;
+            }
             lastInSubtree = std::max(lastInSubtree,
                                        consume(*ie->elseBranch, expectExpire));
+            for (auto& s : snap) {
+                // else's effect is already in s.b->state; fold in then's.
+                if (s.thenSt == OwnState::Moved &&
+                    s.b->state != OwnState::Moved) {
+                    s.b->state = OwnState::Moved;
+                    s.b->moveLine = s.tml;
+                    s.b->moveCol = s.tmc;
+                }
+            }
             return lastInSubtree;
         }
         if (auto* block = dynamic_cast<const ast::BlockExpr*>(&e)) {
@@ -556,8 +717,9 @@ private:
                 // in sync.
                 ++pos_;
             } else {
-                lastInSubtree = std::max(lastInSubtree,
-                                           consume(*fe->object, expectExpire));
+                // The base of a field access is a PLACE being read, not moved.
+                lastInSubtree = std::max(
+                    lastInSubtree, consumePlace(*fe->object, expectExpire));
             }
             return lastInSubtree;
         }
@@ -715,11 +877,12 @@ private:
                 return innerPos;
             }
         }
-        // Any other receiver shape (a temporary produced by a nested call,
-        // an `if`, etc.) has no named binding to borrow from; fall back to
-        // the normal walk so positions stay in sync. The temporary is
-        // produced and consumed within the statement.
-        return consume(*mc.receiver, /*expectExpire=*/-1);
+        // Any other receiver shape for a `&self`/`&mut self` method (a deref
+        // place like `(**self)`, a temporary, an `if`, ...) is BORROWED as the
+        // receiver, not moved — read it as a place so a nested `*r` isn't
+        // mistaken for a move-out-of-borrow. (A by-value `self` returned far
+        // above and is a genuine move.)
+        return consumePlace(*mc.receiver, /*expectExpire=*/-1);
     }
 
     // Apply an autoref borrow to a binding referenced at `atPos`, with the
@@ -856,8 +1019,16 @@ private:
                 // treating it as a use; a FieldExpr target reads its root
                 // place (handled by consume's FieldExpr arm).
                 int p = consume(*as->value, /*expectExpire=*/-1);
-                if (dynamic_cast<const ast::IdentExpr*>(as->target.get())) {
+                if (auto* tid =
+                        dynamic_cast<const ast::IdentExpr*>(as->target.get())) {
                     ++pos_; // matches prePass's single tick for the Ident
+                    // The assignment RE-INITIALIZES the target: it now holds a
+                    // valid value, so it is Owned again — even if the RHS moved
+                    // the old value out (e.g. `acc = f(acc, x)`). Without this,
+                    // a move-and-reassign in a loop tripped the loop-backedge
+                    // move check (the value looked moved at the back edge).
+                    if (Binding* tb = lookupBinding(tid->name))
+                        tb->state = OwnState::Owned;
                 } else {
                     p = std::max(p, consume(*as->target, /*expectExpire=*/-1));
                 }
@@ -889,7 +1060,9 @@ private:
         int myPos = pos_ - 1;
         auto* id = dynamic_cast<const ast::IdentExpr*>(re.operand.get());
         if (!id) {
-            return consume(*re.operand, expectExpire);
+            // `&(place)` borrows the place — a read, not a move (e.g.
+            // `&(**other)` borrows the boxed value rather than moving it).
+            return consumePlace(*re.operand, expectExpire);
         }
         // Match pass 1's recursive prePass(operand): one position for the
         // inner IdentExpr.

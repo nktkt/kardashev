@@ -1093,6 +1093,7 @@ public:
             else if (rfor->kind == TypeKind::Int) typeName = "i64";
             else if (rfor->kind == TypeKind::Float) typeName = "f64";  // Phase 44
             else if (rfor->kind == TypeKind::Bool) typeName = "bool";
+            else if (rfor->kind == TypeKind::Box) typeName = "Box";    // Phase 51
             else {
                 error("impl for unsupported type " + typeToString(forTy),
                       impl.forType.line, impl.forType.column);
@@ -1105,6 +1106,28 @@ public:
             // associated types, and stash the concrete choices for use-site
             // resolution of `Self::Item` / `C::Item`.
             if (!inherent) {
+                // Phase-4-fix: record this impl's concrete trait type-args
+                // (structurally, by string; a generic Var arg becomes "*",
+                // a wildcard) keyed by "type/trait", so a `dyn Trait<Args>`
+                // coercion can verify the impl's PARAMETERIZATION matches — not
+                // just the trait name. Rejects `Producer<i64>` -> `dyn
+                // Producer<String>`.
+                {
+                    GenericEnv targEnv = implParamEnv(impl);
+                    targEnv["Self"] = forTy;
+                    const GenericEnv* savedTArg = currentGenericEnv_;
+                    currentGenericEnv_ = &targEnv;
+                    std::vector<std::string> argStrs;
+                    for (const auto& ta : impl.traitTypeArgs) {
+                        TypePtr rt = resolve(resolveTypeRef(ta));
+                        argStrs.push_back(rt->kind == TypeKind::Var
+                                              ? std::string("*")
+                                              : typeToString(rt));
+                    }
+                    currentGenericEnv_ = savedTArg;
+                    implTraitArgStrs_[typeName + "/" + impl.traitName] =
+                        std::move(argStrs);
+                }
                 const std::vector<std::string>& wantAssoc =
                     traitAssocTypes_.count(impl.traitName)
                         ? traitAssocTypes_[impl.traitName]
@@ -1621,6 +1644,7 @@ public:
         result.fnSchemas = std::move(fnSchemas_);
         result.callInstantiations = std::move(callInstantiations_);
         result.staticCallMangled = std::move(staticCallMangled_);
+        result.staticCallGeneric = std::move(staticCallGeneric_);
         result.methodResolutions = std::move(methodResolutions_);
         result.dynCoercions = std::move(dynCoercions_);
         result.dynVtablesNeeded = std::move(dynVtablesNeeded_);
@@ -1772,6 +1796,13 @@ private:
         methodResolutions_;
     // Phase 48: qualified static call `Type::method()` -> mangled impl method.
     std::unordered_map<const ast::CallExpr*, std::string> staticCallMangled_;
+    // Phase-4-fix: "type/trait" -> the impl's trait type-args as structural
+    // strings ("*" = a generic Var, matches anything). Used to verify a
+    // `dyn Trait<Args>` coercion's parameterization.
+    std::unordered_map<std::string, std::vector<std::string>> implTraitArgStrs_;
+    // Phase 52: generic static call `T::method()` -> (trait, method, varId).
+    std::unordered_map<const ast::CallExpr*, TypeCheckResult::StaticGenericCall>
+        staticCallGeneric_;
     // Phase 11: per-Expr `&T`->`&dyn`/`Box<T>`->`Box<dyn>` coercions and the
     // set of (trait,type) vtables those coercions require.
     std::unordered_map<const ast::Expr*, DynCoercion> dynCoercions_;
@@ -1994,6 +2025,16 @@ private:
         if (auto* mc = dynamic_cast<const ast::MethodCallExpr*>(&e)) {
             collectEffects(*mc->receiver, out);
             for (const auto& a : mc->args) collectEffects(*a, out);
+            // Phase-7-fix: prefer a per-site effect set when one was recorded
+            // (a `dyn Trait` dispatch records the trait method's declared
+            // effects — see checkDynMethodCall — since there is no concrete impl
+            // schema to mangle; previously such a call contributed ZERO effects,
+            // letting a pure-declared fn call an io/alloc trait method through a
+            // trait object).
+            if (auto eit = exprEffects_.find(mc); eit != exprEffects_.end()) {
+                out.unionWith(eit->second);
+                return;
+            }
             // Resolve the impl method via the typechecker's recorded
             // resolution and union in its declared effects.
             auto mit = methodResolutions_.find(mc);
@@ -3670,7 +3711,33 @@ private:
                 if ((expIsBox && actIsBox) || (expIsRef && actIsRef)) {
                     TypePtr pointee = resolve(a->refInner);
                     std::string typeName = concreteTypeName(pointee);
-                    if (!typeName.empty() &&
+                    // Phase-4-fix: for a PARAMETERIZED `dyn Trait<Args>`, the
+                    // concrete type's impl of the trait must carry MATCHING
+                    // trait args — `&IntGen` (impl Producer<i64>) must NOT
+                    // coerce to `&dyn Producer<String>`. A "*" (generic) impl
+                    // arg matches anything. On mismatch, fall through so unify
+                    // fails and the caller reports a type error.
+                    bool argsOk = true;
+                    if (!typeName.empty() && !inner->typeArgs.empty()) {
+                        auto tit = implTraitArgStrs_.find(
+                            typeName + "/" + inner->dynTraitName);
+                        if (tit != implTraitArgStrs_.end()) {
+                            if (tit->second.size() != inner->typeArgs.size()) {
+                                argsOk = false;
+                            } else {
+                                for (std::size_t i = 0;
+                                     i < inner->typeArgs.size(); ++i) {
+                                    if (tit->second[i] == "*") continue;
+                                    if (tit->second[i] !=
+                                        typeToString(resolve(inner->typeArgs[i]))) {
+                                        argsOk = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (argsOk && !typeName.empty() &&
                         typeImplsTrait(typeName, inner->dynTraitName)) {
                         DynCoercion c;
                         c.traitName = inner->dynTraitName;
@@ -3805,11 +3872,18 @@ private:
         }
 
         // Phase 2.4b auto-deref: if the receiver is `&T` (or `&mut T`),
-        // dispatch as though the receiver were the underlying `T`. Phase
-        // 2.4c will refine this so impls of `Trait for &T` (when written
-        // explicitly) take precedence over implicit deref. Phase 11: a
+        // dispatch as though the receiver were the underlying `T`. Phase 11: a
         // `Box<Concrete>` derefs the same way (method call through the box).
-        while (r->kind == TypeKind::Ref || r->kind == TypeKind::Box)
+        // Phase 51: but STOP peeling at a `Box` that ITSELF has an impl of the
+        // called method (e.g. `impl<T: Clone> Clone for Box<T>`), so
+        // `box.clone()` reaches the Box impl rather than the inner T's. A `&` is
+        // always peeled (no `impl for &T`).
+        auto boxHasMethod = [&](const std::string& m) {
+            auto it = methodImplLookup_.find("Box");
+            return it != methodImplLookup_.end() && it->second.count(m) > 0;
+        };
+        while (r->kind == TypeKind::Ref ||
+               (r->kind == TypeKind::Box && !boxHasMethod(mc.methodName)))
             r = resolve(r->refInner);
 
         // Case A: receiver is a generic-param Var. The fn must have a
@@ -3901,6 +3975,7 @@ private:
         else if (r->kind == TypeKind::Int) typeName = "i64";
         else if (r->kind == TypeKind::Float) typeName = "f64";  // Phase 44
         else if (r->kind == TypeKind::Bool) typeName = "bool";
+        else if (r->kind == TypeKind::Box) typeName = "Box";    // Phase 51
         else {
             error("method call on unsupported receiver type " +
                       typeToString(recvT),
@@ -3983,7 +4058,12 @@ private:
         res.traitName = trait;
         res.methodName = mc.methodName;
         res.concreteTypeName = typeName;
-        res.receiverTypeArgs = r->typeArgs;
+        // Phase 51: a Box keeps its element in `refInner`, not `typeArgs`, so
+        // surface it as the single receiver type arg for monomorphizing the
+        // generic `impl<T> .. for Box<T>` method.
+        res.receiverTypeArgs =
+            r->kind == TypeKind::Box ? std::vector<TypePtr>{r->refInner}
+                                     : r->typeArgs;
         res.selfKind = instSig->args.empty()
                            ? ResolvedMethod::SelfKind::ByValue
                            : selfKindFromSlot(instSig->args[0]);
@@ -4124,6 +4204,14 @@ private:
         }
         TypePtr retTy = resolveTypeRef(sig->returnType);
         currentGenericEnv_ = savedEnv;
+
+        // Phase-7-fix: a dynamic call has no concrete impl schema to mangle, so
+        // attribute the TRAIT method's DECLARED effects (the object's contract)
+        // to this site — collectEffects reads exprEffects_ for method calls.
+        // (Conservative upper bound: an impl may not exceed its trait's
+        // declared effects without that being the documented relaxation.)
+        exprEffects_[&mc] = buildEffectSet(sig->effects, {}, mc.methodName,
+                                           nullptr);
 
         const std::size_t expectedExtra =
             paramTypes.empty() ? 0 : paramTypes.size() - 1;
@@ -5117,6 +5205,71 @@ private:
                             exprEffects_[&call] = sch.declaredEffects;
                             staticCallMangled_[&call] = mangIt->second;
                             return resolve(instSig->ret);
+                        }
+                    }
+                }
+            }
+            // Phase 52: a GENERIC static call `T::method()` — T a bounded type
+            // param whose bound trait declares a static (no-self) method. The
+            // concrete impl is chosen at monomorphization; here we resolve the
+            // return type (Self -> T) and record (trait, method, varId).
+            if (tIt == methodImplLookup_.end() && currentGenericEnv_) {
+                auto git = currentGenericEnv_->find(call.pathQualifier);
+                if (git != currentGenericEnv_->end()) {
+                    TypePtr tv = resolve(git->second);
+                    auto bit = tv->kind == TypeKind::Var
+                                   ? currentVarAllBounds_.find(tv->varId)
+                                   : currentVarAllBounds_.end();
+                    if (tv->kind == TypeKind::Var &&
+                        bit != currentVarAllBounds_.end()) {
+                        for (const auto& traitName : bit->second) {
+                            auto trIt = traits_.find(traitName);
+                            if (trIt == traits_.end()) continue;
+                            const ast::MethodSig* sig = nullptr;
+                            for (const auto& m : trIt->second)
+                                if (m.name == call.callee &&
+                                    (m.params.empty() ||
+                                     m.params[0].name != "self")) {
+                                    sig = &m;
+                                    break;
+                                }
+                            if (!sig) continue;
+                            // Resolve param/return with Self -> T (keep the
+                            // surrounding generic env so other names resolve).
+                            GenericEnv selfEnv = *currentGenericEnv_;
+                            selfEnv["Self"] = tv;
+                            const GenericEnv* saved = currentGenericEnv_;
+                            currentGenericEnv_ = &selfEnv;
+                            std::vector<TypePtr> paramTypes;
+                            for (const auto& p : sig->params)
+                                paramTypes.push_back(resolveTypeRef(p.type));
+                            TypePtr retTy = resolveTypeRef(sig->returnType);
+                            currentGenericEnv_ = saved;
+                            if (paramTypes.size() != call.args.size()) {
+                                error("static method '" + call.pathQualifier +
+                                          "::" + call.callee + "' expects " +
+                                          std::to_string(paramTypes.size()) +
+                                          " arg(s), got " +
+                                          std::to_string(call.args.size()),
+                                      call.line, call.column);
+                            }
+                            const std::size_t n = std::min(paramTypes.size(),
+                                                           call.args.size());
+                            for (std::size_t i = 0; i < n; ++i) {
+                                TypePtr at = checkExpr(*call.args[i]);
+                                if (!coerceOrUnify(*call.args[i], at,
+                                                   paramTypes[i]))
+                                    error("argument " + std::to_string(i + 1) +
+                                              " to '" + call.pathQualifier +
+                                              "::" + call.callee + "'",
+                                          call.args[i]->line,
+                                          call.args[i]->column);
+                            }
+                            exprEffects_[&call] = buildEffectSet(
+                                sig->effects, {}, call.callee, nullptr);
+                            staticCallGeneric_[&call] = {traitName, call.callee,
+                                                         tv->varId};
+                            return resolve(retTy);
                         }
                     }
                 }

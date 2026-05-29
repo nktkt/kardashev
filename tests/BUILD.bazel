@@ -467,6 +467,72 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 51 (v9): Box<T> is a registrable impl target (method dispatch prefers a
+# Box impl over auto-deref) + `&*`/`**` deref ergonomics, so the prelude ships
+# Clone/Eq for Box<T> and #[derive(Clone, Eq)] covers a Box field (recursive
+# types). JIT + AOT.
+sh_test(
+    name = "smoke_test_phase51",
+    srcs = ["smoke_test_phase51.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 52 (v9): generic associated functions — a static trait method on a
+# bounded type param `T::method()` (e.g. `T::default()` for `<T: Default>`),
+# monomorphized per instance. JIT + AOT.
+sh_test(
+    name = "smoke_test_phase52",
+    srcs = ["smoke_test_phase52.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 53 (v9): generic Vec higher-order combinators (vec_map / vec_filter /
+# vec_fold) over closures, effect-polymorphic in the closure's effect row,
+# returning fresh owned Vecs. JIT + AOT + a constant-memory gate.
+sh_test(
+    name = "smoke_test_phase53",
+    srcs = ["smoke_test_phase53.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 54 (v9): string tokenizing — str_split (split on a byte, empty pieces
+# kept) + str_trim (ASCII whitespace), written in kardashev. JIT + AOT +
+# constant-memory gate.
+sh_test(
+    name = "smoke_test_phase54",
+    srcs = ["smoke_test_phase54.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 55 (v9): hashmap_entries -> Vec<(K,V)> (deep-cloned tuples), so a map is
+# rankable/printable without manual key lookups. JIT + AOT + constant-memory.
+sh_test(
+    name = "smoke_test_phase55",
+    srcs = ["smoke_test_phase55.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Pre-merge review fixes: a soundness regression guard locking in the 5 memory-
+# safety / type-soundness blocker fixes + the dyn/generic effect attribution.
+sh_test(
+    name = "smoke_test_soundness",
+    srcs = ["smoke_test_soundness.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
+# (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
+# real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the
+# duplicate-key-insert leak fix keeps RSS flat).
+sh_test(
+    name = "smoke_test_wordfreq",
+    srcs = ["smoke_test_wordfreq.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/wordfreq:main.kd",
+    ],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

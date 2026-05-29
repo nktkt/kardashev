@@ -2202,6 +2202,15 @@ private:
 
             b.SetInsertPoint(hitBB);
             auto* valP2 = b.CreateStructGEP(entryTy, eptr, 2, "valP2");
+            // Phase 56: a duplicate-key insert REPLACES the value and DISCARDS
+            // the passed key (the slot keeps its existing key). Drop the old
+            // value (it is being overwritten) and free the redundant key —
+            // otherwise a counter (repeated same-key inserts, e.g. word
+            // frequencies) leaks the cloned key and each replaced value. The
+            // drop thunk is a no-op for trivial types (i64), so this is free for
+            // the common HashMap<_, i64> case.
+            b.CreateCall(getOrEmitDropThunk(V), {valP2});
+            dropConsumedKey(b, kSlot);
             b.CreateStore(v, valP2);
             b.CreateRet(zero);
 
@@ -2435,7 +2444,14 @@ private:
 
             b.SetInsertPoint(hitBB);
             auto* valP = b.CreateStructGEP(entryTy, eptr, 2, "valP");
-            auto* val = b.CreateLoad(valTy, valP, "val");
+            // hashmap_get returns Option<V> BY VALUE while the entry STAYS in
+            // the map, so the returned value must be an independent deep CLONE
+            // — a bitwise load would alias the map's heap buffer and, now that
+            // the map drops its values (Phase 33 interior drop), double-free.
+            // For a Copy V (i64/bool/struct-of-Copy) the clone is a plain copy,
+            // so the common case is unchanged. (get_ref returns a borrow and
+            // needs no clone.)
+            auto* val = b.CreateCall(getOrEmitCloneFn(V), {valP}, "val");
             llvm::Value* someAgg = llvm::UndefValue::get(optLlvm);
             someAgg = b.CreateInsertValue(
                 someAgg, llvm::ConstantInt::get(i32Ty, someIdx), {0}, "some");
@@ -5145,7 +5161,11 @@ private:
             llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
             auto* data = b.CreateExtractValue(fn->getArg(0), {0}, "data");
             auto* ep = b.CreateGEP(elemLlvmTy, data, fn->getArg(1), "elem_ptr");
-            b.CreateRet(b.CreateLoad(elemLlvmTy, ep, "val"));
+            // A slice only BORROWS its backing, so a by-value element must be a
+            // deep CLONE — a bitwise load would alias storage owned elsewhere
+            // (the source Vec/array) and double-free. Copy T is unchanged;
+            // slice_get_ref returns a borrow and needs no clone.
+            b.CreateRet(b.CreateCall(getOrEmitCloneFn(T), {ep}, "val"));
             declaredFns_[mangled] = fn;
             return fn;
         }
@@ -5285,7 +5305,12 @@ private:
             b.CreateCondBr(canRead, inBoundsBB, retZeroBB);
             b.SetInsertPoint(inBoundsBB);
             auto* elemPtr = b.CreateGEP(elemLlvmTy, data, idx, "elem_ptr");
-            auto* val = b.CreateLoad(elemLlvmTy, elemPtr, "val");
+            // vec_get returns the element BY VALUE while it STAYS in the vec, so
+            // the result must be an independent deep CLONE — a bitwise load
+            // would alias the vec's heap buffer and double-free once the vec
+            // drops its elements. Copy T clones to the same bits (common case
+            // unchanged); vec_get_ref returns a borrow and needs no clone.
+            auto* val = b.CreateCall(getOrEmitCloneFn(T), {elemPtr}, "val");
             b.CreateRet(val);
             b.SetInsertPoint(retZeroBB);
             b.CreateRet(llvm::Constant::getNullValue(elemLlvmTy));
@@ -7790,6 +7815,14 @@ private:
     // Compute an address (pointer) for an assignable place. Returns null
     // if the target shape isn't supported.
     llvm::Value* emitPlaceAddr(const ast::Expr& e) {
+        // Phase 51: the address of a deref place `*inner` IS the pointer value
+        // `inner` (it points at the dereferenced location). So `&*e` / `&**e`
+        // is just `e` evaluated to its pointer — closing the `&*` ergonomics
+        // that let `impl Eq for Box<T>` take `&T` out of a `&Box<T>`.
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e);
+            un && un->op == ast::UnaryOp::Deref) {
+            return emitExpr(*un->operand);
+        }
         if (auto* id = dynamic_cast<const ast::IdentExpr*>(&e)) {
             // Phase 17a: a by-ref capture's slot address IS the env pointer
             // into the enclosing variable's storage; storing through it makes
@@ -8690,6 +8723,47 @@ private:
     }
 
     llvm::Value* emitCall(const ast::CallExpr& call) {
+        // Phase 52: a GENERIC static call `T::method()` — resolve the bound Var
+        // to the concrete type at THIS monomorphization, then call that type's
+        // impl method (`__impl_<trait>_for_<concrete>__<method>`).
+        if (auto git = tc_.staticCallGeneric.find(&call);
+            git != tc_.staticCallGeneric.end()) {
+            const auto& sg = git->second;
+            std::string tn;
+            auto sit = currentSchemaVarSubst_.find(sg.boundedVarId);
+            if (sit != currentSchemaVarSubst_.end()) {
+                TypePtr c = resolveInInstance(sit->second);
+                if (c->kind == TypeKind::Struct) tn = c->structName;
+                else if (c->kind == TypeKind::Enum) tn = c->enumName;
+                else if (c->kind == TypeKind::Int) tn = "i64";
+                else if (c->kind == TypeKind::Float) tn = "f64";
+                else if (c->kind == TypeKind::Bool) tn = "bool";
+                else if (c->kind == TypeKind::Box) tn = "Box";
+            }
+            if (tn.empty()) {
+                errors_.push_back("codegen: generic static call " +
+                                  sg.traitName + "::" + sg.methodName +
+                                  " has no concrete type at instance");
+                return llvm::ConstantInt::get(
+                    llvm::Type::getInt64Ty(*ctx_), 0);
+            }
+            std::string mangled =
+                "__impl_" + sg.traitName + "_for_" + tn + "__" + sg.methodName;
+            auto fit = declaredFns_.find(mangled);
+            if (fit == declaredFns_.end()) {
+                errors_.push_back("codegen: generic static method body not "
+                                  "emitted: " + mangled);
+                return llvm::ConstantInt::get(
+                    llvm::Type::getInt64Ty(*ctx_), 0);
+            }
+            llvm::Function* fn = fit->second;
+            std::vector<llvm::Value*> args;
+            args.reserve(call.args.size());
+            for (const auto& a : call.args) args.push_back(emitConsume(*a));
+            return builder_->CreateCall(
+                fn, args,
+                fn->getReturnType()->isVoidTy() ? "" : "call_gstatic");
+        }
         // Phase 48: a qualified static call `Type::method(args)` resolved by the
         // typechecker to a concrete impl method (an associated / no-self trait
         // method like `P::default()`). Emit a direct call to the mangled impl
@@ -9447,8 +9521,17 @@ private:
         // object's data.
         TypePtr recvTy = lookupExprType(*mc.receiver);
         TypePtr recvR = recvTy ? resolveInInstance(recvTy) : nullptr;
-        bool recvIsPtr = recvR && (recvR->kind == TypeKind::Ref ||
-                                   recvR->kind == TypeKind::Box);
+        // Phase 51: when the method is impl'd ON `Box` itself (Self = Box<T>,
+        // e.g. `impl Clone for Box<T>`), a bare `Box<T>` receiver is the Self
+        // VALUE — pass its ADDRESS (&Box<T>), not the box pointer. Only a `&`
+        // layer makes it a pointer-to-Self. For every other impl (dispatch
+        // auto-derefs THROUGH the box to the inner T) a `Box<T>` forwards
+        // directly as the inner `&T`, the long-standing behavior.
+        bool implOnBox = (res.concreteTypeName == "Box");
+        bool recvIsPtr =
+            implOnBox ? (recvR && recvR->kind == TypeKind::Ref)
+                      : (recvR && (recvR->kind == TypeKind::Ref ||
+                                   recvR->kind == TypeKind::Box));
         llvm::Value* recv;
         if (selfByRef) {
             // `&self`: pass a pointer to the object. A pointer-shaped receiver

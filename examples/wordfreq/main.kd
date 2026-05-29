@@ -1,0 +1,75 @@
+// =====================================================================
+// wordfreq — a word-frequency histogram written entirely in kardashev.
+// The Roadmap v9 (Phase 56) capstone: a real DATA PIPELINE that exercises
+// the whole v9 line end to end.
+// =====================================================================
+//
+// Pipeline:  text --str_split/str_trim--> words            (P54 tokenizing)
+//                 --count in a HashMap<String,i64>-->       (P45/46 map ops)
+//                 --hashmap_entries--> Vec<(String,i64)>    (P55 entries)
+//                 --wrap in Count + sort--> ranked          (P47 sort, P48 derive Ord)
+//                 --print top-N-->                          (deterministic output)
+//
+// `Count` orders by frequency DESCENDING then word ASCENDING: we store the
+// NEGATED count as `n`, so the ascending `sort` (derived `Ord`, lexicographic
+// over (n, word)) yields most-frequent-first, ties broken by word. The whole
+// thing round-trips no I/O beyond stdout and is leak-free (every intermediate
+// Vec / String / HashMap drops at scope exit).
+
+#[derive(Ord, Eq, Clone)]
+struct Count { n: i64, word: String }
+
+// Tokenize on spaces, trim each token, and count non-empty words into a map.
+fn count_words(text: &String) -> HashMap<String, i64> ! { alloc } {
+    let words = str_split(text, 32);          // 32 = ' '
+    let mut m = hashmap_new();
+    let mut i = 0;
+    while i < vec_len(&words) {
+        let w = str_trim(vec_get_ref(&words, i));
+        if str_len(&w) > 0 {
+            let cur = match hashmap_get(&m, clone(&w)) { Some(c) => c, None => 0 };
+            hashmap_insert(&mut m, w, cur + 1);
+        } else {}
+        i = i + 1;
+    }
+    m
+}
+
+// Rank the map's entries: most frequent first, ties by word ascending.
+fn rank(m: &HashMap<String, i64>) -> Vec<Count> ! { alloc } {
+    let es = hashmap_entries(m);              // Vec<(String, i64)>
+    let mut cs = vec_new();
+    let mut i = 0;
+    while i < vec_len(&es) {
+        let e = vec_get_ref(&es, i);
+        vec_push(&mut cs, Count { n: 0 - e.1, word: e.0.clone() });  // negate for desc
+        i = i + 1;
+    }
+    sort(&mut cs);                            // ascending (n, word) == freq-desc
+    cs
+}
+
+fn main() -> i64 ! { io, alloc } {
+    let text = "the cat sat on the mat the cat ran";
+    let m = count_words(&text);
+    let ranked = rank(&m);
+
+    // print the top 3 as "word count" lines (deterministic, sorted).
+    let mut i = 0;
+    let mut top = 3;
+    if vec_len(&ranked) < top { top = vec_len(&ranked); } else {}
+    let mut sig = 0;
+    while i < top {
+        let c = vec_get_ref(&ranked, i);
+        let freq = 0 - c.n;                   // un-negate for display
+        let mut line = clone(&c.word);
+        string_push_str(&mut line, " ");
+        string_push_str(&mut line, int_to_string(freq));
+        println(&line);
+        // signal: pack the three frequencies as decimal digits (3,2,1 -> 321)
+        sig = sig * 10 + freq;
+        i = i + 1;
+    }
+    // expected: the=3, cat=2, mat=1 (tie among the 1-counts -> word asc) -> 321
+    sig
+}

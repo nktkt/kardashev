@@ -226,6 +226,17 @@ struct TypeCheckResult {
     // no-self trait method, e.g. `P::default()`) — the resolved LLVM-mangled
     // impl-method name codegen should call. Absent for ordinary calls.
     std::unordered_map<const ast::CallExpr*, std::string> staticCallMangled;
+    // Phase 52: a GENERIC static call `T::method()` where T is a bounded type
+    // param (e.g. `T::default()` for `<T: Default>`). Codegen resolves
+    // `boundedVarId` to the concrete type at the current monomorphization and
+    // calls `__impl_<trait>_for_<concrete>__<method>`.
+    struct StaticGenericCall {
+        std::string traitName;
+        std::string methodName;
+        int boundedVarId = -1;
+    };
+    std::unordered_map<const ast::CallExpr*, StaticGenericCall>
+        staticCallGeneric;
     // Per-MethodCallExpr resolution: which (trait, type) impl provides
     // the called method, plus the receiver-typeArgs context. Codegen
     // uses this to mangle the LLVM function name.

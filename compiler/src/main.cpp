@@ -222,6 +222,14 @@ std::string applyPrelude(const std::string& userSrc) {
             "        }\n"
             "        out\n"
             "    }\n"
+            "}\n"
+            // Phase 51 (v9): trait `Clone` for `Box<T>` — the v8 deferral, now
+            // that Box is a registrable impl target and `**self` / `&*` deref
+            // ergonomics work. Deep-clones the boxed value through T's own
+            // Clone, so `#[derive(Clone)]` covers a Box<T> field (recursive
+            // types) without falling back to the structural intrinsic.
+            "impl<T: Clone> Clone for Box<T> {\n"
+            "    fn clone(&self) -> Box<T> ! { alloc } { Box::new((**self).clone()) }\n"
             "}\n";
     }
     // Phase 41: a generic `impl<T: Eq> Eq for Vec<T>` (the `Eq` trait + its
@@ -274,6 +282,12 @@ std::string applyPrelude(const std::string& userSrc) {
             "            same\n"
             "        }\n"
             "    }\n"
+            "}\n"
+            // Phase 51 (v9): trait `Eq` for `Box<T>` — deep-compares the boxed
+            // values through T's own Eq (`&(**other)` is the `&*` deref that now
+            // lowers to the box pointer). Lets `#[derive(Eq)]` cover a Box field.
+            "impl<T: Eq> Eq for Box<T> {\n"
+            "    fn eq(&self, other: &Box<T>) -> bool { (**self).eq(&(**other)) }\n"
             "}\n";
     }
     // Phase 47 (v8): the `Ord` trait — `cmp(&self, &Self) -> i64` returning
@@ -414,6 +428,59 @@ std::string applyPrelude(const std::string& userSrc) {
             "    out\n"
             "}\n";
     }
+    // Phase 54 (v9): string tokenizing, written in kardashev over str_char_at /
+    // str_substring / str_len. `str_split` splits on a single byte (an empty
+    // piece between adjacent separators is kept); `str_trim` strips leading and
+    // trailing ASCII whitespace (space/tab/CR/LF). Guarded per-fn.
+    if (userSrc.find("fn __kd_is_ws") == std::string::npos &&
+        (userSrc.find("fn str_split") == std::string::npos ||
+         userSrc.find("fn str_trim") == std::string::npos)) {
+        prelude +=
+            "fn __kd_is_ws(c: i64) -> bool {\n"
+            "    if c == 32 { true } else { if c == 9 { true }"
+            " else { if c == 10 { true } else { if c == 13 { true }"
+            " else { false } } } }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_split") == std::string::npos) {
+        prelude +=
+            "fn str_split(s: &String, sep: i64) -> Vec<String> ! { alloc } {\n"
+            "    let mut out = vec_new();\n"
+            "    let n = str_len(s);\n"
+            "    let mut start = 0;\n"
+            "    let mut i = 0;\n"
+            "    while i < n {\n"
+            "        if str_char_at(s, i) == sep {\n"
+            "            vec_push(&mut out, str_substring(s, start, i - start));\n"
+            "            start = i + 1;\n"
+            "        } else {}\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    vec_push(&mut out, str_substring(s, start, n - start));\n"
+            "    out\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_trim") == std::string::npos) {
+        prelude +=
+            "fn str_trim(s: &String) -> String ! { alloc } {\n"
+            "    let n = str_len(s);\n"
+            "    let mut a = 0;\n"
+            "    let mut go = true;\n"
+            "    while go {\n"
+            "        if a >= n { go = false; }\n"
+            "        else { if __kd_is_ws(str_char_at(s, a)) { a = a + 1; }"
+            " else { go = false; } }\n"
+            "    }\n"
+            "    let mut b = n;\n"
+            "    let mut g2 = true;\n"
+            "    while g2 {\n"
+            "        if b <= a { g2 = false; }\n"
+            "        else { if __kd_is_ws(str_char_at(s, b - 1)) { b = b - 1; }"
+            " else { g2 = false; } }\n"
+            "    }\n"
+            "    str_substring(s, a, b - a)\n"
+            "}\n";
+    }
     // Phase 30: file I/O + CLI args. The low-level builtins (fs_read_into /
     // fs_write_raw / fs_exists / arg_count / arg_get) return a status category
     // (0=ok, 1=not-found, 2=permission, 4=other); these wrappers present the
@@ -483,6 +550,76 @@ std::string applyPrelude(const std::string& userSrc) {
             "fn option_map(o: Option<i64>, f: fn(i64) -> i64 ! {e})"
             " -> Option<i64> ! {e} {\n"
             "    match o { Some(x) => Some(f(x)), None => None }\n"
+            "}\n";
+    }
+    // Phase 53 (v9): generic Vec higher-order combinators over closures, each
+    // effect-polymorphic in the closure's effect row `e` (so a pure mapper
+    // keeps the caller pure, an allocating one adds `alloc`). The closure
+    // receives each element BY REFERENCE (`&T`); map/filter return fresh owned
+    // Vecs (filter deep-clones the kept elements — the source is only
+    // borrowed). NOTE: a closure passed here needs its param type annotated
+    // (`|x: &i64| ..`) — closure-param inference from a generic fn-typed param
+    // is not yet wired. Guarded per-fn so a user definition wins.
+    if (userSrc.find("fn vec_map") == std::string::npos) {
+        prelude +=
+            "fn vec_map<T, U, e>(v: &Vec<T>, f: fn(&T) -> U ! {e})"
+            " -> Vec<U> ! { alloc, e } {\n"
+            "    let mut out = vec_new();\n"
+            "    let mut i = 0;\n"
+            "    while i < vec_len(v) {\n"
+            "        vec_push(&mut out, f(vec_get_ref(v, i)));\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    out\n"
+            "}\n";
+    }
+    if (userSrc.find("fn vec_filter") == std::string::npos) {
+        prelude +=
+            "fn vec_filter<T, e>(v: &Vec<T>, pred: fn(&T) -> bool ! {e})"
+            " -> Vec<T> ! { alloc, e } {\n"
+            "    let mut out = vec_new();\n"
+            "    let mut i = 0;\n"
+            "    while i < vec_len(v) {\n"
+            "        let x = vec_get_ref(v, i);\n"
+            "        if pred(x) { vec_push(&mut out, clone(x)); } else {}\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    out\n"
+            "}\n";
+    }
+    if (userSrc.find("fn vec_fold") == std::string::npos) {
+        prelude +=
+            "fn vec_fold<T, A, e>(v: &Vec<T>, init: A, f: fn(A, &T) -> A ! {e})"
+            " -> A ! {e} {\n"
+            "    let mut acc = init;\n"
+            "    let mut i = 0;\n"
+            "    while i < vec_len(v) {\n"
+            "        acc = f(acc, vec_get_ref(v, i));\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    acc\n"
+            "}\n";
+    }
+    // Phase 55 (v9): enumerate a HashMap's entries as a Vec of (key, value)
+    // tuples (each deep-cloned, so the Vec owns them), so a map can be ranked /
+    // printed without manual key lookups. Bucket-order; the caller sorts (e.g.
+    // via a derived-Ord wrapper). Guarded.
+    if (userSrc.find("fn hashmap_entries") == std::string::npos) {
+        prelude +=
+            "fn hashmap_entries<K: Hash + Eq + Clone, V: Clone>"
+            "(m: &HashMap<K, V>) -> Vec<(K, V)> ! { alloc } {\n"
+            "    let mut out = vec_new();\n"
+            "    let ks = hashmap_keys(m);\n"
+            "    let mut i = 0;\n"
+            "    while i < vec_len(&ks) {\n"
+            "        let kref = vec_get_ref(&ks, i);\n"
+            "        match hashmap_get_ref(m, kref.clone()) {\n"
+            "            Some(vref) => { vec_push(&mut out, (kref.clone(), vref.clone())); },\n"
+            "            None => {},\n"
+            "        }\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    out\n"
             "}\n";
     }
     if (userSrc.find("fn option_unwrap_or") == std::string::npos) {
@@ -680,8 +817,11 @@ std::string deriveImplSource(const kardashev::ast::Program& prog) {
             } else if (d == "Default" && s.genericParams.empty()) {
                 // Phase 48: field-wise default. Leaf/container fields inline
                 // their default; a concrete nested user type uses its own
-                // Type::default() (a static call). Non-generic structs only —
-                // a generic field would need a generic static call (deferred).
+                // Type::default() static call. Non-generic structs only: a
+                // generic struct's `Pair::default()` would need a generic-TYPE
+                // static call (type args inferred from context + the static impl
+                // method monomorphized) — deferred. The Phase-52 bounded
+                // `T::default()` form (a generic PARAM) does work.
                 out += "impl Default for " + TN +
                        " { fn default() -> " + TN + " ! { alloc } { " + s.name +
                        " {";
