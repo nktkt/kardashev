@@ -388,6 +388,18 @@ public:
             sch.genericVars.push_back(vecFnGenericVar);
             fnSchemas_["vec_len"] = std::move(sch);
         }
+        // Phase 47: vec_swap<T>(v: &mut Vec<T>, i: i64, j: i64) -> i64 — exchange
+        // two element slots IN PLACE. Ownership-neutral (the two elements trade
+        // storage; no clone, no drop), so it works for non-Copy T — the
+        // primitive an in-place `sort<T: Ord>` needs.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(vecFnInst, /*isMut=*/true), makeInt(), makeInt()},
+                makeInt());
+            sch.genericVars.push_back(vecFnGenericVar);
+            fnSchemas_["vec_swap"] = std::move(sch);
+        }
         // Phase 35: clone<T>(x: &T) -> T ! { alloc } — a DEEP copy. The result
         // owns freshly-allocated heap storage (String buffer, Vec/HashMap
         // backing array, Box payload — recursively), so the clone and the
@@ -3664,6 +3676,16 @@ private:
                     }
                 }
             }
+        }
+        // Phase 47: a `&mut T` reborrows as a shared `&T` — passing a mutable
+        // reference where an immutable one is expected is sound (shared access
+        // is the weaker capability), and bit-identical at codegen (both are
+        // plain pointers). Only mut->shared; never the reverse. This lets a
+        // `fn f(v: &mut Vec<T>)` call `vec_len(v)` / `vec_get_ref(v, i)` (whose
+        // params are `&Vec<T>`) without an explicit reborrow spelling.
+        if (expIsRef && !e->refIsMut && a->kind == TypeKind::Ref &&
+            a->refIsMut && unify(a->refInner, e->refInner)) {
+            return true;
         }
         return unify(actual, expected);
     }

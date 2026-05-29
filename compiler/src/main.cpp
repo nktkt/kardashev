@@ -269,6 +269,62 @@ std::string applyPrelude(const std::string& userSrc) {
             "    }\n"
             "}\n";
     }
+    // Phase 47 (v8): the `Ord` trait — `cmp(&self, &Self) -> i64` returning
+    // -1 / 0 / 1 (less / equal / greater) — with built-in impls for the
+    // ordered primitives (i64, f64, String; String is byte-wise lexicographic
+    // over str_char_at), plus a generic in-place `sort<T: Ord>(v: &mut Vec<T>)`
+    // (insertion sort over vec_swap — the first stdlib algorithm written over a
+    // user trait bound). All pure (no alloc): cmp reads, vec_swap exchanges
+    // slots. Guarded so a user-defined `Ord` wins.
+    if (userSrc.find("trait Ord") == std::string::npos) {
+        prelude +=
+            "trait Ord { fn cmp(&self, other: &Self) -> i64; }\n"
+            "impl Ord for i64 { fn cmp(&self, other: &i64) -> i64 {\n"
+            "    if *self < *other { 0 - 1 } else { if *self > *other { 1 } else { 0 } } } }\n"
+            "impl Ord for f64 { fn cmp(&self, other: &f64) -> i64 {\n"
+            "    if *self < *other { 0 - 1 } else { if *self > *other { 1 } else { 0 } } } }\n"
+            // String compare: byte-wise lexicographic. A shorter string that is
+            // a prefix of the longer compares less. No allocation.
+            "impl Ord for String { fn cmp(&self, other: &String) -> i64 {\n"
+            "    let la = str_len(self);\n"
+            "    let lb = str_len(other);\n"
+            "    let mut i = 0;\n"
+            "    let mut res = 0;\n"
+            "    let mut go = true;\n"
+            "    while go {\n"
+            "        if i >= la {\n"
+            "            if i >= lb { res = 0; } else { res = 0 - 1; }\n"
+            "            go = false;\n"
+            "        } else { if i >= lb { res = 1; go = false; }\n"
+            "        else {\n"
+            "            let ca = str_char_at(self, i);\n"
+            "            let cb = str_char_at(other, i);\n"
+            "            if ca < cb { res = 0 - 1; go = false; }\n"
+            "            else { if ca > cb { res = 1; go = false; } else { i = i + 1; } }\n"
+            "        } }\n"
+            "    }\n"
+            "    res\n"
+            "} }\n"
+            // Generic in-place sort: insertion sort, stable, O(n^2) — adequate
+            // for the canonical-key-ordering the JSON capstone needs; swaps via
+            // the ownership-neutral vec_swap so non-Copy T (e.g. String) is fine.
+            "fn sort<T: Ord>(v: &mut Vec<T>) ! {} {\n"
+            "    let n = vec_len(v);\n"
+            "    let mut i = 1;\n"
+            "    while i < n {\n"
+            "        let mut j = i;\n"
+            "        let mut go = true;\n"
+            "        while go {\n"
+            "            if j > 0 {\n"
+            "                let c = vec_get_ref(v, j - 1).cmp(vec_get_ref(v, j));\n"
+            "                if c > 0 { vec_swap(v, j - 1, j); j = j - 1; }\n"
+            "                else { go = false; }\n"
+            "            } else { go = false; }\n"
+            "        }\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "}\n";
+    }
     // Phase 43: runtime string escape decode/encode for JSON-style strings,
     // written in kardashev over str_push_byte / str_char_at. `\\uXXXX` decodes
     // the Latin-1 subset (cp < 256); higher code points become '?' (documented).
