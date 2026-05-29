@@ -495,6 +495,15 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 54 (v9): string tokenizing — str_split (split on a byte, empty pieces
+# kept) + str_trim (ASCII whitespace), written in kardashev. JIT + AOT +
+# constant-memory gate.
+sh_test(
+    name = "smoke_test_phase54",
+    srcs = ["smoke_test_phase54.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

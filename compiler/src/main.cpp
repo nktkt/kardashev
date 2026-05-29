@@ -428,6 +428,59 @@ std::string applyPrelude(const std::string& userSrc) {
             "    out\n"
             "}\n";
     }
+    // Phase 54 (v9): string tokenizing, written in kardashev over str_char_at /
+    // str_substring / str_len. `str_split` splits on a single byte (an empty
+    // piece between adjacent separators is kept); `str_trim` strips leading and
+    // trailing ASCII whitespace (space/tab/CR/LF). Guarded per-fn.
+    if (userSrc.find("fn __kd_is_ws") == std::string::npos &&
+        (userSrc.find("fn str_split") == std::string::npos ||
+         userSrc.find("fn str_trim") == std::string::npos)) {
+        prelude +=
+            "fn __kd_is_ws(c: i64) -> bool {\n"
+            "    if c == 32 { true } else { if c == 9 { true }"
+            " else { if c == 10 { true } else { if c == 13 { true }"
+            " else { false } } } }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_split") == std::string::npos) {
+        prelude +=
+            "fn str_split(s: &String, sep: i64) -> Vec<String> ! { alloc } {\n"
+            "    let mut out = vec_new();\n"
+            "    let n = str_len(s);\n"
+            "    let mut start = 0;\n"
+            "    let mut i = 0;\n"
+            "    while i < n {\n"
+            "        if str_char_at(s, i) == sep {\n"
+            "            vec_push(&mut out, str_substring(s, start, i - start));\n"
+            "            start = i + 1;\n"
+            "        } else {}\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    vec_push(&mut out, str_substring(s, start, n - start));\n"
+            "    out\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_trim") == std::string::npos) {
+        prelude +=
+            "fn str_trim(s: &String) -> String ! { alloc } {\n"
+            "    let n = str_len(s);\n"
+            "    let mut a = 0;\n"
+            "    let mut go = true;\n"
+            "    while go {\n"
+            "        if a >= n { go = false; }\n"
+            "        else { if __kd_is_ws(str_char_at(s, a)) { a = a + 1; }"
+            " else { go = false; } }\n"
+            "    }\n"
+            "    let mut b = n;\n"
+            "    let mut g2 = true;\n"
+            "    while g2 {\n"
+            "        if b <= a { g2 = false; }\n"
+            "        else { if __kd_is_ws(str_char_at(s, b - 1)) { b = b - 1; }"
+            " else { g2 = false; } }\n"
+            "    }\n"
+            "    str_substring(s, a, b - a)\n"
+            "}\n";
+    }
     // Phase 30: file I/O + CLI args. The low-level builtins (fs_read_into /
     // fs_write_raw / fs_exists / arg_count / arg_get) return a status category
     // (0=ok, 1=not-found, 2=permission, 4=other); these wrappers present the
