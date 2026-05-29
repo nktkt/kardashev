@@ -467,6 +467,16 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 51 (v9): Box<T> is a registrable impl target (method dispatch prefers a
+# Box impl over auto-deref) + `&*`/`**` deref ergonomics, so the prelude ships
+# Clone/Eq for Box<T> and #[derive(Clone, Eq)] covers a Box field (recursive
+# types). JIT + AOT.
+sh_test(
+    name = "smoke_test_phase51",
+    srcs = ["smoke_test_phase51.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

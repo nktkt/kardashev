@@ -1093,6 +1093,7 @@ public:
             else if (rfor->kind == TypeKind::Int) typeName = "i64";
             else if (rfor->kind == TypeKind::Float) typeName = "f64";  // Phase 44
             else if (rfor->kind == TypeKind::Bool) typeName = "bool";
+            else if (rfor->kind == TypeKind::Box) typeName = "Box";    // Phase 51
             else {
                 error("impl for unsupported type " + typeToString(forTy),
                       impl.forType.line, impl.forType.column);
@@ -3805,11 +3806,18 @@ private:
         }
 
         // Phase 2.4b auto-deref: if the receiver is `&T` (or `&mut T`),
-        // dispatch as though the receiver were the underlying `T`. Phase
-        // 2.4c will refine this so impls of `Trait for &T` (when written
-        // explicitly) take precedence over implicit deref. Phase 11: a
+        // dispatch as though the receiver were the underlying `T`. Phase 11: a
         // `Box<Concrete>` derefs the same way (method call through the box).
-        while (r->kind == TypeKind::Ref || r->kind == TypeKind::Box)
+        // Phase 51: but STOP peeling at a `Box` that ITSELF has an impl of the
+        // called method (e.g. `impl<T: Clone> Clone for Box<T>`), so
+        // `box.clone()` reaches the Box impl rather than the inner T's. A `&` is
+        // always peeled (no `impl for &T`).
+        auto boxHasMethod = [&](const std::string& m) {
+            auto it = methodImplLookup_.find("Box");
+            return it != methodImplLookup_.end() && it->second.count(m) > 0;
+        };
+        while (r->kind == TypeKind::Ref ||
+               (r->kind == TypeKind::Box && !boxHasMethod(mc.methodName)))
             r = resolve(r->refInner);
 
         // Case A: receiver is a generic-param Var. The fn must have a
@@ -3901,6 +3909,7 @@ private:
         else if (r->kind == TypeKind::Int) typeName = "i64";
         else if (r->kind == TypeKind::Float) typeName = "f64";  // Phase 44
         else if (r->kind == TypeKind::Bool) typeName = "bool";
+        else if (r->kind == TypeKind::Box) typeName = "Box";    // Phase 51
         else {
             error("method call on unsupported receiver type " +
                       typeToString(recvT),
@@ -3983,7 +3992,12 @@ private:
         res.traitName = trait;
         res.methodName = mc.methodName;
         res.concreteTypeName = typeName;
-        res.receiverTypeArgs = r->typeArgs;
+        // Phase 51: a Box keeps its element in `refInner`, not `typeArgs`, so
+        // surface it as the single receiver type arg for monomorphizing the
+        // generic `impl<T> .. for Box<T>` method.
+        res.receiverTypeArgs =
+            r->kind == TypeKind::Box ? std::vector<TypePtr>{r->refInner}
+                                     : r->typeArgs;
         res.selfKind = instSig->args.empty()
                            ? ResolvedMethod::SelfKind::ByValue
                            : selfKindFromSlot(instSig->args[0]);

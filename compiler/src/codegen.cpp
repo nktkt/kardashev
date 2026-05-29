@@ -7790,6 +7790,14 @@ private:
     // Compute an address (pointer) for an assignable place. Returns null
     // if the target shape isn't supported.
     llvm::Value* emitPlaceAddr(const ast::Expr& e) {
+        // Phase 51: the address of a deref place `*inner` IS the pointer value
+        // `inner` (it points at the dereferenced location). So `&*e` / `&**e`
+        // is just `e` evaluated to its pointer — closing the `&*` ergonomics
+        // that let `impl Eq for Box<T>` take `&T` out of a `&Box<T>`.
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e);
+            un && un->op == ast::UnaryOp::Deref) {
+            return emitExpr(*un->operand);
+        }
         if (auto* id = dynamic_cast<const ast::IdentExpr*>(&e)) {
             // Phase 17a: a by-ref capture's slot address IS the env pointer
             // into the enclosing variable's storage; storing through it makes
@@ -9447,8 +9455,17 @@ private:
         // object's data.
         TypePtr recvTy = lookupExprType(*mc.receiver);
         TypePtr recvR = recvTy ? resolveInInstance(recvTy) : nullptr;
-        bool recvIsPtr = recvR && (recvR->kind == TypeKind::Ref ||
-                                   recvR->kind == TypeKind::Box);
+        // Phase 51: when the method is impl'd ON `Box` itself (Self = Box<T>,
+        // e.g. `impl Clone for Box<T>`), a bare `Box<T>` receiver is the Self
+        // VALUE — pass its ADDRESS (&Box<T>), not the box pointer. Only a `&`
+        // layer makes it a pointer-to-Self. For every other impl (dispatch
+        // auto-derefs THROUGH the box to the inner T) a `Box<T>` forwards
+        // directly as the inner `&T`, the long-standing behavior.
+        bool implOnBox = (res.concreteTypeName == "Box");
+        bool recvIsPtr =
+            implOnBox ? (recvR && recvR->kind == TypeKind::Ref)
+                      : (recvR && (recvR->kind == TypeKind::Ref ||
+                                   recvR->kind == TypeKind::Box));
         llvm::Value* recv;
         if (selfByRef) {
             // `&self`: pass a pointer to the object. A pointer-shaped receiver

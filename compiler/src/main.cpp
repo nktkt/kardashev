@@ -222,6 +222,14 @@ std::string applyPrelude(const std::string& userSrc) {
             "        }\n"
             "        out\n"
             "    }\n"
+            "}\n"
+            // Phase 51 (v9): trait `Clone` for `Box<T>` — the v8 deferral, now
+            // that Box is a registrable impl target and `**self` / `&*` deref
+            // ergonomics work. Deep-clones the boxed value through T's own
+            // Clone, so `#[derive(Clone)]` covers a Box<T> field (recursive
+            // types) without falling back to the structural intrinsic.
+            "impl<T: Clone> Clone for Box<T> {\n"
+            "    fn clone(&self) -> Box<T> ! { alloc } { Box::new((**self).clone()) }\n"
             "}\n";
     }
     // Phase 41: a generic `impl<T: Eq> Eq for Vec<T>` (the `Eq` trait + its
@@ -274,6 +282,12 @@ std::string applyPrelude(const std::string& userSrc) {
             "            same\n"
             "        }\n"
             "    }\n"
+            "}\n"
+            // Phase 51 (v9): trait `Eq` for `Box<T>` — deep-compares the boxed
+            // values through T's own Eq (`&(**other)` is the `&*` deref that now
+            // lowers to the box pointer). Lets `#[derive(Eq)]` cover a Box field.
+            "impl<T: Eq> Eq for Box<T> {\n"
+            "    fn eq(&self, other: &Box<T>) -> bool { (**self).eq(&(**other)) }\n"
             "}\n";
     }
     // Phase 47 (v8): the `Ord` trait — `cmp(&self, &Self) -> i64` returning
