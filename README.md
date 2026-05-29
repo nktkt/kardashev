@@ -298,6 +298,40 @@ Iterator stdlib; 22's arrays fed 25's const-generic lengths; 23 built on v3's Dr
 24's FFI + 26's capstone pair up), each verified — clean build + direct behavior
 checks — and CI-green on ubuntu + macOS before the next built on it.
 
+## Roadmap v5 — planned
+
+v4 proved kardashev can compile a real program written *in itself* (`examples/calc/`).
+v5's **north star** is to make that no longer a demo: compile two genuinely non-trivial
+tools written in kardashev — a **JSON parser** (`examples/json/`) and a **kardashev-subset
+lexer/parser** (`examples/kdlex/`) — as green capstones, standing on a deeper stdlib, a
+leak-free memory model, and accurate docs. The **theme** is to close, one verifiable
+dependency layer at a time, the stdlib/collection/soundness gaps that today block writing
+real programs in the language. *This section is the plan — these phases are not yet
+implemented.* As in v1–v4, each phase will ship fully green (`Makefile.local` + a new smoke
+test, CI on ubuntu + macOS) before the next builds on it, and anything unverifiable in this
+build environment stays documented-deferred, never stubbed.
+
+| Phase | Goal | Status |
+|-------|------|--------|
+| 27 | **String toolkit** | 🎯 planned. Today's only string ops are `print_str` / `str_len` / `str_char_at` and an `i64`-only `print`; add `str_eq`, `str_substring` (byte slice), `int_to_string`, and `println(&str)` so a self-written tool can compare, format, and emit text. Verified by a JIT+AOT smoke test. |
+| 28 | **`Hash` trait + generic map/set keys** | 🎯 planned. `HashMap` keys are pinned to `i64` today (the typechecker rejects any other key — "no Hash trait yet"). Land a `Hash` trait and generalize to `HashMap<K, V>` for `K: Hash + Eq` — which first needs multiple-bounds-per-param (`T: A + B`, not yet in the grammar) — plus `HashSet<T>`. Verified at `i64` + `String` keys, JIT+AOT. |
+| 29 | **Plug the documented Drop leaks** | 🎯 planned. Closure-env structs, async-frame contents, and enum/`match`-payload bindings are not dropped yet (the documented Phase-16 leak — no UAF, but they leak). Run Drop glue through all three so a loop that captures, awaits, or destructures droppable values runs in **constant memory**, extending the Phase-16 guarantee. Verified with a constant-RSS loop test (à la Phase 16/23). *(Dynamic array-index OOB already panics as of Phase 23 — not part of this phase.)* |
+| 30 | **File I/O + CLI args** | 🎯 planned. `fs_read_to_string` / `fs_write` / `fs_exists` returning `Result<_, IoError>` (carrying the `io` effect, lowered through the Phase-24 `extern "C"` path) and `args()` for argv. Verified here on Linux; macOS readiness rides CI. |
+| 31 | **Capstone: a JSON parser + a kd-subset parser, written in kardashev** | 🎯 planned. `examples/json/` (string → AST → value) and `examples/kdlex/` (a kardashev-subset lexer/parser) consuming the Phase 27–30 stdlib, with fixture-driven smoke tests. **The north star** — a real SUBSET self-parse exercising the stdlib end to end, no new language features. |
+| 32 | **Docs + source-comment truth pass** | 🎯 planned. `docs/` still describes the language at roughly Phase 7 / v2, and several source comments label now-fully-working async code as "Phase 6 (stub)". Rewrite `docs/` through v5 and purge the stale markers; a doc-lint check guards against regression. |
+
+**Documented-deferred (carried forward unchanged, never stubbed):** third-party dependency
+resolution via the Bazel module registry (Bazel can't run in this build environment;
+`mod foo;` + `kard.toml` local-path deps are what ship) and macOS/kqueue async fd-readiness
+(Linux/`epoll` only here; timers work cross-platform, and CI covers macOS).
+
+Plan lands in order **27 → 28 → 29 → 30 → 31 → 32** — a deliberate dependency arc: 27's
+strings feed 28's string-key hashing and 31's AST dumps; 28's `Hash` trait must precede
+generic keys; 29 plugs the Drop leaks once 27–28 introduce new droppable values that make
+them load-bearing; 30's `Result<String, IoError>` drops cleanly on the error path *because*
+29 closed that hole; 31 integrates 27–30 into the self-written capstones; 32 documents the
+result last. Each ships green before the next, exactly as v1–v4 did.
+
 ## Why "kardashev"?
 
 The [Kardashev scale](https://en.wikipedia.org/wiki/Kardashev_scale) ranks civilizations by how much energy they can harness. A systems language, in its own small way, is about controlling resources at scale — a fitting name for one that aims to be precise about effects, ownership, and computation.
