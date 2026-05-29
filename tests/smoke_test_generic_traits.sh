@@ -205,8 +205,10 @@ fn main() -> i64 {
     fold(1..=10, 0, add)
 }' 55
 
-# 6. Negative: a generic trait used as `dyn` is rejected (no generic trait
-# objects this phase). The diagnostic must mention it is not supported.
+# 6. Phase 49: a generic trait CAN now be used as a trait object when its type
+# args are supplied (`dyn Iterator<i64>`); see smoke_test_phase49 for dispatch.
+# The remaining negative is an arity MISMATCH — a bare `dyn Iterator` (no
+# `<...>`) for a 1-param trait is rejected with a "trait type arg" diagnostic.
 cat > "$TMP/dyn_generic.kd" <<'EOF'
 trait Iterator<T> { fn next(&mut self) -> T; }
 fn use_it(it: &dyn Iterator) -> i64 { 0 }
@@ -217,14 +219,14 @@ DYN_OUT=$("$KARDC" "$TMP/dyn_generic.kd" 2>&1)
 DYN_RC=$?
 set -e
 if [[ "$DYN_RC" -eq 0 ]]; then
-    echo "FAIL [dyn_generic_rejected]: dyn of a generic trait should be rejected"
+    echo "FAIL [dyn_generic_arity]: bare `dyn Iterator` (missing <T>) should be rejected"
     exit 1
 fi
-if ! echo "$DYN_OUT" | grep -qi 'not supported'; then
-    echo "FAIL [dyn_generic_rejected]: expected a 'not supported' diagnostic, got:"
+if ! echo "$DYN_OUT" | grep -qi 'trait type arg'; then
+    echo "FAIL [dyn_generic_arity]: expected a 'trait type arg' arity diagnostic, got:"
     echo "$DYN_OUT"
     exit 1
 fi
-echo "PASS [dyn_generic_rejected]: dyn of a generic trait is rejected"
+echo "PASS [dyn_generic_arity]: bare dyn of a 1-param trait is rejected (arity)"
 
-echo "PASS: generic trait params work in JIT + AOT (Container<T> at i64+bool; head<T, C: Container<T>>; Iterator<bool> via for; fold over bool; i64 iteration + <I: Iterator> regression; dyn-generic rejected)"
+echo "PASS: generic trait params work in JIT + AOT (Container<T> at i64+bool; head<T, C: Container<T>>; Iterator<bool> via for; fold over bool; i64 iteration + <I: Iterator> regression; dyn-generic arity checked)"

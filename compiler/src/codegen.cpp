@@ -5344,6 +5344,56 @@ private:
             declaredFns_[mangled] = fn;
             return fn;
         }
+        if (op == "vec_swap") {
+            // Phase 47: vec_swap(v: &mut Vec<T>, i, j) — exchange the two slots'
+            // raw element values. Ownership-neutral: the two T values trade
+            // storage (a plain load/store swap of `elemLlvmTy`), so no clone or
+            // drop runs and it is sound for non-Copy T. Out-of-range / equal
+            // indices are no-ops (guarded), so an in-place sort can call it
+            // freely. Returns 0.
+            auto* fnTy = llvm::FunctionType::get(
+                i64Ty, {vecPtrTy, i64Ty, i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+            fn->getArg(0)->setName("v");
+            fn->getArg(1)->setName("i");
+            fn->getArg(2)->setName("j");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* doBB = llvm::BasicBlock::Create(ctx, "do_swap", fn);
+            auto* retBB = llvm::BasicBlock::Create(ctx, "ret", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* data = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(vecTy, fn->getArg(0), 0, "data_ptr"),
+                "data");
+            auto* len = b.CreateLoad(
+                i64Ty, b.CreateStructGEP(vecTy, fn->getArg(0), 1, "len_ptr"),
+                "len");
+            auto* i = fn->getArg(1);
+            auto* j = fn->getArg(2);
+            auto* iOk = b.CreateAnd(b.CreateICmpSGE(i, zero, "i_nn"),
+                                    b.CreateICmpSLT(i, len, "i_lt"), "i_ok");
+            auto* jOk = b.CreateAnd(b.CreateICmpSGE(j, zero, "j_nn"),
+                                    b.CreateICmpSLT(j, len, "j_lt"), "j_ok");
+            auto* dataOk = b.CreateICmpNE(
+                data, llvm::Constant::getNullValue(i8PtrTy), "data_nn");
+            auto* idxNe = b.CreateICmpNE(i, j, "idx_ne");
+            auto* ok = b.CreateAnd(
+                b.CreateAnd(b.CreateAnd(iOk, jOk, "ij_ok"), dataOk, "ijd_ok"),
+                idxNe, "swap_ok");
+            b.CreateCondBr(ok, doBB, retBB);
+            b.SetInsertPoint(doBB);
+            auto* pi = b.CreateGEP(elemLlvmTy, data, i, "slot_i");
+            auto* pj = b.CreateGEP(elemLlvmTy, data, j, "slot_j");
+            auto* vi = b.CreateLoad(elemLlvmTy, pi, "elem_i");
+            auto* vj = b.CreateLoad(elemLlvmTy, pj, "elem_j");
+            b.CreateStore(vj, pi);
+            b.CreateStore(vi, pj);
+            b.CreateBr(retBB);
+            b.SetInsertPoint(retBB);
+            b.CreateRet(zero);
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
         return nullptr;
     }
 
@@ -8640,6 +8690,27 @@ private:
     }
 
     llvm::Value* emitCall(const ast::CallExpr& call) {
+        // Phase 48: a qualified static call `Type::method(args)` resolved by the
+        // typechecker to a concrete impl method (an associated / no-self trait
+        // method like `P::default()`). Emit a direct call to the mangled impl
+        // function; its body is codegen'd via the normal impl-method path.
+        if (auto sit = tc_.staticCallMangled.find(&call);
+            sit != tc_.staticCallMangled.end()) {
+            auto fit = declaredFns_.find(sit->second);
+            if (fit == declaredFns_.end()) {
+                errors_.push_back("codegen: static method body not emitted: " +
+                                  sit->second);
+                return llvm::ConstantInt::get(
+                    llvm::Type::getInt64Ty(*ctx_), 0);
+            }
+            llvm::Function* fn = fit->second;
+            std::vector<llvm::Value*> args;
+            args.reserve(call.args.size());
+            for (const auto& a : call.args) args.push_back(emitConsume(*a));
+            return builder_->CreateCall(
+                fn, args,
+                fn->getReturnType()->isVoidTy() ? "" : "call_static");
+        }
         // Phase 19: lazily declare the OS-thread + Mutex runtime (pthread
         // externs + trampoline + thread_*/mutex_* bodies) the first time any
         // of those builtins is called, then fall through to the normal
@@ -8712,7 +8783,7 @@ private:
             // body — synthesize their specialization directly.
             if ((call.callee == "vec_new" || call.callee == "vec_push" ||
                  call.callee == "vec_get" || call.callee == "vec_get_ref" ||
-                 call.callee == "vec_len") &&
+                 call.callee == "vec_len" || call.callee == "vec_swap") &&
                 !concreteTypeArgs.empty()) {
                 llvm::Function* fn =
                     getOrEmitVecOp(call.callee, concreteTypeArgs[0]);
@@ -8725,7 +8796,9 @@ private:
                 std::vector<llvm::Value*> args;
                 args.reserve(call.args.size());
                 for (const auto& a : call.args) args.push_back(emitConsume(*a));
-                return builder_->CreateCall(fn, args, "call_" + call.callee);
+                return builder_->CreateCall(
+                fn, args,
+                fn->getReturnType()->isVoidTy() ? "" : "call_" + call.callee);
             }
             // Phase 35: `clone<T>(&T) -> T` deep-copies via a per-type clone fn.
             // The argument is a `&T` borrow, so emitConsume yields the pointer
@@ -8750,7 +8823,9 @@ private:
                 std::vector<llvm::Value*> args;
                 args.reserve(call.args.size());
                 for (const auto& a : call.args) args.push_back(emitConsume(*a));
-                return builder_->CreateCall(fn, args, "call_" + call.callee);
+                return builder_->CreateCall(
+                fn, args,
+                fn->getReturnType()->isVoidTy() ? "" : "call_" + call.callee);
             }
             // Phase 17b: `block_on<T>` is a generic built-in with no AST body
             // — synthesize a per-result-type executor (mirrors vec_*). T is
@@ -8807,7 +8882,9 @@ private:
                 std::vector<llvm::Value*> args;
                 args.reserve(call.args.size());
                 for (const auto& a : call.args) args.push_back(emitConsume(*a));
-                return builder_->CreateCall(fn, args, "call_" + call.callee);
+                return builder_->CreateCall(
+                fn, args,
+                fn->getReturnType()->isVoidTy() ? "" : "call_" + call.callee);
             }
             // Phase 28: `hashset_*<T>` over the HashMap-backed set table.
             if ((call.callee == "hashset_new" ||
@@ -8826,7 +8903,9 @@ private:
                 std::vector<llvm::Value*> args;
                 args.reserve(call.args.size());
                 for (const auto& a : call.args) args.push_back(emitConsume(*a));
-                return builder_->CreateCall(fn, args, "call_" + call.callee);
+                return builder_->CreateCall(
+                fn, args,
+                fn->getReturnType()->isVoidTy() ? "" : "call_" + call.callee);
             }
             const std::string mangled =
                 mangleInstance(call.callee, concreteTypeArgs);
@@ -8856,7 +8935,9 @@ private:
             for (const auto& a : call.args) {
                 args.push_back(emitConsume(*a));
             }
-            return builder_->CreateCall(fn, args, "call_" + call.callee);
+            return builder_->CreateCall(
+                fn, args,
+                fn->getReturnType()->isVoidTy() ? "" : "call_" + call.callee);
         }
 
         // Phase 24: a user `extern "C" fn` call. Routed here (before the
@@ -8875,7 +8956,9 @@ private:
             for (const auto& a : call.args) {
                 args.push_back(emitConsume(*a));
             }
-            return builder_->CreateCall(fn, args, "call_" + call.callee);
+            return builder_->CreateCall(
+                fn, args,
+                fn->getReturnType()->isVoidTy() ? "" : "call_" + call.callee);
         }
         // Constructor with payload (e.g. `Some(42)`).
         if (auto vit = tc_.variantIndex.find(call.callee);
@@ -9299,6 +9382,8 @@ private:
                 targetTypeName = "i64";
             else if (concrete->kind == TypeKind::Bool)
                 targetTypeName = "bool";
+            else if (concrete->kind == TypeKind::Float) // Phase 47
+                targetTypeName = "f64";
             else {
                 errors_.push_back(
                     "codegen: bounded-generic receiver resolved to "

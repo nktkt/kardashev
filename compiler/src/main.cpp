@@ -119,7 +119,14 @@ std::string applyPrelude(const std::string& userSrc) {
             "trait Hash { fn hash(&self) -> i64; }\n"
             "impl Hash for i64 { fn hash(&self) -> i64 { hash_i64(self) } }\n"
             "impl Hash for String"
-            " { fn hash(&self) -> i64 { hash_string(self) } }\n";
+            " { fn hash(&self) -> i64 { hash_string(self) } }\n"
+            // Phase 48: bool / f64 Hash, so #[derive(Hash)] covers those fields.
+            // bool -> 0/1; f64 -> hash of its truncated-to-i64 value (lossy but
+            // valid — Eq disambiguates collisions; float map keys are rare).
+            "impl Hash for bool"
+            " { fn hash(&self) -> i64 { if *self { 1 } else { 0 } } }\n"
+            "impl Hash for f64"
+            " { fn hash(&self) -> i64 { let v = float_to_int(*self); hash_i64(&v) } }\n";
     }
     if (userSrc.find("trait Eq") == std::string::npos) {
         prelude +=
@@ -189,13 +196,33 @@ std::string applyPrelude(const std::string& userSrc) {
             "        out\n"
             "    }\n"
             "}\n"
-            // Phase 44: f64 Clone (scalar). (A generic HashMap Clone trait impl
-            // is NOT shipped: a generic `impl<K, V> .. for HashMap<K,V>` body
-            // can't yet satisfy the HashMap-op K: Hash+Eq requirement from a
-            // bounded type param — deferred. The `clone(&x)` intrinsic already
-            // deep-clones a HashMap structurally, so map cloning works via it.)
             "impl Clone for f64"
-            " { fn clone(&self) -> f64 ! { alloc } { *self } }\n";
+            " { fn clone(&self) -> f64 ! { alloc } { *self } }\n"
+            // Phase 46 (v8): the generic HashMap Clone trait impl — the v7
+            // deferral, unblocked by Phase 45 (a `K: Hash + Eq` bound now
+            // satisfies the container key gate from inside a generic body). A
+            // deep copy: enumerate keys (bucket-order), clone each key + value
+            // through their own Clone impls, rebuild. Requires K: Clone too
+            // (the keys are copied into the new map). This makes `#[derive(Clone)]`
+            // apply to a struct/enum with a HashMap field, and `map.clone()`
+            // dispatch through the trait. (The `clone(&x)` intrinsic still
+            // deep-clones structurally as the no-impl fallback.)
+            "impl<K: Hash + Eq + Clone, V: Clone> Clone for HashMap<K, V> {\n"
+            "    fn clone(&self) -> HashMap<K, V> ! { alloc } {\n"
+            "        let mut out = hashmap_new();\n"
+            "        let ks = hashmap_keys(self);\n"
+            "        let mut i = 0;\n"
+            "        while i < vec_len(&ks) {\n"
+            "            let kref = vec_get_ref(&ks, i);\n"
+            "            match hashmap_get_ref(self, kref.clone()) {\n"
+            "                Some(vref) => { hashmap_insert(&mut out, kref.clone(), vref.clone()); },\n"
+            "                None => {},\n"
+            "            }\n"
+            "            i = i + 1;\n"
+            "        }\n"
+            "        out\n"
+            "    }\n"
+            "}\n";
     }
     // Phase 41: a generic `impl<T: Eq> Eq for Vec<T>` (the `Eq` trait + its
     // i64/String impls are injected below) — element-wise deep equality, the
@@ -216,7 +243,109 @@ std::string applyPrelude(const std::string& userSrc) {
             "            same\n"
             "        }\n"
             "    }\n"
+            "}\n"
+            // Phase 46 (v8): the generic HashMap Eq trait impl — order-
+            // INDEPENDENT key-set + per-key value equality (the right notion
+            // for a map). Same length, then every key of `self` must be present
+            // in `other` with an equal value. The body allocates (it enumerates
+            // keys via hashmap_keys and clones keys for the by-value lookups), so
+            // the method is declared `! { alloc }` even though the `Eq` trait's
+            // `eq` is pure — a trait-impl method may carry MORE effects than the
+            // trait declares; static dispatch attributes the impl's real effects
+            // at the call site. Requires K: Clone (keys are cloned per lookup).
+            "impl<K: Hash + Eq + Clone, V: Eq> Eq for HashMap<K, V> {\n"
+            "    fn eq(&self, other: &HashMap<K, V>) -> bool ! { alloc } {\n"
+            "        if hashmap_len(self) != hashmap_len(other) { false }\n"
+            "        else {\n"
+            "            let ks = hashmap_keys(self);\n"
+            "            let mut i = 0;\n"
+            "            let mut same = true;\n"
+            "            while i < vec_len(&ks) {\n"
+            "                let kref = vec_get_ref(&ks, i);\n"
+            "                match hashmap_get_ref(self, kref.clone()) {\n"
+            "                    Some(sv) => match hashmap_get_ref(other, kref.clone()) {\n"
+            "                        Some(ov) => { if !sv.eq(ov) { same = false; } else {} },\n"
+            "                        None => { same = false; },\n"
+            "                    },\n"
+            "                    None => {},\n"
+            "                }\n"
+            "                i = i + 1;\n"
+            "            }\n"
+            "            same\n"
+            "        }\n"
+            "    }\n"
             "}\n";
+    }
+    // Phase 47 (v8): the `Ord` trait — `cmp(&self, &Self) -> i64` returning
+    // -1 / 0 / 1 (less / equal / greater) — with built-in impls for the
+    // ordered primitives (i64, f64, String; String is byte-wise lexicographic
+    // over str_char_at), plus a generic in-place `sort<T: Ord>(v: &mut Vec<T>)`
+    // (insertion sort over vec_swap — the first stdlib algorithm written over a
+    // user trait bound). All pure (no alloc): cmp reads, vec_swap exchanges
+    // slots. Guarded so a user-defined `Ord` wins.
+    if (userSrc.find("trait Ord") == std::string::npos) {
+        prelude +=
+            "trait Ord { fn cmp(&self, other: &Self) -> i64; }\n"
+            "impl Ord for i64 { fn cmp(&self, other: &i64) -> i64 {\n"
+            "    if *self < *other { 0 - 1 } else { if *self > *other { 1 } else { 0 } } } }\n"
+            "impl Ord for f64 { fn cmp(&self, other: &f64) -> i64 {\n"
+            "    if *self < *other { 0 - 1 } else { if *self > *other { 1 } else { 0 } } } }\n"
+            // String compare: byte-wise lexicographic. A shorter string that is
+            // a prefix of the longer compares less. No allocation.
+            "impl Ord for String { fn cmp(&self, other: &String) -> i64 {\n"
+            "    let la = str_len(self);\n"
+            "    let lb = str_len(other);\n"
+            "    let mut i = 0;\n"
+            "    let mut res = 0;\n"
+            "    let mut go = true;\n"
+            "    while go {\n"
+            "        if i >= la {\n"
+            "            if i >= lb { res = 0; } else { res = 0 - 1; }\n"
+            "            go = false;\n"
+            "        } else { if i >= lb { res = 1; go = false; }\n"
+            "        else {\n"
+            "            let ca = str_char_at(self, i);\n"
+            "            let cb = str_char_at(other, i);\n"
+            "            if ca < cb { res = 0 - 1; go = false; }\n"
+            "            else { if ca > cb { res = 1; go = false; } else { i = i + 1; } }\n"
+            "        } }\n"
+            "    }\n"
+            "    res\n"
+            "} }\n"
+            // Generic in-place sort: insertion sort, stable, O(n^2) — adequate
+            // for the canonical-key-ordering the JSON capstone needs; swaps via
+            // the ownership-neutral vec_swap so non-Copy T (e.g. String) is fine.
+            "fn sort<T: Ord>(v: &mut Vec<T>) ! {} {\n"
+            "    let n = vec_len(v);\n"
+            "    let mut i = 1;\n"
+            "    while i < n {\n"
+            "        let mut j = i;\n"
+            "        let mut go = true;\n"
+            "        while go {\n"
+            "            if j > 0 {\n"
+            "                let c = vec_get_ref(v, j - 1).cmp(vec_get_ref(v, j));\n"
+            "                if c > 0 { vec_swap(v, j - 1, j); j = j - 1; }\n"
+            "                else { go = false; }\n"
+            "            } else { go = false; }\n"
+            "        }\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "}\n";
+    }
+    // Phase 48 (v8): the `Default` trait — a STATIC (no-self) associated method
+    // `default() -> Self`, called as `Type::default()`. Built-in impls for the
+    // primitives + String + Vec<T>. Declared `! { alloc }` since constructing a
+    // default may allocate (String/Vec); a derived struct default builds its
+    // value field-wise (#[derive(Default)] — see deriveImplSource). Guarded so a
+    // user-defined `Default` wins.
+    if (userSrc.find("trait Default") == std::string::npos) {
+        prelude +=
+            "trait Default { fn default() -> Self ! { alloc }; }\n"
+            "impl Default for i64 { fn default() -> i64 ! { alloc } { 0 } }\n"
+            "impl Default for bool { fn default() -> bool ! { alloc } { false } }\n"
+            "impl Default for f64 { fn default() -> f64 ! { alloc } { 0.0 } }\n"
+            "impl Default for String { fn default() -> String ! { alloc } { \"\" } }\n"
+            "impl<T> Default for Vec<T> { fn default() -> Vec<T> ! { alloc } { vec_new() } }\n";
     }
     // Phase 43: runtime string escape decode/encode for JSON-style strings,
     // written in kardashev over str_push_byte / str_char_at. `\\uXXXX` decodes
@@ -390,7 +519,71 @@ std::string applyPrelude(const std::string& userSrc) {
 // (field-/payload-wise Clone, Eq, Display), then re-parse + append. Reuses the
 // real impl machinery (incl. generic impls, Phase 40) instead of hand-building
 // AST. A generic type's params each gain the derived trait as a bound.
+// Phase 46: does a DERIVED `eq` over this field/payload type allocate? True iff
+// the type is — or transitively contains — a HashMap/HashSet, whose Eq impl
+// enumerates keys (an `alloc`). `allocEqUserTypes` names the user struct/enums
+// already known (via the fixpoint below) to derive an allocating `eq`.
+static bool typeRefAllocEq(
+    const kardashev::ast::TypeRef& tr,
+    const std::unordered_set<std::string>& allocEqUserTypes) {
+    if (tr.name == "HashMap" || tr.name == "HashSet") return true;
+    if (allocEqUserTypes.count(tr.name)) return true;
+    for (const auto& a : tr.typeArgs)
+        if (typeRefAllocEq(a, allocEqUserTypes)) return true;
+    return false;
+}
+
 std::string deriveImplSource(const kardashev::ast::Program& prog) {
+    auto hasDerive = [](const std::vector<std::string>& ds,
+                        const char* d) -> bool {
+        for (const auto& x : ds)
+            if (x == d) return true;
+        return false;
+    };
+    // Phase 46: the set of derived types whose generated `eq` ALLOCATES, by
+    // least-fixpoint: a type allocates if it derives Eq and has a field/payload
+    // that is (or transitively contains) a map, OR another already-allocating
+    // derived type. Only such an `eq` is annotated `! { alloc }`; a map-free
+    // derived `eq` stays pure (so comparing pure structs needs no alloc
+    // context). Propagation is restricted to types that derive Eq — the only
+    // ones whose `eq` we know to be the generated, allocating form.
+    std::unordered_set<std::string> allocEq;
+    {
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (const auto& s : prog.structs) {
+                if (allocEq.count(s.name) || !hasDerive(s.derives, "Eq"))
+                    continue;
+                for (const auto& f : s.fields)
+                    if (typeRefAllocEq(f.type, allocEq)) {
+                        allocEq.insert(s.name);
+                        changed = true;
+                        break;
+                    }
+            }
+            for (const auto& e : prog.enums) {
+                if (allocEq.count(e.name) || !hasDerive(e.derives, "Eq"))
+                    continue;
+                bool hit = false;
+                for (const auto& v : e.variants) {
+                    for (const auto& pt : v.payloadTypes)
+                        if (typeRefAllocEq(pt, allocEq)) {
+                            hit = true;
+                            break;
+                        }
+                    if (hit) break;
+                }
+                if (hit) {
+                    allocEq.insert(e.name);
+                    changed = true;
+                }
+            }
+        }
+    }
+    auto eqEffect = [&](const std::string& name) -> const char* {
+        return allocEq.count(name) ? " ! { alloc }" : "";
+    };
     auto header = [](const std::vector<kardashev::ast::TypeParam>& ps,
                      const char* bound) -> std::string {
         if (ps.empty()) return "";
@@ -413,6 +606,22 @@ std::string deriveImplSource(const kardashev::ast::Program& prog) {
         }
         return s + ">";
     };
+    // Phase 48: the default-value expression for a field of the given type in a
+    // derived `default()`. Leaf primitives + containers are inlined (no static
+    // call needed); a concrete nested user type defers to its own
+    // `Type::default()`. A generic-param field would need a generic static
+    // call (deferred), so derive(Default) is emitted only for non-generic
+    // structs below.
+    auto defaultExprFor =
+        [](const kardashev::ast::TypeRef& tr) -> std::string {
+        if (tr.name == "i64") return "0";
+        if (tr.name == "bool") return "false";
+        if (tr.name == "f64") return "0.0";
+        if (tr.name == "String") return "\"\"";
+        if (tr.name == "Vec") return "vec_new()";
+        if (tr.name == "HashMap") return "hashmap_new()";
+        return tr.name + "::default()"; // concrete nested user type
+    };
     std::string out;
     for (const auto& s : prog.structs) {
         const std::string TN = tyName(s.name, s.genericParams);
@@ -427,7 +636,8 @@ std::string deriveImplSource(const kardashev::ast::Program& prog) {
                 out += " } } }\n";
             } else if (d == "Eq") {
                 out += "impl" + header(s.genericParams, "Eq") + " Eq for " + TN +
-                       " { fn eq(&self, other: &" + TN + ") -> bool { ";
+                       " { fn eq(&self, other: &" + TN + ") -> bool" +
+                       eqEffect(s.name) + " { ";
                 if (s.fields.empty()) out += "true";
                 for (std::size_t i = 0; i < s.fields.size(); ++i)
                     out += (i ? " && " : "") + ("self." + s.fields[i].name +
@@ -447,6 +657,38 @@ std::string deriveImplSource(const kardashev::ast::Program& prog) {
                            s.fields[i].name + ".to_string());";
                 }
                 out += " string_push_str(&mut out, \" }\"); out } }\n";
+            } else if (d == "Hash") {
+                // Phase 48: combine field hashes left-to-right (h = h*31 + fi).
+                out += "impl" + header(s.genericParams, "Hash") + " Hash for " +
+                       TN + " { fn hash(&self) -> i64 { let mut h = 17;";
+                for (const auto& f : s.fields)
+                    out += " h = h * 31 + self." + f.name + ".hash();";
+                out += " h } }\n";
+            } else if (d == "Ord") {
+                // Phase 48: lexicographic field compare — first non-equal field
+                // decides; all-equal => 0. Built as a nested if/else so each
+                // `cmp` is evaluated only until one differs.
+                out += "impl" + header(s.genericParams, "Ord") + " Ord for " +
+                       TN + " { fn cmp(&self, other: &" + TN + ") -> i64 { ";
+                std::string tail;
+                for (const auto& f : s.fields) {
+                    out += "let c = self." + f.name + ".cmp(&other." + f.name +
+                           "); if c != 0 { c } else { ";
+                    tail += " }";
+                }
+                out += "0" + tail + " } }\n";
+            } else if (d == "Default" && s.genericParams.empty()) {
+                // Phase 48: field-wise default. Leaf/container fields inline
+                // their default; a concrete nested user type uses its own
+                // Type::default() (a static call). Non-generic structs only —
+                // a generic field would need a generic static call (deferred).
+                out += "impl Default for " + TN +
+                       " { fn default() -> " + TN + " ! { alloc } { " + s.name +
+                       " {";
+                for (std::size_t i = 0; i < s.fields.size(); ++i)
+                    out += (i ? "," : "") + (" " + s.fields[i].name + ": " +
+                                             defaultExprFor(s.fields[i].type));
+                out += " } } }\n";
             }
         }
     }
@@ -480,8 +722,8 @@ std::string deriveImplSource(const kardashev::ast::Program& prog) {
                 out += " } } }\n";
             } else if (d == "Eq") {
                 out += "impl" + header(e.genericParams, "Eq") + " Eq for " + TN +
-                       " { fn eq(&self, other: &" + TN +
-                       ") -> bool { match self {";
+                       " { fn eq(&self, other: &" + TN + ") -> bool" +
+                       eqEffect(e.name) + " { match self {";
                 for (const auto& var : e.variants) {
                     out += " " + var.name;
                     if (!var.payloadTypes.empty()) {
@@ -537,6 +779,84 @@ std::string deriveImplSource(const kardashev::ast::Program& prog) {
                     }
                 }
                 out += " } } }\n";
+            } else if (d == "Hash") {
+                // Phase 48: hash = combine(variant ordinal, payload hashes).
+                out += "impl" + header(e.genericParams, "Hash") + " Hash for " +
+                       TN + " { fn hash(&self) -> i64 { match self {";
+                for (std::size_t v = 0; v < e.variants.size(); ++v) {
+                    const auto& var = e.variants[v];
+                    const std::string seed = std::to_string(527 + v); // 17*31+v
+                    out += " " + var.name;
+                    if (!var.payloadTypes.empty()) {
+                        out += "(";
+                        for (std::size_t i = 0; i < var.payloadTypes.size(); ++i)
+                            out += (i ? ", " : "") + ("x" + std::to_string(i));
+                        out += ")";
+                    }
+                    if (var.payloadTypes.empty()) {
+                        out += " => " + seed + ",";
+                    } else {
+                        out += " => { let mut h = " + seed + ";";
+                        for (std::size_t i = 0; i < var.payloadTypes.size(); ++i)
+                            out += " h = h * 31 + x" + std::to_string(i) +
+                                   ".hash();";
+                        out += " h },";
+                    }
+                }
+                out += " } } }\n";
+            } else if (d == "Ord") {
+                // Phase 48: lexicographic — compare variant ordinals first, then
+                // (for the same variant) payloads field-by-field. The two
+                // ordinal matches use `_` payload wildcards.
+                out += "impl" + header(e.genericParams, "Ord") + " Ord for " +
+                       TN + " { fn cmp(&self, other: &" + TN + ") -> i64 {";
+                auto ordinalMatch = [&](const char* scrut) {
+                    std::string m = std::string(" match ") + scrut + " {";
+                    for (std::size_t v = 0; v < e.variants.size(); ++v) {
+                        const auto& var = e.variants[v];
+                        m += " " + var.name;
+                        if (!var.payloadTypes.empty()) {
+                            m += "(";
+                            for (std::size_t i = 0;
+                                 i < var.payloadTypes.size(); ++i)
+                                m += (i ? ", " : "") + std::string("_");
+                            m += ")";
+                        }
+                        m += " => " + std::to_string(v) + ",";
+                    }
+                    return m + " }";
+                };
+                out += " let so =" + ordinalMatch("self") + ";";
+                out += " let oo =" + ordinalMatch("other") + ";";
+                out += " if so != oo { if so < oo { 0 - 1 } else { 1 } } else {";
+                out += " match self {";
+                for (const auto& var : e.variants) {
+                    out += " " + var.name;
+                    if (!var.payloadTypes.empty()) {
+                        out += "(";
+                        for (std::size_t i = 0; i < var.payloadTypes.size(); ++i)
+                            out += (i ? ", " : "") + ("a" + std::to_string(i));
+                        out += ")";
+                    }
+                    if (var.payloadTypes.empty()) {
+                        out += " => 0,";
+                    } else {
+                        out += " => match other { " + var.name + "(";
+                        for (std::size_t i = 0; i < var.payloadTypes.size(); ++i)
+                            out += (i ? ", " : "") + ("b" + std::to_string(i));
+                        out += ") => { ";
+                        std::string tail;
+                        for (std::size_t i = 0; i < var.payloadTypes.size();
+                             ++i) {
+                            out += "let c = a" + std::to_string(i) + ".cmp(b" +
+                                   std::to_string(i) + "); if c != 0 { c } else { ";
+                            tail += " }";
+                        }
+                        out += "0" + tail;
+                        out += " }, _ => 0 },";
+                    }
+                }
+                out += " } } } }\n";
             }
         }
     }

@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 # JSON capstone smoke test: the full nested-JSON example (examples/json/main.kd).
-# Roadmap v7 (Phase 44) — JSON 2.0: floats + string escapes + #[derive(Clone, Eq)].
-#   1. It parses `{"pi":3.14159,"msg":"a\nb","xs":[1.5,-2.0,true,null]}` into a
-#      recursive `#[derive(Clone, Eq)] enum Json` with `JNum(f64)`, decodes the
-#      runtime string escape, serializes back through a `Display` impl, RE-PARSES,
-#      and confirms a round trip via the DERIVED `Eq` (no hand-written json_eq).
-#      Returns the serialized byte length (51) on a successful round trip.
+# Roadmap v8 (Phase 50) — JSON 3.0: HashMap objects + full derive + canonical
+# sorted-key output.
+#   1. It parses `{ "b": 2, "a": [1, 2.5], "c": "x\ny" }` (keys OUT of order)
+#      into a recursive `#[derive(Clone, Eq)] enum Json` whose objects are a
+#      `JObj(HashMap<String, Json>)`, decodes the runtime string escape, then
+#      serializes through a `Display` impl that SORTS the map keys (P47 sort) for
+#      CANONICAL byte-stable output `{"a":[1,2.5],"b":2,"c":"x\ny"}`, RE-PARSES,
+#      and confirms a round trip via the DERIVED `Eq` — whose HashMap arm is
+#      ORDER-INDEPENDENT (no hand-written json_eq, no clone intrinsic).
+#      Returns the serialized byte length (30) on a successful round trip.
 #   2. A constant-memory gate: a 200k-iteration parse+serialize+drop loop holds
-#      peak RSS flat (recursive Drop frees the whole tree; the string builders
-#      free what they consume).
+#      peak RSS flat (recursive Drop frees the whole tree incl. the HashMaps;
+#      the string builders free what they consume).
 # JIT + AOT.
 set -euo pipefail
 
@@ -42,14 +46,14 @@ trap 'rm -rf "$TMP"' EXIT
 jit=$("$KARDC" "$SRC")
 echo "$jit"
 echo "$jit" | grep -q "round-trips = yes" || { echo "FAIL: round-trip not confirmed"; exit 1; }
-echo "$jit" | grep -q 'serialized = {"pi":3.14159,"msg":"a\\nb","xs":\[1.5,-2,true,null\]}' \
-    || { echo "FAIL: serialized form unexpected"; exit 1; }
+echo "$jit" | grep -q 'serialized = {"a":\[1,2.5\],"b":2,"c":"x\\ny"}' \
+    || { echo "FAIL: canonical (sorted-key) serialized form unexpected"; exit 1; }
 sig=$(echo "$jit" | tail -1)
-echo "$jit" | tail -1 | grep -qx "51" || { echo "FAIL: expected signal 51, got $sig"; exit 1; }
+echo "$jit" | tail -1 | grep -qx "30" || { echo "FAIL: expected signal 30, got $sig"; exit 1; }
 "$KARDC" --no-cache -o "$TMP/json" "$SRC" >/dev/null
 set +e; "$TMP/json" >/dev/null; rc=$?; set -e
-[[ "$rc" -ne $((51 % 256)) ]] && { echo "FAIL [aot]: exit $rc expected $((51 % 256))"; exit 1; }
-echo "PASS [parse/serialize/derived-Eq round-trip]: JIT signal 51, AOT exit $rc"
+[[ "$rc" -ne $((30 % 256)) ]] && { echo "FAIL [aot]: exit $rc expected $((30 % 256))"; exit 1; }
+echo "PASS [parse/serialize/derived-Eq round-trip, canonical sorted keys]: JIT signal 30, AOT exit $rc"
 
 # 2. constant memory over a parse+serialize+drop loop (floats + escapes + nesting).
 cat > "$TMP/loop.kd" <<EOF
@@ -69,10 +73,10 @@ fn main() -> i64 ! { io, alloc } {
 EOF
 "$KARDC" --no-cache -o "$TMP/loop" "$TMP/loop.kd" >/dev/null
 rss=$( /usr/bin/time -v "$TMP/loop" 2>&1 | awk '/Maximum resident/ {print $NF}' )
-echo "INFO [loop]: peak RSS over 200k JSON-2.0 parse+serialize+drop = ${rss} KB"
+echo "INFO [loop]: peak RSS over 200k JSON-3.0 parse+serialize+drop = ${rss} KB"
 if [[ -n "$rss" && "$rss" -gt 32768 ]]; then
     echo "FAIL [loop]: RSS ${rss} KB > 32 MB — the JSON pipeline leaks"; exit 1
 fi
-echo "PASS [loop]: JSON-2.0 parse+serialize+drop — RSS flat (<= 32 MB)"
+echo "PASS [loop]: JSON-3.0 parse+serialize+drop (incl. HashMap objects) — RSS flat (<= 32 MB)"
 
-echo "PASS: Phase 44 — JSON 2.0 (floats + escapes + #[derive(Clone, Eq)]) JIT + AOT"
+echo "PASS: Phase 50 — JSON 3.0 (HashMap objects + full derive + canonical sorted output) JIT + AOT"

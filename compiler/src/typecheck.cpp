@@ -388,6 +388,18 @@ public:
             sch.genericVars.push_back(vecFnGenericVar);
             fnSchemas_["vec_len"] = std::move(sch);
         }
+        // Phase 47: vec_swap<T>(v: &mut Vec<T>, i: i64, j: i64) -> i64 — exchange
+        // two element slots IN PLACE. Ownership-neutral (the two elements trade
+        // storage; no clone, no drop), so it works for non-Copy T — the
+        // primitive an in-place `sort<T: Ord>` needs.
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(vecFnInst, /*isMut=*/true), makeInt(), makeInt()},
+                makeInt());
+            sch.genericVars.push_back(vecFnGenericVar);
+            fnSchemas_["vec_swap"] = std::move(sch);
+        }
         // Phase 35: clone<T>(x: &T) -> T ! { alloc } — a DEEP copy. The result
         // owns freshly-allocated heap storage (String buffer, Vec/HashMap
         // backing array, Box payload — recursively), so the clone and the
@@ -1009,10 +1021,17 @@ public:
                           m.line, m.column);
                     continue;
                 }
-                if (m.params.empty() || m.params[0].name != "self" ||
-                    m.params[0].type.name != "Self") {
-                    error("trait method '" + m.name + "' must take `self` "
-                          "as its first parameter",
+                // Phase 48: a method whose first param is NOT `self` is a
+                // STATIC (associated) method — e.g. `fn default() -> Self`.
+                // Allowed; it is called as `Type::method(args)` (no receiver),
+                // resolved against the implementing type, not a value. Only a
+                // method that DOES start with a param literally named `self`
+                // must spell its type `Self` (the receiver convention).
+                bool hasSelf =
+                    !m.params.empty() && m.params[0].name == "self";
+                if (hasSelf && m.params[0].type.name != "Self") {
+                    error("trait method '" + m.name + "' receiver must be "
+                          "`self` of type `Self`",
                           m.line, m.column);
                 }
                 uniqueMethods.push_back(m);
@@ -1060,7 +1079,12 @@ public:
             GenericEnv implEnv0 = implParamEnv(impl);
             const GenericEnv* savedEnv0 = currentGenericEnv_;
             currentGenericEnv_ = &implEnv0;
+            currentVarBound_.clear();
+            currentVarAllBounds_.clear();
+            exposeImplGenericBounds(impl, implEnv0);
             TypePtr forTy = resolveTypeRef(impl.forType);
+            currentVarBound_.clear();
+            currentVarAllBounds_.clear();
             currentGenericEnv_ = savedEnv0;
             TypePtr rfor = resolve(forTy);
             std::string typeName;
@@ -1329,9 +1353,14 @@ public:
             // Phase 21b: expose each bounded param's trait to `resolveTypeRef`
             // so a `C::Item` projection in this signature resolves C's bound.
             currentVarBound_.clear();
+            currentVarAllBounds_.clear();
             for (std::size_t i = 0; i < genVars.size(); ++i) {
-                if (i < genBounds.size() && !genBounds[i].empty())
-                    currentVarBound_[genVars[i]->varId] = genBounds[i];
+                recordVarBounds(genVars[i]->varId,
+                                i < genBounds.size() ? genBounds[i]
+                                                     : std::string{},
+                                i < genExtraBounds.size()
+                                    ? genExtraBounds[i]
+                                    : std::vector<std::string>{});
             }
 
             std::vector<TypePtr> argTypes;
@@ -1344,6 +1373,7 @@ public:
             currentGenericEnv_ = nullptr;
             currentEffectRowVarNames_ = nullptr;
             currentVarBound_.clear();
+            currentVarAllBounds_.clear();
 
             FnSchema schema;
             schema.signature = makeFunction(std::move(argTypes), ret);
@@ -1443,6 +1473,12 @@ public:
                 // already holds the impl's generic params (Phase 40), so
                 // `Pair<T>` resolves T to its Var — set it active first.
                 currentGenericEnv_ = &genEnv;
+                // Phase 46: expose the impl's bounds before resolving forType so
+                // an `impl<K: Hash + Eq, V> .. for HashMap<K,V>` method schema
+                // passes the key gate on `Self = HashMap<K,V>`.
+                currentVarBound_.clear();
+                currentVarAllBounds_.clear();
+                exposeImplGenericBounds(impl, genEnv);
                 TypePtr selfTy = resolveTypeRef(impl.forType);
                 genEnv["Self"] = selfTy;
                 // Phase 21a: bind the trait's generic params to this impl's
@@ -1480,6 +1516,19 @@ public:
                         resolved.push_back(resolveTypeRef(a));
                     genBoundArgs[i] = std::move(resolved);
                 }
+                // Phase 45: expose the method's generic bounds (impl + fn
+                // params) so a `HashMap<K,V>` param/return with `K: Hash + Eq`
+                // passes keyIsHashable while the schema's signature resolves.
+                currentVarBound_.clear();
+                currentVarAllBounds_.clear();
+                for (std::size_t i = 0; i < genVars.size(); ++i) {
+                    recordVarBounds(genVars[i]->varId,
+                                    i < genBounds.size() ? genBounds[i]
+                                                         : std::string{},
+                                    i < genExtraBounds.size()
+                                        ? genExtraBounds[i]
+                                        : std::vector<std::string>{});
+                }
                 std::vector<TypePtr> argTypes;
                 for (const auto& p : fn.params) {
                     argTypes.push_back(resolveTypeRef(p.type));
@@ -1487,6 +1536,8 @@ public:
                 TypePtr ret = resolveTypeRef(fn.returnType);
                 currentGenericEnv_ = nullptr;
                 currentEffectRowVarNames_ = nullptr;
+                currentVarBound_.clear();
+                currentVarAllBounds_.clear();
                 FnSchema sch;
                 sch.signature = makeFunction(std::move(argTypes), ret);
                 sch.genericVars = std::move(genVars);
@@ -1522,7 +1573,12 @@ public:
             GenericEnv implEnv2 = implParamEnv(impl);
             const GenericEnv* savedEnv2 = currentGenericEnv_;
             currentGenericEnv_ = &implEnv2;
+            currentVarBound_.clear();
+            currentVarAllBounds_.clear();
+            exposeImplGenericBounds(impl, implEnv2);
             TypePtr selfTy = resolveTypeRef(impl.forType);
+            currentVarBound_.clear();
+            currentVarAllBounds_.clear();
             currentGenericEnv_ = savedEnv2;
             for (const auto& fn : impl.methods) {
                 checkImplMethod(fn, impl, selfTy);
@@ -1564,6 +1620,7 @@ public:
         result.usesFileIo = usesFileIo_;
         result.fnSchemas = std::move(fnSchemas_);
         result.callInstantiations = std::move(callInstantiations_);
+        result.staticCallMangled = std::move(staticCallMangled_);
         result.methodResolutions = std::move(methodResolutions_);
         result.dynCoercions = std::move(dynCoercions_);
         result.dynVtablesNeeded = std::move(dynVtablesNeeded_);
@@ -1656,6 +1713,38 @@ private:
     // signature resolves. Persisted long-term in `assocProjections_` for the
     // projection Vars that survive into bodies / codegen.
     std::unordered_map<int, std::string> currentVarBound_;
+    // Phase 45: the FULL set of trait bounds on each generic Var in scope
+    // (primary `.bound` + every `.extraBound`). currentVarBound_ keeps only the
+    // primary for `C::Item` projection; container-op gates like keyIsHashable
+    // need the whole set so a `K: Hash + Eq` param satisfies HashMap's key
+    // requirement from inside a generic body. Cleared/populated in lockstep
+    // with currentVarBound_.
+    std::unordered_map<int, std::unordered_set<std::string>> currentVarAllBounds_;
+    // Register every bound of a generic Var (primary + extras) into the two
+    // bound maps. Safe to call with an empty primary (extras still recorded).
+    void recordVarBounds(int varId, const std::string& primary,
+                         const std::vector<std::string>& extras) {
+        if (!primary.empty()) {
+            currentVarBound_[varId] = primary;
+            currentVarAllBounds_[varId].insert(primary);
+        }
+        for (const auto& e : extras)
+            if (!e.empty()) currentVarAllBounds_[varId].insert(e);
+    }
+    // Phase 45/46: expose an impl's generic-param bounds (looked up by name in
+    // `env`) into the bound maps. Must run BEFORE resolving `impl.forType` so an
+    // `impl<K: Hash + Eq, V> .. for HashMap<K,V>` passes the key-hashable gate
+    // on its own forType — otherwise the impl can't even be registered.
+    void exposeImplGenericBounds(const ast::ImplDecl& impl,
+                                 const GenericEnv& env) {
+        for (const auto& gp : impl.genericParams) {
+            auto it = env.find(gp.name);
+            if (it == env.end()) continue;
+            TypePtr v = resolve(it->second);
+            if (v->kind == TypeKind::Var)
+                recordVarBounds(v->varId, gp.bound, gp.extraBounds);
+        }
+    }
     // Phase 21b: placeholder-Var id -> how to resolve that `C::Item` projection
     // at codegen. Survives into the TypeCheckResult.
     std::unordered_map<int, AssocProjection> assocProjections_;
@@ -1681,6 +1770,8 @@ private:
     // Per-MethodCallExpr resolution (Concrete, BoundedGeneric, or Dyn).
     std::unordered_map<const ast::MethodCallExpr*, ResolvedMethod>
         methodResolutions_;
+    // Phase 48: qualified static call `Type::method()` -> mangled impl method.
+    std::unordered_map<const ast::CallExpr*, std::string> staticCallMangled_;
     // Phase 11: per-Expr `&T`->`&dyn`/`Box<T>`->`Box<dyn>` coercions and the
     // set of (trait,type) vtables those coercions require.
     std::unordered_map<const ast::Expr*, DynCoercion> dynCoercions_;
@@ -2177,6 +2268,24 @@ private:
             if (gvi < schema.genericVars.size())
                 genEnv[gp.name] = schema.genericVars[gvi++];
         }
+        // Phase 45/46: expose every generic param's bounds (impl params, then fn
+        // params) BEFORE resolving forType / the body, so the method's container
+        // ops — and the `Self = HashMap<K,V>` resolution itself — see a
+        // `K: Hash + Eq` promise. This is why a generic-impl method may build,
+        // query, or be defined `for HashMap<K,V>`.
+        currentVarBound_.clear();
+        currentVarAllBounds_.clear();
+        {
+            auto expose = [&](const ast::TypeParam& gp) {
+                auto git = genEnv.find(gp.name);
+                if (git == genEnv.end()) return;
+                TypePtr v = resolve(git->second);
+                if (v->kind == TypeKind::Var)
+                    recordVarBounds(v->varId, gp.bound, gp.extraBounds);
+            };
+            for (const auto& gp : impl.genericParams) expose(gp);
+            for (const auto& gp : fn.genericParams) expose(gp);
+        }
         // Phase 40: for a generic impl, recompute Self from THIS env so it uses
         // the schema's impl-param Vars (the passed selfTy was resolved with
         // throwaway Vars). For a non-generic impl this is identical to selfTy.
@@ -2243,6 +2352,8 @@ private:
         currentGenericEnv_ = nullptr;
         currentEffectRowVarNames_ = nullptr;
         currentEffectRowVarById_.clear();
+        currentVarBound_.clear();
+        currentVarAllBounds_.clear();
     }
 
     // Allocate a schema shell: an opaque Type (Struct or Enum kind, empty
@@ -2567,6 +2678,16 @@ private:
         if (ty->kind == TypeKind::Int) return true;
         if (ty->kind == TypeKind::Struct && ty->structName == "String")
             return true;
+        // Phase 45: a still-generic key Var is hashable iff the body's bounds
+        // promise it — `K: Hash + Eq`. This lets a generic fn/impl body build
+        // and query a `HashMap<K,V>`; the concrete K (which DOES impl Hash+Eq,
+        // checked at the call site against the bound) is substituted at
+        // monomorphization, so codegen always sees a real hashable type.
+        if (ty->kind == TypeKind::Var) {
+            auto bit = currentVarAllBounds_.find(ty->varId);
+            return bit != currentVarAllBounds_.end() &&
+                   bit->second.count("Hash") && bit->second.count("Eq");
+        }
         std::string name;
         if (ty->kind == TypeKind::Struct) name = ty->structName;
         else if (ty->kind == TypeKind::Enum) name = ty->enumName;
@@ -2654,23 +2775,27 @@ private:
                       tr.line, tr.column);
                 return makeInt();
             }
-            // Phase 21a: generic trait objects (`dyn Iterator<T>`) are NOT
-            // supported this phase — monomorphization keeps generic-trait
-            // method calls static. Reject with a clear message rather than
-            // emitting an unsound vtable. Non-generic `dyn Trait` is unchanged.
+            // Phase 49: a parameterized trait object `dyn Trait<Args>` (e.g.
+            // `dyn Producer<i64>`). The trait's concrete args are carried on the
+            // Dyn type (in `typeArgs`); checkDynMethodCall binds the trait's
+            // params to them so a method returning the trait param resolves to
+            // the concrete type. The vtable thunk forwards to the impl method's
+            // already-concrete signature, so codegen needs nothing extra.
             auto pit = traitGenericParams_.find(tr.name);
-            if (pit != traitGenericParams_.end() && !pit->second.empty()) {
-                error("`dyn " + tr.name + "` is not supported: trait '" +
-                          tr.name +
-                          "' has generic type parameters (generic trait "
-                          "objects aren't supported; use a generic param with "
-                          "a trait bound like `<I: " + tr.name + "<...>>` "
-                          "instead)",
+            std::size_t want =
+                pit != traitGenericParams_.end() ? pit->second.size() : 0;
+            if (tr.typeArgs.size() != want) {
+                error("`dyn " + tr.name + "` expects " +
+                          std::to_string(want) + " trait type arg(s), got " +
+                          std::to_string(tr.typeArgs.size()),
                       tr.line, tr.column);
                 return makeInt();
             }
             checkObjectSafe(tr.name, tr.line, tr.column);
-            return makeDyn(tr.name);
+            TypePtr d = makeDyn(tr.name);
+            for (const auto& a : tr.typeArgs)
+                d->typeArgs.push_back(resolveTypeRef(a));
+            return d;
         }
         // Phase 11: `Box<T>` — the built-in heap-owned pointer. Built-in,
         // single type arg; the inner T may itself be `dyn Trait` (a heap
@@ -2932,14 +3057,14 @@ private:
         // Phase 21b: expose bounded params' traits so a `C::Item` projection in
         // the body / return type resolves C's bound (mirrors Pass 1b).
         currentVarBound_.clear();
+        currentVarAllBounds_.clear();
         for (std::size_t i = 0;
              i < fn.genericParams.size() && i < schema.genericVars.size();
              ++i) {
-            if (!fn.genericParams[i].bound.empty()) {
-                TypePtr v = resolve(schema.genericVars[i]);
-                if (v->kind == TypeKind::Var)
-                    currentVarBound_[v->varId] = fn.genericParams[i].bound;
-            }
+            TypePtr v = resolve(schema.genericVars[i]);
+            if (v->kind == TypeKind::Var)
+                recordVarBounds(v->varId, fn.genericParams[i].bound,
+                                fn.genericParams[i].extraBounds);
         }
 
         pushScope();
@@ -2987,6 +3112,7 @@ private:
         currentEffectRowVarNames_ = nullptr;
         currentEffectRowVarById_.clear();
         currentVarBound_.clear();
+        currentVarAllBounds_.clear();
     }
 
     // --- Phase 25: the compile-time evaluator -------------------------------
@@ -3565,6 +3691,16 @@ private:
                 }
             }
         }
+        // Phase 47: a `&mut T` reborrows as a shared `&T` — passing a mutable
+        // reference where an immutable one is expected is sound (shared access
+        // is the weaker capability), and bit-identical at codegen (both are
+        // plain pointers). Only mut->shared; never the reverse. This lets a
+        // `fn f(v: &mut Vec<T>)` call `vec_len(v)` / `vec_get_ref(v, i)` (whose
+        // params are `&Vec<T>`) without an explicit reborrow spelling.
+        if (expIsRef && !e->refIsMut && a->kind == TypeKind::Ref &&
+            a->refIsMut && unify(a->refInner, e->refInner)) {
+            return true;
+        }
         return unify(actual, expected);
     }
 
@@ -3656,16 +3792,16 @@ private:
         // through the object's vtable at runtime instead of resolving to a
         // single impl. We type-check args against the *trait's* method
         // signature (Self = the receiver's trait-object type).
-        if (r->kind == TypeKind::Ref || r->kind == TypeKind::Box) {
-            TypePtr inner = resolve(r->refInner);
-            if (inner->kind == TypeKind::Dyn) {
-                return checkDynMethodCall(mc, inner->dynTraitName, recvT);
-            }
-        }
-        // A bare `dyn Trait` value can't reach here normally (it's unsized),
-        // but guard defensively.
-        if (r->kind == TypeKind::Dyn) {
-            return checkDynMethodCall(mc, r->dynTraitName, recvT);
+        // Peel ANY number of pointer layers to find a `dyn` underneath:
+        // `&dyn`, `Box<dyn>`, AND `&Box<dyn>` (the shape returned by
+        // vec_get_ref over a `Vec<Box<dyn Trait>>`). Codegen's dyn dispatch
+        // already loads the fat pointer through an arbitrary pointer receiver.
+        {
+            TypePtr p = r;
+            while (p->kind == TypeKind::Ref || p->kind == TypeKind::Box)
+                p = resolve(p->refInner);
+            if (p->kind == TypeKind::Dyn)
+                return checkDynMethodCall(mc, p->dynTraitName, recvT);
         }
 
         // Phase 2.4b auto-deref: if the receiver is `&T` (or `&mut T`),
@@ -3964,6 +4100,22 @@ private:
         // and any `&self`/`self` receiver is irrelevant to the args.
         GenericEnv selfEnv;
         selfEnv["Self"] = dynRecvTy;
+        // Phase 49: bind the trait's generic params to the trait object's
+        // concrete args (`dyn Producer<i64>` => T -> i64), so a method whose
+        // signature names a trait param resolves to the concrete type. The
+        // args live on the Dyn type (its `typeArgs`); peel the receiver's
+        // pointer layers to reach it.
+        {
+            TypePtr p = resolve(dynRecvTy);
+            while (p->kind == TypeKind::Ref || p->kind == TypeKind::Box)
+                p = resolve(p->refInner);
+            auto pit = traitGenericParams_.find(traitName);
+            if (p->kind == TypeKind::Dyn && pit != traitGenericParams_.end()) {
+                for (std::size_t i = 0;
+                     i < pit->second.size() && i < p->typeArgs.size(); ++i)
+                    selfEnv[pit->second[i]] = p->typeArgs[i];
+            }
+        }
         const GenericEnv* savedEnv = currentGenericEnv_;
         currentGenericEnv_ = &selfEnv;
         std::vector<TypePtr> paramTypes;
@@ -4915,6 +5067,60 @@ private:
             call.callee == "fs_exists" || call.callee == "arg_count" ||
             call.callee == "arg_get") {
             usesFileIo_ = true;
+        }
+        // Phase 48: a qualified static call `Type::method(args)` — an
+        // associated (no-self) trait method such as `P::default()`. Resolve it
+        // against the named type's impl rather than a value receiver. Only
+        // fires when `pathQualifier` names a type that actually has a method
+        // `callee`; otherwise this is an ordinary (flat-merged) module path and
+        // falls through to the bare-name lookup below.
+        if (!call.pathQualifier.empty()) {
+            auto tIt = methodImplLookup_.find(call.pathQualifier);
+            if (tIt != methodImplLookup_.end()) {
+                auto mIt = tIt->second.find(call.callee);
+                if (mIt != tIt->second.end() && mIt->second.second) {
+                    auto mangIt = implMethodMangled_.find(mIt->second.second);
+                    if (mangIt != implMethodMangled_.end()) {
+                        auto sIt = fnSchemas_.find(mangIt->second);
+                        if (sIt != fnSchemas_.end()) {
+                            const FnSchema& sch = sIt->second;
+                            // Concrete impl: no generic vars to bind (generic
+                            // static methods are deferred). Instantiate with an
+                            // empty subst so any stray Var is freshened.
+                            std::unordered_map<int, TypePtr> subst;
+                            TypePtr instSig = instantiate(sch.signature, subst);
+                            if (instSig->args.size() != call.args.size()) {
+                                error("static method '" + call.pathQualifier +
+                                          "::" + call.callee + "' expects " +
+                                          std::to_string(instSig->args.size()) +
+                                          " arg(s), got " +
+                                          std::to_string(call.args.size()),
+                                      call.line, call.column);
+                            }
+                            const std::size_t n = std::min(
+                                instSig->args.size(), call.args.size());
+                            for (std::size_t i = 0; i < n; ++i) {
+                                TypePtr at = checkExpr(*call.args[i]);
+                                if (!coerceOrUnify(*call.args[i], at,
+                                                   instSig->args[i])) {
+                                    error("argument " + std::to_string(i + 1) +
+                                              " to '" + call.pathQualifier +
+                                              "::" + call.callee +
+                                              "' has type " + typeToString(at) +
+                                              ", expected " +
+                                              typeToString(instSig->args[i]),
+                                          call.args[i]->line,
+                                          call.args[i]->column);
+                                }
+                            }
+                            // Attribute the method's effects to this call site.
+                            exprEffects_[&call] = sch.declaredEffects;
+                            staticCallMangled_[&call] = mangIt->second;
+                            return resolve(instSig->ret);
+                        }
+                    }
+                }
+            }
         }
         // Phase 4.3: first-class fn values. If the call's callee name
         // resolves to a local binding with a Function type, this is an

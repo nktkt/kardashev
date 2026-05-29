@@ -418,6 +418,55 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 45 (v8): a bounded `K: Hash + Eq` type param satisfies HashMap's key
+# requirement from inside a generic fn / generic-impl method body (the
+# key-hashable gate accepts a bounded Var, not just concrete i64/String). JIT +
+# AOT, plus a negative test that an unbounded key param is rejected.
+sh_test(
+    name = "smoke_test_phase45",
+    srcs = ["smoke_test_phase45.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 46 (v8): generic Clone/Eq TRAIT impls for HashMap (the v7 deferral) —
+# direct map.clone()/map.eq() (order-independent), #[derive(Clone, Eq)] over a
+# struct with a HashMap field, and a no-regression check that a map-free derived
+# eq stays pure. JIT + AOT.
+sh_test(
+    name = "smoke_test_phase46",
+    srcs = ["smoke_test_phase46.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 47 (v8): Ord trait (cmp -> -1/0/1) + a generic in-place sort<T: Ord>
+# (insertion sort over a new ownership-neutral vec_swap), proven for i64 /
+# String / f64 / a user Ord type. JIT + AOT.
+sh_test(
+    name = "smoke_test_phase47",
+    srcs = ["smoke_test_phase47.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 48 (v8): #[derive(Hash, Ord, Default)] — Hash combines field hashes
+# (derived HashMap keys), Ord is lexicographic (derived sort), Default builds
+# field-wise via the static `Type::default()` associated method (a new no-self
+# trait-method + qualified-call capability). JIT + AOT.
+sh_test(
+    name = "smoke_test_phase48",
+    srcs = ["smoke_test_phase48.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 49 (v8): generic trait objects — a `dyn Trait<Arg>` carries the trait's
+# concrete arg (bound when resolving method sigs), and dispatch works through
+# the `&Box<dyn>` that vec_get_ref returns, so a heterogeneous Vec<Box<dyn ...>>
+# is iterated with dynamic dispatch. JIT + AOT.
+sh_test(
+    name = "smoke_test_phase49",
+    srcs = ["smoke_test_phase49.sh"],
+    data = ["//compiler:kardc"],
+)
+
 cc_test(
     name = "lexer_test",
     srcs = ["lexer_test.cpp"],

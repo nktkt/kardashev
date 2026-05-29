@@ -194,6 +194,12 @@ struct CallExpr : Expr {
     // without breaking bare-name calls that the Phase 7.1 flat-merge
     // semantics still permits.
     bool wasPath = false;
+    // Phase 48: the segment immediately before the callee when the path is a
+    // qualified call (`Type::method(args)`) — empty otherwise. The typechecker
+    // uses it ONLY when it names a type with a static (no-self) trait method
+    // `method`; for an ordinary module path (`foo::bar()`) it stays unused and
+    // the call falls back to the flat-merged bare-name lookup of `callee`.
+    std::string pathQualifier;
 };
 
 // Phase 17a: call a fn VALUE produced by an arbitrary expression — e.g.

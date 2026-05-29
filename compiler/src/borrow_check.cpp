@@ -18,6 +18,12 @@ struct Binding {
     int declPos = -1;
     OwnState state = OwnState::Owned;
     bool isMoveTyped = true;
+    // Phase 47: this binding's own type is a `&mut T` reference. Such a binding
+    // is move-typed (a mut-ref isn't Copy — copying it would alias mutable
+    // access), but passing it as a call ARGUMENT reborrows rather than moves
+    // (the callee can't escape the reference — kardashev fns can't return one),
+    // so it stays usable afterwards. Mirrors Rust's implicit `&mut *r` reborrow.
+    bool isMutRef = false;
     int sharedLoans = 0;
     bool mutLoanActive = false;
     std::size_t moveLine = 0;
@@ -143,6 +149,10 @@ private:
         b.declPos = dp;
         b.state = OwnState::Owned;
         b.isMoveTyped = !isCopyType(ty);
+        if (ty) {
+            TypePtr r = resolve(ty);
+            b.isMutRef = r->kind == TypeKind::Ref && r->refIsMut;
+        }
         bindings_[dp] = std::move(b);
         return dp;
     }
@@ -439,6 +449,24 @@ private:
     // position visited inside this subtree — the caller's enclosing
     // statement passes this back as `expectExpire` to retire temporary
     // borrows at end-of-statement.
+    // Phase 47: consume a CALL ARGUMENT. A bare `&mut`-typed binding passed by
+    // value reborrows (a read) rather than moving, so the caller's reference
+    // stays usable for the rest of the call / function — matching the implicit
+    // `&mut *r` reborrow other languages insert. Any other argument shape
+    // (a `&place` borrow, a temporary, a literal, an owned value) consumes
+    // exactly as before.
+    int consumeArg(const ast::Expr& a, int expectExpire) {
+        if (auto* id = dynamic_cast<const ast::IdentExpr*>(&a)) {
+            Binding* b = lookupBinding(id->name);
+            if (b && b->isMutRef) {
+                int p = pos_++;
+                checkRead(*id); // reborrow: errors only if the ref was moved
+                return p;
+            }
+        }
+        return consume(a, expectExpire);
+    }
+
     int consume(const ast::Expr& e, int expectExpire) {
         int startPos = pos_++;
         int lastInSubtree = startPos;
@@ -470,7 +498,7 @@ private:
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
             for (const auto& a : call->args) {
                 lastInSubtree = std::max(lastInSubtree,
-                                           consume(*a, expectExpire));
+                                           consumeArg(*a, expectExpire));
             }
             return lastInSubtree;
         }
@@ -481,7 +509,7 @@ private:
                                        consume(*cv->callee, expectExpire));
             for (const auto& a : cv->args) {
                 lastInSubtree = std::max(lastInSubtree,
-                                           consume(*a, expectExpire));
+                                           consumeArg(*a, expectExpire));
             }
             return lastInSubtree;
         }
@@ -490,7 +518,7 @@ private:
                                        consumeReceiver(*mc));
             for (const auto& a : mc->args) {
                 lastInSubtree = std::max(lastInSubtree,
-                                           consume(*a, expectExpire));
+                                           consumeArg(*a, expectExpire));
             }
             return lastInSubtree;
         }

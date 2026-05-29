@@ -626,6 +626,21 @@ private:
             tr.refIsMut = refIsMut;
             tr.line = isRef ? ampTok.line : traitTok.line;
             tr.column = isRef ? ampTok.column : traitTok.column;
+            // Phase 49: a parameterized trait object `dyn Trait<Args>` (e.g.
+            // `dyn Producer<i64>`). The trait's type args follow, mirroring the
+            // generic-type parse below; they pin the trait's params for the
+            // object's method signatures (the return/param types in the vtable
+            // thunks).
+            if (accept(TokenKind::Lt)) {
+                if (!check(TokenKind::Gt)) {
+                    while (true) {
+                        tr.typeArgs.push_back(parseTypeRef());
+                        if (!accept(TokenKind::Comma)) break;
+                        if (check(TokenKind::Gt)) break;
+                    }
+                }
+                expect(TokenKind::Gt, ">");
+            }
             return tr;
         }
         Token t = expect(TokenKind::Identifier, "type name");
@@ -1541,9 +1556,11 @@ private:
             // path-qualified references.
             Token first = consume();
             Token tok = first;
+            Token prevSeg = first; // Phase 48: the segment just before `tok`
             bool wasPath = false;
             while (check(TokenKind::DoubleColon)) {
                 consume();
+                prevSeg = tok;
                 tok = expect(TokenKind::Identifier,
                               "identifier after `::`");
                 wasPath = true;
@@ -1574,6 +1591,7 @@ private:
                 call->column = tok.column;
                 call->callee = tok.lexeme;
                 call->wasPath = wasPath;
+                if (wasPath) call->pathQualifier = prevSeg.lexeme; // Phase 48
                 bool prevCallRestrict = restrictStructLit_;
                 restrictStructLit_ = false;
                 if (!check(TokenKind::RParen)) {

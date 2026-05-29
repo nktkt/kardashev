@@ -1015,13 +1015,27 @@ void test_parameterized_bound_arity_errors() {
         "parameterized_bound_arity_errors");
 }
 
-// Phase 21a: `dyn` of a generic trait is rejected with a clear message
-// (generic trait objects unsupported this phase).
+// Phase 49: a generic trait CAN be a trait object when its type args are
+// supplied; a BARE `dyn Iterator` (no `<...>`) for a 1-param trait is an arity
+// mismatch and still rejected.
 void test_dyn_generic_trait_rejected() {
     expectErr(
         "trait Iterator<T> { fn next(&mut self) -> T; }\n"
         "fn use_it(it: &dyn Iterator) -> i64 { 0 }",
         "dyn_generic_trait_rejected");
+}
+
+// Phase 49: a PARAMETERIZED trait object `dyn Producer<i64>` typechecks — the
+// trait arg binds the method's return type, and dispatch goes through the
+// vtable.
+void test_dyn_parameterized_trait_ok() {
+    expectOk(
+        "trait Producer<T> { fn produce(&self) -> T; }\n"
+        "struct G { v: i64 }\n"
+        "impl Producer<i64> for G { fn produce(&self) -> i64 { self.v } }\n"
+        "fn run(p: &dyn Producer<i64>) -> i64 { p.produce() }\n"
+        "fn main() -> i64 { let g = G { v: 7 }; run(&g) }",
+        "dyn_parameterized_trait_ok");
 }
 
 // Regression: a NON-generic trait used as `dyn` still works.
@@ -2555,6 +2569,7 @@ int main() {
     test_generic_trait_impl_arity_errors();
     test_parameterized_bound_arity_errors();
     test_dyn_generic_trait_rejected();
+    test_dyn_parameterized_trait_ok();
     test_dyn_nongeneric_trait_still_ok();
     test_generic_trait_bound_effects_compose();
     // Phase 21b: where clauses + associated types

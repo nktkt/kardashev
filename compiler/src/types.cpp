@@ -336,7 +336,13 @@ bool unify(const TypePtr& a, const TypePtr& b) {
 
     if (ra->kind == TypeKind::Dyn) {
         // Phase 11: two `dyn Trait` objects unify iff the trait matches.
-        return ra->dynTraitName == rb->dynTraitName;
+        // Phase 49: a PARAMETERIZED trait object also requires equal trait args
+        // (`dyn Producer<i64>` != `dyn Producer<String>`).
+        if (ra->dynTraitName != rb->dynTraitName) return false;
+        if (ra->typeArgs.size() != rb->typeArgs.size()) return false;
+        for (std::size_t i = 0; i < ra->typeArgs.size(); ++i)
+            if (!unify(ra->typeArgs[i], rb->typeArgs[i])) return false;
+        return true;
     }
 
     if (ra->kind == TypeKind::Box) {

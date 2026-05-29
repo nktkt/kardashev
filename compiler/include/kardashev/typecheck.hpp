@@ -222,6 +222,10 @@ struct TypeCheckResult {
     // monomorphic functions are NOT recorded here.
     std::unordered_map<const ast::CallExpr*, std::vector<TypePtr>>
         callInstantiations;
+    // Phase 48: a qualified static call `Type::method(args)` (an associated /
+    // no-self trait method, e.g. `P::default()`) — the resolved LLVM-mangled
+    // impl-method name codegen should call. Absent for ordinary calls.
+    std::unordered_map<const ast::CallExpr*, std::string> staticCallMangled;
     // Per-MethodCallExpr resolution: which (trait, type) impl provides
     // the called method, plus the receiver-typeArgs context. Codegen
     // uses this to mangle the LLVM function name.
