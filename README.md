@@ -50,11 +50,12 @@ Effect sets are unioned across the call graph and checked at definition sites; n
 
 ## Status
 
-The full README roadmap (Phases 0–8) lands in the repository. Built
-locally with `bazel build //... && bazel test //...` or, when Bazel
-isn't available, the `Makefile.local` shim (LLVM + clang). The CI
-matrix runs both ubuntu-latest and macos-latest via Bazel on every
-push; every commit goes in green.
+All nine roadmaps (Phases 0–56, **v1–v9**) have shipped and are merged to
+`main` — 631 unit cases across 6 suites plus the full smoke-test aggregate pass
+**JIT and AOT** on a cleared clean build. Built locally with `bazel build //...
+&& bazel test //...` or, when Bazel isn't available, the `Makefile.local` shim
+(LLVM + clang). The CI matrix runs both ubuntu-latest and macos-latest via Bazel
+on every push; every commit goes in green.
 
 Tour: see [`docs/`](docs/) for the language reference, effects-system
 notes, stdlib catalog, and compiler-architecture deep dive.
@@ -135,6 +136,38 @@ pub fn double(n: i64) -> i64 { n + n }
 mod util;
 fn main() -> i64 { util::double(21) }      // -> 42
 ```
+
+Since v5 the language has grown a full data layer and abstraction layer
+(roadmaps v6–v9, detailed below):
+
+- **`f64` floats** + the recursive heap (`Box<T>`, `Vec<Self>`, `HashMap<K,V>` of
+  self) — arbitrarily nested values that drop and deep-clone soundly.
+- **Traits + `#[derive]`**: `Clone`, `Eq`, `Ord`, `Hash`, `Display`, `Default`
+  derive automatically (over structs, recursive enums, generics, and `HashMap`/
+  `Box` fields); generic `impl<T: Bound>` blocks, prelude trait impls for the
+  containers, and **generic trait objects** `dyn Trait<T>` (heterogeneous
+  `Vec<Box<dyn …>>` with dynamic dispatch).
+- **Generic associated functions** — `T::default()` for a bounded `T`.
+- **`Ord` + a generic in-place `sort<T: Ord>`**, and `Vec` higher-order
+  combinators `vec_map` / `vec_filter` / `vec_fold` over closures
+  (effect-polymorphic in the closure's effects).
+- **Strings & maps**: `str_split` / `str_trim` tokenizing; `hashmap_entries ->
+  Vec<(K, V)>` for ranking/printing a map.
+
+Two capstones written entirely in kardashev exercise it end to end:
+[`examples/json/`](examples/json/) — a full nested-JSON parser+serializer with
+`JObj(HashMap<String, Json>)`, `#[derive(Clone, Eq)]`, and canonical
+sorted-key output, round-tripping via the derived `Eq`; and
+[`examples/wordfreq/`](examples/wordfreq/) — a word-frequency histogram
+(tokenize → count in a `HashMap` → rank by a derived `Ord` → top-N). Both run
+leak-free under a constant-memory gate, JIT and AOT.
+
+> Before v6–v9 landed on `main`, an adversarial multi-agent review hardened five
+> memory-safety / type-soundness holes the green smoke suite had missed (a
+> by-value container-getter double-free, a `dyn Trait<T>` argument-confusion, a
+> move-out-of-`&` via `*r`, a `&mut` reborrow aliasing `f(r, r)`, and an
+> unjoined `if`-branch move-state) plus dynamic-dispatch effect attribution —
+> all locked in by `tests/smoke_test_soundness.sh`.
 
 Four driver entry points:
 
