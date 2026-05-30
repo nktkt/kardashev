@@ -62,6 +62,13 @@ bool isCopyType(const TypePtr& t) {
         // Phase 13b: a slice `&[T]` is a fat pointer (a borrow), so it's
         // Copy — like `&T`. Other structs move by default.
         if (r->structName == "Slice") return true;
+        // Phase 76 (v13): the channel endpoints `Sender<T>` / `Receiver<T>` are
+        // Copy i64 HANDLES — passing one to chan_send / chan_recv doesn't
+        // consume it, and `chan_recv(rx)` works repeatedly in a loop. (Copy is
+        // orthogonal to Send: a Receiver is Copy but NOT Send — it may be
+        // recv'd repeatedly here yet can't cross a thread boundary, Phase 77.)
+        if (r->structName == "Sender" || r->structName == "Receiver")
+            return true;
         return false;
     case TypeKind::Var:
     case TypeKind::Function:

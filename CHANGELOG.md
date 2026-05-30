@@ -36,6 +36,17 @@ witness).
   `<T: Task>` / `&dyn Task` interface (the super-effecting impl is rejected).
   This is the value-crossing *control* half; the value-*safety* half (only
   `Send` data crosses) lands with channels in Phase 77.
+- **Typed MPSC channels** (Phase 76) — `channel() -> (Sender<i64>,
+  Receiver<i64>)`, `chan_send` / `chan_recv` (→ `Option`, `None` once closed
+  AND drained) / `chan_close`. The runtime is an unbounded linked-list queue
+  guarded by a **pthread mutex + condition variable** (`chan_recv` blocks on
+  the condvar while the channel is empty and open; `chan_close` broadcasts to
+  wake blocked receivers). A producer thread sending 1..=100 and the main
+  thread draining sums to exactly 5050, deterministic across runs, JIT and
+  AOT. `Sender`/`Receiver` are named generic structs that lower to a Copy i64
+  handle, so a `Sender` (multi-producer, `Send`) is captured by value into a
+  worker thread — while a `Receiver` is the single-consumer endpoint and is
+  **not** `Send`: moving one into a thread is a compile error.
 
 ## [0.12.0] — Roadmap v12 "real stdlib" (Phases 69–74)
 

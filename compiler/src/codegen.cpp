@@ -797,6 +797,20 @@ private:
     llvm::StructType* mutexBlkTy_ = nullptr;
     llvm::Function* threadTrampolineFn_ = nullptr; // __kd_thread_trampoline
 
+    // --- Phase 76 (v13): typed MPSC channels (pthread mutex + condvar) ---
+    // The channel block `{ [64 x i8] mtx, [64 x i8] cond, i8* head, i8* tail,
+    // i64 count, i64 closed }` guards an unbounded linked-list queue of nodes
+    // `{ i64 value, i8* next }` (i64 cells this phase). 64 bytes each covers
+    // pthread_mutex_t / pthread_cond_t on both glibc and macOS. Declared lazily
+    // (channelRuntimeDeclared_) on first use of any chan_* builtin.
+    llvm::Function* pthreadCondInitFn_ = nullptr;
+    llvm::Function* pthreadCondWaitFn_ = nullptr;
+    llvm::Function* pthreadCondSignalFn_ = nullptr;
+    llvm::Function* pthreadCondBroadcastFn_ = nullptr;
+    llvm::StructType* chanBlkTy_ = nullptr;
+    llvm::StructType* chanNodeTy_ = nullptr;
+    bool channelRuntimeDeclared_ = false;
+
     // --- Phase 23: real panic + unwinding (setjmp/longjmp + cleanup stack) ---
     // `programMayPanic_` is computed once in run(): true iff the program text
     // contains a `panic`/`catch` call or any array `[T;N]` indexing (which can
@@ -3306,6 +3320,211 @@ private:
             (void)voidTy;
             b.CreateRet(fn->getArg(1));
             declaredFns_["mutex_set"] = fn;
+        }
+    }
+
+    // --- Phase 76 (v13): typed MPSC channels (pthread mutex + condition var) ---
+    // An unbounded linked-list queue guarded by a mutex + condvar. The handle is
+    // a Copy i64 (PtrToInt of the block), so a Sender can be captured by value
+    // into a producer thread; both endpoints point at the same block. send
+    // appends a node + signals; recv pops (blocking on the condvar while empty +
+    // open) and returns Option (None once closed AND drained); close sets the
+    // flag + broadcasts so blocked receivers wake. Reuses the thread runtime's
+    // pthread mutex externs; declared lazily on first chan_* use.
+    void ensureChannelRuntime() {
+        if (channelRuntimeDeclared_) return;
+        channelRuntimeDeclared_ = true;
+        ensureThreadRuntime(); // for the pthread mutex externs + malloc/free
+        declareChannelRuntime();
+    }
+    void declareChannelRuntime() {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* z64 = llvm::ConstantInt::get(i64Ty, 0);
+        auto* nullp = llvm::ConstantPointerNull::get(i8PtrTy);
+        auto mkFn = [&](llvm::FunctionType* ty, const char* nm) {
+            return llvm::Function::Create(
+                ty, llvm::Function::ExternalLinkage, nm, module_.get());
+        };
+
+        // pthread_cond_* externs (mutex externs come from the thread runtime).
+        auto* cond2Ty = llvm::FunctionType::get(i32Ty, {i8PtrTy, i8PtrTy}, false);
+        auto* cond1Ty = llvm::FunctionType::get(i32Ty, {i8PtrTy}, false);
+        pthreadCondInitFn_ = mkFn(cond2Ty, "pthread_cond_init");
+        pthreadCondWaitFn_ = mkFn(cond2Ty, "pthread_cond_wait");
+        pthreadCondSignalFn_ = mkFn(cond1Ty, "pthread_cond_signal");
+        pthreadCondBroadcastFn_ = mkFn(cond1Ty, "pthread_cond_broadcast");
+
+        // { [64] mtx, [64] cond, i8* head, i8* tail, i64 count, i64 closed }
+        auto* pad64 = llvm::ArrayType::get(i8Ty, 64);
+        chanBlkTy_ = llvm::StructType::create(
+            ctx, {pad64, pad64, i8PtrTy, i8PtrTy, i64Ty, i64Ty}, "kd.chan_blk");
+        chanNodeTy_ = llvm::StructType::create(ctx, {i64Ty, i8PtrTy},
+                                               "kd.chan_node");
+        auto blkSz = module_->getDataLayout().getTypeAllocSize(chanBlkTy_);
+        auto nodeSz = module_->getDataLayout().getTypeAllocSize(chanNodeTy_);
+        auto* blkSzK = llvm::ConstantInt::get(i64Ty, blkSz);
+        auto* nodeSzK = llvm::ConstantInt::get(i64Ty, nodeSz);
+        auto mtxOf = [&](llvm::IRBuilder<>& b, llvm::Value* blk) {
+            return b.CreateStructGEP(chanBlkTy_, blk, 0, "mtx");
+        };
+        auto condOf = [&](llvm::IRBuilder<>& b, llvm::Value* blk) {
+            return b.CreateStructGEP(chanBlkTy_, blk, 1, "cond");
+        };
+
+        // channel() -> { i64, i64 } : alloc + init the block, return both
+        // handles (Sender, Receiver) — the same block pointer.
+        {
+            auto* pairTy = llvm::StructType::get(ctx, {i64Ty, i64Ty});
+            auto* fn = mkFn(llvm::FunctionType::get(pairTy, {}, false), "channel");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto* blk = b.CreateCall(mallocFn_, {blkSzK}, "chan_blk");
+            b.CreateCall(pthreadMutexInitFn_, {mtxOf(b, blk), nullp});
+            b.CreateCall(pthreadCondInitFn_, {condOf(b, blk), nullp});
+            b.CreateStore(nullp, b.CreateStructGEP(chanBlkTy_, blk, 2, "head"));
+            b.CreateStore(nullp, b.CreateStructGEP(chanBlkTy_, blk, 3, "tail"));
+            b.CreateStore(z64, b.CreateStructGEP(chanBlkTy_, blk, 4, "count"));
+            b.CreateStore(z64, b.CreateStructGEP(chanBlkTy_, blk, 5, "closed"));
+            auto* h = b.CreatePtrToInt(blk, i64Ty, "handle");
+            llvm::Value* pair = llvm::UndefValue::get(pairTy);
+            pair = b.CreateInsertValue(pair, h, {0}, "tx");
+            pair = b.CreateInsertValue(pair, h, {1}, "rx");
+            b.CreateRet(pair);
+            declaredFns_["channel"] = fn;
+        }
+
+        // chan_send(i64 s, i64 v) -> i64 : lock, append a node, signal, unlock.
+        {
+            auto* fn = mkFn(
+                llvm::FunctionType::get(i64Ty, {i64Ty, i64Ty}, false),
+                "chan_send");
+            fn->getArg(0)->setName("s");
+            fn->getArg(1)->setName("v");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* firstBB = llvm::BasicBlock::Create(ctx, "first", fn);
+            auto* appendBB = llvm::BasicBlock::Create(ctx, "append", fn);
+            auto* doneBB = llvm::BasicBlock::Create(ctx, "done", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* blk = b.CreateIntToPtr(fn->getArg(0), i8PtrTy, "blk");
+            b.CreateCall(pthreadMutexLockFn_, {mtxOf(b, blk)});
+            auto* node = b.CreateCall(mallocFn_, {nodeSzK}, "node");
+            b.CreateStore(fn->getArg(1),
+                          b.CreateStructGEP(chanNodeTy_, node, 0, "nval"));
+            b.CreateStore(nullp,
+                          b.CreateStructGEP(chanNodeTy_, node, 1, "nnext"));
+            auto* tailP = b.CreateStructGEP(chanBlkTy_, blk, 3, "tailP");
+            auto* tail = b.CreateLoad(i8PtrTy, tailP, "tail");
+            b.CreateCondBr(
+                b.CreateICmpEQ(tail, nullp, "empty"), firstBB, appendBB);
+            b.SetInsertPoint(firstBB);
+            b.CreateStore(node, b.CreateStructGEP(chanBlkTy_, blk, 2, "headP"));
+            b.CreateBr(doneBB);
+            b.SetInsertPoint(appendBB);
+            b.CreateStore(node,
+                          b.CreateStructGEP(chanNodeTy_, tail, 1, "tnext"));
+            b.CreateBr(doneBB);
+            b.SetInsertPoint(doneBB);
+            b.CreateStore(node, tailP);
+            auto* cntP = b.CreateStructGEP(chanBlkTy_, blk, 4, "cntP");
+            b.CreateStore(b.CreateAdd(b.CreateLoad(i64Ty, cntP, "cnt"),
+                                      llvm::ConstantInt::get(i64Ty, 1), "cnt1"),
+                          cntP);
+            b.CreateCall(pthreadCondSignalFn_, {condOf(b, blk)});
+            b.CreateCall(pthreadMutexUnlockFn_, {mtxOf(b, blk)});
+            b.CreateRet(z64);
+            declaredFns_["chan_send"] = fn;
+        }
+
+        // chan_recv(i64 r) -> Option<i64> : lock; block while empty+open; on
+        // closed+empty return None; else pop a node, free it, return Some.
+        {
+            TypePtr optTy = optionType(makeInt());
+            mapKardashevType(optTy);
+            const std::string optMangled =
+                mangleStructInstance(optTy->enumName, optTy->typeArgs);
+            auto* optLlvm = enumTypes_[optMangled];
+            unsigned someIdx = variantIndexInEnum(optTy, "Some");
+            unsigned noneIdx = variantIndexInEnum(optTy, "None");
+            unsigned someSlot = enumPayloadIndices_[optMangled][someIdx][0];
+            auto* fn = mkFn(llvm::FunctionType::get(optLlvm, {i64Ty}, false),
+                            "chan_recv");
+            fn->getArg(0)->setName("r");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* loopBB = llvm::BasicBlock::Create(ctx, "wait_loop", fn);
+            auto* closedBB = llvm::BasicBlock::Create(ctx, "check_closed", fn);
+            auto* waitBB = llvm::BasicBlock::Create(ctx, "cwait", fn);
+            auto* popBB = llvm::BasicBlock::Create(ctx, "pop", fn);
+            auto* clrTailBB = llvm::BasicBlock::Create(ctx, "clear_tail", fn);
+            auto* afterBB = llvm::BasicBlock::Create(ctx, "after", fn);
+            auto* noneBB = llvm::BasicBlock::Create(ctx, "none", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* blk = b.CreateIntToPtr(fn->getArg(0), i8PtrTy, "blk");
+            b.CreateCall(pthreadMutexLockFn_, {mtxOf(b, blk)});
+            b.CreateBr(loopBB);
+            b.SetInsertPoint(loopBB);
+            auto* cntP = b.CreateStructGEP(chanBlkTy_, blk, 4, "cntP");
+            auto* cnt = b.CreateLoad(i64Ty, cntP, "cnt");
+            b.CreateCondBr(b.CreateICmpSGT(cnt, z64, "has"), popBB, closedBB);
+            b.SetInsertPoint(closedBB);
+            auto* closed = b.CreateLoad(
+                i64Ty, b.CreateStructGEP(chanBlkTy_, blk, 5, "closedP"),
+                "closed");
+            b.CreateCondBr(b.CreateICmpNE(closed, z64, "isClosed"), noneBB,
+                           waitBB);
+            b.SetInsertPoint(waitBB);
+            b.CreateCall(pthreadCondWaitFn_, {condOf(b, blk), mtxOf(b, blk)});
+            b.CreateBr(loopBB);
+            b.SetInsertPoint(popBB);
+            auto* headP = b.CreateStructGEP(chanBlkTy_, blk, 2, "headP");
+            auto* head = b.CreateLoad(i8PtrTy, headP, "head");
+            auto* val = b.CreateLoad(
+                i64Ty, b.CreateStructGEP(chanNodeTy_, head, 0, "hval"), "val");
+            auto* next = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(chanNodeTy_, head, 1, "hnext"),
+                "next");
+            b.CreateStore(next, headP);
+            b.CreateStore(b.CreateSub(cnt, llvm::ConstantInt::get(i64Ty, 1),
+                                      "cntm1"),
+                          cntP);
+            b.CreateCall(freeFn_, {head});
+            b.CreateCondBr(b.CreateICmpEQ(next, nullp, "drained"), clrTailBB,
+                           afterBB);
+            b.SetInsertPoint(clrTailBB);
+            b.CreateStore(nullp, b.CreateStructGEP(chanBlkTy_, blk, 3, "tailP"));
+            b.CreateBr(afterBB);
+            b.SetInsertPoint(afterBB);
+            b.CreateCall(pthreadMutexUnlockFn_, {mtxOf(b, blk)});
+            llvm::Value* some = llvm::UndefValue::get(optLlvm);
+            some = b.CreateInsertValue(
+                some, llvm::ConstantInt::get(i32Ty, someIdx), {0}, "some");
+            some = b.CreateInsertValue(some, val, {someSlot}, "someV");
+            b.CreateRet(some);
+            b.SetInsertPoint(noneBB);
+            b.CreateCall(pthreadMutexUnlockFn_, {mtxOf(b, blk)});
+            llvm::Value* none = llvm::UndefValue::get(optLlvm);
+            none = b.CreateInsertValue(
+                none, llvm::ConstantInt::get(i32Ty, noneIdx), {0}, "none");
+            b.CreateRet(none);
+            declaredFns_["chan_recv"] = fn;
+        }
+
+        // chan_close(i64 s) -> i64 : set closed, broadcast to wake receivers.
+        {
+            auto* fn = mkFn(llvm::FunctionType::get(i64Ty, {i64Ty}, false),
+                            "chan_close");
+            fn->getArg(0)->setName("s");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto* blk = b.CreateIntToPtr(fn->getArg(0), i8PtrTy, "blk");
+            b.CreateCall(pthreadMutexLockFn_, {mtxOf(b, blk)});
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, 1),
+                          b.CreateStructGEP(chanBlkTy_, blk, 5, "closedP"));
+            b.CreateCall(pthreadCondBroadcastFn_, {condOf(b, blk)});
+            b.CreateCall(pthreadMutexUnlockFn_, {mtxOf(b, blk)});
+            b.CreateRet(z64);
+            declaredFns_["chan_close"] = fn;
         }
     }
 
@@ -5992,6 +6211,12 @@ private:
                 return llvm::PointerType::get(*ctx_, /*AS=*/0);
             }
             case TypeKind::Struct: {
+                // Phase 76 (v13): the channel endpoints `Sender<T>` /
+                // `Receiver<T>` are Copy i64 HANDLES (a pointer to the shared
+                // channel block, PtrToInt'd) — they lower to i64 regardless of
+                // T, like the Mutex handle.
+                if (r->structName == "Sender" || r->structName == "Receiver")
+                    return llvm::Type::getInt64Ty(*ctx_);
                 // Built-in single-layout generics: `Vec<T>`, `String`,
                 // `Slice`, `HashMap<V>` and `Future<T>` always lower to one
                 // hand-built struct regardless of their type arg(s). Vec keeps
@@ -9517,6 +9742,12 @@ private:
             call.callee == "mutex_unlock" || call.callee == "mutex_get" ||
             call.callee == "mutex_set") {
             ensureThreadRuntime();
+        }
+        // Phase 76 (v13): lazily declare the channel runtime on first chan_*
+        // use (it also pulls in the thread runtime's pthread externs).
+        if (call.callee == "channel" || call.callee == "chan_send" ||
+            call.callee == "chan_recv" || call.callee == "chan_close") {
+            ensureChannelRuntime();
         }
         // Phase 10b: indirect call through a fn VALUE (fat pointer). Applies
         // to let-bound fn values, fn-typed params, and if-selected fns. We

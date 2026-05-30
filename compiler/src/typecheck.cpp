@@ -585,6 +585,32 @@ public:
             sch.genericVars.push_back(hsVar);
             structSchemas_["HashSet"] = std::move(sch);
         }
+
+        // Phase 76 (v13): `Sender<T>` / `Receiver<T>` — typed channel endpoints.
+        // Both lower to a single i64 HANDLE (a heap pointer to the shared
+        // channel block), so they are Copy — a Sender can be captured BY VALUE
+        // into a producer thread's closure (the cross-thread send path). They
+        // are DISTINCT named types so the receiver endpoint can be marked
+        // single-consumer / not-Send (Phase 77): a Receiver may not be moved
+        // into a second thread.
+        TypePtr senderVar = makeFreshVar();
+        TypePtr senderInst = makeStruct("Sender", {});
+        senderInst->typeArgs = {senderVar};
+        {
+            StructSchema sch;
+            sch.type = senderInst;
+            sch.genericVars.push_back(senderVar);
+            structSchemas_["Sender"] = std::move(sch);
+        }
+        TypePtr receiverVar = makeFreshVar();
+        TypePtr receiverInst = makeStruct("Receiver", {});
+        receiverInst->typeArgs = {receiverVar};
+        {
+            StructSchema sch;
+            sch.type = receiverInst;
+            sch.genericVars.push_back(receiverVar);
+            structSchemas_["Receiver"] = std::move(sch);
+        }
         // hashset_new<T>() -> HashSet<T> ! { alloc }
         {
             FnSchema sch;
@@ -1062,6 +1088,60 @@ public:
                 rsch.genericVars.push_back(hmKeyVar);
                 rsch.genericVars.push_back(hmValVar);
                 fnSchemas_["hashmap_get_ref"] = std::move(rsch);
+            }
+
+            // Phase 76 (v13): the typed MPSC channel API (i64 cells this phase;
+            // generic over T in Phase 77). A channel splits into a Copy Sender
+            // (multi-producer) and a single Receiver. The ops carry `share`
+            // (Phase 75) — channels are the cross-thread communication path, so
+            // a pure-declared interface can't smuggle one in. recv returns
+            // Option (None once the channel is closed AND drained).
+            {
+                TypePtr senderI64 = makeStruct("Sender", {});
+                senderI64->typeArgs = {makeInt()};
+                TypePtr receiverI64 = makeStruct("Receiver", {});
+                receiverI64->typeArgs = {makeInt()};
+                TypePtr optI64;
+                if (!optSchema.genericVars.empty()) {
+                    std::unordered_map<int, TypePtr> subst;
+                    subst[optSchema.genericVars[0]->varId] = makeInt();
+                    optI64 = instantiate(optSchema.type, subst);
+                    optI64->typeArgs = {makeInt()};
+                } else {
+                    optI64 = optSchema.type;
+                }
+                // channel() -> (Sender<i64>, Receiver<i64>) ! { alloc }
+                {
+                    TypePtr pair = std::make_shared<Type>();
+                    pair->kind = TypeKind::Tuple;
+                    pair->tupleElems = {senderI64, receiverI64};
+                    FnSchema sch;
+                    sch.signature = makeFunction({}, pair);
+                    sch.declaredEffects.add("alloc");
+                    fnSchemas_["channel"] = std::move(sch);
+                }
+                // chan_send(s: Sender<i64>, v: i64) -> i64 ! { share }
+                {
+                    FnSchema sch;
+                    sch.signature =
+                        makeFunction({senderI64, makeInt()}, makeInt());
+                    sch.declaredEffects.add("share");
+                    fnSchemas_["chan_send"] = std::move(sch);
+                }
+                // chan_recv(r: Receiver<i64>) -> Option<i64> ! { share }
+                {
+                    FnSchema sch;
+                    sch.signature = makeFunction({receiverI64}, optI64);
+                    sch.declaredEffects.add("share");
+                    fnSchemas_["chan_recv"] = std::move(sch);
+                }
+                // chan_close(s: Sender<i64>) -> i64 ! { share }
+                {
+                    FnSchema sch;
+                    sch.signature = makeFunction({senderI64}, makeInt());
+                    sch.declaredEffects.add("share");
+                    fnSchemas_["chan_close"] = std::move(sch);
+                }
             }
         }
 
@@ -5796,6 +5876,13 @@ private:
             bool copyable = rt->kind == TypeKind::Int ||
                             rt->kind == TypeKind::Bool ||
                             rt->kind == TypeKind::Unit;
+            // Phase 76 (v13): a channel `Sender<T>` is a Copy i64 HANDLE and is
+            // Send, so it may be captured BY VALUE into a producer thread's
+            // closure (the cross-thread send path). A `Receiver<T>` is NOT
+            // capturable — it is single-consumer / not-Send — and falls through
+            // to the rejection below (a Receiver can't be moved into a thread).
+            if (rt->kind == TypeKind::Struct && rt->structName == "Sender")
+                copyable = true;
             if (mutated) {
                 // FnMut: capture by reference. The mutation requires the
                 // enclosing binding be `let mut`.
@@ -5806,6 +5893,17 @@ private:
                               "needs a mutable binding",
                           cl.line, cl.column);
                 }
+            } else if (rt->kind == TypeKind::Struct &&
+                       rt->structName == "Receiver") {
+                // Phase 76 (v13): a channel Receiver is the SINGLE-CONSUMER
+                // endpoint — it is not Send, so it can't be moved into another
+                // thread (only the Sender crosses). This is what keeps the MPSC
+                // contract sound; recv on the owning thread.
+                error("cannot move a channel `Receiver` into a thread — it is "
+                      "the single-consumer endpoint and is not Send; keep the "
+                      "Receiver on the owning thread and move the Sender across "
+                      "instead",
+                      cl.line, cl.column);
             } else if (!copyable) {
                 // By-value capture: keep the Phase 10b Copy-only rule.
                 // Capturing a non-Copy aggregate (struct / enum / &mut /
