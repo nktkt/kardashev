@@ -70,3 +70,23 @@ jobs:
 
       - name: Bazel test
         run: bazel test //... --test_output=errors
+
+      # Surface every failing test's captured log (Bazel keeps them under
+      # bazel-testlogs/ but an Aborted test prints nothing to the console with
+      # --test_output=errors). Lets a red CI be diagnosed from the run log alone.
+      - name: Dump failing test logs
+        if: failure()
+        shell: bash
+        run: |
+          echo "=== failing test logs (bazel-testlogs) ==="
+          if [ -d bazel-testlogs ]; then
+            find -L bazel-testlogs -name 'test.log' | while read -r log; do
+              # Only the failures: a passing test.log starts with a PASSED banner.
+              if ! grep -q 'PASSED' "$log" 2>/dev/null; then
+                echo "########## $log ##########"
+                tail -80 "$log" || true
+              fi
+            done
+          else
+            echo "(no bazel-testlogs directory)"
+          fi

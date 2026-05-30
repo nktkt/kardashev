@@ -23,6 +23,20 @@ echo "Using kardc at: $KARDC"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
+# Portable peak-RSS (KB): GNU `time -v` (Linux) or BSD `time -l` (macOS); empty
+# if neither exists (caller SKIPs the gate). Safe under `set -e`/`pipefail`.
+peak_rss_kb() {
+    local f; f=$(mktemp)
+    if /usr/bin/time -v true >/dev/null 2>&1; then
+        { /usr/bin/time -v "$@" >/dev/null; } 2>"$f" || true
+        awk '/Maximum resident set size/ {print $NF}' "$f"
+    elif /usr/bin/time -l true >/dev/null 2>&1; then
+        { /usr/bin/time -l "$@" >/dev/null; } 2>"$f" || true
+        awk '/maximum resident set size/ {print int($1/1024)}' "$f"
+    fi
+    rm -f "$f"
+}
+
 check() { # name file expected
     local n=$1 f=$2 w=$3 jit
     jit=$("$KARDC" "$f")
@@ -77,11 +91,15 @@ EOF
 "$KARDC" --no-cache -o "$TMP/async" "$TMP/async.kd" >/dev/null
 set +e; "$TMP/async" >/dev/null; ar=$?; set -e
 [[ "$ar" -ne 0 ]] && { echo "FAIL [async]: exit $ar"; exit 1; }
-rss=$( /usr/bin/time -v "$TMP/async" 2>&1 | awk '/Maximum resident/ {print $NF}' )
-echo "INFO [async]: peak RSS over 300k block_on(double) = ${rss} KB"
-if [[ -n "$rss" && "$rss" -gt 32768 ]]; then
-    echo "FAIL [async]: RSS ${rss} KB > 32 MB — async frames leak"; exit 1
+rss=$(peak_rss_kb "$TMP/async")
+if [[ -z "$rss" ]]; then
+    echo "SKIP [async]: no GNU/BSD /usr/bin/time available for the RSS gate"
+else
+    echo "INFO [async]: peak RSS over 300k block_on(double) = ${rss} KB"
+    if [[ "$rss" -gt 32768 ]]; then
+        echo "FAIL [async]: RSS ${rss} KB > 32 MB — async frames leak"; exit 1
+    fi
+    echo "PASS [async]: 300k completed futures — RSS flat (frames reclaimed)"
 fi
-echo "PASS [async]: 300k completed futures — RSS flat (frames reclaimed)"
 
 echo "PASS: Phase 43 — runtime string escapes + async-frame reclaim (JIT + AOT)"

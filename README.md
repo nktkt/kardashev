@@ -400,6 +400,27 @@ generic keys; 29 plugged the Drop leaks 27–28's new droppable values made load
 hole; 31 integrated 27–30 into the self-written capstones; 32 documented the result last.
 Each shipped green before the next, exactly as v1–v4 did.
 
+## Roadmap v14 — in progress
+
+> **Status: in progress** on `feat/roadmap-v14`. "Hardening" — make the toolchain
+> trustworthy across platforms and inputs: a fully **green macOS CI**, robust test
+> harnesses, the last known soundness footguns closed, and property/differential
+> testing. The first deliverable after three feature roadmaps (v11–v13) that each
+> needed a soundness fix at review time.
+>
+> - **Phase 82 — portable memory/leak gates.** The RSS leak gates (the
+>   constant-memory checks that catch drop/refcount leaks) hard-required GNU
+>   `/usr/bin/time -v`, so on macOS (BSD `time`) they failed the build under
+>   `set -euo pipefail` — the bulk of the long-standing macOS-CI red (11 of 12
+>   failures). A shared portable `peak_rss_kb` (GNU `time -v` *or* BSD `time -l`,
+>   else a clean SKIP) keeps the gate **running** on both platforms. Plus a CI
+>   step that dumps any failing test's `test.log` so a red run is diagnosable
+>   from the log alone.
+>
+> Planned: macOS `codegen_test` abort (the remaining macOS failure); the channel
+> capture-and-keep footgun → compile error; smoke-harness `| tail` SIGPIPE
+> robustness; JIT-vs-AOT differential / property testing.
+
 ## Roadmap v13 — shipped
 
 > **Status: shipped.** "Concurrency" — make thread-safety a CHECKED property, not a library convention. All of v13 (Phases 75–81) is implemented and fully green — 6 unit suites + the smoke-test aggregate (incl. ~600 concurrency stress runs), JIT **and** AOT, on a cleared clean build.

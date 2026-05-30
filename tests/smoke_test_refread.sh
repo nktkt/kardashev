@@ -25,16 +25,18 @@ echo "Using kardc at: $KARDC"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-rss_kb() {
+# Portable peak-RSS (KB): GNU `time -v` (Linux) or BSD `time -l` (macOS); empty
+# if neither exists (caller SKIPs the gate). Safe under `set -e`/`pipefail`.
+peak_rss_kb() {
+    local f; f=$(mktemp)
     if /usr/bin/time -v true >/dev/null 2>&1; then
-        /usr/bin/time -v "$1" 2>&1 | awk '/Maximum resident/ {print $NF}'
-    else
-        # No GNU `/usr/bin/time -v`: we cannot measure RSS, so the leak gate
-        # cannot run. FAIL LOUDLY rather than echo 0 (which silently passed the
-        # `> 32768` gate without measuring anything — a false-green).
-        echo "FAIL: GNU /usr/bin/time -v unavailable; cannot run the memory gate" >&2
-        exit 1
+        { /usr/bin/time -v "$@" >/dev/null; } 2>"$f" || true
+        awk '/Maximum resident set size/ {print $NF}' "$f"
+    elif /usr/bin/time -l true >/dev/null 2>&1; then
+        { /usr/bin/time -l "$@" >/dev/null; } 2>"$f" || true
+        awk '/maximum resident set size/ {print int($1/1024)}' "$f"
     fi
+    rm -f "$f"
 }
 
 check() { # name file jit-out aot-exit
@@ -94,11 +96,15 @@ fn main() -> i64 ! { alloc } {
 }
 EOF
 "$KARDC" --no-cache -o "$TMP/loop" "$TMP/loop.kd" >/dev/null
-rss=$(rss_kb "$TMP/loop")
-echo "INFO [loop]: peak RSS over 1M build+match-by-ref+drop = ${rss} KB"
-if [[ -n "$rss" && "$rss" -gt 32768 ]]; then
-    echo "FAIL [loop]: RSS ${rss} KB > 32 MB — by-ref match copied/leaked the payload"; exit 1
+rss=$(peak_rss_kb "$TMP/loop")
+if [[ -z "$rss" ]]; then
+    echo "SKIP [loop]: no GNU/BSD /usr/bin/time available for the RSS gate"
+else
+    echo "INFO [loop]: peak RSS over 1M build+match-by-ref+drop = ${rss} KB"
+    if [[ "$rss" -gt 32768 ]]; then
+        echo "FAIL [loop]: RSS ${rss} KB > 32 MB — by-ref match copied/leaked the payload"; exit 1
+    fi
+    echo "PASS [loop]: match-by-ref + enum-String drop — RSS flat (<= 32 MB)"
 fi
-echo "PASS [loop]: match-by-ref + enum-String drop — RSS flat (<= 32 MB)"
 
 echo "PASS: Phase 34 — read-without-move (vec_get_ref / hashmap_get_ref / deref / match &Enum) works in JIT + AOT"

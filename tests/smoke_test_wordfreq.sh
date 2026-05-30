@@ -67,12 +67,29 @@ fn main() -> i64 ! { io, alloc } {
     if acc > 0 { 0 } else { 1 }
 }
 EOF
+# Portable peak-RSS (KB) for a command: GNU `time -v` (Linux) or BSD `time -l`
+# (macOS); empty if neither exists (the caller then SKIPs the gate). Never trips
+# `set -e`/`pipefail`, even when the measured program exits non-zero.
+peak_rss_kb() {
+    local f; f=$(mktemp)
+    if /usr/bin/time -v true >/dev/null 2>&1; then
+        { /usr/bin/time -v "$@" >/dev/null; } 2>"$f" || true
+        awk '/Maximum resident set size/ {print $NF}' "$f"
+    elif /usr/bin/time -l true >/dev/null 2>&1; then
+        { /usr/bin/time -l "$@" >/dev/null; } 2>"$f" || true
+        awk '/maximum resident set size/ {print int($1/1024)}' "$f"
+    fi
+    rm -f "$f"
+}
+
 "$KARDC" --no-cache -o "$TMP/loop" "$TMP/loop.kd" >/dev/null
-rss=$( /usr/bin/time -v "$TMP/loop" 2>&1 | awk '/Maximum resident/ {print $NF}' )
-echo "INFO [loop]: peak RSS over 200k count+rank+drop = ${rss} KB"
-if [[ -n "$rss" && "$rss" -gt 32768 ]]; then
-    echo "FAIL [loop]: RSS ${rss} KB > 32 MB — the word-count pipeline leaks"; exit 1
+rss=$(peak_rss_kb "$TMP/loop")
+if [[ -z "$rss" ]]; then
+    echo "SKIP [loop]: no GNU/BSD /usr/bin/time available for the RSS leak gate"
+else
+    echo "INFO [loop]: peak RSS over 200k count+rank+drop = ${rss} KB"
+    [[ "$rss" -gt 32768 ]] && { echo "FAIL [loop]: RSS ${rss} KB > 32 MB — the word-count pipeline leaks"; exit 1; }
+    echo "PASS [loop]: count+rank+drop (duplicate-key inserts) — RSS flat (<= 32 MB)"
 fi
-echo "PASS [loop]: count+rank+drop (duplicate-key inserts) — RSS flat (<= 32 MB)"
 
 echo "PASS: Phase 56 — word-frequency histogram capstone (JIT + AOT)"

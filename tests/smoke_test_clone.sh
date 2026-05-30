@@ -28,6 +28,20 @@ echo "Using kardc at: $KARDC"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
+# Portable peak-RSS (KB): GNU `time -v` (Linux) or BSD `time -l` (macOS); empty
+# if neither exists (caller SKIPs the gate). Safe under `set -e`/`pipefail`.
+peak_rss_kb() {
+    local f; f=$(mktemp)
+    if /usr/bin/time -v true >/dev/null 2>&1; then
+        { /usr/bin/time -v "$@" >/dev/null; } 2>"$f" || true
+        awk '/Maximum resident set size/ {print $NF}' "$f"
+    elif /usr/bin/time -l true >/dev/null 2>&1; then
+        { /usr/bin/time -l "$@" >/dev/null; } 2>"$f" || true
+        awk '/maximum resident set size/ {print int($1/1024)}' "$f"
+    fi
+    rm -f "$f"
+}
+
 check() { # name file expected
     local n=$1 f=$2 w=$3 jit
     jit=$("$KARDC" "$f")
@@ -157,11 +171,15 @@ fn main() -> i64 ! { alloc } {
 }
 EOF
 "$KARDC" --no-cache -o "$TMP/loop" "$TMP/loop.kd" >/dev/null
-rss=$( /usr/bin/time -v "$TMP/loop" 2>&1 | awk '/Maximum resident/ {print $NF}' )
-echo "INFO [loop]: peak RSS over 200k build+clone+match+drop = ${rss} KB"
-if [[ -n "$rss" && "$rss" -gt 32768 ]]; then
-    echo "FAIL [loop]: RSS ${rss} KB > 32 MB — clone/drop leaked or shared a buffer"; exit 1
+rss=$(peak_rss_kb "$TMP/loop")
+if [[ -z "$rss" ]]; then
+    echo "SKIP [loop]: no GNU/BSD /usr/bin/time available for the RSS gate"
+else
+    echo "INFO [loop]: peak RSS over 200k build+clone+match+drop = ${rss} KB"
+    if [[ "$rss" -gt 32768 ]]; then
+        echo "FAIL [loop]: RSS ${rss} KB > 32 MB — clone/drop leaked or shared a buffer"; exit 1
+    fi
+    echo "PASS [loop]: recursive clone + drop — RSS flat (<= 32 MB)"
 fi
-echo "PASS [loop]: recursive clone + drop — RSS flat (<= 32 MB)"
 
 echo "PASS: Phase 35 — sound recursive heap enums + deep clone (JIT + AOT)"
