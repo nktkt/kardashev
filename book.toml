@@ -1,0 +1,27 @@
+# mdBook configuration — builds the docs/ Markdown into the published
+# documentation site (https://kardashevlang.github.io/kardashev/), the same
+# toolchain Rust uses for The Book and the Reference. `src = "docs"` keeps the
+# reference chapters in-tree next to the compiler so a feature PR can update the
+# docs in the same change. Build: `mdbook build` (output -> ./book, gitignored);
+# `mdbook serve` for a live local preview. CI deploys via .github/workflows/docs.yml.
+
+[book]
+title = "The kardashev Documentation"
+authors = ["The kardashev Authors"]
+description = "Language reference, effects system, standard library, and compiler architecture for the kardashev programming language."
+src = "docs"
+language = "en"
+
+[output.html]
+git-repository-url = "https://github.com/kardashevlang/kardashev"
+default-theme = "rust"
+preferred-dark-theme = "navy"
+no-section-label = false
+
+[output.html.search]
+enable = true
+limit-results = 30
+
+[output.html.fold]
+enable = true
+level = 1
