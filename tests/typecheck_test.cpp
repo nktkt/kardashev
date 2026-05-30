@@ -2599,6 +2599,49 @@ void test_int_literal_out_of_range_errors() {
                       "int_literal_out_of_range_errors");
 }
 
+// Phase 64 (v11): integer-literal width suffixes + radix prefixes.
+void test_int_suffix_literal_ok() {
+    // A suffixed literal IS that int type with NO annotation; it must match the
+    // i32 parameter without any widening.
+    expectOk("fn use32(x: i32) -> i32 { x }\n"
+             "fn main() -> i64 { let y = use32(5i32); let z: i32 = y + 1i32;"
+             " 0 }",
+             "int_suffix_literal_ok");
+}
+
+void test_radix_literal_ok() {
+    // Hex / binary literals are default i64 and add up as values.
+    expectOk("fn main() -> i64 { let a = 0xFF; let b = 0b1010; a + b }",
+             "radix_literal_ok");
+}
+
+void test_radix_suffix_combo_ok() {
+    expectOk("fn use32(x: i32) -> i32 { x }\n"
+             "fn main() -> i64 { let m = use32(0xFFi32); 0 }",
+             "radix_suffix_combo_ok");
+}
+
+void test_int_suffix_out_of_range_errors() {
+    expectErrContains("fn main() -> i64 { let x = 200i8; 0 }",
+                      "out of range",
+                      "int_suffix_out_of_range_errors");
+}
+
+void test_int_suffix_width_mismatch_errors() {
+    // A suffixed i32 can't be added to an i64 var (non-coercive lattice).
+    expectErrContains("fn main() -> i64 { let a = 5i32; let b: i64 = 7;"
+                      " let c = a + b; 0 }",
+                      "same integer",
+                      "int_suffix_width_mismatch_errors");
+}
+
+void test_unsigned_suffix_deferred_errors() {
+    // u8..u64 suffixes are honestly rejected until Phase 66 lands unsigned ints.
+    expectErrContains("fn main() -> i64 { let x = 5u8; 0 }",
+                      "unsigned",
+                      "unsigned_suffix_deferred_errors");
+}
+
 } // namespace
 
 int main() {
@@ -2882,6 +2925,12 @@ int main() {
     test_sized_int_ok();
     test_int_width_mismatch_errors();
     test_int_literal_out_of_range_errors();
+    test_int_suffix_literal_ok();
+    test_radix_literal_ok();
+    test_radix_suffix_combo_ok();
+    test_int_suffix_out_of_range_errors();
+    test_int_suffix_width_mismatch_errors();
+    test_unsigned_suffix_deferred_errors();
     test_const_fn_array_len_ok();
     test_const_div_by_zero_errors();
     test_const_overflow_errors();
@@ -2890,6 +2939,6 @@ int main() {
     test_const_type_mismatch_errors();
     test_const_array_len_bool_errors();
     test_const_array_len_calls_nonconst_fn_errors();
-    std::cout << "All typecheck tests passed (263 cases)\n";
+    std::cout << "All typecheck tests passed (269 cases)\n";
     return 0;
 }

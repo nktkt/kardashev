@@ -142,6 +142,11 @@ struct TypeRef;
 
 struct IntLitExpr : Expr {
     std::int64_t value = 0;
+    // Phase 64 (v11): an explicit suffix `5i32` / `0xFFu8` pins the literal's
+    // type (width + signedness). `suffixWidth == 0` means no suffix (an
+    // unsuffixed literal is i64 by default and narrows in context).
+    int suffixWidth = 0;
+    bool suffixSigned = true;
 };
 
 // Phase 39: an `f64` floating-point literal (e.g. `1.5`, `-2.0`, `3e8`). The

@@ -33,6 +33,15 @@ instead of i64-only. The first step toward production use.
   compile error. An unsuffixed literal is i64 by default and narrows to a
   concrete width in context (`let x: i32 = 5`); the type system carries zero
   literal churn (all v10 i64 programs are byte-for-byte unchanged).
+- Integer-literal **width suffixes** and **radix prefixes** (Phase 64). A
+  suffixed literal `5i32` *is* an `i32` with no annotation (it does not narrow,
+  it has that concrete type), so `add(5i32, 3i32)` type-checks against an `i32`
+  parameter directly; an out-of-range suffixed literal (`200i8`) is a compile
+  error. Hexadecimal `0xFF` and binary `0b1010` literals parse to their value
+  (default `i64`), compose with a suffix (`0xFFi32`), and work in `match`
+  patterns (`0xFF => …`). Unsigned suffixes (`u8`..`u64`) are parsed and
+  rejected with a clear "arrives in a later phase" diagnostic until Phase 66
+  lands unsigned integers — never silently mis-typed.
 
 ## [0.10.0] — Roadmap v10 "sized and sound at compile time" (Phases 57–62)
 

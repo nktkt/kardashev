@@ -3803,7 +3803,31 @@ private:
     }
 
     TypePtr computeExprType(const ast::Expr& e) {
-        if (dynamic_cast<const ast::IntLitExpr*>(&e)) {
+        if (auto* lit = dynamic_cast<const ast::IntLitExpr*>(&e)) {
+            // Phase 64: a SUFFIXED literal (`5i32`) has a fixed concrete width
+            // and signedness — it does not narrow, it IS that type. A range
+            // check at the suffixed width still applies (see below).
+            if (lit->suffixWidth != 0) {
+                // Phase 66 lands unsigned integers (u8..u64); until then an
+                // unsigned suffix names a type with no real semantics, so
+                // reject it honestly rather than silently mis-typing.
+                if (!lit->suffixSigned) {
+                    error("unsigned integer literals (" +
+                              intTypeName(lit->suffixWidth, false) +
+                              ") arrive with unsigned integers in a later "
+                              "phase; use a signed width for now",
+                          e.line, e.column);
+                    return makeInt();
+                }
+                if (!intLitFitsWidth(lit->value, lit->suffixWidth,
+                                     lit->suffixSigned)) {
+                    error("integer literal " + std::to_string(lit->value) +
+                              " out of range for " +
+                              intTypeName(lit->suffixWidth, lit->suffixSigned),
+                          e.line, e.column);
+                }
+                return makeIntW(lit->suffixWidth, lit->suffixSigned);
+            }
             // v11: an unsuffixed integer literal is i64 by default; a coercion
             // site (let annotation / fn arg / binary operand / return) may
             // NARROW it to a concrete int width via narrowIntLiteral(), which
@@ -4029,20 +4053,25 @@ private:
     // `target` (a literal is i64 by default; in an int context it adopts the
     // target's width). Records the literal's exprType so codegen emits the
     // right width; range-checks narrow widths. No-op (false) for non-literals.
+    // Phase 63/64: does `value` fit a signed/unsigned integer of `width` bits?
+    // A 64-bit width always fits (the literal is a `long long`).
+    static bool intLitFitsWidth(long long value, int width, bool isSigned) {
+        if (width >= 64) return true;
+        long long lo = isSigned ? -(1LL << (width - 1)) : 0;
+        long long hi = isSigned ? (1LL << (width - 1)) - 1
+                                : (1LL << width) - 1;
+        return value >= lo && value <= hi;
+    }
+
     bool narrowIntLiteral(const ast::Expr& srcExpr, const TypePtr& target) {
         auto* lit = dynamic_cast<const ast::IntLitExpr*>(&srcExpr);
         if (!lit) return false;
         TypePtr t = resolve(target);
         if (t->kind != TypeKind::Int || t->isConstValue) return false;
-        if (t->intWidth < 64) {
-            long long lo = t->intSigned ? -(1LL << (t->intWidth - 1)) : 0;
-            long long hi = t->intSigned ? (1LL << (t->intWidth - 1)) - 1
-                                        : (1LL << t->intWidth) - 1;
-            if (lit->value < lo || lit->value > hi)
-                error("integer literal " + std::to_string(lit->value) +
-                          " out of range for " + typeToString(t),
-                      srcExpr.line, srcExpr.column);
-        }
+        if (!intLitFitsWidth(lit->value, t->intWidth, t->intSigned))
+            error("integer literal " + std::to_string(lit->value) +
+                      " out of range for " + typeToString(t),
+                  srcExpr.line, srcExpr.column);
         exprTypes_[&srcExpr] = t;
         return true;
     }

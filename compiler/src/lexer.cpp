@@ -134,6 +134,46 @@ std::vector<Token> lex(std::string_view source) {
             // still lexes as a float.
             bool afterDot =
                 !tokens.empty() && tokens.back().kind == TokenKind::Dot;
+            // Phase 64 (v11): consume an optional integer SUFFIX `i8/i16/i32/
+            // i64/u8/u16/u32/u64` into the token (the parser splits it back
+            // out). Shared by the decimal / hex / binary paths below.
+            auto consumeIntSuffix = [&]() {
+                if (i < source.size() &&
+                    (source[i] == 'i' || source[i] == 'u')) {
+                    std::size_t j = i + 1, digits = 0;
+                    while (j < source.size() &&
+                           std::isdigit(static_cast<unsigned char>(source[j]))) {
+                        ++j;
+                        ++digits;
+                    }
+                    if (digits > 0) { // e.g. i32, u8
+                        col += static_cast<int>(j - i);
+                        i = j;
+                    }
+                }
+            };
+            // Phase 64: hex `0x..` / binary `0b..` integer literals (never
+            // floats; not in tuple-index position).
+            if (!afterDot && source[i] == '0' && i + 1 < source.size() &&
+                (source[i + 1] == 'x' || source[i + 1] == 'X' ||
+                 source[i + 1] == 'b' || source[i + 1] == 'B')) {
+                bool hex = (source[i + 1] == 'x' || source[i + 1] == 'X');
+                i += 2;
+                col += 2;
+                auto isDig = [&](char ch) {
+                    return hex ? std::isxdigit(static_cast<unsigned char>(ch))
+                               : (ch == '0' || ch == '1');
+                };
+                while (i < source.size() && isDig(source[i])) {
+                    ++i;
+                    ++col;
+                }
+                consumeIntSuffix();
+                tokens.push_back({TokenKind::Integer,
+                                  std::string(source.substr(start, i - start)),
+                                  line, startCol});
+                continue;
+            }
             while (i < source.size() &&
                    std::isdigit(static_cast<unsigned char>(source[i]))) {
                 ++i;
@@ -171,6 +211,8 @@ std::vector<Token> lex(std::string_view source) {
                     }
                 }
             }
+            // Phase 64: an integer (not a float) may carry a width suffix.
+            if (!isFloat) consumeIntSuffix();
             tokens.push_back({isFloat ? TokenKind::Float : TokenKind::Integer,
                               std::string(source.substr(start, i - start)),
                               line, startCol});

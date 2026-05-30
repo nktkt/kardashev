@@ -158,6 +158,65 @@ private:
         errors_.push_back({std::move(msg), line, column});
     }
 
+    // Phase 64: parse an integer-literal lexeme that may carry an optional
+    // width suffix (`5i32`) and/or a `0x`/`0b` radix prefix (`0xFF`, `0b1010`).
+    // Returns the numeric value; `*outWidth`/`*outSigned` receive the suffix
+    // (outWidth==0 when there is no suffix — an i64-default literal that
+    // narrows in context). `tok` is only used for error reporting.
+    long long parseIntLitLexeme(const Token& tok, int* outWidth,
+                                bool* outSigned) {
+        std::string lex = tok.lexeme;
+        int width = 0;
+        bool isSigned = true;
+        // A width suffix is an `i`/`u` followed by 8/16/32/64. The parser
+        // records it faithfully (signedness included); whether an *unsigned*
+        // suffix is usable yet is a typecheck question (Phase 66 lands unsigned
+        // integers — until then typecheck rejects a `u*` suffix honestly).
+        static const struct { const char* s; int w; bool sg; } kSuffixes[] = {
+            {"i8", 8, true},   {"i16", 16, true},  {"i32", 32, true},
+            {"i64", 64, true}, {"u8", 8, false},   {"u16", 16, false},
+            {"u32", 32, false}, {"u64", 64, false},
+        };
+        for (const auto& sx : kSuffixes) {
+            std::string s = sx.s;
+            if (lex.size() > s.size() &&
+                lex.compare(lex.size() - s.size(), s.size(), s) == 0) {
+                width = sx.w;
+                isSigned = sx.sg;
+                lex = lex.substr(0, lex.size() - s.size());
+                break;
+            }
+        }
+        int base = 10;
+        if (lex.size() > 2 && lex[0] == '0' &&
+            (lex[1] == 'x' || lex[1] == 'X')) {
+            base = 16;
+            lex = lex.substr(2);
+        } else if (lex.size() > 2 && lex[0] == '0' &&
+                   (lex[1] == 'b' || lex[1] == 'B')) {
+            base = 2;
+            lex = lex.substr(2);
+        }
+        long long value = 0;
+        try {
+            value = std::stoll(lex, nullptr, base);
+        } catch (const std::exception&) {
+            errorHere("integer literal out of range: " + tok.lexeme);
+            value = 0;
+        }
+        if (outWidth) *outWidth = width;
+        if (outSigned) *outSigned = isSigned;
+        return value;
+    }
+
+    void fillIntLit(const Token& tok, ast::IntLitExpr& e) {
+        int width = 0;
+        bool isSigned = true;
+        e.value = parseIntLitLexeme(tok, &width, &isSigned);
+        e.suffixWidth = width;
+        e.suffixSigned = isSigned;
+    }
+
     // --- Top-level ---
 
     ast::ModDecl parseModDecl() {
@@ -1560,12 +1619,7 @@ private:
             auto e = std::make_unique<ast::IntLitExpr>();
             e->line = tok.line;
             e->column = tok.column;
-            try {
-                e->value = std::stoll(tok.lexeme);
-            } catch (const std::exception&) {
-                errorHere("integer literal out of range: " + tok.lexeme);
-                e->value = 0;
-            }
+            fillIntLit(tok, *e);
             return e;
         }
 
@@ -1943,12 +1997,7 @@ private:
             auto p = std::make_unique<ast::LitIntPat>();
             p->line = tok.line;
             p->column = tok.column;
-            try {
-                p->value = std::stoll(tok.lexeme);
-            } catch (const std::exception&) {
-                errorHere("integer literal out of range: " + tok.lexeme);
-                p->value = 0;
-            }
+            p->value = parseIntLitLexeme(tok, nullptr, nullptr);
             return p;
         }
         if (t.kind == TokenKind::Underscore) {
