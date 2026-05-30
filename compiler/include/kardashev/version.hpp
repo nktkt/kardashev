@@ -1,7 +1,7 @@
 // The single source of truth for the kardashev toolchain version.
 //
 // Versioning policy (SemVer): the project is pre-1.0, so each completed
-// ROADMAP is a MINOR bump (Roadmap v12 -> 0.12.0, v13 -> 0.13.0); bug-fix
+// ROADMAP is a MINOR bump (Roadmap v13 -> 0.13.0, v14 -> 0.14.0); bug-fix
 // releases bump PATCH. 1.0 is reserved for a language-surface stability
 // commitment, after which the language evolves via opt-in editions rather than
 // MAJOR bumps (the Rust model). Keep this in sync with `MODULE.bazel`'s
@@ -11,6 +11,6 @@
 
 namespace kardashev {
 
-inline constexpr const char* kVersion = "0.13.0";
+inline constexpr const char* kVersion = "0.14.0";
 
 } // namespace kardashev

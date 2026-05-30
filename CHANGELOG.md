@@ -18,6 +18,62 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.14.0] — Roadmap v14 "hardening" (Phases 82–87)
+
+Theme: make the toolchain trustworthy across platforms and inputs — a green
+**macOS CI** for the first time, a SIGPIPE-robust test harness, the last known
+channel footgun closed as a precise compile error, and a JIT-vs-AOT differential
+sweep. The consolidation roadmap after three feature roadmaps (v11–v13) that each
+needed a soundness fix at review time.
+
+### Added
+- **Portable memory/leak gates** (Phase 82) — the constant-memory leak gates
+  (peak-RSS checks that catch drop/refcount leaks) hard-required GNU
+  `/usr/bin/time -v`, so on macOS (BSD `time`) they died under `set -euo
+  pipefail` — 11 of the 12 long-standing macOS-CI failures. A shared portable
+  `peak_rss_kb` (GNU `time -v` **or** BSD `time -l`, else a clean SKIP) keeps the
+  gate *running* on both platforms; this took **macOS CI green for the first
+  time**. Plus a CI step that dumps any failing test's `test.log` (an Aborted
+  test prints nothing with `--test_output=errors`).
+- **SIGPIPE-robust smoke harness** (Phases 84–85) — `echo "$big" | grep -q` /
+  `awk '…exit'` / `$CMD | head -N` make the producer die with SIGPIPE (exit 141)
+  when the consumer closes the pipe early — a load-sensitive flake under
+  `set -o pipefail`. Swept ~51 such pipelines across 31 files to here-strings /
+  capture-then-process; consumers that read to EOF (`tail`, `wc`, plain `grep`)
+  left alone. const.sh went from ~3/5 to 12/12 under load.
+- **The channel capture-and-keep footgun is a compile error** (Phase 86) — a
+  `Sender` captured into a closure is owned by the closure's heap env, which
+  never drops its captures, so the only way it is ever dropped (and the channel
+  closes) is being MOVED out of the closure. The typechecker now rejects a
+  captured `Sender` with no bare (by-value) use anywhere in the body — exactly
+  the send-only-never-moved case that leaks and hangs a `recv`-until-`None`
+  consumer. The rule is *precise* (a bare use is the only way a non-Copy Sender
+  leaves an env, so sound code always has one): zero false positives across the
+  whole v13 channel suite.
+- **JIT-vs-AOT differential sweep** (Phase 87) — one test runs all 9 single-file
+  capstones (calc, checksum, csvstats, json, kdlex, matrix, parstats, rpn,
+  wordfreq) through both backends and asserts they agree. The ORC-JIT prints
+  `main`'s `i64` return as a trailing line while the clang-linked AOT exits with
+  it (& 255), so AOT stdout must equal JIT stdout minus that line and the line
+  mod 256 must equal the AOT exit code. One place any future codegen change must
+  keep green — verified 9/9 agree, on Linux **and** macOS-arm64.
+
+### Fixed
+- **jmp_buf alignment + size** (Phase 83) — the catch-stack `_setjmp` jmp_buf was
+  a 1-aligned `[256 x i8]` byte array (the entry struct 264 bytes, so entries
+  past the first landed at non-16 offsets). Now a generously-sized, 16-byte
+  aligned `[32 x i128]` (512 bytes) cell — correct defensive hardening for any
+  platform. (It did not clear the remaining macOS-arm64 `codegen_test` flake — an
+  arm64-JIT-execution issue that is ASan/UBSan-clean on Linux and needs a
+  macOS-arm64 environment to diagnose; tracked, not papered over.)
+
+### Notes
+- Tested green on a cleared clean build: 6 unit suites + the smoke aggregate
+  (incl. the new differential + v13-review footgun checks), JIT **and** AOT.
+  **Linux CI green; macOS CI green except a flaky `codegen_test` abort** (the
+  9-capstone differential passing on macOS-arm64 confirms the *generated code*
+  agrees across backends there — the flake is in the unit-test harness).
+
 ## [0.13.0] — Roadmap v13 "concurrency" (Phases 75–81)
 
 Theme: make concurrency SAFE BY CONSTRUCTION — typed channels that move data

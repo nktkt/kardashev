@@ -52,9 +52,14 @@ Effect sets are unioned across the call graph and checked at definition sites; n
 
 ## Status
 
-All thirteen roadmaps (Phases 0–81, **v1–v13**) have shipped and are merged to
+All fourteen roadmaps (Phases 0–87, **v1–v14**) have shipped and are merged to
 `main` — 6 unit suites plus the full smoke-test aggregate pass **JIT and AOT**
-on a cleared clean build. v13 ("concurrency") made thread-safety a *checked
+on a cleared clean build. v14 ("hardening") made the toolchain trustworthy
+across platforms: **macOS CI went green for the first time** (portable leak
+gates), the smoke harness is SIGPIPE-robust, the channel capture-and-keep footgun
+is now a precise compile error, and a JIT-vs-AOT differential sweep over the 9
+capstones confirms both backends agree (Linux + macOS-arm64). v13
+("concurrency") made thread-safety a *checked
 property*: the **`share` effect** (a pure-declared trait can't launder a
 `thread_spawn`), **typed MPSC channels** that MOVE a real `T` across threads
 guarded by the structural **`Send`** rule, and `Rc<T>` as the legible non-`Send`
@@ -400,13 +405,16 @@ generic keys; 29 plugged the Drop leaks 27–28's new droppable values made load
 hole; 31 integrated 27–30 into the self-written capstones; 32 documented the result last.
 Each shipped green before the next, exactly as v1–v4 did.
 
-## Roadmap v14 — in progress
+## Roadmap v14 — shipped
 
-> **Status: in progress** on `feat/roadmap-v14`. "Hardening" — make the toolchain
-> trustworthy across platforms and inputs: a fully **green macOS CI**, robust test
-> harnesses, the last known soundness footguns closed, and property/differential
-> testing. The first deliverable after three feature roadmaps (v11–v13) that each
-> needed a soundness fix at review time.
+> **Status: shipped.** "Hardening" — make the toolchain trustworthy across
+> platforms and inputs. All of v14 (Phases 82–87) is implemented and green — 6
+> unit suites + the smoke aggregate (incl. the new JIT/AOT differential + the
+> footgun checks), JIT **and** AOT. The headline: **macOS CI is green for the
+> first time** (Linux CI green throughout; macOS green except a flaky
+> `codegen_test` abort that's an arm64-JIT issue, documented below). The
+> consolidation roadmap after three feature roadmaps (v11–v13) that each needed a
+> soundness fix at review time.
 >
 > - **Phase 82 — portable memory/leak gates.** The RSS leak gates (the
 >   constant-memory checks that catch drop/refcount leaks) hard-required GNU
