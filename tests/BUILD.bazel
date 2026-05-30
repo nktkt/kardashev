@@ -729,6 +729,14 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 78 (v13 — concurrency): Rc<T> refcounted shared owner (drop-once, no
+# leak) — the legible non-Send witness (sending one on a channel is rejected).
+sh_test(
+    name = "smoke_test_phase78",
+    srcs = ["smoke_test_phase78.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

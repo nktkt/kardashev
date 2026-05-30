@@ -56,6 +56,14 @@ witness).
   aggregates / the channel `Sender` are `Send`, while a `&T` borrow, the
   `Receiver`, and (Phase 78) `Rc` are not — sending a non-`Send` value on a
   channel is a compile error, so no borrow can dangle across a thread.
+- **`Rc<T>`** (Phase 78) — a non-atomic reference-counted shared owner
+  (`rc_new` / `rc_clone` / `rc_get` / `rc_strong_count`), a pointer to a heap
+  `{ i64 strong, T value }`. The strong count tracks clones; the shared value
+  and the block are dropped EXACTLY once when the last `Rc` drops (verified
+  drop-once over a `Drop`-counted inner; 200k clone+drop pairs stay flat). It
+  is the **legible non-`Send` witness**: its refcount is non-atomic, so an
+  `Rc` may not cross a thread boundary (sending one on a channel is a compile
+  error that names `Rc`) — the contrast to sharing safely via a `Mutex`.
 
 ## [0.12.0] — Roadmap v12 "real stdlib" (Phases 69–74)
 

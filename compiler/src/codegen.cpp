@@ -3545,6 +3545,83 @@ private:
         return nullptr;
     }
 
+    // Phase 78 (v13): the per-T `Rc<T>` ops over a heap `{ i64 strong, T value }`
+    // block. rc_new allocates with strong=1; rc_clone shares (count++) and
+    // returns the same block; rc_get borrows the value; rc_strong_count reads
+    // the count. The DROP (a non-atomic decrement + free-at-zero) lives in
+    // emitDropGlueInline — non-atomic on purpose, which is exactly why an Rc is
+    // not Send.
+    llvm::Function* getOrEmitRcOp(const std::string& op, const TypePtr& T) {
+        std::string suffix = mangleType(T);
+        std::string mangled = op + "__" + suffix;
+        if (auto it = declaredFns_.find(mangled); it != declaredFns_.end())
+            return it->second;
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* one = llvm::ConstantInt::get(i64Ty, 1);
+        llvm::Type* elemTy = mapKardashevType(T);
+        auto* blkTy = rcBlockType(T);
+        auto* blkSzK = llvm::ConstantInt::get(
+            i64Ty, module_->getDataLayout().getTypeAllocSize(blkTy));
+        auto mk = [&](llvm::FunctionType* ty) {
+            auto* fn = llvm::Function::Create(
+                ty, llvm::Function::ExternalLinkage, mangled, module_.get());
+            return fn;
+        };
+        if (op == "rc_new") {
+            auto* fn = mk(llvm::FunctionType::get(i8PtrTy, {elemTy}, false));
+            fn->getArg(0)->setName("v");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto* blk = b.CreateCall(mallocFn_, {blkSzK}, "rc_blk");
+            b.CreateStore(one, b.CreateStructGEP(blkTy, blk, 0, "strong"));
+            b.CreateStore(fn->getArg(0),
+                          b.CreateStructGEP(blkTy, blk, 1, "value"));
+            b.CreateRet(blk);
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        if (op == "rc_clone") {
+            auto* fn = mk(llvm::FunctionType::get(i8PtrTy, {i8PtrTy}, false));
+            fn->getArg(0)->setName("r");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto* blk = b.CreateLoad(i8PtrTy, fn->getArg(0), "blk");
+            auto* cntP = b.CreateStructGEP(blkTy, blk, 0, "strongP");
+            b.CreateStore(b.CreateAdd(b.CreateLoad(i64Ty, cntP, "cnt"), one,
+                                      "inc"),
+                          cntP);
+            b.CreateRet(blk);
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        if (op == "rc_get") {
+            auto* fn = mk(llvm::FunctionType::get(i8PtrTy, {i8PtrTy}, false));
+            fn->getArg(0)->setName("r");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto* blk = b.CreateLoad(i8PtrTy, fn->getArg(0), "blk");
+            b.CreateRet(b.CreateStructGEP(blkTy, blk, 1, "valueP"));
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        if (op == "rc_strong_count") {
+            auto* fn = mk(llvm::FunctionType::get(i64Ty, {i8PtrTy}, false));
+            fn->getArg(0)->setName("r");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto* blk = b.CreateLoad(i8PtrTy, fn->getArg(0), "blk");
+            b.CreateRet(b.CreateLoad(
+                i64Ty, b.CreateStructGEP(blkTy, blk, 0, "strongP"), "cnt"));
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        return nullptr;
+    }
+    // The `{ i64 strong, T value }` layout of an Rc<T> block. Anonymous so the
+    // drop glue and the ops agree on field offsets without a name table.
+    llvm::StructType* rcBlockType(const TypePtr& T) {
+        return llvm::StructType::get(
+            *ctx_, {llvm::Type::getInt64Ty(*ctx_), mapKardashevType(T)});
+    }
+
     // --- Phase 23: real panic + unwinding (setjmp/longjmp + cleanup stack) ---
     //
     // Mechanism. Two process-global growable stacks live in IR:
@@ -6234,6 +6311,10 @@ private:
                 // T, like the Mutex handle.
                 if (r->structName == "Sender" || r->structName == "Receiver")
                     return llvm::Type::getInt64Ty(*ctx_);
+                // Phase 78 (v13): `Rc<T>` is a pointer to a heap
+                // `{ i64 strong, T value }` refcount block.
+                if (r->structName == "Rc")
+                    return llvm::PointerType::get(*ctx_, 0);
                 // Built-in single-layout generics: `Vec<T>`, `String`,
                 // `Slice`, `HashMap<V>` and `Future<T>` always lower to one
                 // hand-built struct regardless of their type arg(s). Vec keeps
@@ -7838,10 +7919,16 @@ private:
             if (r->structName == "Vec" || r->structName == "String" ||
                 r->structName == "HashMap" || r->structName == "HashSet")
                 return true;
+            // Phase 78 (v13): Rc<T> owns a refcount block — droppable (its drop
+            // decrements + frees at zero).
+            if (r->structName == "Rc") return true;
             // Slice / Range / fn-value / future structs own no heap (Slice is
             // a borrow; Range/Future are plain scalars in the MVP).
+            // Sender/Receiver are Copy i64 handles (the channel block is owned
+            // by the runtime, not the handle) — not droppable.
             if (r->structName == "Slice" || r->structName == "Range" ||
-                r->structName == "Future")
+                r->structName == "Future" || r->structName == "Sender" ||
+                r->structName == "Receiver")
                 return false;
             std::string key = mangleStructInstance(r->structName, r->typeArgs);
             if (!seen.insert("S:" + key).second) return false;
@@ -8004,6 +8091,39 @@ private:
                 emitDropGlue(boxPtr, inner);
             }
             builder_->CreateCall(freeFn_, {boxPtr});
+            return;
+        }
+
+        // Phase 78 (v13): Rc<T> drop — decrement the (non-atomic) strong count;
+        // when it reaches zero, drop the shared value and free the block. The
+        // count lives in the shared block, so cloning + dropping balance and
+        // the value is freed exactly once (by the last owner). Non-atomic by
+        // design — which is why an Rc is not Send.
+        if (r->kind == TypeKind::Struct && r->structName == "Rc" &&
+            !r->typeArgs.empty()) {
+            auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+            TypePtr inner = resolveInInstance(r->typeArgs[0]);
+            auto* blkTy = rcBlockType(inner);
+            auto* blk = builder_->CreateLoad(i8PtrTy, valuePtr, "rc.ptr");
+            auto* cntP = builder_->CreateStructGEP(blkTy, blk, 0, "rc.strongP");
+            auto* dec = builder_->CreateSub(
+                builder_->CreateLoad(i64Ty, cntP, "rc.cnt"),
+                llvm::ConstantInt::get(i64Ty, 1), "rc.dec");
+            builder_->CreateStore(dec, cntP);
+            auto* curFn = builder_->GetInsertBlock()->getParent();
+            auto* freeBB = llvm::BasicBlock::Create(ctx, "rc.free", curFn);
+            auto* contBB = llvm::BasicBlock::Create(ctx, "rc.cont", curFn);
+            builder_->CreateCondBr(
+                builder_->CreateICmpEQ(dec, llvm::ConstantInt::get(i64Ty, 0),
+                                       "rc.last"),
+                freeBB, contBB);
+            builder_->SetInsertPoint(freeBB);
+            if (isDroppable(inner))
+                emitDropGlue(builder_->CreateStructGEP(blkTy, blk, 1, "rc.val"),
+                             inner);
+            builder_->CreateCall(freeFn_, {blk});
+            builder_->CreateBr(contBB);
+            builder_->SetInsertPoint(contBB);
             return;
         }
 
@@ -9852,6 +9972,26 @@ private:
                 !concreteTypeArgs.empty()) {
                 llvm::Function* fn =
                     getOrEmitChannelOp(call.callee, concreteTypeArgs[0]);
+                if (!fn) {
+                    errors_.push_back("codegen: cannot specialize " +
+                                      call.callee);
+                    return llvm::ConstantInt::get(
+                        llvm::Type::getInt64Ty(*ctx_), 0);
+                }
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(
+                    fn, args,
+                    fn->getReturnType()->isVoidTy() ? "" : "call_" + call.callee);
+            }
+            // Phase 78 (v13): the per-T Rc<T> ops.
+            if ((call.callee == "rc_new" || call.callee == "rc_clone" ||
+                 call.callee == "rc_get" ||
+                 call.callee == "rc_strong_count") &&
+                !concreteTypeArgs.empty()) {
+                llvm::Function* fn =
+                    getOrEmitRcOp(call.callee, concreteTypeArgs[0]);
                 if (!fn) {
                     errors_.push_back("codegen: cannot specialize " +
                                       call.callee);

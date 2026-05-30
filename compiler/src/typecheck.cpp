@@ -611,6 +611,55 @@ public:
             sch.genericVars.push_back(receiverVar);
             structSchemas_["Receiver"] = std::move(sch);
         }
+
+        // Phase 78 (v13): `Rc<T>` — a NON-ATOMIC reference-counted shared owner
+        // (a pointer to a heap `{ i64 strong, T value }`). rc_clone shares (the
+        // count++); the value is dropped + freed when the last Rc drops. It is
+        // the canonical NOT-Send type: its refcount is non-atomic, so two
+        // threads racing on rc_clone/drop would corrupt it — sending or
+        // capturing an Rc across a thread is a compile error (isSend(Rc)=false).
+        // The legible witness for the Send rule (vs sharing safely via Mutex).
+        TypePtr rcVar = makeFreshVar();
+        TypePtr rcInst = makeStruct("Rc", {});
+        rcInst->typeArgs = {rcVar};
+        {
+            StructSchema sch;
+            sch.type = rcInst;
+            sch.genericVars.push_back(rcVar);
+            structSchemas_["Rc"] = std::move(sch);
+        }
+        // rc_new<T>(v: T) -> Rc<T> ! { alloc }
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({rcVar}, rcInst);
+            sch.declaredEffects.add("alloc");
+            sch.genericVars.push_back(rcVar);
+            fnSchemas_["rc_new"] = std::move(sch);
+        }
+        // rc_clone<T>(r: &Rc<T>) -> Rc<T>  (shares; bumps the strong count)
+        {
+            FnSchema sch;
+            sch.signature =
+                makeFunction({makeRef(rcInst, /*isMut=*/false)}, rcInst);
+            sch.genericVars.push_back(rcVar);
+            fnSchemas_["rc_clone"] = std::move(sch);
+        }
+        // rc_get<T>(r: &Rc<T>) -> &T   (borrow the shared value)
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeRef(rcInst, /*isMut=*/false)},
+                                         makeRef(rcVar, /*isMut=*/false));
+            sch.genericVars.push_back(rcVar);
+            fnSchemas_["rc_get"] = std::move(sch);
+        }
+        // rc_strong_count<T>(r: &Rc<T>) -> i64
+        {
+            FnSchema sch;
+            sch.signature =
+                makeFunction({makeRef(rcInst, /*isMut=*/false)}, makeInt());
+            sch.genericVars.push_back(rcVar);
+            fnSchemas_["rc_strong_count"] = std::move(sch);
+        }
         // hashset_new<T>() -> HashSet<T> ! { alloc }
         {
             FnSchema sch;
