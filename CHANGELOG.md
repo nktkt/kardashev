@@ -60,6 +60,13 @@ step toward production use.
   link now pulls in `-lm`), plus more Option/Result inspectors
   (`option_is_some`, `option_ok_or`, `result_is_ok`). A real-number program no
   longer needs its own FFI declaration of libm.
+- **Capstone** `examples/csvstats` (Phase 74) — "the real stdlib, applied": a
+  CSV statistics aggregator that READS data (the thing v11 could not do),
+  grouping `category,value` rows and reporting per-category count + sum + the
+  running global max in sorted order. Exercises the whole v12 line at once —
+  `parse_int` (with an `Option`-driven skip of a malformed row), `str_split`,
+  HashMap aggregation, `i64_max`, `sort`, and `int_to_string` + `str_concat`
+  formatting.
 
 ## [0.11.0] — Roadmap v11 "real machine integers" (Phases 63–68)
 

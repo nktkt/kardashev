@@ -1,0 +1,82 @@
+// Roadmap v12 CAPSTONE — "the real stdlib, applied."
+//
+// A CSV statistics aggregator: it READS DATA (the thing v11 could not do) and
+// computes per-category aggregates. Every line is `category,value`; the tool
+// groups by category and reports each group's count, sum, and the running
+// global maximum — then prints the categories in sorted order.
+//
+// It exercises the whole v12 stdlib line at once:
+//   - parse_int (Phase 69)        — turn the value field into a number, and
+//                                    SKIP a malformed row (Option = None);
+//   - str_split (line + field)    — tokenize the CSV;
+//   - HashMap aggregation         — sum/count per category, keyed by String;
+//   - i64_max (Phase 73)          — the running global maximum;
+//   - hashmap_keys + sort         — deterministic, sorted output;
+//   - int_to_string + str_concat  — format each report line.
+// None of this is expressible without real parsing — the v12 milestone.
+
+// sums[cat] += v ; returns nothing (mutates the map).
+fn bump(m: &mut HashMap<String, i64>, key: &String, by: i64) -> i64 ! { alloc } {
+    let prev = match hashmap_get(m, clone(key)) { Some(p) => p, None => 0 };
+    hashmap_insert(m, clone(key), prev + by);
+    0
+}
+
+fn lookup(m: &HashMap<String, i64>, key: &String) -> i64 ! { alloc } {
+    match hashmap_get(m, clone(key)) { Some(p) => p, None => 0 }
+}
+
+fn main() -> i64 ! { io, alloc } {
+    // Note the deliberately malformed row `oops,x` — parse_int rejects it and
+    // the pipeline skips it, demonstrating Option-driven error handling.
+    let data = "apple,3\nbanana,5\napple,7\noops,x\ncherry,2\nbanana,1\napple,4";
+    let lines = str_split(&data, 10);   // 10 = '\n'
+
+    let mut sums = hashmap_new();
+    let mut counts = hashmap_new();
+    let mut gmax = 0;
+    let mut total = 0;
+    let mut skipped = 0;
+
+    let mut i = 0;
+    while i < vec_len(&lines) {
+        let line = vec_get_ref(&lines, i);
+        let fields = str_split(line, 44);   // 44 = ','
+        if vec_len(&fields) == 2 {
+            let cat = clone(vec_get_ref(&fields, 0));
+            let vfield = vec_get_ref(&fields, 1);
+            match parse_int(vfield) {
+                Some(v) => {
+                    total = total + v;
+                    gmax = i64_max(gmax, v);
+                    bump(&mut sums, &cat, v);
+                    bump(&mut counts, &cat, 1);
+                },
+                None => { skipped = skipped + 1; },
+            }
+        } else {}
+        i = i + 1;
+    }
+
+    // Sorted report: `<category> <sum> <count>` per line (String is Ord).
+    let mut keys = hashmap_keys(&sums);
+    sort(&mut keys);
+    let mut k = 0;
+    while k < vec_len(&keys) {
+        let cat = vec_get_ref(&keys, k);
+        let s = lookup(&sums, cat);
+        let c = lookup(&counts, cat);
+        let sp = " ";
+        let mut line = str_concat(cat, &sp);
+        string_push_str(&mut line, int_to_string(s));
+        string_push_str(&mut line, clone(&sp));
+        string_push_str(&mut line, int_to_string(c));
+        println(&line);
+        k = k + 1;
+    }
+
+    // A single witness, correct only if every step is:
+    //   total = 3+5+7+2+1+4 = 22 ; gmax = 7 ; categories = 3 ; skipped = 1.
+    //   22 + 7*1000 + 3*100000 + 1*10000000 = 10307022
+    total + gmax * 1000 + vec_len(&keys) * 100000 + skipped * 10000000
+}

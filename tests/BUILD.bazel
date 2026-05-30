@@ -686,6 +686,17 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 74 (v12) CAPSTONE: a CSV statistics aggregator in kardashev. Builds the
+# real examples/csvstats/main.kd.
+sh_test(
+    name = "smoke_test_phase74",
+    srcs = ["smoke_test_phase74.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/csvstats:main.kd",
+    ],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the
