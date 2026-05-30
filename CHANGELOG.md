@@ -18,11 +18,14 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
-## [Unreleased] — Roadmap v11 "real machine integers" (Phases 63–68, in progress)
+## [0.11.0] — Roadmap v11 "real machine integers" (Phases 63–68)
 
 Theme: the **numeric tower** — make kardashev practical by giving it real
 machine integers (sized + unsigned + f32, `as` casts, bit ops, defined overflow)
-instead of i64-only. The first step toward production use.
+instead of i64-only. The first step toward production use. A pre-merge
+adversarial multi-agent review hardened a const-evaluation width/sign cluster
+(including an invalid-IR blocker) plus two parser/lexer bugs the green suite had
+missed (see Fixed).
 
 ### Added
 - Sized SIGNED machine integers `i8` / `i16` / `i32` (Phase 63) — `i64` stays
@@ -88,6 +91,32 @@ instead of i64-only. The first step toward production use.
   routine is generic over its input length with a const-generic `[u8; N]`,
   integrating the v10 const-generic line with the whole v11 numeric tower —
   none of it is expressible in an i64-only language.
+
+### Fixed
+- A pre-merge adversarial multi-agent review hardened a cluster the green smoke
+  suite had missed — every one with a verified repro, now pinned by
+  `tests/smoke_test_v11_review.sh`:
+  - **(blocker)** a narrow / unsigned `const` flowed into a narrow slot as a
+    64-bit immediate — invalid LLVM IR (`call i32 @id(i64 7)`) / verifier
+    crash. Codegen now emits a folded const at the const-reference's resolved
+    int width.
+  - a sized / unsigned `const`'s folded value disagreed with the same
+    expression at run time — an unsigned `>>` folded as an arithmetic shift, a
+    narrow result was not wrapped to its width (`100i8 + 100i8` → 200 at const
+    time vs −56 at run time), and `1i32 << 31` silently held 2147483648 in an
+    `i32`. The const evaluator now wraps every result to its expression-type
+    width (two's-complement), so an unsigned `>>` is logical and every sized
+    const folds identically to run time.
+  - a plain-literal narrow / unsigned `const` (`const C: i32 = 100`) was
+    rejected though the identical `let` was accepted — `const` now narrows its
+    initializer like any other coercion site.
+  - `expr as Type << ..` / `expr as Type < ..` was a parse error — the cast's
+    target type greedily consumed the `<` / `<<` as a generic-argument list.
+    A cast now parses only a bare (numeric) target, leaving the operator for
+    the expression parser.
+  - an integer/float width suffix was absorbed in tuple-index position
+    (`t.0i32` silently became `t.0`) — the suffix is no longer taken after a
+    `.`.
 
 ## [0.10.0] — Roadmap v10 "sized and sound at compile time" (Phases 57–62)
 
