@@ -864,6 +864,17 @@ sh_test(
     ],
 )
 
+# v16 Phase 95 (self-hosting, cont.): a statement/block parser + evaluator —
+# `let NAME = EXPR ;` bindings + a result expr, evaluated with a growing env.
+sh_test(
+    name = "smoke_test_phase95",
+    srcs = ["smoke_test_phase95.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:stmt.kd",
+    ],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

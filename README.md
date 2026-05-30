@@ -426,10 +426,18 @@ Each shipped green before the next, exactly as v1–v4 did.
 >   JIT + AOT. (`eval` walks the Box-recursive tree via the `&(**child)` borrow;
 >   the cursor threads as a `&mut Pos` cell since kardashev has no `&mut i64`
 >   deref-assign — a candidate ergonomics improvement.)
+> - **Phase 95 — a statement/block parser + evaluator (done).** `examples/selfhost/stmt.kd`
+>   grows the body grammar to a BLOCK: a sequence of `let NAME = EXPR ;` bindings
+>   plus a final result expression, parsed into `Block { lets: Vec<Stmt>, result:
+>   Box<Expr> }` and evaluated by running each `let` in order — EXTENDING the
+>   environment — then the result, exactly how an interpreter executes a function
+>   body. Over `let x = a + 1 ; let y = x * 2 ; y` with `{ a: 3 }`: `x = 4`,
+>   `y = 8` (a `let` references both the outer `a` and the earlier `x`), result
+>   `8`, JIT + AOT.
 >
-> Planned: parse statements (`let`, `return`) + a function body of statements →
-> `Fn { sig, body }`; a real type checker over the body; eventually emit code —
-> closing language gaps as they surface.
+> Planned: a function body of statements wired to the v15 `FnSig` → `Fn { sig,
+> body }`; a real type checker over the body; eventually emit code — closing
+> language gaps as they surface.
 
 ## Roadmap v15 — shipped
 
