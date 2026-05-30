@@ -2834,6 +2834,14 @@ void test_vec_pop_returns_element_type() {
              "vec_pop_returns_element_type");
 }
 
+// v12 Phase 71: hashset_items builtin returns Vec<T>.
+void test_hashset_items_ok() {
+    expectOk("fn main() -> i64 ! { alloc } { let mut s = hashset_new();"
+             " hashset_insert(&mut s, 5); let v = hashset_items(&s);"
+             " vec_len(&v) }",
+             "hashset_items_ok");
+}
+
 } // namespace
 
 int main() {
@@ -3150,6 +3158,7 @@ int main() {
     test_int_to_hex_ok();
     test_vec_mutation_ok();
     test_vec_pop_returns_element_type();
+    test_hashset_items_ok();
     test_const_fn_array_len_ok();
     test_const_div_by_zero_errors();
     test_const_overflow_errors();
@@ -3158,6 +3167,6 @@ int main() {
     test_const_type_mismatch_errors();
     test_const_array_len_bool_errors();
     test_const_array_len_calls_nonconst_fn_errors();
-    std::cout << "All typecheck tests passed (296 cases)\n";
+    std::cout << "All typecheck tests passed (297 cases)\n";
     return 0;
 }

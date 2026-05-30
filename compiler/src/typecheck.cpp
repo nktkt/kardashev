@@ -612,6 +612,19 @@ public:
             sch.genericVars.push_back(hsVar);
             fnSchemas_["hashset_len"] = std::move(sch);
         }
+        // v12 Phase 71: hashset_items<T>(s: &HashSet<T>) -> Vec<T> ! { alloc } —
+        // enumerate the set (deep-cloned items, bucket order). The set is only
+        // borrowed; the Vec owns its copies.
+        {
+            FnSchema sch;
+            TypePtr vecOfElem = makeStruct("Vec", {});
+            vecOfElem->typeArgs = {hsVar};
+            sch.signature = makeFunction(
+                {makeRef(hashSetInst, /*isMut=*/false)}, vecOfElem);
+            sch.genericVars.push_back(hsVar);
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["hashset_items"] = std::move(sch);
+        }
 
         // Phase 13b built-in: `&[i64]` slices (MVP element = i64). A slice is
         // the fat pointer produced by `&v[a..b]`; the two ops mirror Vec's

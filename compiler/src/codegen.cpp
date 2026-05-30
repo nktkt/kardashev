@@ -2793,7 +2793,9 @@ private:
             getOrEmitHashMapOp("hashmap_insert", T, i64T);
         llvm::Function* mapGet = getOrEmitHashMapOp("hashmap_get", T, i64T);
         llvm::Function* mapLen = getOrEmitHashMapOp("hashmap_len", T, i64T);
-        if (!mapNew || !mapInsert || !mapGet || !mapLen) return nullptr;
+        llvm::Function* mapKeys = getOrEmitHashMapOp("hashmap_keys", T, i64T);
+        if (!mapNew || !mapInsert || !mapGet || !mapLen || !mapKeys)
+            return nullptr;
 
         // hashset_new() -> HashSet
         {
@@ -2856,6 +2858,22 @@ private:
             b.CreateRet(b.CreateICmpEQ(
                 disc, llvm::ConstantInt::get(i32Ty, someIdx), "found"));
             declaredFns_["hashset_contains__set_" + suffix] = fn;
+        }
+        // v12 Phase 71: hashset_items(s) -> Vec<T> — enumerate the set's
+        // elements (the underlying map's keys). Closes the "no way to iterate a
+        // HashSet" gap. The returned Vec owns deep clones of the elements (it is
+        // what hashmap_keys produces), so the set is only borrowed.
+        {
+            auto* vecTy = structTypes_["Vec"];
+            auto* fnTy = llvm::FunctionType::get(vecTy, {i8PtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage,
+                "hashset_items__set_" + suffix, module_.get());
+            fn->getArg(0)->setName("s");
+            auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(e);
+            b.CreateRet(b.CreateCall(mapKeys, {fn->getArg(0)}, "items"));
+            declaredFns_["hashset_items__set_" + suffix] = fn;
         }
         auto it = declaredFns_.find(want);
         return it != declaredFns_.end() ? it->second : nullptr;
@@ -9608,7 +9626,8 @@ private:
             if ((call.callee == "hashset_new" ||
                  call.callee == "hashset_insert" ||
                  call.callee == "hashset_contains" ||
-                 call.callee == "hashset_len") &&
+                 call.callee == "hashset_len" ||
+                 call.callee == "hashset_items") &&
                 !concreteTypeArgs.empty()) {
                 llvm::Function* fn =
                     getOrEmitHashSetOp(call.callee, concreteTypeArgs[0]);

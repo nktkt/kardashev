@@ -662,6 +662,14 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 71 (v12 — real stdlib): HashMap/HashSet enumeration + membership
+# (hashmap_contains/values, hashset_items).
+sh_test(
+    name = "smoke_test_phase71",
+    srcs = ["smoke_test_phase71.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

@@ -691,6 +691,38 @@ std::string applyPrelude(const std::string& userSrc) {
             "    out\n"
             "}\n";
     }
+    // v12 Phase 71: HashMap membership + value enumeration, written in
+    // kardashev over hashmap_get_ref / hashmap_keys (the dual of
+    // hashmap_entries). `hashmap_contains(m, &k)` borrows the key (cloned for
+    // the lookup). `hashmap_values` deep-clones each value into a fresh Vec.
+    if (userSrc.find("fn hashmap_contains") == std::string::npos) {
+        prelude +=
+            "fn hashmap_contains<K: Hash + Eq + Clone, V>"
+            "(m: &HashMap<K, V>, k: &K) -> bool ! { alloc } {\n"
+            "    match hashmap_get_ref(m, k.clone()) {\n"
+            "        Some(vref) => true,\n"
+            "        None => false,\n"
+            "    }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn hashmap_values") == std::string::npos) {
+        prelude +=
+            "fn hashmap_values<K: Hash + Eq + Clone, V: Clone>"
+            "(m: &HashMap<K, V>) -> Vec<V> ! { alloc } {\n"
+            "    let mut out = vec_new();\n"
+            "    let ks = hashmap_keys(m);\n"
+            "    let mut i = 0;\n"
+            "    while i < vec_len(&ks) {\n"
+            "        let kref = vec_get_ref(&ks, i);\n"
+            "        match hashmap_get_ref(m, kref.clone()) {\n"
+            "            Some(vref) => { vec_push(&mut out, vref.clone()); },\n"
+            "            None => {},\n"
+            "        }\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    out\n"
+            "}\n";
+    }
     if (userSrc.find("fn option_unwrap_or") == std::string::npos) {
         prelude +=
             "fn option_unwrap_or(o: Option<i64>, default: i64) -> i64 {\n"

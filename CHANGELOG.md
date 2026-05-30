@@ -41,6 +41,14 @@ step toward production use.
   longer owns that slot — no clone, no double-free, the dual of the cloning
   `vec_get`), so they are sound for a non-Copy element type (`Vec<String>`).
   `vec_insert` grows when full and clamps its index to `[0, len]`.
+- **HashMap / HashSet enumeration + membership** (Phase 71):
+  `hashmap_contains(&HashMap, &K) -> bool` and `hashmap_values(&HashMap) ->
+  Vec<V>` (`Eq`+`Clone`-bounded prelude scans over `hashmap_get_ref` /
+  `hashmap_keys`, deep-cloning the values), plus `hashset_items(&HashSet) ->
+  Vec<T>` — the first way to enumerate a `HashSet` (a codegen built-in
+  delegating to the backing map's keys). `hashmap_remove` / `hashset_remove`
+  are a deliberate deferral (open-addressing deletion needs tombstone-aware
+  get/insert).
 
 ## [0.11.0] — Roadmap v11 "real machine integers" (Phases 63–68)
 
