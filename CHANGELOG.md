@@ -64,6 +64,13 @@ witness).
   is the **legible non-`Send` witness**: its refcount is non-atomic, so an
   `Rc` may not cross a thread boundary (sending one on a channel is a compile
   error that names `Rc`) — the contrast to sharing safely via a `Mutex`.
+- **The parallelism payoff + `chan_try_recv`** (Phase 79) — the v13 primitives
+  compose into real fork-join parallelism: split 0..N across W worker threads,
+  each summing its range and sending the partial on a SHARED `Sender`
+  (multi-producer), with the main thread gathering the W partials over the
+  MPSC channel (W producers → 1 consumer) and folding — deterministic, JIT and
+  AOT. Plus `chan_try_recv` — a non-blocking receive (`Some` if ready, `None`
+  if momentarily empty, never blocks on the condvar) for poll loops.
 
 ## [0.12.0] — Roadmap v12 "real stdlib" (Phases 69–74)
 

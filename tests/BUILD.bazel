@@ -737,6 +737,14 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 79 (v13 — concurrency): the parallelism payoff — fork-join parallel sum
+# over worker threads gathered via an MPSC channel + chan_try_recv (non-blocking).
+sh_test(
+    name = "smoke_test_phase79",
+    srcs = ["smoke_test_phase79.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

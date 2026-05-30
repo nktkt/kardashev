@@ -3528,6 +3528,63 @@ private:
             declaredFns_[mangled] = fn;
             return fn;
         }
+        if (op == "chan_try_recv") {
+            // Non-blocking: pop if an item is ready, else return None at once
+            // (no condvar wait). Otherwise identical to chan_recv.
+            TypePtr optTy = optionType(T);
+            mapKardashevType(optTy);
+            const std::string optMangled =
+                mangleStructInstance(optTy->enumName, optTy->typeArgs);
+            auto* optLlvm = enumTypes_[optMangled];
+            unsigned someIdx = variantIndexInEnum(optTy, "Some");
+            unsigned noneIdx = variantIndexInEnum(optTy, "None");
+            unsigned someSlot = enumPayloadIndices_[optMangled][someIdx][0];
+            auto* fn = mkFn(llvm::FunctionType::get(optLlvm, {i64Ty}, false));
+            fn->getArg(0)->setName("r");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* popBB = llvm::BasicBlock::Create(ctx, "pop", fn);
+            auto* clrTailBB = llvm::BasicBlock::Create(ctx, "clear_tail", fn);
+            auto* afterBB = llvm::BasicBlock::Create(ctx, "after", fn);
+            auto* noneBB = llvm::BasicBlock::Create(ctx, "none", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* blk = b.CreateIntToPtr(fn->getArg(0), i8PtrTy, "blk");
+            b.CreateCall(pthreadMutexLockFn_, {mtxOf(b, blk)});
+            auto* cntP = b.CreateStructGEP(chanBlkTy_, blk, 4, "cntP");
+            auto* cnt = b.CreateLoad(i64Ty, cntP, "cnt");
+            b.CreateCondBr(b.CreateICmpSGT(cnt, z64, "has"), popBB, noneBB);
+            b.SetInsertPoint(popBB);
+            auto* headP = b.CreateStructGEP(chanBlkTy_, blk, 2, "headP");
+            auto* head = b.CreateLoad(i8PtrTy, headP, "head");
+            auto* val = b.CreateLoad(
+                elemTy, b.CreateStructGEP(nodeTy, head, 0, "hval"), "val");
+            auto* next = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(nodeTy, head, 1, "hnext"), "next");
+            b.CreateStore(next, headP);
+            b.CreateStore(b.CreateSub(cnt, llvm::ConstantInt::get(i64Ty, 1),
+                                      "cntm1"),
+                          cntP);
+            b.CreateCall(freeFn_, {head});
+            b.CreateCondBr(b.CreateICmpEQ(next, nullp, "drained"), clrTailBB,
+                           afterBB);
+            b.SetInsertPoint(clrTailBB);
+            b.CreateStore(nullp, b.CreateStructGEP(chanBlkTy_, blk, 3, "tailP"));
+            b.CreateBr(afterBB);
+            b.SetInsertPoint(afterBB);
+            b.CreateCall(pthreadMutexUnlockFn_, {mtxOf(b, blk)});
+            llvm::Value* some = llvm::UndefValue::get(optLlvm);
+            some = b.CreateInsertValue(
+                some, llvm::ConstantInt::get(i32Ty, someIdx), {0}, "some");
+            some = b.CreateInsertValue(some, val, {someSlot}, "someV");
+            b.CreateRet(some);
+            b.SetInsertPoint(noneBB);
+            b.CreateCall(pthreadMutexUnlockFn_, {mtxOf(b, blk)});
+            llvm::Value* none = llvm::UndefValue::get(optLlvm);
+            none = b.CreateInsertValue(
+                none, llvm::ConstantInt::get(i32Ty, noneIdx), {0}, "none");
+            b.CreateRet(none);
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
         if (op == "chan_close") {
             auto* fn = mkFn(llvm::FunctionType::get(i64Ty, {i64Ty}, false));
             fn->getArg(0)->setName("s");
@@ -9968,7 +10025,8 @@ private:
             // message type T (the node carries a T-sized cell). channel<T>()
             // infers T from the (Sender<T>, Receiver<T>) it is unified into.
             if ((call.callee == "channel" || call.callee == "chan_send" ||
-                 call.callee == "chan_recv" || call.callee == "chan_close") &&
+                 call.callee == "chan_recv" || call.callee == "chan_close" ||
+                 call.callee == "chan_try_recv") &&
                 !concreteTypeArgs.empty()) {
                 llvm::Function* fn =
                     getOrEmitChannelOp(call.callee, concreteTypeArgs[0]);

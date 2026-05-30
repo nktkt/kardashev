@@ -1189,6 +1189,27 @@ public:
                     sch.genericVars.push_back(chanVar);
                     fnSchemas_["chan_recv"] = std::move(sch);
                 }
+                // Phase 79: chan_try_recv<T>(r) -> Option<T> ! { share } — a
+                // NON-BLOCKING recv: Some if an item is ready, None if the queue
+                // is momentarily empty (does NOT block on the condvar). For
+                // poll loops / draining the tail of a fork-join gather. Needs a
+                // FRESH Option<T> (instantiating reuses a Var-bearing schema).
+                {
+                    TypePtr optT2;
+                    if (!optSchema.genericVars.empty()) {
+                        std::unordered_map<int, TypePtr> subst;
+                        subst[optSchema.genericVars[0]->varId] = chanVar;
+                        optT2 = instantiate(optSchema.type, subst);
+                        optT2->typeArgs = {chanVar};
+                    } else {
+                        optT2 = optSchema.type;
+                    }
+                    FnSchema sch;
+                    sch.signature = makeFunction({receiverT}, optT2);
+                    sch.declaredEffects.add("share");
+                    sch.genericVars.push_back(chanVar);
+                    fnSchemas_["chan_try_recv"] = std::move(sch);
+                }
                 // chan_close<T>(s: Sender<T>) -> i64 ! { share }
                 {
                     FnSchema sch;
