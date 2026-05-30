@@ -2,6 +2,8 @@
 
 A systems programming language with lightweight effect-label typing, built on LLVM.
 
+**[📖 Documentation](https://kardashevlang.github.io/kardashev/)** · [Language Reference](https://kardashevlang.github.io/kardashev/language-reference.html) · [Effects](https://kardashevlang.github.io/kardashev/effects.html) · [Stdlib](https://kardashevlang.github.io/kardashev/stdlib.html) · [Architecture](https://kardashevlang.github.io/kardashev/architecture.html) — Licensed [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE)
+
 ## What it is
 
 kardashev is a Rust-flavored systems language whose signature feature is **lightweight effect labels in the type system**: every function declares which side-effects it can produce (`io`, `alloc`, `panic`, `async`, ...) as part of its signature, and the compiler tracks them across call chains. Unlike Koka, there are no handlers or continuations — effects are pure type-system information, with zero runtime cost.
@@ -57,8 +59,9 @@ All nine roadmaps (Phases 0–56, **v1–v9**) have shipped and are merged to
 (LLVM + clang). The CI matrix runs both ubuntu-latest and macos-latest via Bazel
 on every push; every commit goes in green.
 
-Tour: see [`docs/`](docs/) for the language reference, effects-system
-notes, stdlib catalog, and compiler-architecture deep dive.
+📖 **Documentation: <https://kardashevlang.github.io/kardashev/>** — the
+language reference, effects-system notes, stdlib catalog, and
+compiler-architecture deep dive (built from [`docs/`](docs/) with mdBook).
 [`examples/hello/`](examples/hello/) shows a two-file program built
 through the Bazel rules.
 
@@ -466,3 +469,20 @@ enum Json { JNull, JBool(bool), JInt(i64), JStr(String), JArr(Vec<Json>), JObj(H
 ## Why "kardashev"?
 
 The [Kardashev scale](https://en.wikipedia.org/wiki/Kardashev_scale) ranks civilizations by how much energy they can harness. A systems language, in its own small way, is about controlling resources at scale — a fitting name for one that aims to be precise about effects, ownership, and computation.
+
+## License
+
+Licensed under either of
+
+ * Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+   <http://www.apache.org/licenses/LICENSE-2.0>)
+ * MIT license ([LICENSE-MIT](LICENSE-MIT) or
+   <http://opensource.org/licenses/MIT>)
+
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.

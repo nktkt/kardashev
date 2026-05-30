@@ -23,3 +23,6 @@ Makefile.local
 .idea/
 *.swp
 *.swo
+
+# mdBook output (docs site is built in CI; see .github/workflows/docs.yml)
+/book/

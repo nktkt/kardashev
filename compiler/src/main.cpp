@@ -30,6 +30,7 @@
 #include "kardashev/codegen.hpp"
 #include "kardashev/parser.hpp"
 #include "kardashev/typecheck.hpp"
+#include "kardashev/version.hpp"
 
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
@@ -1877,6 +1878,9 @@ int main(int argc, char** argv) {
             optLevel = kardashev::OptLevel::O2;
         } else if (a == "-O3") {
             optLevel = kardashev::OptLevel::O3;
+        } else if (a == "--version" || a == "-V") {
+            std::cout << "kardc " << kardashev::kVersion << "\n";
+            return 0;
         } else if (a == "-h" || a == "--help") {
             std::cout << "usage: kardc                     # interactive REPL\n"
                          "       kardc <file.kd>            # JIT-run main()\n"
@@ -1885,7 +1889,8 @@ int main(int argc, char** argv) {
                          "       kardc -O0|-O1|-O2|-O3 ...   # optimization level (default -O2)\n"
                          "       kardc -g ...               # emit DWARF debug info\n"
                          "       kardc --emit-llvm <file.kd> # print LLVM IR to stdout\n"
-                         "       kardc --no-cache ...       # bypass the AOT compile cache\n";
+                         "       kardc --no-cache ...       # bypass the AOT compile cache\n"
+                         "       kardc --version            # print the toolchain version\n";
             return 0;
         } else if (!a.empty() && a[0] == '-') {
             std::cerr << "kardc: unknown option `" << a << "`\n";
