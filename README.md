@@ -2,6 +2,8 @@
 
 A systems programming language with lightweight effect-label typing, built on LLVM.
 
+**[📖 Documentation](https://kardashevlang.github.io/kardashev/)** · [Language Reference](https://kardashevlang.github.io/kardashev/language-reference.html) · [Effects](https://kardashevlang.github.io/kardashev/effects.html) · [Stdlib](https://kardashevlang.github.io/kardashev/stdlib.html) · [Architecture](https://kardashevlang.github.io/kardashev/architecture.html) — Licensed [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE)
+
 ## What it is
 
 kardashev is a Rust-flavored systems language whose signature feature is **lightweight effect labels in the type system**: every function declares which side-effects it can produce (`io`, `alloc`, `panic`, `async`, ...) as part of its signature, and the compiler tracks them across call chains. Unlike Koka, there are no handlers or continuations — effects are pure type-system information, with zero runtime cost.
@@ -57,8 +59,9 @@ All nine roadmaps (Phases 0–56, **v1–v9**) have shipped and are merged to
 (LLVM + clang). The CI matrix runs both ubuntu-latest and macos-latest via Bazel
 on every push; every commit goes in green.
 
-Tour: see [`docs/`](docs/) for the language reference, effects-system
-notes, stdlib catalog, and compiler-architecture deep dive.
+📖 **Documentation: <https://kardashevlang.github.io/kardashev/>** — the
+language reference, effects-system notes, stdlib catalog, and
+compiler-architecture deep dive (built from [`docs/`](docs/) with mdBook).
 [`examples/hello/`](examples/hello/) shows a two-file program built
 through the Bazel rules.
 
