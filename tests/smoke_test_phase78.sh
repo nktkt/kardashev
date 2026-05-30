@@ -71,7 +71,7 @@ cat > "$TMP/send.kd" <<'EOF'
 fn main() -> i64 ! { alloc, share } {
     let (tx, rx) = channel();
     let a = rc_new(7);
-    chan_send(tx, a);
+    chan_send(&tx, a);
     0
 }
 EOF

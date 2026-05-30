@@ -31,14 +31,14 @@ trap 'rm -rf "$TMP"' EXIT
 cat > "$TMP/one.kd" <<'EOF'
 fn main() -> i64 ! { alloc, share } {
     let (tx, rx) = channel();
-    chan_send(tx, 10);
-    chan_send(tx, 20);
-    chan_send(tx, 12);
-    chan_close(tx);
+    chan_send(&tx, 10);
+    chan_send(&tx, 20);
+    chan_send(&tx, 12);
+    chan_close(tx);          // consumes the only Sender -> channel closes
     let mut sum = 0;
     let mut go = true;
     while go {
-        match chan_recv(rx) { Some(v) => { sum = sum + v; }, None => { go = false; }, }
+        match chan_recv(&rx) { Some(v) => { sum = sum + v; }, None => { go = false; }, }
     }
     sum   // 42
 }
@@ -51,17 +51,19 @@ echo "PASS [single-thread]: send/recv/close drains -> 42"
 cat > "$TMP/prod.kd" <<'EOF'
 fn produce(tx: Sender<i64>) -> i64 ! { share } {
     let mut i = 1;
-    while i <= 100 { chan_send(tx, i); i = i + 1; }
-    chan_close(tx);
+    while i <= 100 { chan_send(&tx, i); i = i + 1; }
+    chan_close(tx);          // this producer's Sender done
     0
 }
 fn main() -> i64 ! { io, alloc, share } {
     let (tx, rx) = channel();
-    let h = thread_spawn(|| produce(tx));
+    let h = thread_spawn(|| produce(tx));   // tx cloned into the producer
+    chan_close(tx);          // main relinquishes its own Sender; the channel
+                             // closes only once BOTH senders are gone
     let mut sum = 0;
     let mut go = true;
     while go {
-        match chan_recv(rx) { Some(v) => { sum = sum + v; }, None => { go = false; }, }
+        match chan_recv(&rx) { Some(v) => { sum = sum + v; }, None => { go = false; }, }
     }
     thread_join(h);
     sum   // 5050
@@ -81,11 +83,11 @@ echo "PASS [producer-thread]: blocking recv sums 1..100 -> 5050, deterministic (
 # 3. moving a Receiver into a thread is rejected (single-consumer / not Send).
 cat > "$TMP/neg.kd" <<'EOF'
 fn consume(rx: Receiver<i64>) -> i64 ! { share } {
-    match chan_recv(rx) { Some(v) => v, None => 0 }
+    match chan_recv(&rx) { Some(v) => v, None => 0 }
 }
 fn main() -> i64 ! { io, alloc, share } {
     let (tx, rx) = channel();
-    chan_send(tx, 1);
+    chan_send(&tx, 1);
     let h = thread_spawn(|| consume(rx));
     thread_join(h)
 }

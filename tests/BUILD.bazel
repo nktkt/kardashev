@@ -756,6 +756,16 @@ sh_test(
     ],
 )
 
+# v13 PRE-MERGE REVIEW regressions: the rc_get/vec_get_ref use-after-free
+# (now a borrow error), the unbounded channel leak (block + nodes + undrained
+# payloads, now reclaimed at last-endpoint drop), and the multi-producer
+# chan_close data loss (now closes only when the last Sender is gone).
+sh_test(
+    name = "smoke_test_v13_review",
+    srcs = ["smoke_test_v13_review.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

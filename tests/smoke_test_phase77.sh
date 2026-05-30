@@ -30,19 +30,20 @@ trap 'rm -rf "$TMP"' EXIT
 cat > "$TMP/str.kd" <<'EOF'
 fn produce(tx: Sender<String>) -> i64 ! { alloc, share } {
     let a = "alpha"; let b = "bravo"; let c = "charlie";
-    chan_send(tx, clone(&a));
-    chan_send(tx, clone(&b));
-    chan_send(tx, clone(&c));
+    chan_send(&tx, clone(&a));
+    chan_send(&tx, clone(&b));
+    chan_send(&tx, clone(&c));
     chan_close(tx);
     0
 }
 fn main() -> i64 ! { io, alloc, share } {
     let (tx, rx) = channel();
     let h = thread_spawn(|| produce(tx));
+    chan_close(tx);          // main relinquishes its own Sender
     let mut total = 0;
     let mut go = true;
     while go {
-        match chan_recv(rx) { Some(s) => { total = total + str_len(&s); }, None => { go = false; }, }
+        match chan_recv(&rx) { Some(s) => { total = total + str_len(&s); }, None => { go = false; }, }
     }
     thread_join(h);
     total   // 5 + 5 + 7 = 17
@@ -62,17 +63,18 @@ cat > "$TMP/vec.kd" <<'EOF'
 fn produce(tx: Sender<Vec<i64>>) -> i64 ! { alloc, share } {
     let mut v = vec_new();
     vec_push(&mut v, 3); vec_push(&mut v, 4); vec_push(&mut v, 5);
-    chan_send(tx, v);     // move the whole Vec across
+    chan_send(&tx, v);     // move the whole Vec across
     chan_close(tx);
     0
 }
 fn main() -> i64 ! { io, alloc, share } {
     let (tx, rx) = channel();
     let h = thread_spawn(|| produce(tx));
+    chan_close(tx);          // main relinquishes its own Sender
     let mut total = 0;
     let mut go = true;
     while go {
-        match chan_recv(rx) {
+        match chan_recv(&rx) {
             Some(v) => {
                 let mut i = 0;
                 while i < vec_len(&v) { total = total + vec_get(&v, i); i = i + 1; }
@@ -96,7 +98,7 @@ cat > "$TMP/bad.kd" <<'EOF'
 fn main() -> i64 ! { alloc, share } {
     let (tx, rx) = channel();
     let x = 5;
-    chan_send(tx, &x);
+    chan_send(&tx, &x);
     0
 }
 EOF

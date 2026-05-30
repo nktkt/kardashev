@@ -31,7 +31,7 @@ cat > "$TMP/pj.kd" <<'EOF'
 fn worker(lo: i64, hi: i64, tx: Sender<i64>) -> i64 ! { share } {
     let mut s = 0; let mut i = lo;
     while i < hi { s = s + i; i = i + 1; }
-    chan_send(tx, s);
+    chan_send(&tx, s);
     0
 }
 fn main() -> i64 ! { io, alloc, share } {
@@ -43,13 +43,13 @@ fn main() -> i64 ! { io, alloc, share } {
     while k < w {
         let lo = k * chunk;
         let hi = if k == w - 1 { n } else { (k + 1) * chunk };
-        let h = thread_spawn(|| worker(lo, hi, tx));   // shared Sender, Copy work
+        let h = thread_spawn(|| worker(lo, hi, tx));   // tx cloned per worker
         vec_push(&mut handles, h);
         k = k + 1;
     }
     let mut total = 0; let mut got = 0;
     while got < w {
-        match chan_recv(rx) { Some(p) => { total = total + p; got = got + 1; }, None => {}, }
+        match chan_recv(&rx) { Some(p) => { total = total + p; got = got + 1; }, None => {}, }
     }
     let mut j = 0;
     while j < w { thread_join(vec_get(&handles, j)); j = j + 1; }
@@ -71,11 +71,11 @@ echo "PASS [fork-join]: 4 workers sum 0..1000 -> 499500, deterministic (5 JIT + 
 cat > "$TMP/tr.kd" <<'EOF'
 fn main() -> i64 ! { alloc, share } {
     let (tx, rx) = channel();
-    chan_send(tx, 5); chan_send(tx, 9); chan_send(tx, 14);
+    chan_send(&tx, 5); chan_send(&tx, 9); chan_send(&tx, 14);
     let mut sum = 0;
     let mut go = true;
     while go {
-        match chan_try_recv(rx) { Some(v) => { sum = sum + v; }, None => { go = false; }, }
+        match chan_try_recv(&rx) { Some(v) => { sum = sum + v; }, None => { go = false; }, }
     }
     sum   // 28, then None (empty) stops the loop without blocking
 }

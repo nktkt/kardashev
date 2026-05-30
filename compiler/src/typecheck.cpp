@@ -1173,21 +1173,41 @@ public:
                     sch.genericVars.push_back(chanVar);
                     fnSchemas_["channel"] = std::move(sch);
                 }
-                // chan_send<T>(s: Sender<T>, v: T) -> i64 ! { share }
+                // Phase 81 (v13 review fix): the endpoints are refcounted,
+                // move-only OWNERS now (not Copy handles), so chan_send / recv /
+                // try_recv BORROW the endpoint (`&Sender` / `&Receiver`) — a
+                // Sender can be sent on in a loop, and a Receiver recv'd in a
+                // loop, without being moved. Multi-producer uses sender_clone;
+                // an endpoint's drop decrements the refcount (close on the last
+                // sender, drain + free on the last endpoint).
+                // chan_send<T>(s: &Sender<T>, v: T) -> i64 ! { share }
                 {
                     FnSchema sch;
-                    sch.signature = makeFunction({senderT, chanVar}, makeInt());
+                    sch.signature = makeFunction(
+                        {makeRef(senderT, /*isMut=*/false), chanVar}, makeInt());
                     sch.declaredEffects.add("share");
                     sch.genericVars.push_back(chanVar);
                     fnSchemas_["chan_send"] = std::move(sch);
                 }
-                // chan_recv<T>(r: Receiver<T>) -> Option<T> ! { share }
+                // chan_recv<T>(r: &Receiver<T>) -> Option<T> ! { share }
                 {
                     FnSchema sch;
-                    sch.signature = makeFunction({receiverT}, optT);
+                    sch.signature = makeFunction(
+                        {makeRef(receiverT, /*isMut=*/false)}, optT);
                     sch.declaredEffects.add("share");
                     sch.genericVars.push_back(chanVar);
                     fnSchemas_["chan_recv"] = std::move(sch);
+                }
+                // sender_clone<T>(s: &Sender<T>) -> Sender<T> ! { share } — the
+                // multi-producer primitive: a second owning Sender on the same
+                // channel (bumps the live-sender + endpoint counts).
+                {
+                    FnSchema sch;
+                    sch.signature = makeFunction(
+                        {makeRef(senderT, /*isMut=*/false)}, senderT);
+                    sch.declaredEffects.add("share");
+                    sch.genericVars.push_back(chanVar);
+                    fnSchemas_["sender_clone"] = std::move(sch);
                 }
                 // Phase 79: chan_try_recv<T>(r) -> Option<T> ! { share } — a
                 // NON-BLOCKING recv: Some if an item is ready, None if the queue
@@ -1205,12 +1225,17 @@ public:
                         optT2 = optSchema.type;
                     }
                     FnSchema sch;
-                    sch.signature = makeFunction({receiverT}, optT2);
+                    sch.signature = makeFunction(
+                        {makeRef(receiverT, /*isMut=*/false)}, optT2);
                     sch.declaredEffects.add("share");
                     sch.genericVars.push_back(chanVar);
                     fnSchemas_["chan_try_recv"] = std::move(sch);
                 }
-                // chan_close<T>(s: Sender<T>) -> i64 ! { share }
+                // chan_close<T>(s: Sender<T>) -> i64 ! { share } — takes the
+                // Sender BY VALUE (consumes it): the explicit "this producer is
+                // done" that decrements the live-sender count (closing only when
+                // it is the LAST sender), so one producer closing can no longer
+                // abandon another's queued items.
                 {
                     FnSchema sch;
                     sch.signature = makeFunction({senderT}, makeInt());
@@ -5952,11 +5977,15 @@ private:
             bool copyable = rt->kind == TypeKind::Int ||
                             rt->kind == TypeKind::Bool ||
                             rt->kind == TypeKind::Unit;
-            // Phase 76 (v13): a channel `Sender<T>` is a Copy i64 HANDLE and is
-            // Send, so it may be captured BY VALUE into a producer thread's
-            // closure (the cross-thread send path). A `Receiver<T>` is NOT
-            // capturable — it is single-consumer / not-Send — and falls through
-            // to the rejection below (a Receiver can't be moved into a thread).
+            // Phase 81 (v13 review fix): a channel `Sender<T>` is Send, so it
+            // may be captured into a producer thread's closure. It is no longer
+            // Copy — capturing it CLONES it (codegen emits sender_clone when
+            // building the env), so each producer thread gets its own refcounted
+            // handle and the enclosing binding keeps its own. The captured clone
+            // must be moved into the spawned worker by value (so the worker's
+            // by-value `Sender` param drops it on that thread). A `Receiver<T>`
+            // is NOT capturable — single-consumer / not-Send — and falls through
+            // to the rejection below (a Receiver can't cross a thread boundary).
             if (rt->kind == TypeKind::Struct && rt->structName == "Sender")
                 copyable = true;
             if (mutated) {

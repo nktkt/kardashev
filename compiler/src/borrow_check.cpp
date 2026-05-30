@@ -62,13 +62,12 @@ bool isCopyType(const TypePtr& t) {
         // Phase 13b: a slice `&[T]` is a fat pointer (a borrow), so it's
         // Copy — like `&T`. Other structs move by default.
         if (r->structName == "Slice") return true;
-        // Phase 76 (v13): the channel endpoints `Sender<T>` / `Receiver<T>` are
-        // Copy i64 HANDLES — passing one to chan_send / chan_recv doesn't
-        // consume it, and `chan_recv(rx)` works repeatedly in a loop. (Copy is
-        // orthogonal to Send: a Receiver is Copy but NOT Send — it may be
-        // recv'd repeatedly here yet can't cross a thread boundary, Phase 77.)
-        if (r->structName == "Sender" || r->structName == "Receiver")
-            return true;
+        // Phase 81 (v13 review fix): the channel endpoints `Sender<T>` /
+        // `Receiver<T>` are now refcounted, move-only OWNERS (NOT Copy) — they
+        // have drop glue that decrements the channel refcount, so copying a
+        // handle would double-decrement and free the block early. chan_send /
+        // recv BORROW the endpoint (`&Sender` / `&Receiver`), so a single owner
+        // can still send / recv in a loop; multi-producer uses sender_clone.
         return false;
     case TypeKind::Var:
     case TypeKind::Function:
@@ -1026,11 +1025,22 @@ private:
                 // PR#15: a slice `let s = &v[a..b];` is likewise a named
                 // borrow of `v` — tie the loan to `s` so mutating `v` while
                 // `s` is live (a stale-slice read) is rejected.
+                // v13 review fix (UAF BLOCKER): a borrow-returning builtin such
+                // as `rc_get(&a)` / `vec_get_ref(&v, i)` yields a `&T` that
+                // aliases its `&owner` argument. Treat `let r = rc_get(&a);` as
+                // a NAMED borrow of `a` (exactly like `let r = &a;`): retag the
+                // `&owner` loan synthesized while walking the RHS to `r`, so the
+                // loan lives for r's scope and moving/dropping `a` while `r` is
+                // live is rejected. Without this, the loan expired at the end of
+                // the let statement and the freed-while-borrowed read compiled
+                // clean. The owner-borrow arg is the most-recent loan on the
+                // stack, which is what attachLoanToBorrower retags.
                 const bool rhsStartsNamedBorrow =
                     dynamic_cast<const ast::RefExpr*>(let->value.get()) !=
                         nullptr ||
                     dynamic_cast<const ast::SliceExpr*>(let->value.get()) !=
-                        nullptr;
+                        nullptr ||
+                    rhsIsBorrowIntoArgBuiltin(let->value.get());
                 int rhsEnd = consume(*let->value, /*expectExpire=*/-1);
                 // Phase 22: tuple-destructuring re-maps each element name to
                 // the declPos that pass 1 assigned (one `pos_` tick per
@@ -1208,6 +1218,19 @@ private:
         last = std::max(last, consume(*se.start, expectExpire));
         last = std::max(last, consume(*se.end, expectExpire));
         return last;
+    }
+
+    // v13 review fix: is `e` a direct call to a builtin that returns a `&T`
+    // borrowed FROM its `&owner` argument (rc_get(&rc) / vec_get_ref(&v, i))?
+    // For those, `let r = <call>` ties r's lifetime to the owner borrow, so the
+    // owner cannot be moved/dropped while r is live. Only the bare-`&T`-returning
+    // forms qualify — hashmap_get_ref returns Option<&V> (the borrow is unwrapped
+    // by a later match, a separate scope) and slice_get_ref's owner is the slice
+    // value itself (no `&ident` loan to retag), so neither is listed here.
+    static bool rhsIsBorrowIntoArgBuiltin(const ast::Expr* e) {
+        auto* call = dynamic_cast<const ast::CallExpr*>(e);
+        if (!call || call->args.empty()) return false;
+        return call->callee == "rc_get" || call->callee == "vec_get_ref";
     }
 
     // After `let r = <RHS>`, find the most-recent loan added that was

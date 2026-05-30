@@ -31,7 +31,7 @@ fn analyze(lo: i64, hi: i64, tx: Sender<Stats>) -> i64 ! { share } {
         mx = i64_max(mx, v);
         i = i + 1;
     }
-    chan_send(tx, Stats { sum: sum, count: hi - lo, lo_v: mn, hi_v: mx });
+    chan_send(&tx, Stats { sum: sum, count: hi - lo, lo_v: mn, hi_v: mx });
     0
 }
 
@@ -47,7 +47,7 @@ fn main() -> i64 ! { io, alloc, share } {
     while k < w {
         let lo = k * chunk;
         let hi = if k == w - 1 { n } else { (k + 1) * chunk };
-        let h = thread_spawn(|| analyze(lo, hi, tx));   // tx: Copy, Send
+        let h = thread_spawn(|| analyze(lo, hi, tx));   // tx cloned per worker
         vec_push(&mut handles, h);
         k = k + 1;
     }
@@ -59,7 +59,7 @@ fn main() -> i64 ! { io, alloc, share } {
     let mut gmax = 0 - 1;
     let mut got = 0;
     while got < w {
-        match chan_recv(rx) {
+        match chan_recv(&rx) {
             Some(s) => {
                 total_sum = total_sum + s.sum;
                 total_count = total_count + s.count;
