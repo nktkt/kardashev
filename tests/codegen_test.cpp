@@ -2406,6 +2406,32 @@ void test_const_folds_to_literal_in_ir() {
     }
 }
 
+// v17 Phase 104: a UNIT-returning fn whose body is a `match` in tail position
+// must emit `ret void` and DISCARD the value the match materializes — previously
+// codegen keyed the return on "did the tail produce a value", so it emitted
+// `ret i64` into a void fn (invalid IR, rejected by the verifier). Found by
+// self-hosting (examples/selfhost/emit.kd). If the bug regressed, compileAndRun
+// would fail module verification before this could return 30.
+void test_unit_fn_tail_match_returns_void() {
+    const char* src =
+        "enum E { A(i64), B(i64) }\n"
+        "fn handle(e: &E, out: &mut Vec<i64>) ! { alloc } {\n"
+        "    match e {\n"
+        "        A(v) => { vec_push(out, *v); },\n"
+        "        B(v) => { vec_push(out, *v * 2); },\n"
+        "    }\n"
+        "}\n"
+        "fn main() -> i64 ! { alloc } {\n"
+        "    let mut out = vec_new();\n"
+        "    let ea = A(10); let eb = B(10);\n"
+        "    handle(&ea, &mut out);\n"
+        "    handle(&eb, &mut out);\n"
+        "    vec_get(&out, 0) + vec_get(&out, 1)\n"
+        "}\n";
+    auto v = compileAndRun(src, "main", "unit_fn_tail_match_returns_void");
+    expectEquals(v, 30, "unit_fn_tail_match_returns_void"); // 10 + 20
+}
+
 } // namespace
 
 int main() {
@@ -2588,7 +2614,8 @@ int main() {
     test_const_fn_array_len_runs();
     test_const_fn_runtime_call_runs();
     test_const_folds_to_literal_in_ir();
-    std::cout << "All codegen tests passed (154 cases) — Phase 16 Drop/RAII: "
+    test_unit_fn_tail_match_returns_void();
+    std::cout << "All codegen tests passed (155 cases) — Phase 16 Drop/RAII: "
                  "reverse-order scope drops, move semantics, conditional-move "
                  "drop flags, Vec/Box free, scalar codegen unchanged; Phase "
                  "17a fn-value field calls + FnMut captures; Phase 17b generic "
@@ -2602,6 +2629,8 @@ int main() {
                  "double-free over 50k unwinds, array OOB panics, panic runtime "
                  "gated to may-panic programs); Phase 24 extern \"C\" FFI "
                  "(i32->C-int decl + trunc/sext coercions, i64->C-long, "
-                 "&String->C pointer, unmangled C symbol name)\n";
+                 "&String->C pointer, unmangled C symbol name); Phase 104 "
+                 "unit-returning fn with a tail match emits ret void (not ret "
+                 "i64 into a void fn)\n";
     return 0;
 }

@@ -492,8 +492,20 @@ Each shipped green before the next, exactly as v1–v4 did.
 >   the next phase fixes — a host miscompile of a `match` in tail position of a
 >   unit-returning function; another bug found by dogfooding self-hosting.)
 >
-> Planned: fix the unit-tail-`match` miscompile; widen the codegen toward whole
-> functions — continuing toward a bootstrap.
+> - **Phase 104 — fixed the unit-tail-`match` miscompile (done).** The bug Phase
+>   103 surfaced: a `match` (or any value-producing expression) in tail position
+>   of a UNIT-returning function emitted `ret i64` into a void function — invalid
+>   IR, rejected by the verifier — because codegen chose `ret` vs `ret void` on
+>   "did the tail produce a value" instead of the function's actual return type.
+>   Fixed in `codegen.cpp`'s function epilogue: a void-returning function always
+>   emits `ret void`, discarding any value its tail materializes. Proven by
+>   reverting `emit.kd`'s `-> i64` workaround back to the natural unit-returning
+>   `emit` (still passes, JIT + AOT) and by a focused codegen unit test
+>   (`unit_fn_tail_match_returns_void`, 155 cases). Another bug found *and* fixed
+>   by dogfooding self-hosting.
+>
+> Planned: widen the self-hosted codegen toward whole functions and more types —
+> continuing toward a bootstrap.
 
 ## Roadmap v16 — shipped
 

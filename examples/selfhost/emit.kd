@@ -133,19 +133,18 @@ fn slot_of(slots: &HashMap<String, i64>, name: &String) -> i64 ! { alloc } {
 }
 
 // ---- CODEGEN: lower an Expr into the bytecode stream `code` ----
-// Returns a dummy i64 (callers discard it): the host compiler currently
-// miscompiles a match-in-tail-position of a UNIT-returning function, so emit
-// yields a value rather than `()` — idiomatic anyway, and a clean workaround.
-fn emit(e: &Expr, slots: &HashMap<String, i64>, code: &mut Vec<Instr>) -> i64 ! { alloc } {
+// A UNIT-returning fn whose body is a tail `match` — the natural shape — now
+// compiles correctly (v17 Phase 104 fixed the host miscompile that this exact
+// function first surfaced; before the fix it needed an `-> i64` dummy return).
+fn emit(e: &Expr, slots: &HashMap<String, i64>, code: &mut Vec<Instr>) ! { alloc } {
     match e {
-        Num(v) => { vec_push(code, Instr { op: 1, arg: *v }); 0 },
-        Var(name) => { vec_push(code, Instr { op: 2, arg: slot_of(slots, name) }); 0 },
+        Num(v) => { vec_push(code, Instr { op: 1, arg: *v }); },
+        Var(name) => { vec_push(code, Instr { op: 2, arg: slot_of(slots, name) }); },
         Bin(op, a, b) => {
             emit(&(**a), slots, code);
             emit(&(**b), slots, code);
             let oc = if *op == 10 { 3 } else { if *op == 11 { 4 } else { if *op == 20 { 5 } else { 6 } } };
             vec_push(code, Instr { op: oc, arg: 0 });
-            0
         },
         If(c, t, e2) => {
             // branch-free: push then-value, else-value, cond; SELECT picks.
@@ -153,7 +152,6 @@ fn emit(e: &Expr, slots: &HashMap<String, i64>, code: &mut Vec<Instr>) -> i64 ! 
             emit(&(**e2), slots, code);
             emit(&(**c), slots, code);
             vec_push(code, Instr { op: 7, arg: 0 });
-            0
         },
     }
 }

@@ -7451,12 +7451,21 @@ private:
         }
         dropScopes_.pop_back();
         if (!currentBlockTerminated()) {
-            if (bodyVal) {
+            // v17 Phase 104: gate ret-vs-ret-void on the function's ACTUAL LLVM
+            // return type, NOT on whether the tail produced a value. A
+            // unit-returning fn whose tail is an expression that still
+            // materializes a value (e.g. a `match` in tail position) must emit
+            // `ret void` and DISCARD that value — emitting `ret i64` into a void
+            // fn is invalid IR (the module verifier rejects it). Previously this
+            // keyed off `bodyVal != null`, so a unit fn with a value-producing
+            // tail miscompiled (found by self-hosting, examples/selfhost/emit.kd).
+            if (currentFn_->getReturnType()->isVoidTy()) {
+                builder_->CreateRetVoid();
+            } else if (bodyVal) {
                 builder_->CreateRet(bodyVal);
             } else {
-                // No tail value — unit body. Either the fn returns void
-                // (Phase 1 doesn't actually have such fns), or this is
-                // ill-typed; either way emit ret void as a safe default.
+                // Non-void return type but no tail value — ill-typed; emit ret
+                // void as a safe default (the type checker should have rejected).
                 builder_->CreateRetVoid();
             }
         }
