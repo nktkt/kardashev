@@ -143,6 +143,12 @@ struct Type {
     // the source value that substitutes a symbolic array length `[T; N]`.
     bool isConstValue = false;
     long long constValue = 0;
+    // Phase 61 (v10): a SYMBOLIC const-generic argument — the `CAP` in `impl<..,
+    // const CAP> Clone for RingBuffer<T, CAP>` or the `C` in `transpose() ->
+    // Matrix<C, R>`. When non-empty this const value's `constValue` is unknown;
+    // it names a const param in scope and is resolved to a concrete value at
+    // the leaf monomorphization (codegen's currentConstParamSubst_).
+    std::string constValueName;
 
     // Tuple (Phase 22): the ordered element types of `(A, B, ...)`.
     std::vector<TypePtr> tupleElems;
@@ -184,6 +190,10 @@ TypePtr makeTuple(std::vector<TypePtr> elems);
 // fresh `TypeKind::Int` node carrying `isConstValue` + the integer; lives
 // only inside a struct/enum/fn instance's `typeArgs`.
 TypePtr makeConstValue(long long v);
+
+// Phase 61 (v10): a SYMBOLIC const-generic argument naming a const param in
+// scope (value resolved at the leaf monomorphization).
+TypePtr makeConstSymbol(std::string name);
 
 // Phase 58 (v10): materialize a generic struct/enum instance from a schema.
 // Splits `typeArgs` (in declaration order) into a type-Var substitution and a

@@ -41,6 +41,16 @@ effect system's last soundness floor.
   (`dot([i64;3], [i64;2])`) and a const param that appears in no argument array
   type are compile errors.
 
+- `RingBuffer<T, const CAP>` (Phase 61): a struct generic over BOTH a type and
+  a const param, with element-wise Drop and deep clone over a NON-Copy element.
+  Fixed-size arrays `[T; N]` now allow non-Copy elements (String/struct/Vec/Box)
+  — clone element-wise, drop element-wise; moving a non-Copy element out by
+  index (`let x = a[i]`) is a compile error (clone or borrow instead). Symbolic
+  const params flow through generic impls (`impl<T, const CAP> Clone for
+  RingBuffer<T, CAP>`) and `derive(Clone)`. Plus closure-param INFERENCE:
+  `vec_map(v, |x| *x * 2)` infers `x`'s type from the callee's fn-typed
+  parameter — no `|x: &i64|` annotation needed.
+
 ### Changed
 - The **effect-subset rule** (Phase 60), the effect system's last soundness
   floor: a trait impl method's effects must be a SUBSET of the trait method's

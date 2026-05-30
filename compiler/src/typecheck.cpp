@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "kardashev/typecheck.hpp"
 
 #include <algorithm>
@@ -1084,7 +1085,9 @@ public:
             currentVarBound_.clear();
             currentVarAllBounds_.clear();
             exposeImplGenericBounds(impl, implEnv0);
+            setConstParamsInScope(impl.genericParams); // Phase 61
             TypePtr forTy = resolveTypeRef(impl.forType);
+            currentConstParams_.clear();
             currentVarBound_.clear();
             currentVarAllBounds_.clear();
             currentGenericEnv_ = savedEnv0;
@@ -1303,7 +1306,9 @@ public:
                           gp.line, gp.column);
                 }
                 TypePtr v = makeFreshVar();
-                genEnv[gp.name] = v;
+                // Phase 61: a const param is NOT a type Var in genEnv — it
+                // resolves symbolically via currentConstParams_.
+                if (!gp.isConst) genEnv[gp.name] = v;
                 if (rowVarNames.count(gp.name)) {
                     // Explicit effect-row generic param: tracked separately,
                     // kept out of genVars/genBounds (no monomorphization, no
@@ -1486,7 +1491,10 @@ public:
                 // body and T inferred from the receiver at a call.
                 for (const auto& gp : impl.genericParams) {
                     TypePtr v = makeFreshVar();
-                    genEnv[gp.name] = v;
+                    // Phase 61: a const param keeps a genVars SLOT (positional
+                    // monomorphization) but is NOT a type Var in genEnv — it
+                    // resolves to a symbolic const via currentConstParams_.
+                    if (!gp.isConst) genEnv[gp.name] = v;
                     genVars.push_back(v);
                     genBounds.push_back(gp.bound);
                     genExtraBounds.push_back(gp.extraBounds);
@@ -1494,7 +1502,7 @@ public:
                 }
                 for (const auto& gp : fn.genericParams) {
                     TypePtr v = makeFreshVar();
-                    genEnv[gp.name] = v;
+                    if (!gp.isConst) genEnv[gp.name] = v; // Phase 61
                     genVars.push_back(v);
                     genBounds.push_back(gp.bound);
                     genExtraBounds.push_back(gp.extraBounds); // Phase 28
@@ -1512,6 +1520,9 @@ public:
                 currentVarBound_.clear();
                 currentVarAllBounds_.clear();
                 exposeImplGenericBounds(impl, genEnv);
+                // Phase 61: the impl's const params in scope so the forType
+                // `RingBuffer<T, CAP>` resolves CAP as a symbolic const arg.
+                setConstParamsInScope(impl.genericParams, fn.genericParams);
                 TypePtr selfTy = resolveTypeRef(impl.forType);
                 genEnv["Self"] = selfTy;
                 // Phase 21a: bind the trait's generic params to this impl's
@@ -1562,11 +1573,15 @@ public:
                                         ? genExtraBounds[i]
                                         : std::vector<std::string>{});
                 }
+                // Phase 61: impl + method const params in scope so `[T; CAP]`
+                // and `RingBuffer<T, CAP>` resolve CAP symbolically.
+                setConstParamsInScope(impl.genericParams, fn.genericParams);
                 std::vector<TypePtr> argTypes;
                 for (const auto& p : fn.params) {
                     argTypes.push_back(resolveTypeRef(p.type));
                 }
                 TypePtr ret = resolveTypeRef(fn.returnType);
+                currentConstParams_.clear();
                 currentGenericEnv_ = nullptr;
                 currentEffectRowVarNames_ = nullptr;
                 currentVarBound_.clear();
@@ -1664,7 +1679,9 @@ public:
             currentVarBound_.clear();
             currentVarAllBounds_.clear();
             exposeImplGenericBounds(impl, implEnv2);
+            setConstParamsInScope(impl.genericParams); // Phase 61
             TypePtr selfTy = resolveTypeRef(impl.forType);
+            currentConstParams_.clear();
             currentVarBound_.clear();
             currentVarAllBounds_.clear();
             currentGenericEnv_ = savedEnv2;
@@ -1946,9 +1963,25 @@ private:
     // symbolic-length array (recorded, not const-evaluated). Set/cleared in
     // lockstep with currentGenericEnv_.
     std::unordered_set<std::string> currentConstParams_;
+    // Phase 61: when checking a call argument that is a closure, the callee's
+    // expected fn-typed parameter — so `checkClosure` can infer an unannotated
+    // `|x|`'s param type before checking the body. Consumed (cleared) by
+    // checkClosure so it never leaks into nested expressions.
+    TypePtr expectedArgType_;
     void setConstParamsInScope(const std::vector<ast::TypeParam>& ps) {
         currentConstParams_.clear();
         for (const auto& p : ps)
+            if (p.isConst) currentConstParams_.insert(p.name);
+    }
+    // Phase 61: an impl method sees BOTH the impl's const params and its own
+    // (`impl<.., const CAP> .. for RingBuffer<T, CAP>` + a `fn f<const M>`).
+    void setConstParamsInScope(const std::vector<ast::TypeParam>& implPs,
+                               const std::vector<ast::TypeParam>& fnPs) {
+        currentConstParams_.clear();
+        for (const auto& p : implPs) {
+            if (p.isConst) currentConstParams_.insert(p.name);
+        }
+        for (const auto& p : fnPs)
             if (p.isConst) currentConstParams_.insert(p.name);
     }
     // Phase 10a: names of generic params that are effect-row variables in
@@ -2335,8 +2368,10 @@ private:
     // forType's NAME / shape (registration, pass-2 selfTy).
     GenericEnv implParamEnv(const ast::ImplDecl& impl) {
         GenericEnv env;
+        // Phase 61: const params are NOT type Vars — they resolve symbolically
+        // via currentConstParams_ (set by the caller around forType / body).
         for (const auto& gp : impl.genericParams)
-            env[gp.name] = makeFreshVar();
+            if (!gp.isConst) env[gp.name] = makeFreshVar();
         return env;
     }
 
@@ -2377,12 +2412,18 @@ private:
         // (with its bound) is in scope in the method body.
         std::size_t gvi = 0;
         for (const auto& gp : impl.genericParams) {
-            if (gvi < schema.genericVars.size())
-                genEnv[gp.name] = schema.genericVars[gvi++];
+            // Phase 61: const params hold a genericVars SLOT but are not type
+            // Vars in genEnv (they resolve symbolically via currentConstParams_).
+            if (gvi < schema.genericVars.size()) {
+                if (!gp.isConst) genEnv[gp.name] = schema.genericVars[gvi];
+                gvi++;
+            }
         }
         for (const auto& gp : fn.genericParams) {
-            if (gvi < schema.genericVars.size())
-                genEnv[gp.name] = schema.genericVars[gvi++];
+            if (gvi < schema.genericVars.size()) {
+                if (!gp.isConst) genEnv[gp.name] = schema.genericVars[gvi];
+                gvi++;
+            }
         }
         // Phase 45/46: expose every generic param's bounds (impl params, then fn
         // params) BEFORE resolving forType / the body, so the method's container
@@ -2405,6 +2446,8 @@ private:
         // Phase 40: for a generic impl, recompute Self from THIS env so it uses
         // the schema's impl-param Vars (the passed selfTy was resolved with
         // throwaway Vars). For a non-generic impl this is identical to selfTy.
+        // Phase 61: impl + method const params in scope for the whole body.
+        setConstParamsInScope(impl.genericParams, fn.genericParams);
         TypePtr selfTyLocal = selfTy;
         if (!impl.genericParams.empty()) {
             currentGenericEnv_ = &genEnv;
@@ -2578,39 +2621,49 @@ private:
     // conflicting second use surfaces as a field-unify mismatch). Recurses
     // through arrays, refs/boxes, tuples and nested struct/enum fields — so
     // `data: [[i64; C]; R]` recovers both R (outer) and C (inner).
-    void solveConstLengths(const TypePtr& schemaTy, const TypePtr& valTy,
-                           std::unordered_map<std::string, std::size_t>& out) {
+    void solveConstLengths(
+        const TypePtr& schemaTy, const TypePtr& valTy,
+        std::unordered_map<std::string, std::size_t>& out,
+        std::unordered_map<std::string, std::string>& outSym) {
         TypePtr s = resolve(schemaTy);
         TypePtr v = resolve(valTy);
         if (s->kind != v->kind) return;
         switch (s->kind) {
         case TypeKind::Array:
-            if (!s->arrayLenParam.empty())
-                out.emplace(s->arrayLenParam, v->arrayLen);
-            solveConstLengths(s->arrayElem, v->arrayElem, out);
+            if (!s->arrayLenParam.empty()) {
+                // Phase 61: a SYMBOLIC value length (`[T; CAP]` from a generic
+                // field) binds the struct's param to that symbolic name; a
+                // concrete length binds to its value.
+                if (!v->arrayLenParam.empty())
+                    outSym.emplace(s->arrayLenParam, v->arrayLenParam);
+                else
+                    out.emplace(s->arrayLenParam, v->arrayLen);
+            }
+            solveConstLengths(s->arrayElem, v->arrayElem, out, outSym);
             break;
         case TypeKind::Ref:
         case TypeKind::Box:
-            solveConstLengths(s->refInner, v->refInner, out);
+            solveConstLengths(s->refInner, v->refInner, out, outSym);
             break;
         case TypeKind::Tuple:
             for (std::size_t i = 0; i < s->tupleElems.size() &&
                                     i < v->tupleElems.size(); ++i)
-                solveConstLengths(s->tupleElems[i], v->tupleElems[i], out);
+                solveConstLengths(s->tupleElems[i], v->tupleElems[i], out,
+                                  outSym);
             break;
         case TypeKind::Struct:
             for (std::size_t i = 0; i < s->structFields.size() &&
                                     i < v->structFields.size(); ++i)
                 solveConstLengths(s->structFields[i].second,
-                                  v->structFields[i].second, out);
+                                  v->structFields[i].second, out, outSym);
             for (std::size_t i = 0; i < s->typeArgs.size() &&
                                     i < v->typeArgs.size(); ++i)
-                solveConstLengths(s->typeArgs[i], v->typeArgs[i], out);
+                solveConstLengths(s->typeArgs[i], v->typeArgs[i], out, outSym);
             break;
         case TypeKind::Enum:
             for (std::size_t i = 0; i < s->typeArgs.size() &&
                                     i < v->typeArgs.size(); ++i)
-                solveConstLengths(s->typeArgs[i], v->typeArgs[i], out);
+                solveConstLengths(s->typeArgs[i], v->typeArgs[i], out, outSym);
             break;
         default:
             break;
@@ -2943,6 +2996,14 @@ private:
                 return makeConstValue(0);
             }
             return makeConstValue(tr.constArgValue);
+        }
+        // Phase 61: a bare const-generic param used as a type argument — the
+        // `CAP` in `RingBuffer<T, CAP>` or `C`/`R` in `Matrix<C, R>`. It is a
+        // SYMBOLIC const value (resolved per monomorphization), not a type.
+        if (!tr.isRef && !tr.isDyn && !tr.isSlice && !tr.isArray &&
+            !tr.isTuple && !tr.isFn && tr.assocName.empty() &&
+            tr.typeArgs.empty() && currentConstParams_.count(tr.name)) {
+            return makeConstSymbol(tr.name);
         }
         // Phase 13b: slice type `&[T]`. The `&` is part of the slice spelling
         // (a slice is its own fat-pointer borrow), so handle it before the
@@ -3300,7 +3361,10 @@ private:
         for (std::size_t i = 0;
              i < fn.genericParams.size() && i < schema.genericVars.size();
              ++i) {
-            genEnv[fn.genericParams[i].name] = schema.genericVars[i];
+            // Phase 61: const params resolve symbolically (currentConstParams_),
+            // not as type Vars in genEnv.
+            if (!fn.genericParams[i].isConst)
+                genEnv[fn.genericParams[i].name] = schema.genericVars[i];
         }
         // Phase 10a: reconstruct the effect-row-var name set and the
         // Var-id -> name map so (a) `resolveTypeRef` builds fn-typed params
@@ -4600,13 +4664,14 @@ private:
                 valTypes[f.first] = checkExpr(*f.second);
 
             std::unordered_map<std::string, std::size_t> constSubst;
+            std::unordered_map<std::string, std::string> constSym;
             for (const auto& [fname, fty] : schema.type->structFields) {
                 auto vit = valTypes.find(fname);
                 if (vit != valTypes.end())
-                    solveConstLengths(fty, vit->second, constSubst);
+                    solveConstLengths(fty, vit->second, constSubst, constSym);
             }
             for (const auto& nm : schema.constParamNames) {
-                if (!nm.empty() && !constSubst.count(nm)) {
+                if (!nm.empty() && !constSubst.count(nm) && !constSym.count(nm)) {
                     error("cannot infer const parameter '" + nm +
                               "' of struct '" + sl.structName +
                               "' from the literal; a field typed `[..; " + nm +
@@ -4616,27 +4681,30 @@ private:
                 }
             }
 
-            std::unordered_map<int, TypePtr> subst;
+            // Phase 61: a const param inferred SYMBOLICALLY (the field value's
+            // array length is itself a const param in scope) yields a symbolic
+            // const arg; a concrete one yields its value.
             std::vector<TypePtr> args;
             args.reserve(schema.genericVars.size());
             for (std::size_t i = 0; i < schema.genericVars.size(); ++i) {
                 bool isConstSlot = i < schema.constParamNames.size() &&
                                    !schema.constParamNames[i].empty();
                 if (isConstSlot) {
-                    args.push_back(makeConstValue(static_cast<long long>(
-                        constSubst[schema.constParamNames[i]])));
+                    const std::string& pn = schema.constParamNames[i];
+                    if (auto sy = constSym.find(pn); sy != constSym.end())
+                        args.push_back(makeConstSymbol(sy->second));
+                    else
+                        args.push_back(makeConstValue(
+                            static_cast<long long>(constSubst[pn])));
                 } else {
-                    TypePtr fr = makeFreshVar();
-                    subst[schema.genericVars[i]->varId] = fr;
-                    args.push_back(fr);
+                    args.push_back(makeFreshVar());
                 }
             }
-            TypePtr inst = instantiate(schema.type, subst);
-            if (!constSubst.empty())
-                inst = substituteConstLengths(inst, constSubst);
-            if (inst.get() == schema.type.get())
-                inst = makeStruct(inst->structName, inst->structFields);
-            inst->typeArgs = std::move(args);
+            TypePtr inst = instantiateGeneric(schema.type, schema.genericVars,
+                                              schema.constParamNames,
+                                              std::move(args), /*isStruct=*/true);
+            // Re-unify field values against the materialized fields to solve the
+            // fresh type-param Vars (instantiateGeneric used those Vars).
             validateStructLitFields(sl, inst, &valTypes);
             return inst;
         }
@@ -5336,6 +5404,24 @@ private:
                 paramTypes.push_back(makeFreshVar());
             }
         }
+        // Phase 61: closure-param INFERENCE. Consume the expected fn-typed
+        // parameter (set by the call-arg check) and unify each unannotated
+        // param's fresh Var with the expected param type BEFORE checking the
+        // body — so `vec_map(v, |x| ..)` infers `x: &i64` instead of letting
+        // the body pin it to `i64` (which then fails to match `fn(&i64)`).
+        {
+            TypePtr expected = expectedArgType_;
+            expectedArgType_ = nullptr; // consume; don't leak into the body
+            if (expected) {
+                TypePtr e = resolve(expected);
+                if (e->kind == TypeKind::Function &&
+                    e->args.size() == paramTypes.size()) {
+                    for (std::size_t i = 0; i < paramTypes.size(); ++i)
+                        if (!cl.params[i].hasAnnotation)
+                            unify(paramTypes[i], e->args[i]);
+                }
+            }
+        }
 
         // 3) Check the body in a fresh scope containing only params +
         // captures. A new scope frame on top of the existing stack would
@@ -5660,7 +5746,9 @@ private:
                 std::unordered_map<std::string, std::size_t> constSubst;
                 for (std::size_t i = 0; i < n; ++i) {
                     std::unordered_map<std::string, std::size_t> local;
-                    solveConstLengths(instSig->args[i], preArgTypes[i], local);
+                    std::unordered_map<std::string, std::string> localSym;
+                    solveConstLengths(instSig->args[i], preArgTypes[i], local,
+                                      localSym);
                     for (const auto& [nm, val] : local) {
                         auto it = constSubst.find(nm);
                         if (it == constSubst.end())
@@ -5699,8 +5787,19 @@ private:
             }
 
             for (std::size_t i = 0; i < n; ++i) {
-                TypePtr argType =
-                    fnHasConst ? preArgTypes[i] : checkExpr(*call.args[i]);
+                TypePtr argType;
+                if (fnHasConst) {
+                    argType = preArgTypes[i];
+                } else {
+                    // Phase 61: closure-param inference — propagate the callee's
+                    // expected fn-typed parameter into the closure so an
+                    // unannotated `|x|` infers x's type (`vec_map(v, |x| ..)`
+                    // needs no `|x: &i64|`). Earlier args (the Vec) have already
+                    // solved the element type, so `instSig->args[i]` is concrete.
+                    expectedArgType_ = resolve(instSig->args[i]);
+                    argType = checkExpr(*call.args[i]);
+                    expectedArgType_ = nullptr;
+                }
                 // Phase 11: a `&Concrete`/`Box<Concrete>` arg coerces into a
                 // `&dyn Trait`/`Box<dyn Trait>` parameter.
                 if (!coerceOrUnify(*call.args[i], argType, instSig->args[i])) {
@@ -6208,12 +6307,11 @@ private:
                       al.elements[i]->line, al.elements[i]->column);
             }
         }
-        if (!isCopyAggregateElem(elemTy)) {
-            error("array elements must be Copy types (i64, bool, or nested "
-                  "arrays/tuples of those) in this version, got " +
-                      typeToString(elemTy),
-                  al.line, al.column);
-        }
+        // Phase 61 (v10): non-Copy element types (String, structs, Vec, Box)
+        // are now allowed — codegen clones the array element-wise and drops it
+        // element-wise (mirroring non-Copy tuples). A non-Copy-element array is
+        // itself non-Copy (isCopyType recurses on the element), so the borrow
+        // checker move-tracks it correctly.
         return makeArray(elemTy, al.elements.size());
     }
 

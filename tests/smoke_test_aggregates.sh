@@ -252,16 +252,31 @@ EOF
 reject_expect "neg_oob" "$TMP/bad_oob.kd" "out of bounds"
 echo "PASS [neg_oob]: a compile-time-constant out-of-range index a[5] is rejected"
 
-cat > "$TMP/bad_noncopy.kd" <<'EOF'
+# Phase 61 (v10): a fixed-size array over a NON-Copy element type (String) is
+# now allowed — element-wise clone + element-wise Drop. (The old Copy-only
+# restriction is lifted.) Build the AOT binary and run it to exercise the
+# element drops without a leak/crash.
+cat > "$TMP/noncopy.kd" <<'EOF'
 fn main() -> i64 ! { alloc } {
-    let v = vec_new();
-    vec_push(&mut v, 1);
-    let a = [v];
-    0
+    let a: [String; 2] = [int_to_string(11), int_to_string(222)];
+    str_len(&a[0]) + str_len(&a[1])
 }
 EOF
-reject_expect "neg_noncopy" "$TMP/bad_noncopy.kd" "must be Copy"
-echo "PASS [neg_noncopy]: a non-Copy array element (Vec) is rejected"
+jit=$("$KARDC" "$TMP/noncopy.kd" 2>/dev/null | tail -1)
+[[ "$jit" == "5" ]] || { echo "FAIL [noncopy]: expected 5 got '$jit'"; exit 1; }
+"$KARDC" --no-cache -o "$TMP/noncopy" "$TMP/noncopy.kd" >/dev/null 2>&1
+set +e; "$TMP/noncopy"; rc=$?; set -e
+[[ "$rc" -eq 5 ]] || { echo "FAIL [noncopy/aot]: exit $rc expected 5"; exit 1; }
+# moving a non-Copy element OUT of an array by index is rejected (clone/borrow).
+cat > "$TMP/noncopy_move.kd" <<'EOF'
+fn main() -> i64 ! { alloc } {
+    let a: [String; 1] = [int_to_string(1)];
+    let x = a[0];
+    str_len(&x)
+}
+EOF
+reject_expect "neg_noncopy_move" "$TMP/noncopy_move.kd" "cannot move a non-Copy"
+echo "PASS [noncopy]: [String; 2] non-Copy array clones/drops; index move-out rejected (JIT + AOT)"
 
 cat > "$TMP/bad_arity.kd" <<'EOF'
 fn main() -> i64 {

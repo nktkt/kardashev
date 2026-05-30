@@ -3755,8 +3755,25 @@ private:
             return builder_->CreateLoad(st, resultSlot, "clone.enum");
         }
         case TypeKind::Array: {
-            // Phase 22 arrays are Copy-element only — a value bit-copy clones.
-            return builder_->CreateLoad(mapKardashevType(r), src, "clone.arr");
+            // Phase 61: a non-owning (non-droppable) element bit-copies as a
+            // clone; an owning element (String/struct/Vec/Box) is deep-cloned
+            // element-wise, mirroring the Tuple case but with array GEP {0, i}.
+            if (!isDroppable(r->arrayElem)) {
+                return builder_->CreateLoad(mapKardashevType(r), src,
+                                            "clone.arr");
+            }
+            llvm::Type* arrTy = mapKardashevType(r);
+            auto* i64Ty = llvm::Type::getInt64Ty(*ctx_);
+            auto* zero = llvm::ConstantInt::get(i64Ty, 0);
+            llvm::Value* agg = llvm::UndefValue::get(arrTy);
+            for (unsigned i = 0; i < r->arrayLen; ++i) {
+                auto* ep = builder_->CreateInBoundsGEP(
+                    arrTy, src, {zero, llvm::ConstantInt::get(i64Ty, i)},
+                    "arr.p");
+                llvm::Value* cv = emitCloneValue(ep, r->arrayElem);
+                agg = builder_->CreateInsertValue(agg, cv, {i}, "arr.clone");
+            }
+            return agg;
         }
         case TypeKind::Tuple: {
             llvm::Type* st = mapKardashevType(r);
@@ -5694,6 +5711,16 @@ private:
         // monomorphic identity (otherwise the signature would mangle to
         // `Mat__i64` with a `[0 x i64]` field and clash with `Mat__c3`).
         if (tr.isConstArg) return makeConstValue(tr.constArgValue);
+        // Phase 61: a bare const-generic param as a type argument (`RingBuffer
+        // <T, CAP>` / `Matrix<C, R>`) resolves to this instance's concrete
+        // value. (Outside an instance it stays a symbolic const placeholder.)
+        if (!tr.isRef && !tr.isDyn && !tr.isSlice && !tr.isArray &&
+            !tr.isTuple && !tr.isFn && tr.assocName.empty() &&
+            tr.typeArgs.empty()) {
+            if (auto it = currentConstParamSubst_.find(tr.name);
+                it != currentConstParamSubst_.end())
+                return makeConstValue(static_cast<long long>(it->second));
+        }
         // Phase 13b: slice type `&[T]`. Handle before the ref-peel (the `&`
         // is part of the slice spelling, not an extra Ref wrapper).
         if (tr.isSlice) {
@@ -6074,6 +6101,16 @@ private:
     }
 
     TypePtr resolveInInstanceImpl(const TypePtr& r) {
+        // Phase 61: a SYMBOLIC const value (a const param like `CAP` carried in
+        // a type's typeArgs) resolves to this instance's concrete value, so
+        // `RingBuffer<T, CAP>` in a method body mangles to the right `c<N>`.
+        if (r->kind == TypeKind::Int && r->isConstValue &&
+            !r->constValueName.empty()) {
+            auto it = currentConstParamSubst_.find(r->constValueName);
+            if (it != currentConstParamSubst_.end())
+                return makeConstValue(static_cast<long long>(it->second));
+            return r;
+        }
         switch (r->kind) {
         case TypeKind::Var: {
             if (auto it = currentSchemaVarSubst_.find(r->varId);
@@ -6260,8 +6297,17 @@ private:
                 }
             }
             // Phase 61: an impl's const params (e.g. `RingBuffer<T, const CAP>`)
-            // bind their values for the method body's `[T; CAP]` types.
-            if (sch) recordConstParamSubst(sch->constParamNames, typeArgs);
+            // bind their concrete values for the method body's `[T; CAP]` types
+            // and `RingBuffer<T, CAP>` type-args.
+            for (std::size_t i = 0;
+                 i < impl->genericParams.size() && i < typeArgs.size(); ++i) {
+                if (!impl->genericParams[i].isConst) continue;
+                TypePtr a = resolve(typeArgs[i]);
+                if (a->kind == TypeKind::Int && a->isConstValue &&
+                    a->constValueName.empty() && a->constValue >= 0)
+                    currentConstParamSubst_[impl->genericParams[i].name] =
+                        static_cast<std::size_t>(a->constValue);
+            }
             // Self = the impl's forType with the params now bound.
             currentInstanceTypeMap_["Self"] = astTypeRefToConcrete(impl->forType);
             return;
@@ -7159,12 +7205,14 @@ private:
         // reclaims everything a closure owns.
         case TypeKind::Function:
             return true;
-        // Phase 36: a tuple owns its elements, so it is droppable iff any
-        // element is. (Arrays stay Copy-only -> never droppable.)
+        // Phase 36 / 61: a tuple or fixed-size array owns its elements, so it
+        // is droppable iff an element is (Phase 61 lifted arrays to non-Copy).
         case TypeKind::Tuple:
             for (const auto& el : r->tupleElems)
                 if (isDroppableImpl(el, seen)) return true;
             return false;
+        case TypeKind::Array:
+            return isDroppableImpl(r->arrayElem, seen);
         // Scalars, references, dyn objects, arrays: never owning.
         default:
             return false;
@@ -7365,6 +7413,23 @@ private:
         if (r->kind == TypeKind::Enum) {
             emitUserDrop(valuePtr, r);
             emitDropEnum(valuePtr, r);
+            return;
+        }
+
+        // Phase 61: a fixed-size array owns its elements — drop each in turn.
+        // Inline storage (no heap); element pointers via array GEP {0, i}.
+        if (r->kind == TypeKind::Array) {
+            if (isDroppable(r->arrayElem)) {
+                llvm::Type* arrTy = mapKardashevType(r);
+                auto* i64Ty = llvm::Type::getInt64Ty(*ctx_);
+                auto* zero = llvm::ConstantInt::get(i64Ty, 0);
+                for (unsigned i = 0; i < r->arrayLen; ++i) {
+                    auto* ep = builder_->CreateInBoundsGEP(
+                        arrTy, valuePtr,
+                        {zero, llvm::ConstantInt::get(i64Ty, i)}, "drop.arr");
+                    emitDropGlue(ep, r->arrayElem);
+                }
+            }
             return;
         }
 

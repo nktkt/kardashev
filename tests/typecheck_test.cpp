@@ -2547,6 +2547,24 @@ void test_effect_subset_drop_exempt_ok() {
              "effect_subset_drop_exempt_ok");
 }
 
+// Phase 61 (v10): non-Copy arrays + RingBuffer<T, const CAP> + closure infer.
+void test_noncopy_array_ok() {
+    // A non-Copy element type in a fixed-size array is now allowed (used WITHOUT
+    // the prelude here, so a tiny user `String`-like struct stands in for it).
+    expectOk("struct S { x: i64 }\n"
+             "fn main() -> i64 { let a: [S; 2] = [S { x: 1 }, S { x: 2 }];"
+             " a[0].x + a[1].x }",
+             "noncopy_array_ok");
+}
+
+void test_const_generic_mixed_struct_ok() {
+    // A struct generic over BOTH a type param and a const param.
+    expectOk("struct Buf<T, const N: i64> { data: [T; N] }\n"
+             "fn main() -> i64 { let b: Buf<i64, 2> = Buf { data: [3, 4] };"
+             " b.data[0] + b.data[1] }",
+             "const_generic_mixed_struct_ok");
+}
+
 } // namespace
 
 int main() {
@@ -2823,6 +2841,9 @@ int main() {
     test_effect_subset_super_effecting_errors();
     test_effect_subset_fewer_ok();
     test_effect_subset_drop_exempt_ok();
+    // Phase 61 (v10): non-Copy arrays + mixed type+const generics.
+    test_noncopy_array_ok();
+    test_const_generic_mixed_struct_ok();
     test_const_fn_array_len_ok();
     test_const_div_by_zero_errors();
     test_const_overflow_errors();
@@ -2831,6 +2852,6 @@ int main() {
     test_const_type_mismatch_errors();
     test_const_array_len_bool_errors();
     test_const_array_len_calls_nonconst_fn_errors();
-    std::cout << "All typecheck tests passed (257 cases)\n";
+    std::cout << "All typecheck tests passed (259 cases)\n";
     return 0;
 }

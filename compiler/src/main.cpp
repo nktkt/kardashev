@@ -762,9 +762,19 @@ std::string deriveImplSource(const kardashev::ast::Program& prog) {
         std::string s = "<";
         for (std::size_t i = 0; i < ps.size(); ++i) {
             if (i) s += ", ";
-            s += ps[i].name;
-            s += ": ";
-            s += bound;
+            // Phase 61: a const-generic param is re-declared `const N: i64`
+            // (NOT bounded by the derive's trait) so the generated impl is
+            // generic over it; `tyName` then passes it through as `RingBuffer
+            // <T, CAP>` (CAP a symbolic const arg).
+            if (ps[i].isConst) {
+                s += "const ";
+                s += ps[i].name;
+                s += ": i64";
+            } else {
+                s += ps[i].name;
+                s += ": ";
+                s += bound;
+            }
         }
         return s + ">";
     };
@@ -794,6 +804,15 @@ std::string deriveImplSource(const kardashev::ast::Program& prog) {
         if (tr.name == "HashMap") return "hashmap_new()";
         return tr.name + "::default()"; // concrete nested user type
     };
+    // Phase 61: clone a field. An ARRAY field `[T; N]` has no `.clone()` method
+    // (it is not a struct/enum); use the structural `clone(&...)` intrinsic,
+    // which deep-clones element-wise. Other fields dispatch through their own
+    // `.clone()` (respecting a custom Clone impl).
+    auto cloneField = [](const std::string& fname,
+                         const kardashev::ast::TypeRef& tr) -> std::string {
+        if (tr.isArray) return "clone(&self." + fname + ")";
+        return "self." + fname + ".clone()";
+    };
     std::string out;
     for (const auto& s : prog.structs) {
         const std::string TN = tyName(s.name, s.genericParams);
@@ -803,8 +822,9 @@ std::string deriveImplSource(const kardashev::ast::Program& prog) {
                        TN + " { fn clone(&self) -> " + TN + " ! { alloc } { " +
                        s.name + " {";
                 for (std::size_t i = 0; i < s.fields.size(); ++i)
-                    out += (i ? "," : "") + (" " + s.fields[i].name + ": self." +
-                                             s.fields[i].name + ".clone()");
+                    out += (i ? "," : "") +
+                           (" " + s.fields[i].name + ": " +
+                            cloneField(s.fields[i].name, s.fields[i].type));
                 out += " } } }\n";
             } else if (d == "Eq") {
                 out += "impl" + header(s.genericParams, "Eq") + " Eq for " + TN +

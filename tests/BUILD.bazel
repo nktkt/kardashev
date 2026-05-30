@@ -555,6 +555,15 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 61 (v10): RingBuffer<T, const CAP> — mixed type+const generics, Drop +
+# deep clone over a NON-Copy element, symbolic const params through a generic
+# impl; plus closure-param inference (`vec_map(v, |x| ..)`). JIT + AOT.
+sh_test(
+    name = "smoke_test_phase61",
+    srcs = ["smoke_test_phase61.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

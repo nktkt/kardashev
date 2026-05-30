@@ -556,7 +556,12 @@ private:
         int lastInSubtree = startPos;
 
         if (auto* id = dynamic_cast<const ast::IdentExpr*>(&e)) {
-            consumeIdent(*id);
+            // Phase 61: in a PLACE context (consuming the base/root of a
+            // `&place`, an index `a[i]`, or a deref projection), the ident is
+            // READ, not moved — so borrowing/indexing into a non-Copy local
+            // (`&a[i]`) doesn't move the whole local out.
+            if (derefMoveCheckSuppressed_) checkRead(*id);
+            else consumeIdent(*id);
             return startPos;
         }
         if (dynamic_cast<const ast::IntLitExpr*>(&e)) {
@@ -811,8 +816,22 @@ private:
             return lastInSubtree;
         }
         if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
-            lastInSubtree =
-                std::max(lastInSubtree, consume(*ix->object, expectExpire));
+            // Phase 61: indexing PROJECTS into the base array — the base is a
+            // place (read), not moved (so `&a[i]`, `a[i] = x`, and reading a
+            // Copy `a[i]` never move `a`). Moving a NON-COPY element OUT in
+            // value position (`let x = a[i];`) is a partial move we don't
+            // track; reject it — clone (`a[i].clone()`) or borrow (`&a[i]`).
+            if (!derefMoveCheckSuppressed_) {
+                TypePtr et = typeOf(e);
+                if (et && !isCopyType(et)) {
+                    error("cannot move a non-Copy value out of an array index "
+                          "(`a[i]`); clone it (`a[i].clone()`) or borrow it "
+                          "(`&a[i]`) instead",
+                          e.line, e.column);
+                }
+            }
+            lastInSubtree = std::max(
+                lastInSubtree, consumePlace(*ix->object, expectExpire));
             lastInSubtree =
                 std::max(lastInSubtree, consume(*ix->index, expectExpire));
             return lastInSubtree;
