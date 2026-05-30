@@ -853,6 +853,50 @@ sh_test(
     ],
 )
 
+# v16 Phase 94 (self-hosting, cont.): an expression parser + evaluator (Expr AST
+# with variable references, precedence, parens; eval over a HashMap env).
+sh_test(
+    name = "smoke_test_phase94",
+    srcs = ["smoke_test_phase94.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:expr.kd",
+    ],
+)
+
+# v16 Phase 95 (self-hosting, cont.): a statement/block parser + evaluator —
+# `let NAME = EXPR ;` bindings + a result expr, evaluated with a growing env.
+sh_test(
+    name = "smoke_test_phase95",
+    srcs = ["smoke_test_phase95.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:stmt.kd",
+    ],
+)
+
+# v16 Phase 96 (self-hosting, cont.): a scope/semantic checker — walks the block
+# AST verifying every variable reference is bound; reports undefined variables.
+sh_test(
+    name = "smoke_test_phase96",
+    srcs = ["smoke_test_phase96.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:scopechk.kd",
+    ],
+)
+
+# v16 Phase 97 CAPSTONE (self-hosting, cont.): a function-body interpreter tying
+# lex -> parse -> scope-check -> evaluate, running a body with arguments.
+sh_test(
+    name = "smoke_test_phase97",
+    srcs = ["smoke_test_phase97.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:interp.kd",
+    ],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

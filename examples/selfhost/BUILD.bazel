@@ -2,7 +2,7 @@ load("//bazel/rules_kardashev:defs.bzl", "kardashev_binary")
 
 # Readable by //tests:smoke_test_phase88..93.
 exports_files(
-    ["lexer.kd", "tokens.kd", "parser.kd", "printer.kd", "checker.kd", "front.kd"],
+    ["lexer.kd", "tokens.kd", "parser.kd", "printer.kd", "checker.kd", "front.kd", "expr.kd", "stmt.kd", "scopechk.kd", "interp.kd"],
     visibility = ["//visibility:public"],
 )
 
@@ -16,3 +16,11 @@ kardashev_binary(name = "parser", src = "parser.kd")
 kardashev_binary(name = "printer", src = "printer.kd")
 kardashev_binary(name = "checker", src = "checker.kd")
 kardashev_binary(name = "front", src = "front.kd")
+# v16 Phase 94: expression parser + evaluator (variables, precedence, parens).
+kardashev_binary(name = "expr", src = "expr.kd")
+# v16 Phase 95: a statement/block parser + evaluator.
+kardashev_binary(name = "stmt", src = "stmt.kd")
+# v16 Phase 96: a scope/semantic checker (undefined-variable detection).
+kardashev_binary(name = "scopechk", src = "scopechk.kd")
+# v16 Phase 97 CAPSTONE: a function-body interpreter (lex->parse->check->eval).
+kardashev_binary(name = "interp", src = "interp.kd")

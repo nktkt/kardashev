@@ -1,0 +1,220 @@
+// Roadmap v16 — "self-hosting, cont.", Phase 96. A scope/semantic CHECKER over
+// the body grammar (Phases 94-95), written in kardashev: it parses a block and
+// walks the AST verifying every VARIABLE REFERENCE is BOUND — an outer parameter
+// or an earlier `let` — reporting UNDEFINED variables. A `let` RHS is checked
+// against the scope BEFORE its own name is bound (no self-reference), and each
+// `let` extends the scope for the statements that follow. Checked on a
+// well-scoped block (0 errors) and one referencing an undeclared variable (1).
+
+// Roadmap v16 — "self-hosting, cont.", Phase 95. Grows the body grammar from a
+// single expression (Phase 94) to a BLOCK OF STATEMENTS: a sequence of
+// `let NAME = EXPR ;` bindings followed by a final result expression. The parser
+// (in kardashev) builds `Block { lets: Vec<Stmt>, result: Box<Expr> }`; the
+// evaluator runs each `let` in order, EXTENDING the environment, then evaluates
+// the result — exactly how an interpreter executes a function body. Checked on
+//   let x = a + 1 ; let y = x * 2 ; y      with { a: 3 }  ->  x=4, y=8, result 8
+// (so a `let` can reference both outer bindings and earlier `let`s).
+
+enum Expr { Num(i64), Var(String), Add(Box<Expr>, Box<Expr>), Mul(Box<Expr>, Box<Expr>) }
+enum Stmt { Let(String, Box<Expr>) }
+
+// kind: 1 number, 2 identifier, 10 '+', 11 '*', 12 '(', 13 ')', 14 '=', 15 ';'
+struct Token { kind: i64, start: i64, len: i64, value: i64 }
+struct Pos { i: i64 }
+struct Block { lets: Vec<Stmt>, result: Box<Expr> }
+
+fn is_alpha(b: i64) -> i64 {
+    if b >= 97 { if b <= 122 { 1 } else { 0 } }
+    else { if b >= 65 { if b <= 90 { 1 } else { 0 } } else { if b == 95 { 1 } else { 0 } } }
+}
+fn is_digit(b: i64) -> i64 { if b >= 48 { if b <= 57 { 1 } else { 0 } } else { 0 } }
+fn is_alnum(b: i64) -> i64 { if is_alpha(b) == 1 { 1 } else { is_digit(b) } }
+fn is_space(b: i64) -> i64 {
+    if b == 32 { 1 } else { if b == 10 { 1 } else { if b == 9 { 1 } else { 0 } } }
+}
+
+fn lex(src: &String) -> Vec<Token> ! { alloc } {
+    let n = str_len(src);
+    let mut toks = vec_new();
+    let mut i = 0;
+    while i < n {
+        let b = str_char_at(src, i);
+        if is_space(b) == 1 { i = i + 1; }
+        else {
+            if is_alpha(b) == 1 {
+                let start = i; i = i + 1;
+                let mut go = true;
+                while go {
+                    if i >= n { go = false; }
+                    else { let c = str_char_at(src, i); if is_alnum(c) == 1 { i = i + 1; } else { go = false; } }
+                }
+                vec_push(&mut toks, Token { kind: 2, start: start, len: i - start, value: 0 });
+            } else {
+                if is_digit(b) == 1 {
+                    let start = i; let mut v = 0;
+                    let mut go = true;
+                    while go {
+                        if i >= n { go = false; }
+                        else { let c = str_char_at(src, i); if is_digit(c) == 1 { v = v * 10 + (c - 48); i = i + 1; } else { go = false; } }
+                    }
+                    vec_push(&mut toks, Token { kind: 1, start: start, len: i - start, value: v });
+                } else {
+                    let k = if b == 43 { 10 } else { if b == 42 { 11 } else { if b == 40 { 12 } else { if b == 41 { 13 } else { if b == 61 { 14 } else { if b == 59 { 15 } else { 0 - 1 } } } } } };
+                    vec_push(&mut toks, Token { kind: k, start: i, len: 1, value: 0 });
+                    i = i + 1;
+                }
+            }
+        }
+    }
+    toks
+}
+
+fn tok_text(src: &String, t: &Token) -> String ! { alloc } { str_substring(src, t.start, t.len) }
+fn peek_kind(toks: &Vec<Token>, pos: &Pos) -> i64 {
+    if pos.i < vec_len(toks) { let t = vec_get(toks, pos.i); t.kind } else { 0 - 9 }
+}
+
+fn parse_factor(src: &String, toks: &Vec<Token>, pos: &mut Pos) -> Box<Expr> ! { alloc } {
+    let t = vec_get(toks, pos.i);
+    if t.kind == 1 { pos.i = pos.i + 1; Box::new(Num(t.value)) }
+    else { if t.kind == 2 { pos.i = pos.i + 1; Box::new(Var(tok_text(src, &t))) }
+    else {
+        pos.i = pos.i + 1;
+        let e = parse_expr(src, toks, pos);
+        pos.i = pos.i + 1;
+        e
+    } }
+}
+fn parse_term(src: &String, toks: &Vec<Token>, pos: &mut Pos) -> Box<Expr> ! { alloc } {
+    let mut left = parse_factor(src, toks, pos);
+    let mut go = true;
+    while go {
+        if peek_kind(toks, pos) == 11 { pos.i = pos.i + 1; let right = parse_factor(src, toks, pos); left = Box::new(Mul(left, right)); }
+        else { go = false; }
+    }
+    left
+}
+fn parse_expr(src: &String, toks: &Vec<Token>, pos: &mut Pos) -> Box<Expr> ! { alloc } {
+    let mut left = parse_term(src, toks, pos);
+    let mut go = true;
+    while go {
+        if peek_kind(toks, pos) == 10 { pos.i = pos.i + 1; let right = parse_term(src, toks, pos); left = Box::new(Add(left, right)); }
+        else { go = false; }
+    }
+    left
+}
+
+// Is the current token the `let` keyword (an identifier whose text is "let")?
+fn at_let(src: &String, toks: &Vec<Token>, pos: &Pos) -> i64 ! { alloc } {
+    if peek_kind(toks, pos) == 2 {
+        let t = vec_get(toks, pos.i);
+        let txt = tok_text(src, &t);
+        let kw = "let";
+        if str_eq(&txt, &kw) { 1 } else { 0 }
+    } else { 0 }
+}
+
+fn parse_block(src: &String, toks: &Vec<Token>, pos: &mut Pos) -> Block ! { alloc } {
+    let mut lets = vec_new();
+    let mut go = true;
+    while go {
+        if at_let(src, toks, pos) == 1 {
+            pos.i = pos.i + 1;                          // 'let'
+            let nt = vec_get(toks, pos.i);
+            let name = tok_text(src, &nt);
+            pos.i = pos.i + 1;                          // NAME
+            pos.i = pos.i + 1;                          // '='
+            let e = parse_expr(src, toks, pos);
+            pos.i = pos.i + 1;                          // ';'
+            vec_push(&mut lets, Let(name, e));
+        } else { go = false; }
+    }
+    let result = parse_expr(src, toks, pos);            // the final expression
+    Block { lets: lets, result: result }
+}
+
+fn eval(e: &Expr, env: &HashMap<String, i64>) -> i64 ! { alloc } {
+    match e {
+        Num(v) => *v,
+        Var(name) => match hashmap_get(env, clone(name)) { Some(x) => x, None => 0 },
+        Add(a, b) => eval(&(**a), env) + eval(&(**b), env),
+        Mul(a, b) => eval(&(**a), env) * eval(&(**b), env),
+    }
+}
+
+// Run the block: each `let` extends `env`, then evaluate the result.
+fn eval_block(block: &Block, env: &mut HashMap<String, i64>) -> i64 ! { alloc } {
+    let nl = vec_len(&block.lets);
+    let mut k = 0;
+    while k < nl {
+        let s = vec_get(&block.lets, k);               // owned Stmt (deep clone)
+        match s {
+            Let(name, e) => {
+                let v = eval(&(*e), env);
+                hashmap_insert(env, name, v);
+            },
+        }
+        k = k + 1;
+    }
+    eval(&(*block.result), env)
+}
+
+
+// Count undefined variable references in an expression, given the in-scope set.
+fn check_expr(e: &Expr, scope: &HashMap<String, i64>) -> i64 ! { alloc } {
+    match e {
+        Num(v) => 0,
+        Var(name) => match hashmap_get(scope, clone(name)) { Some(_) => 0, None => 1 },
+        Add(a, b) => check_expr(&(**a), scope) + check_expr(&(**b), scope),
+        Mul(a, b) => check_expr(&(**a), scope) + check_expr(&(**b), scope),
+    }
+}
+
+// Check a block: thread the scope through the lets, then the result.
+fn check_block(block: &Block, params: &Vec<String>) -> i64 ! { alloc } {
+    let mut scope = hashmap_new();
+    let np = vec_len(params);
+    let mut p = 0;
+    while p < np { let pn = vec_get(params, p); hashmap_insert(&mut scope, pn, 1); p = p + 1; }
+    let nl = vec_len(&block.lets);
+    let mut errs = 0;
+    let mut k = 0;
+    while k < nl {
+        let s = vec_get(&block.lets, k);
+        match s {
+            Let(name, e) => {
+                errs = errs + check_expr(&(*e), &scope);     // RHS in current scope
+                hashmap_insert(&mut scope, name, 1);          // then bind the name
+            },
+        }
+        k = k + 1;
+    }
+    errs + check_expr(&(*block.result), &scope)
+}
+
+// Parse `src` and return its undefined-variable count given declared `params`.
+fn analyze(src: &String, params: &Vec<String>) -> i64 ! { alloc } {
+    let toks = lex(src);
+    let mut pos = Pos { i: 0 };
+    let block = parse_block(src, &toks, &mut pos);
+    check_block(&block, params)
+}
+
+fn main() -> i64 ! { io, alloc } {
+    // Declared parameters: a, b.
+    let mut params = vec_new();
+    let pa = "a"; let pb = "b";
+    vec_push(&mut params, clone(&pa));
+    vec_push(&mut params, clone(&pb));
+
+    // Well-scoped: x is an earlier let; a, b are params.
+    let good = "let x = a + 1 ; x + b";
+    print(analyze(&good, &params));      // 0 undefined
+
+    // Ill-scoped: c is never declared.
+    let bad = "let x = a + 1 ; x + c";
+    print(analyze(&bad, &params));       // 1 undefined (c)
+
+    // witness: good*10 + bad = 1
+    analyze(&good, &params) * 10 + analyze(&bad, &params)
+}

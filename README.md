@@ -52,13 +52,13 @@ Effect sets are unioned across the call graph and checked at definition sites; n
 
 ## Status
 
-All fifteen roadmaps (Phases 0–93, **v1–v15**) have shipped and are merged to
+All sixteen roadmaps (Phases 0–97, **v1–v16**) have shipped and are merged to
 `main` — 6 unit suites plus the full smoke-test aggregate pass **JIT and AOT**
-on a cleared clean build. v15 ("self-hosting") delivers a self-hosted compiler
-**front-end** (lexer + parser + scope checker) written *in* kardashev — the
-north-star arc toward a bootstrap (`examples/selfhost/`, capstone `front.kd`
-running lex → parse → check → reprint end-to-end). v14 ("hardening") made the
-toolchain trustworthy
+on a cleared clean build. v15–v16 ("self-hosting") build a self-hosted compiler
+front *in* kardashev — the north-star arc toward a bootstrap: v15 the front-end
+(lexer + parser + signature checker), v16 the BODY (expression/statement parser,
+scope checker, and a function-body interpreter; `examples/selfhost/`, capstone
+`interp.kd`). v14 ("hardening") made the toolchain trustworthy
 across platforms: **macOS CI went green for the first time** (portable leak
 gates), the smoke harness is SIGPIPE-robust, the channel capture-and-keep footgun
 is now a precise compile error, and a JIT-vs-AOT differential sweep over the 9
@@ -408,6 +408,49 @@ generic keys; 29 plugged the Drop leaks 27–28's new droppable values made load
 30's `Result<String, IoError>` drops cleanly on the error path *because* 29 closed that
 hole; 31 integrated 27–30 into the self-written capstones; 32 documented the result last.
 Each shipped green before the next, exactly as v1–v4 did.
+
+## Roadmap v16 — shipped
+
+> **Status: shipped.** "Self-hosting, continued" — grow the self-hosted front from
+> v15's signatures to the BODY grammar: expressions, statements, scope checking,
+> and a function-body interpreter, all written in kardashev in
+> `examples/selfhost/`. All of v16 (Phases 94–97) is implemented and green — 6
+> unit suites + the smoke aggregate, JIT **and** AOT.
+>
+> - **Phase 94 — an expression parser + evaluator (done).** `examples/selfhost/expr.kd`
+>   is a recursive-descent parser for the body grammar: it builds an `enum Expr`
+>   AST (`Num` / `Var` / `Add` / `Mul`, recursive via `Box`) for an arithmetic
+>   expression with VARIABLE REFERENCES (the step beyond `examples/calc`'s
+>   variable-free arithmetic), then EVALUATES it against a `HashMap<String, i64>`
+>   environment `{ a: 3, b: 4 }`. Proves `*` binds tighter than `+`
+>   (`a + b * 2` = 11) and that parentheses override it (`(a + b) * 2` = 14),
+>   JIT + AOT. (`eval` walks the Box-recursive tree via the `&(**child)` borrow;
+>   the cursor threads as a `&mut Pos` cell since kardashev has no `&mut i64`
+>   deref-assign — a candidate ergonomics improvement.)
+> - **Phase 95 — a statement/block parser + evaluator (done).** `examples/selfhost/stmt.kd`
+>   grows the body grammar to a BLOCK: a sequence of `let NAME = EXPR ;` bindings
+>   plus a final result expression, parsed into `Block { lets: Vec<Stmt>, result:
+>   Box<Expr> }` and evaluated by running each `let` in order — EXTENDING the
+>   environment — then the result, exactly how an interpreter executes a function
+>   body. Over `let x = a + 1 ; let y = x * 2 ; y` with `{ a: 3 }`: `x = 4`,
+>   `y = 8` (a `let` references both the outer `a` and the earlier `x`), result
+>   `8`, JIT + AOT.
+> - **Phase 96 — a scope/semantic checker (done).** `examples/selfhost/scopechk.kd`
+>   walks the block AST and verifies every VARIABLE REFERENCE is bound — an outer
+>   parameter or an earlier `let` — reporting UNDEFINED variables (a `let` RHS is
+>   checked before its own name binds; each `let` extends the scope). With params
+>   `{ a, b }`: `let x = a + 1 ; x + b` → 0 undefined; `let x = a + 1 ; x + c` → 1
+>   (the undeclared `c`), JIT + AOT.
+> - **Phase 97 — CAPSTONE: a function-body interpreter (done).** `examples/selfhost/interp.kd`
+>   ties the whole body pipeline (lex → parse → scope-check → evaluate) into one
+>   `interpret(body, params, args)`: it REJECTS a body referencing an undefined
+>   variable (returns `-1`), and otherwise binds the arguments to the parameters
+>   and runs the block to a value. `fn f(x=3, y=4) { let sq = x*x; let dbl = y+y;
+>   sq + dbl }` → `17`; an ill-scoped body → `-1`. A self-hosted interpreter for
+>   kardashev function bodies, written in the language it interprets, JIT + AOT.
+>
+> Planned: wire the body interpreter to the v15 `FnSig` (a full `Fn`); a real type
+> checker; eventually emit code — closing language gaps as they surface.
 
 ## Roadmap v15 — shipped
 

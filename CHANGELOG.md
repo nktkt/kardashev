@@ -18,6 +18,42 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.16.0] — Roadmap v16 "self-hosting, continued" (Phases 94–97)
+
+Theme: grow the self-hosted front (v15: lexer + parser + signature checker)
+toward a full compiler — the BODY grammar: expressions, statements, scope
+checking, and a function-body interpreter, all written in kardashev in
+`examples/selfhost/`.
+
+### Added
+- **An expression parser + evaluator** (Phase 94, `expr.kd`) — a recursive-descent
+  parser builds an `enum Expr` AST (`Num` / `Var` / `Add` / `Mul`, recursive via
+  `Box`) for an arithmetic expression with VARIABLE REFERENCES (the step beyond
+  `examples/calc`'s variable-free arithmetic), then evaluates it against a
+  `HashMap<String, i64>` environment. Proves precedence (`a + b * 2` = 11) and
+  parentheses (`(a + b) * 2` = 14).
+- **A statement/block parser + evaluator** (Phase 95, `stmt.kd`) — grows the body
+  to a block: `let NAME = EXPR ;` bindings + a result expression →
+  `Block { lets: Vec<Stmt>, result: Box<Expr> }`, evaluated by running each `let`
+  in order (extending the environment) then the result. `let x = a + 1 ; let y =
+  x * 2 ; y` with `{ a: 3 }` → 8.
+- **A scope/semantic checker** (Phase 96, `scopechk.kd`) — walks the block AST and
+  reports UNDEFINED variable references (a `let` RHS checked before its own name
+  binds; each `let` extends the scope). `… x + c` with `c` undeclared → 1 error.
+- **Capstone: a function-body interpreter** (Phase 97, `interp.kd`) — ties the
+  whole pipeline (lex → parse → scope-check → evaluate) into one
+  `interpret(body, params, args)`: rejects a body referencing an undefined
+  variable (`-1`), else binds the arguments and runs the block. `fn f(x=3, y=4)
+  { let sq = x*x; let dbl = y+y; sq + dbl }` → 17.
+
+### Notes
+- A self-hosted interpreter for kardashev function bodies, written in the
+  language it interprets. Surfaced two ergonomics findings handled in-source
+  (candidate later-roadmap polish): a `Box`-AST child is dereferenced in `eval`
+  as `&(**child)` (`&**child` doesn't parse), and the parser cursor threads as a
+  `&mut Pos` struct cell since there is no `*pos = x` deref-assign of a `&mut
+  i64`. All four phases green, JIT **and** AOT; Linux + macOS CI green.
+
 ## [0.15.0] — Roadmap v15 "self-hosting" (Phases 88–93)
 
 Theme: the north-star arc toward a bootstrap — grow kardashev until a kardashev
