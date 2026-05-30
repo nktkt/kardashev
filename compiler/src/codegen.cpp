@@ -1645,6 +1645,169 @@ private:
             declaredFns_["f64_to_string"] = fn;
         }
 
+        // --- v12 Phase 69: int_to_hex(n: i64) -> String ---
+        // The dual of int_to_string with "%llx": lowercase hex, no prefix, the
+        // two's-complement pattern for a negative n. 17 bytes (16 nibbles + NUL).
+        {
+            auto* fnTy = llvm::FunctionType::get(strTy, {i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "int_to_hex",
+                module_.get());
+            fn->getArg(0)->setName("n");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* cap = llvm::ConstantInt::get(i64Ty, 24);
+            auto* buf = b.CreateCall(mallocFn_, {cap}, "ith_buf");
+            auto* snprintfTy = llvm::FunctionType::get(
+                i32Ty, {i8PtrTy, i64Ty, i8PtrTy}, /*isVarArg=*/true);
+            auto snprintfFn =
+                module_->getOrInsertFunction("snprintf", snprintfTy);
+            auto* fmt = b.CreateGlobalString("%llx", "kd_itoh_fmt", 0,
+                                             module_.get());
+            auto* written = b.CreateCall(
+                snprintfFn, {buf, cap, fmt, fn->getArg(0)}, "ith_written");
+            auto* len = b.CreateSExt(written, i64Ty, "ith_len");
+            llvm::Value* v = llvm::UndefValue::get(strTy);
+            v = b.CreateInsertValue(v, buf, {0}, "ith_data");
+            v = b.CreateInsertValue(v, len, {1}, "ith_len_f");
+            v = b.CreateInsertValue(v, cap, {2}, "ith_cap");
+            b.CreateRet(v);
+            declaredFns_["int_to_hex"] = fn;
+        }
+
+        // --- v12 Phase 69: str_parse_i64 / str_parse_f64 ---
+        // Copy the (possibly non-NUL-terminated) String bytes into a transient
+        // stack buffer, NUL-terminate, run the C strtoll/strtod, and report
+        // success iff the WHOLE string was consumed (endptr at the NUL) and was
+        // non-empty. The value is written through the out-pointer. Inputs longer
+        // than the buffer fail (no number is that long). Pure — the buffer is on
+        // the stack and nothing escapes.
+        auto emitStrParse = [&](const char* name, llvm::Type* valTy,
+                                bool isFloat) {
+            auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+            auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+            constexpr unsigned kBufLen = 512;
+            auto* fnTy =
+                llvm::FunctionType::get(i1Ty, {i8PtrTy, i8PtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, name, module_.get());
+            fn->getArg(0)->setName("s");
+            fn->getArg(1)->setName("out");
+            auto* sArg = fn->getArg(0);
+            auto* outArg = fn->getArg(1);
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* parseBB = llvm::BasicBlock::Create(ctx, "parse", fn);
+            auto* failBB = llvm::BasicBlock::Create(ctx, "fail", fn);
+            auto* mergeBB = llvm::BasicBlock::Create(ctx, "merge", fn);
+            llvm::IRBuilder<> b(entry);
+            // Stack buffer + endptr slot, allocated in the entry block.
+            auto* bufArrTy = llvm::ArrayType::get(i8Ty, kBufLen);
+            auto* bufAlloca = b.CreateAlloca(bufArrTy, nullptr, "pbuf");
+            auto* buf = b.CreateConstInBoundsGEP2_64(bufArrTy, bufAlloca, 0, 0,
+                                                     "pbuf_p");
+            auto* endSlot = b.CreateAlloca(i8PtrTy, nullptr, "endp");
+            // data, len from the &String.
+            auto* dataPtr = b.CreateStructGEP(strTy, sArg, 0, "s_data_p");
+            auto* data = b.CreateLoad(i8PtrTy, dataPtr, "s_data");
+            auto* lenPtr = b.CreateStructGEP(strTy, sArg, 1, "s_len_p");
+            auto* len = b.CreateLoad(i64Ty, lenPtr, "s_len");
+            // len > 0 && len < kBufLen (leave room for the NUL).
+            auto* gt0 = b.CreateICmpSGT(len, llvm::ConstantInt::get(i64Ty, 0));
+            auto* lt = b.CreateICmpSLT(
+                len, llvm::ConstantInt::get(i64Ty, kBufLen));
+            b.CreateCondBr(b.CreateAnd(gt0, lt), parseBB, failBB);
+
+            b.SetInsertPoint(parseBB);
+            b.CreateMemCpy(buf, llvm::MaybeAlign(1), data, llvm::MaybeAlign(1),
+                           len);
+            auto* nulP = b.CreateInBoundsGEP(i8Ty, buf, len, "nul_p");
+            b.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulP);
+            llvm::Value* val;
+            // Review fix (v12): an integer that OVERFLOWS i64 must be None, not
+            // a silently-clamped Some. strtoll clamps to LLONG_MAX/MIN and sets
+            // errno=ERANGE, so we clear errno before the call and treat ERANGE
+            // as a parse failure. (strtod's ERANGE is overflow-to-inf, which IS
+            // a valid f64 parse — Rust agrees — so the float path skips this.)
+            llvm::Value* notOverflow = llvm::ConstantInt::getTrue(ctx);
+            if (isFloat) {
+                auto* strtodTy = llvm::FunctionType::get(
+                    valTy, {i8PtrTy, i8PtrTy}, false);
+                auto strtod = module_->getOrInsertFunction("strtod", strtodTy);
+                val = b.CreateCall(strtod, {buf, endSlot}, "pval");
+            } else {
+                // errno is `*__errno_location()` on glibc/musl, `*__error()` on
+                // Darwin. ERANGE == 34 on both.
+                llvm::Triple triple(llvm::sys::getDefaultTargetTriple());
+                const char* errnoSym =
+                    triple.isOSDarwin() ? "__error" : "__errno_location";
+                auto errnoLoc = module_->getOrInsertFunction(
+                    errnoSym, llvm::FunctionType::get(i8PtrTy, {}, false));
+                b.CreateStore(llvm::ConstantInt::get(i32Ty, 0),
+                              b.CreateCall(errnoLoc, {}, "errno_loc0"));
+                auto* strtollTy = llvm::FunctionType::get(
+                    valTy, {i8PtrTy, i8PtrTy, i32Ty}, false);
+                auto strtoll =
+                    module_->getOrInsertFunction("strtoll", strtollTy);
+                val = b.CreateCall(
+                    strtoll,
+                    {buf, endSlot, llvm::ConstantInt::get(i32Ty, 10)}, "pval");
+                auto* errv = b.CreateLoad(
+                    i32Ty, b.CreateCall(errnoLoc, {}, "errno_loc1"), "errno_v");
+                notOverflow = b.CreateICmpNE(
+                    errv, llvm::ConstantInt::get(i32Ty, 34), "not_erange");
+            }
+            // Valid iff (a) the whole string was consumed (endptr at the NUL)
+            // AND (b) there was no leading whitespace. strtoll/strtod silently
+            // skip leading whitespace; for a predictable stdlib `parse_int(" 5")`
+            // should be None, like Rust — so reject a first byte <= ' ' (0x20),
+            // which excludes every whitespace/control char while admitting the
+            // sign and digits (all > 0x20).
+            auto* endv = b.CreateLoad(i8PtrTy, endSlot, "endv");
+            auto* expectedEnd = b.CreateInBoundsGEP(i8Ty, buf, len, "exp_end");
+            auto* consumed = b.CreateICmpEQ(endv, expectedEnd, "consumed");
+            auto* first = b.CreateLoad(i8Ty, buf, "first");
+            auto* firstU = b.CreateZExt(first, i32Ty, "first_u");
+            auto* notWs = b.CreateICmpUGT(
+                firstU, llvm::ConstantInt::get(i32Ty, 32), "not_ws");
+            consumed = b.CreateAnd(consumed, notWs, "valid");
+            consumed = b.CreateAnd(consumed, notOverflow, "valid_no_ovf");
+            b.CreateStore(val, outArg);
+            b.CreateBr(mergeBB);
+
+            b.SetInsertPoint(failBB);
+            b.CreateBr(mergeBB);
+
+            b.SetInsertPoint(mergeBB);
+            auto* ok = b.CreatePHI(i1Ty, 2, "ok");
+            ok->addIncoming(consumed, parseBB);
+            ok->addIncoming(llvm::ConstantInt::getFalse(ctx), failBB);
+            b.CreateRet(ok);
+            declaredFns_[name] = fn;
+        };
+        emitStrParse("str_parse_i64", i64Ty, /*isFloat=*/false);
+        emitStrParse("str_parse_f64", llvm::Type::getDoubleTy(ctx),
+                     /*isFloat=*/true);
+
+        // --- v12 Phase 73: f64 math (libm via LLVM intrinsics) ---
+        // f64_sqrt / f64_floor / f64_ceil / f64_abs lower to the LLVM unary
+        // float intrinsics (resolved by both the JIT and the AOT link), so a
+        // real-number program no longer needs an FFI declaration of its own.
+        auto emitF64Math = [&](const char* name, llvm::Intrinsic::ID id) {
+            auto* dblTy = llvm::Type::getDoubleTy(ctx);
+            auto* fnTy = llvm::FunctionType::get(dblTy, {dblTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, name, module_.get());
+            fn->getArg(0)->setName("x");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            b.CreateRet(b.CreateUnaryIntrinsic(id, fn->getArg(0)));
+            declaredFns_[name] = fn;
+        };
+        emitF64Math("f64_sqrt", llvm::Intrinsic::sqrt);
+        emitF64Math("f64_floor", llvm::Intrinsic::floor);
+        emitF64Math("f64_ceil", llvm::Intrinsic::ceil);
+        emitF64Math("f64_abs", llvm::Intrinsic::fabs);
+
         // --- Phase 27: print_no_nl(s: &String) -> i64 (no trailing newline) ---
         {
             auto* fnTy = llvm::FunctionType::get(i64Ty, {i8PtrTy}, false);
@@ -2670,7 +2833,9 @@ private:
             getOrEmitHashMapOp("hashmap_insert", T, i64T);
         llvm::Function* mapGet = getOrEmitHashMapOp("hashmap_get", T, i64T);
         llvm::Function* mapLen = getOrEmitHashMapOp("hashmap_len", T, i64T);
-        if (!mapNew || !mapInsert || !mapGet || !mapLen) return nullptr;
+        llvm::Function* mapKeys = getOrEmitHashMapOp("hashmap_keys", T, i64T);
+        if (!mapNew || !mapInsert || !mapGet || !mapLen || !mapKeys)
+            return nullptr;
 
         // hashset_new() -> HashSet
         {
@@ -2733,6 +2898,22 @@ private:
             b.CreateRet(b.CreateICmpEQ(
                 disc, llvm::ConstantInt::get(i32Ty, someIdx), "found"));
             declaredFns_["hashset_contains__set_" + suffix] = fn;
+        }
+        // v12 Phase 71: hashset_items(s) -> Vec<T> — enumerate the set's
+        // elements (the underlying map's keys). Closes the "no way to iterate a
+        // HashSet" gap. The returned Vec owns deep clones of the elements (it is
+        // what hashmap_keys produces), so the set is only borrowed.
+        {
+            auto* vecTy = structTypes_["Vec"];
+            auto* fnTy = llvm::FunctionType::get(vecTy, {i8PtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage,
+                "hashset_items__set_" + suffix, module_.get());
+            fn->getArg(0)->setName("s");
+            auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(e);
+            b.CreateRet(b.CreateCall(mapKeys, {fn->getArg(0)}, "items"));
+            declaredFns_["hashset_items__set_" + suffix] = fn;
         }
         auto it = declaredFns_.find(want);
         return it != declaredFns_.end() ? it->second : nullptr;
@@ -5460,6 +5641,198 @@ private:
             declaredFns_[mangled] = fn;
             return fn;
         }
+        // v12 Phase 70: vec_pop(v: &mut Vec<T>) -> T — remove and return the
+        // last element (moved out; len decremented so the slot is no longer
+        // owned, no double-free). An empty Vec yields a type-correct zero, the
+        // same out-of-bounds contract as vec_get — check vec_len first.
+        if (op == "vec_pop") {
+            auto* fnTy = llvm::FunctionType::get(elemLlvmTy, {vecPtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+            fn->getArg(0)->setName("v");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* popBB = llvm::BasicBlock::Create(ctx, "pop", fn);
+            auto* emptyBB = llvm::BasicBlock::Create(ctx, "empty", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* dataPtr = b.CreateStructGEP(vecTy, fn->getArg(0), 0, "data_p");
+            auto* lenPtr = b.CreateStructGEP(vecTy, fn->getArg(0), 1, "len_p");
+            auto* data = b.CreateLoad(i8PtrTy, dataPtr, "data");
+            auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
+            auto* nonEmpty = b.CreateAnd(
+                b.CreateICmpSGT(len, zero, "gt0"),
+                b.CreateICmpNE(data, llvm::Constant::getNullValue(i8PtrTy),
+                               "nn"),
+                "non_empty");
+            b.CreateCondBr(nonEmpty, popBB, emptyBB);
+            b.SetInsertPoint(popBB);
+            auto* newLen =
+                b.CreateSub(len, llvm::ConstantInt::get(i64Ty, 1), "new_len");
+            auto* elemPtr = b.CreateGEP(elemLlvmTy, data, newLen, "elem_p");
+            auto* elem = b.CreateLoad(elemLlvmTy, elemPtr, "elem");
+            b.CreateStore(newLen, lenPtr);
+            b.CreateRet(elem);
+            b.SetInsertPoint(emptyBB);
+            b.CreateRet(llvm::Constant::getNullValue(elemLlvmTy));
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        // v12 Phase 70: vec_remove(v: &mut Vec<T>, i) -> T — remove the element
+        // at index i (moved out, returned), shifting the tail down by one slot
+        // (memmove). Out-of-range yields a zero, like vec_get.
+        if (op == "vec_remove") {
+            auto* fnTy = llvm::FunctionType::get(
+                elemLlvmTy, {vecPtrTy, i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+            fn->getArg(0)->setName("v");
+            fn->getArg(1)->setName("i");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* doBB = llvm::BasicBlock::Create(ctx, "do_rm", fn);
+            auto* oobBB = llvm::BasicBlock::Create(ctx, "oob", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* dataPtr = b.CreateStructGEP(vecTy, fn->getArg(0), 0, "data_p");
+            auto* lenPtr = b.CreateStructGEP(vecTy, fn->getArg(0), 1, "len_p");
+            auto* data = b.CreateLoad(i8PtrTy, dataPtr, "data");
+            auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
+            auto* idx = fn->getArg(1);
+            auto* ok = b.CreateAnd(
+                b.CreateAnd(b.CreateICmpSGE(idx, zero, "nn"),
+                            b.CreateICmpSLT(idx, len, "lt"), "in_range"),
+                b.CreateICmpNE(data, llvm::Constant::getNullValue(i8PtrTy),
+                               "data_nn"),
+                "ok");
+            b.CreateCondBr(ok, doBB, oobBB);
+            b.SetInsertPoint(doBB);
+            auto* elemPtr = b.CreateGEP(elemLlvmTy, data, idx, "elem_p");
+            auto* elem = b.CreateLoad(elemLlvmTy, elemPtr, "elem");
+            // Shift the (len - 1 - i) elements after i down by one.
+            auto* tail = b.CreateSub(
+                b.CreateSub(len, idx, "len_minus_i"),
+                llvm::ConstantInt::get(i64Ty, 1), "tail_count");
+            auto* srcPtr = b.CreateGEP(
+                elemLlvmTy, data,
+                b.CreateAdd(idx, llvm::ConstantInt::get(i64Ty, 1), "i_plus_1"),
+                "src_p");
+            auto* bytes = b.CreateMul(tail, elemBytesK, "shift_bytes");
+            b.CreateMemMove(elemPtr, llvm::MaybeAlign(1), srcPtr,
+                            llvm::MaybeAlign(1), bytes);
+            b.CreateStore(
+                b.CreateSub(len, llvm::ConstantInt::get(i64Ty, 1), "new_len"),
+                lenPtr);
+            b.CreateRet(elem);
+            b.SetInsertPoint(oobBB);
+            b.CreateRet(llvm::Constant::getNullValue(elemLlvmTy));
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        // v12 Phase 70: vec_insert(v: &mut Vec<T>, i, x) -> i64 — insert x at
+        // index i, shifting the tail up by one (growing if full). i is clamped
+        // to [0, len] (insert at len == push). Returns 0.
+        if (op == "vec_insert") {
+            auto* fnTy = llvm::FunctionType::get(
+                i64Ty, {vecPtrTy, i64Ty, elemLlvmTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+            fn->getArg(0)->setName("v");
+            fn->getArg(1)->setName("i");
+            fn->getArg(2)->setName("x");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* growBB = llvm::BasicBlock::Create(ctx, "grow", fn);
+            auto* shiftBB = llvm::BasicBlock::Create(ctx, "shift", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* vPtr = fn->getArg(0);
+            auto* dataPtr = b.CreateStructGEP(vecTy, vPtr, 0, "data_p");
+            auto* lenPtr = b.CreateStructGEP(vecTy, vPtr, 1, "len_p");
+            auto* capPtr = b.CreateStructGEP(vecTy, vPtr, 2, "cap_p");
+            auto* len = b.CreateLoad(i64Ty, lenPtr, "len");
+            auto* cap = b.CreateLoad(i64Ty, capPtr, "cap");
+            // Clamp index to [0, len].
+            auto* idxNN = b.CreateSelect(
+                b.CreateICmpSLT(fn->getArg(1), zero, "neg"), zero,
+                fn->getArg(1), "idx_nn");
+            auto* idx = b.CreateSelect(b.CreateICmpSGT(idxNN, len, "over"), len,
+                                       idxNN, "idx");
+            auto* needGrow = b.CreateICmpEQ(len, cap, "need_grow");
+            b.CreateCondBr(needGrow, growBB, shiftBB);
+            b.SetInsertPoint(growBB);
+            auto* capIsZero = b.CreateICmpEQ(cap, zero, "cap0");
+            auto* newCap = b.CreateSelect(
+                capIsZero, llvm::ConstantInt::get(i64Ty, 4),
+                b.CreateMul(cap, llvm::ConstantInt::get(i64Ty, 2), "dbl"),
+                "new_cap");
+            auto* oldData = b.CreateLoad(i8PtrTy, dataPtr, "old_data");
+            auto* newData = b.CreateCall(
+                reallocFn_, {oldData, b.CreateMul(newCap, elemBytesK, "nb")},
+                "new_data");
+            b.CreateStore(newData, dataPtr);
+            b.CreateStore(newCap, capPtr);
+            b.CreateBr(shiftBB);
+            b.SetInsertPoint(shiftBB);
+            auto* data = b.CreateLoad(i8PtrTy, dataPtr, "data");
+            auto* atPtr = b.CreateGEP(elemLlvmTy, data, idx, "at_p");
+            // Shift the (len - i) tail elements up by one to open a slot at i.
+            auto* tail = b.CreateSub(len, idx, "tail_count");
+            auto* dstPtr = b.CreateGEP(
+                elemLlvmTy, data,
+                b.CreateAdd(idx, llvm::ConstantInt::get(i64Ty, 1), "i_plus_1"),
+                "dst_p");
+            b.CreateMemMove(dstPtr, llvm::MaybeAlign(1), atPtr,
+                            llvm::MaybeAlign(1),
+                            b.CreateMul(tail, elemBytesK, "shift_bytes"));
+            b.CreateStore(fn->getArg(2), atPtr);
+            b.CreateStore(
+                b.CreateAdd(len, llvm::ConstantInt::get(i64Ty, 1), "new_len"),
+                lenPtr);
+            b.CreateRet(zero);
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        // v12 Phase 70: vec_reverse(v: &mut Vec<T>) -> i64 — reverse in place
+        // (a load/store swap of slots i and len-1-i, ownership-neutral like
+        // vec_swap). Returns 0.
+        if (op == "vec_reverse") {
+            auto* fnTy = llvm::FunctionType::get(i64Ty, {vecPtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+            fn->getArg(0)->setName("v");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* condBB = llvm::BasicBlock::Create(ctx, "cond", fn);
+            auto* bodyBB = llvm::BasicBlock::Create(ctx, "body", fn);
+            auto* retBB = llvm::BasicBlock::Create(ctx, "ret", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* data = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(vecTy, fn->getArg(0), 0, "data_p"),
+                "data");
+            auto* len = b.CreateLoad(
+                i64Ty, b.CreateStructGEP(vecTy, fn->getArg(0), 1, "len_p"),
+                "len");
+            auto* iSlot = b.CreateAlloca(i64Ty, nullptr, "i_slot");
+            b.CreateStore(zero, iSlot);
+            auto* half =
+                b.CreateSDiv(len, llvm::ConstantInt::get(i64Ty, 2), "half");
+            b.CreateBr(condBB);
+            b.SetInsertPoint(condBB);
+            auto* i = b.CreateLoad(i64Ty, iSlot, "i");
+            b.CreateCondBr(b.CreateICmpSLT(i, half, "more"), bodyBB, retBB);
+            b.SetInsertPoint(bodyBB);
+            auto* j = b.CreateSub(
+                b.CreateSub(len, i, "len_minus_i"),
+                llvm::ConstantInt::get(i64Ty, 1), "j");
+            auto* pi = b.CreateGEP(elemLlvmTy, data, i, "slot_i");
+            auto* pj = b.CreateGEP(elemLlvmTy, data, j, "slot_j");
+            auto* vi = b.CreateLoad(elemLlvmTy, pi, "elem_i");
+            auto* vj = b.CreateLoad(elemLlvmTy, pj, "elem_j");
+            b.CreateStore(vj, pi);
+            b.CreateStore(vi, pj);
+            b.CreateStore(b.CreateAdd(i, llvm::ConstantInt::get(i64Ty, 1),
+                                      "i_next"),
+                          iSlot);
+            b.CreateBr(condBB);
+            b.SetInsertPoint(retBB);
+            b.CreateRet(zero);
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
         return nullptr;
     }
 
@@ -7921,7 +8294,30 @@ private:
             return;
         }
         if (auto* es = dynamic_cast<const ast::ExprStmt*>(&s)) {
-            emitExpr(*es->expr);
+            llvm::Value* v = emitExpr(*es->expr);
+            // Review fix (v12): a discarded owned temporary leaks. The String
+            // moved out by `vec_remove(&mut v, 0);` (or `int_to_string(n);`)
+            // used as an expression-statement is never bound, so without this it
+            // is never dropped and its heap is orphaned. Only a CALL result is a
+            // fresh, untracked owned temporary that is safe to drop here
+            // unconditionally (a bare place / identifier has its own move+drop
+            // accounting). The temp slot is an ENTRY-block alloca so a discard
+            // inside a loop doesn't grow the stack.
+            bool callLike =
+                dynamic_cast<const ast::CallExpr*>(es->expr.get()) ||
+                dynamic_cast<const ast::MethodCallExpr*>(es->expr.get()) ||
+                dynamic_cast<const ast::CallValueExpr*>(es->expr.get());
+            if (callLike && v) {
+                auto tit = tc_.exprTypes.find(es->expr.get());
+                if (tit != tc_.exprTypes.end()) {
+                    TypePtr ty = resolveInInstance(tit->second);
+                    if (isDroppable(ty)) {
+                        auto* tmp = entryAlloca(v->getType(), "discard.tmp");
+                        builder_->CreateStore(v, tmp);
+                        emitDropGlue(tmp, ty);
+                    }
+                }
+            }
             return;
         }
     }
@@ -9184,7 +9580,9 @@ private:
             // body — synthesize their specialization directly.
             if ((call.callee == "vec_new" || call.callee == "vec_push" ||
                  call.callee == "vec_get" || call.callee == "vec_get_ref" ||
-                 call.callee == "vec_len" || call.callee == "vec_swap") &&
+                 call.callee == "vec_len" || call.callee == "vec_swap" ||
+                 call.callee == "vec_pop" || call.callee == "vec_remove" ||
+                 call.callee == "vec_insert" || call.callee == "vec_reverse") &&
                 !concreteTypeArgs.empty()) {
                 llvm::Function* fn =
                     getOrEmitVecOp(call.callee, concreteTypeArgs[0]);
@@ -9291,7 +9689,8 @@ private:
             if ((call.callee == "hashset_new" ||
                  call.callee == "hashset_insert" ||
                  call.callee == "hashset_contains" ||
-                 call.callee == "hashset_len") &&
+                 call.callee == "hashset_len" ||
+                 call.callee == "hashset_items") &&
                 !concreteTypeArgs.empty()) {
                 llvm::Function* fn =
                     getOrEmitHashSetOp(call.callee, concreteTypeArgs[0]);

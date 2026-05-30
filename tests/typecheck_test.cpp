@@ -2805,6 +2805,50 @@ void test_cast_then_shift_parses() {
              "cast_then_shift_parses");
 }
 
+// v12 Phase 69: string->number parse builtins + hex formatting.
+void test_str_parse_builtin_ok() {
+    expectOk("fn main() -> i64 { let s = \"5\"; let mut out: i64 = 0;"
+             " if str_parse_i64(&s, &mut out) { out } else { 0 } }",
+             "str_parse_builtin_ok");
+}
+
+void test_int_to_hex_ok() {
+    expectOk("fn main() -> i64 ! { alloc } { let h = int_to_hex(255);"
+             " str_len(&h) }",
+             "int_to_hex_ok");
+}
+
+// v12 Phase 70: Vec mutation builtins.
+void test_vec_mutation_ok() {
+    expectOk("fn main() -> i64 ! { alloc } { let mut v = vec_new();"
+             " vec_push(&mut v, 1); vec_insert(&mut v, 0, 9);"
+             " let r = vec_remove(&mut v, 0); vec_reverse(&mut v);"
+             " let p = vec_pop(&mut v); r + p + vec_len(&v) }",
+             "vec_mutation_ok");
+}
+
+void test_vec_pop_returns_element_type() {
+    // vec_pop<T> returns T, so popping a Vec<i64> yields an i64 (not Option).
+    expectOk("fn main() -> i64 ! { alloc } { let mut v = vec_new();"
+             " vec_push(&mut v, 42); vec_pop(&mut v) }",
+             "vec_pop_returns_element_type");
+}
+
+// v12 Phase 73: f64 math builtins.
+void test_f64_math_ok() {
+    expectOk("fn main() -> i64 { (f64_sqrt(4.0) + f64_floor(2.9)"
+             " + f64_ceil(1.1) + f64_abs(0.0 - 3.0)) as i64 }",
+             "f64_math_ok");
+}
+
+// v12 Phase 71: hashset_items builtin returns Vec<T>.
+void test_hashset_items_ok() {
+    expectOk("fn main() -> i64 ! { alloc } { let mut s = hashset_new();"
+             " hashset_insert(&mut s, 5); let v = hashset_items(&s);"
+             " vec_len(&v) }",
+             "hashset_items_ok");
+}
+
 } // namespace
 
 int main() {
@@ -3117,6 +3161,12 @@ int main() {
     test_plain_literal_narrow_const_ok();
     test_out_of_range_const_rejected();
     test_cast_then_shift_parses();
+    test_str_parse_builtin_ok();
+    test_int_to_hex_ok();
+    test_vec_mutation_ok();
+    test_vec_pop_returns_element_type();
+    test_hashset_items_ok();
+    test_f64_math_ok();
     test_const_fn_array_len_ok();
     test_const_div_by_zero_errors();
     test_const_overflow_errors();
@@ -3125,6 +3175,6 @@ int main() {
     test_const_type_mismatch_errors();
     test_const_array_len_bool_errors();
     test_const_array_len_calls_nonconst_fn_errors();
-    std::cout << "All typecheck tests passed (292 cases)\n";
+    std::cout << "All typecheck tests passed (298 cases)\n";
     return 0;
 }

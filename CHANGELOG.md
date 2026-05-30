@@ -18,6 +18,73 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.12.0] — Roadmap v12 "real stdlib" (Phases 69–74)
+
+Theme: turn a language you can *compute* in into one you can *get data in and
+out of* — parsing, richer collections, string and numeric methods. The second
+step toward production use. A pre-merge adversarial multi-agent review fixed a
+`parse_int` integer-overflow and a discarded-owned-temporary leak the green
+suite had missed (see Fixed).
+
+### Added
+- **String → number parsing** (Phase 69): `parse_int(&String) -> Option<i64>`
+  and `parse_f64(&String) -> Option<f64>` — the all-or-nothing parse a real
+  stdlib needs (a string that is not *wholly* a valid number, including one
+  with leading/trailing junk or whitespace, is `None`). Built on low-level
+  `str_parse_i64` / `str_parse_f64` out-param primitives (C `strtoll`/`strtod`
+  over a transient stack buffer, with strict full-consume + no-leading-
+  whitespace validation). Plus `int_to_hex(i64) -> String` (lowercase hex, the
+  two's-complement pattern for a negative). Reading data no longer needs a
+  hand-rolled digit loop.
+- **Vec mutation + query** (Phase 70): `vec_pop` / `vec_remove` / `vec_insert`
+  / `vec_reverse` (built-ins) and `vec_contains` / `vec_index_of`
+  (`Eq`-bounded prelude scans; index −1 when absent). `vec_pop` and
+  `vec_remove` MOVE the element out (the length is decremented so the Vec no
+  longer owns that slot — no clone, no double-free, the dual of the cloning
+  `vec_get`), so they are sound for a non-Copy element type (`Vec<String>`).
+  `vec_insert` grows when full and clamps its index to `[0, len]`.
+- **HashMap / HashSet enumeration + membership** (Phase 71):
+  `hashmap_contains(&HashMap, &K) -> bool` and `hashmap_values(&HashMap) ->
+  Vec<V>` (`Eq`+`Clone`-bounded prelude scans over `hashmap_get_ref` /
+  `hashmap_keys`, deep-cloning the values), plus `hashset_items(&HashSet) ->
+  Vec<T>` — the first way to enumerate a `HashSet` (a codegen built-in
+  delegating to the backing map's keys). `hashmap_remove` / `hashset_remove`
+  are a deliberate deferral (open-addressing deletion needs tombstone-aware
+  get/insert).
+- **String methods** (Phase 72): `str_starts_with` / `str_ends_with` /
+  `str_contains` / `str_index_of` (pure reads, substring index or −1) and
+  `str_to_upper` / `str_to_lower` / `str_concat` / `str_repeat` (fresh heap
+  Strings). All kardashev prelude functions over `str_char_at` / `str_len` /
+  `str_push_byte` — high-level string manipulation without a manual char loop.
+- **Numeric + math helpers** (Phase 73): integer `i64_abs` / `i64_min` /
+  `i64_max` / `i64_pow` (prelude) and the f64 math `f64_sqrt` / `f64_floor` /
+  `f64_ceil` / `f64_abs` (built-ins lowering to LLVM float intrinsics; the AOT
+  link now pulls in `-lm`), plus more Option/Result inspectors
+  (`option_is_some`, `option_ok_or`, `result_is_ok`). A real-number program no
+  longer needs its own FFI declaration of libm.
+- **Capstone** `examples/csvstats` (Phase 74) — "the real stdlib, applied": a
+  CSV statistics aggregator that READS data (the thing v11 could not do),
+  grouping `category,value` rows and reporting per-category count + sum + the
+  running global max in sorted order. Exercises the whole v12 line at once —
+  `parse_int` (with an `Option`-driven skip of a malformed row), `str_split`,
+  HashMap aggregation, `i64_max`, `sort`, and `int_to_string` + `str_concat`
+  formatting.
+
+### Fixed
+- A pre-merge adversarial multi-agent review found + fixed two MAJORs the green
+  smoke suite had missed — both pinned by `tests/smoke_test_v12_review.sh`:
+  - `parse_int` of a value PAST the `i64` range returned a silently-clamped
+    `Some(i64::MAX/MIN)` instead of `None` (C `strtoll`'s `ERANGE` was
+    unchecked). It now clears `errno` and rejects on `ERANGE`; `i64::MAX` /
+    `i64::MIN` themselves still parse. (`parse_f64` keeps `strtod`'s
+    overflow-to-`inf` — a valid `f64` parse, like Rust.)
+  - a DISCARDED owned temporary leaked: a value moved out by
+    `vec_remove(&mut v, 0);` (or any call result like `int_to_string(n);`) used
+    as an expression-STATEMENT was never dropped, orphaning its heap. The
+    codegen now drops a discarded droppable call-result via an entry-block temp
+    — exactly once (the drop / dropleaks / soundness suites confirm no
+    double-free).
+
 ## [0.11.0] — Roadmap v11 "real machine integers" (Phases 63–68)
 
 Theme: the **numeric tower** — make kardashev practical by giving it real

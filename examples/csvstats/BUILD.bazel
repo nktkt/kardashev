@@ -1,0 +1,21 @@
+load("//bazel/rules_kardashev:defs.bzl", "kardashev_binary")
+
+# Make the capstone source readable by //tests:smoke_test_phase74, which builds
+# the real file (rather than an inlined copy) so the test doubles as a build
+# check of the shipped example.
+exports_files(
+    ["main.kd"],
+    visibility = ["//visibility:public"],
+)
+
+# Phase 74 (v12) CAPSTONE — "the real stdlib, applied." A CSV statistics
+# aggregator: it READS data (the thing v11 could not do), grouping
+# `category,value` rows and reporting per-category count + sum + the running
+# global max in sorted order. Exercises the whole v12 line — parse_int (with an
+# Option-driven skip of a malformed row), str_split, HashMap aggregation,
+# i64_max, sort, and int_to_string + str_concat formatting. AOT-compiled via
+# //compiler:kardc and exercised by //tests:smoke_test_phase74.
+kardashev_binary(
+    name = "csvstats",
+    src = "main.kd",
+)

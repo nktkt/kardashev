@@ -646,6 +646,65 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 69 (v12 — real stdlib): string->number parsing (parse_int / parse_f64
+# returning Option, all-or-nothing) + int_to_hex formatting.
+sh_test(
+    name = "smoke_test_phase69",
+    srcs = ["smoke_test_phase69.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 70 (v12 — real stdlib): Vec mutation + query (pop/remove/insert/reverse,
+# contains/index_of); non-Copy moves out via remove/pop with no double-free.
+sh_test(
+    name = "smoke_test_phase70",
+    srcs = ["smoke_test_phase70.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 71 (v12 — real stdlib): HashMap/HashSet enumeration + membership
+# (hashmap_contains/values, hashset_items).
+sh_test(
+    name = "smoke_test_phase71",
+    srcs = ["smoke_test_phase71.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 72 (v12 — real stdlib): String methods (starts_with/ends_with/contains/
+# index_of, to_upper/to_lower/concat/repeat).
+sh_test(
+    name = "smoke_test_phase72",
+    srcs = ["smoke_test_phase72.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 73 (v12 — real stdlib): integer math helpers + f64 math (LLVM
+# float intrinsics) + a few Option/Result inspectors.
+sh_test(
+    name = "smoke_test_phase73",
+    srcs = ["smoke_test_phase73.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 74 (v12) CAPSTONE: a CSV statistics aggregator in kardashev. Builds the
+# real examples/csvstats/main.kd.
+sh_test(
+    name = "smoke_test_phase74",
+    srcs = ["smoke_test_phase74.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/csvstats:main.kd",
+    ],
+)
+
+# v12 pre-merge adversarial-review regressions: parse_int ERANGE overflow ->
+# None, and a discarded owned call-result (vec_remove statement) dropped once.
+sh_test(
+    name = "smoke_test_v12_review",
+    srcs = ["smoke_test_v12_review.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

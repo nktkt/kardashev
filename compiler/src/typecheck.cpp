@@ -239,6 +239,46 @@ public:
             sch.declaredEffects.add("alloc");
             fnSchemas_["f64_to_string"] = std::move(sch);
         }
+        // v12 Phase 69: int_to_hex(n: i64) -> String ! { alloc } — lowercase
+        // hexadecimal (no `0x` prefix; the two's-complement bit pattern for a
+        // negative n, like Rust's `{:x}`). snprintf "%llx".
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeInt()}, stringTy);
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["int_to_hex"] = std::move(sch);
+        }
+        // v12 Phase 69: the low-level string->number parse primitives. Each
+        // writes the parsed value through an out-pointer and returns whether the
+        // ENTIRE string was a valid number (no leftover characters). The
+        // Option-returning `parse_int` / `parse_f64` are kardashev prelude
+        // wrappers over these (see applyPrelude). Pure: they only read the
+        // input and use a transient stack buffer.
+        //   str_parse_i64(s: &String, out: &mut i64) -> bool
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(stringTy, /*isMut=*/false),
+                 makeRef(makeInt(), /*isMut=*/true)},
+                makeBool());
+            fnSchemas_["str_parse_i64"] = std::move(sch);
+        }
+        //   str_parse_f64(s: &String, out: &mut f64) -> bool
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(stringTy, /*isMut=*/false),
+                 makeRef(makeFloat(), /*isMut=*/true)},
+                makeBool());
+            fnSchemas_["str_parse_f64"] = std::move(sch);
+        }
+        // v12 Phase 73: f64 math (f64 -> f64), pure. sqrt / floor / ceil / abs.
+        for (const char* nm :
+             {"f64_sqrt", "f64_floor", "f64_ceil", "f64_abs"}) {
+            FnSchema sch;
+            sch.signature = makeFunction({makeFloat()}, makeFloat());
+            fnSchemas_[nm] = std::move(sch);
+        }
         // print_no_nl(s: &String) -> i64 ! { io } — writes s with NO trailing
         // newline (print_str / print_string / println all force one), so
         // output can be composed piece by piece on a single line.
@@ -401,6 +441,46 @@ public:
             sch.genericVars.push_back(vecFnGenericVar);
             fnSchemas_["vec_swap"] = std::move(sch);
         }
+        // v12 Phase 70: Vec mutation. vec_pop / vec_remove MOVE the element out
+        // (len decremented, so the Vec no longer owns that slot — no clone, no
+        // double-free; the dual of vec_get which CLONES because the Vec keeps
+        // its copy). An empty/out-of-range index yields a zero (vec_get's
+        // contract). vec_insert may grow (alloc); the others are pure mutators.
+        // vec_pop<T>(v: &mut Vec<T>) -> T
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(vecFnInst, /*isMut=*/true)}, vecFnGenericVar);
+            sch.genericVars.push_back(vecFnGenericVar);
+            fnSchemas_["vec_pop"] = std::move(sch);
+        }
+        // vec_remove<T>(v: &mut Vec<T>, i: i64) -> T
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(vecFnInst, /*isMut=*/true), makeInt()},
+                vecFnGenericVar);
+            sch.genericVars.push_back(vecFnGenericVar);
+            fnSchemas_["vec_remove"] = std::move(sch);
+        }
+        // vec_insert<T>(v: &mut Vec<T>, i: i64, x: T) -> i64 ! { alloc }
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(vecFnInst, /*isMut=*/true), makeInt(), vecFnGenericVar},
+                makeInt());
+            sch.declaredEffects.add("alloc");
+            sch.genericVars.push_back(vecFnGenericVar);
+            fnSchemas_["vec_insert"] = std::move(sch);
+        }
+        // vec_reverse<T>(v: &mut Vec<T>) -> i64
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(vecFnInst, /*isMut=*/true)}, makeInt());
+            sch.genericVars.push_back(vecFnGenericVar);
+            fnSchemas_["vec_reverse"] = std::move(sch);
+        }
         // Phase 35: clone<T>(x: &T) -> T ! { alloc } — a DEEP copy. The result
         // owns freshly-allocated heap storage (String buffer, Vec/HashMap
         // backing array, Box payload — recursively), so the clone and the
@@ -538,6 +618,19 @@ public:
                 {makeRef(hashSetInst, /*isMut=*/false)}, makeInt());
             sch.genericVars.push_back(hsVar);
             fnSchemas_["hashset_len"] = std::move(sch);
+        }
+        // v12 Phase 71: hashset_items<T>(s: &HashSet<T>) -> Vec<T> ! { alloc } —
+        // enumerate the set (deep-cloned items, bucket order). The set is only
+        // borrowed; the Vec owns its copies.
+        {
+            FnSchema sch;
+            TypePtr vecOfElem = makeStruct("Vec", {});
+            vecOfElem->typeArgs = {hsVar};
+            sch.signature = makeFunction(
+                {makeRef(hashSetInst, /*isMut=*/false)}, vecOfElem);
+            sch.genericVars.push_back(hsVar);
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["hashset_items"] = std::move(sch);
         }
 
         // Phase 13b built-in: `&[i64]` slices (MVP element = i64). A slice is

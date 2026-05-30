@@ -571,6 +571,56 @@ std::string applyPrelude(const std::string& userSrc) {
             "    match o { Some(x) => Some(f(x)), None => None }\n"
             "}\n";
     }
+    // v12 Phase 69: string -> number parsing. The Option-returning public API,
+    // wrapping the low-level out-param builtins (str_parse_i64 / str_parse_f64).
+    // `parse_int("42")` is `Some(42)`; a string that is not WHOLLY a valid
+    // number (`"42x"`, `""`, `"  1 "`) is `None`. The #1 gap a real stdlib fills
+    // — reading data no longer needs a hand-rolled digit loop.
+    if (userSrc.find("fn parse_int") == std::string::npos) {
+        prelude +=
+            "fn parse_int(s: &String) -> Option<i64> {\n"
+            "    let mut out: i64 = 0;\n"
+            "    if str_parse_i64(s, &mut out) { Some(out) } else { None }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn parse_f64") == std::string::npos) {
+        prelude +=
+            "fn parse_f64(s: &String) -> Option<f64> {\n"
+            "    let mut out: f64 = 0.0;\n"
+            "    if str_parse_f64(s, &mut out) { Some(out) } else { None }\n"
+            "}\n";
+    }
+    // v12 Phase 70: Vec membership queries over the Eq trait, written in
+    // kardashev (a linear scan calling `.eq`). `! { alloc }` because the Eq
+    // trait method declares it (the effect-subset floor: a bounded `<T: Eq>`
+    // call attributes the trait's declared effects). vec_index_of returns the
+    // first matching index or -1.
+    if (userSrc.find("fn vec_contains") == std::string::npos) {
+        prelude +=
+            "fn vec_contains<T: Eq>(v: &Vec<T>, x: &T) -> bool ! { alloc } {\n"
+            "    let mut i = 0;\n"
+            "    let mut found = false;\n"
+            "    while i < vec_len(v) {\n"
+            "        if vec_get_ref(v, i).eq(x) { found = true; } else {}\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    found\n"
+            "}\n";
+    }
+    if (userSrc.find("fn vec_index_of") == std::string::npos) {
+        prelude +=
+            "fn vec_index_of<T: Eq>(v: &Vec<T>, x: &T) -> i64 ! { alloc } {\n"
+            "    let mut i = 0;\n"
+            "    let mut idx = 0 - 1;\n"
+            "    while i < vec_len(v) {\n"
+            "        if idx < 0 {\n"
+            "            if vec_get_ref(v, i).eq(x) { idx = i; } else {}\n"
+            "        } else {}\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    idx\n"
+            "}\n";
+    }
     // Phase 53 (v9): generic Vec higher-order combinators over closures, each
     // effect-polymorphic in the closure's effect row `e` (so a pure mapper
     // keeps the caller pure, an allocating one adds `alloc`). The closure
@@ -641,6 +691,152 @@ std::string applyPrelude(const std::string& userSrc) {
             "    out\n"
             "}\n";
     }
+    // v12 Phase 71: HashMap membership + value enumeration, written in
+    // kardashev over hashmap_get_ref / hashmap_keys (the dual of
+    // hashmap_entries). `hashmap_contains(m, &k)` borrows the key (cloned for
+    // the lookup). `hashmap_values` deep-clones each value into a fresh Vec.
+    if (userSrc.find("fn hashmap_contains") == std::string::npos) {
+        prelude +=
+            "fn hashmap_contains<K: Hash + Eq + Clone, V>"
+            "(m: &HashMap<K, V>, k: &K) -> bool ! { alloc } {\n"
+            "    match hashmap_get_ref(m, k.clone()) {\n"
+            "        Some(vref) => true,\n"
+            "        None => false,\n"
+            "    }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn hashmap_values") == std::string::npos) {
+        prelude +=
+            "fn hashmap_values<K: Hash + Eq + Clone, V: Clone>"
+            "(m: &HashMap<K, V>) -> Vec<V> ! { alloc } {\n"
+            "    let mut out = vec_new();\n"
+            "    let ks = hashmap_keys(m);\n"
+            "    let mut i = 0;\n"
+            "    while i < vec_len(&ks) {\n"
+            "        let kref = vec_get_ref(&ks, i);\n"
+            "        match hashmap_get_ref(m, kref.clone()) {\n"
+            "            Some(vref) => { vec_push(&mut out, vref.clone()); },\n"
+            "            None => {},\n"
+            "        }\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    out\n"
+            "}\n";
+    }
+    // v12 Phase 72: string methods, written in kardashev over str_char_at /
+    // str_len / str_push_byte. The query methods (starts_with / ends_with /
+    // index_of / contains) are pure reads; the transforms (to_upper / to_lower
+    // / concat / repeat) build a fresh heap String (`! { alloc }`).
+    if (userSrc.find("fn str_starts_with") == std::string::npos) {
+        prelude +=
+            "fn str_starts_with(s: &String, prefix: &String) -> bool {\n"
+            "    let pl = str_len(prefix);\n"
+            "    let mut ok = pl <= str_len(s);\n"
+            "    let mut i = 0;\n"
+            "    while i < pl {\n"
+            "        if ok {\n"
+            "            if str_char_at(s, i) != str_char_at(prefix, i) { ok = false; } else {}\n"
+            "        } else {}\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    ok\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_ends_with") == std::string::npos) {
+        prelude +=
+            "fn str_ends_with(s: &String, suffix: &String) -> bool {\n"
+            "    let sl = str_len(s);\n"
+            "    let fl = str_len(suffix);\n"
+            "    let mut ok = fl <= sl;\n"
+            "    let mut i = 0;\n"
+            "    while i < fl {\n"
+            "        if ok {\n"
+            "            if str_char_at(s, sl - fl + i) != str_char_at(suffix, i) { ok = false; } else {}\n"
+            "        } else {}\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    ok\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_index_of") == std::string::npos) {
+        prelude +=
+            "fn str_index_of(s: &String, needle: &String) -> i64 {\n"
+            "    let sl = str_len(s);\n"
+            "    let nl = str_len(needle);\n"
+            "    let mut idx = 0 - 1;\n"
+            "    if nl == 0 { idx = 0; } else {\n"
+            "        let mut i = 0;\n"
+            "        while i + nl <= sl {\n"
+            "            if idx < 0 {\n"
+            "                let mut j = 0;\n"
+            "                let mut m = true;\n"
+            "                while j < nl {\n"
+            "                    if str_char_at(s, i + j) != str_char_at(needle, j) { m = false; } else {}\n"
+            "                    j = j + 1;\n"
+            "                }\n"
+            "                if m { idx = i; } else {}\n"
+            "            } else {}\n"
+            "            i = i + 1;\n"
+            "        }\n"
+            "    }\n"
+            "    idx\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_contains") == std::string::npos) {
+        prelude +=
+            "fn str_contains(s: &String, needle: &String) -> bool {\n"
+            "    str_index_of(s, needle) >= 0\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_to_upper") == std::string::npos) {
+        prelude +=
+            "fn str_to_upper(s: &String) -> String ! { alloc } {\n"
+            "    let mut out = string_new();\n"
+            "    let mut i = 0;\n"
+            "    while i < str_len(s) {\n"
+            "        let c = str_char_at(s, i);\n"
+            "        let up = if c >= 97 && c <= 122 { c - 32 } else { c };\n"
+            "        str_push_byte(&mut out, up);\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    out\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_to_lower") == std::string::npos) {
+        prelude +=
+            "fn str_to_lower(s: &String) -> String ! { alloc } {\n"
+            "    let mut out = string_new();\n"
+            "    let mut i = 0;\n"
+            "    while i < str_len(s) {\n"
+            "        let c = str_char_at(s, i);\n"
+            "        let lo = if c >= 65 && c <= 90 { c + 32 } else { c };\n"
+            "        str_push_byte(&mut out, lo);\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    out\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_concat") == std::string::npos) {
+        prelude +=
+            "fn str_concat(a: &String, b: &String) -> String ! { alloc } {\n"
+            "    let mut out = string_new();\n"
+            "    string_push_str(&mut out, clone(a));\n"
+            "    string_push_str(&mut out, clone(b));\n"
+            "    out\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_repeat") == std::string::npos) {
+        prelude +=
+            "fn str_repeat(s: &String, n: i64) -> String ! { alloc } {\n"
+            "    let mut out = string_new();\n"
+            "    let mut i = 0;\n"
+            "    while i < n {\n"
+            "        string_push_str(&mut out, clone(s));\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    out\n"
+            "}\n";
+    }
     if (userSrc.find("fn option_unwrap_or") == std::string::npos) {
         prelude +=
             "fn option_unwrap_or(o: Option<i64>, default: i64) -> i64 {\n"
@@ -666,6 +862,47 @@ std::string applyPrelude(const std::string& userSrc) {
             "fn result_unwrap_or(r: Result<i64, i64>, default: i64)"
             " -> i64 {\n"
             "    match r { Ok(x) => x, Err(e) => default }\n"
+            "}\n";
+    }
+    // v12 Phase 73: integer math helpers (concrete i64), and a few more
+    // Option/Result inspectors. The numeric tower has the operators; a real
+    // stdlib also wants abs / min / max / pow as named functions.
+    if (userSrc.find("fn i64_abs") == std::string::npos) {
+        prelude += "fn i64_abs(n: i64) -> i64 { if n < 0 { 0 - n } else { n } }\n";
+    }
+    if (userSrc.find("fn i64_min") == std::string::npos) {
+        prelude +=
+            "fn i64_min(a: i64, b: i64) -> i64 { if a < b { a } else { b } }\n";
+    }
+    if (userSrc.find("fn i64_max") == std::string::npos) {
+        prelude +=
+            "fn i64_max(a: i64, b: i64) -> i64 { if a > b { a } else { b } }\n";
+    }
+    if (userSrc.find("fn i64_pow") == std::string::npos) {
+        prelude +=
+            "fn i64_pow(base: i64, exp: i64) -> i64 {\n"
+            "    let mut r = 1;\n"
+            "    let mut i = 0;\n"
+            "    while i < exp { r = r * base; i = i + 1; }\n"
+            "    r\n"
+            "}\n";
+    }
+    if (userSrc.find("fn option_is_some") == std::string::npos) {
+        prelude +=
+            "fn option_is_some(o: Option<i64>) -> bool {\n"
+            "    match o { Some(x) => true, None => false }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn option_ok_or") == std::string::npos) {
+        prelude +=
+            "fn option_ok_or(o: Option<i64>, err: i64) -> Result<i64, i64> {\n"
+            "    match o { Some(x) => Ok(x), None => Err(err) }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn result_is_ok") == std::string::npos) {
+        prelude +=
+            "fn result_is_ok(r: Result<i64, i64>) -> bool {\n"
+            "    match r { Ok(x) => true, Err(e) => false }\n"
             "}\n";
     }
     return prelude + userSrc;
@@ -1502,8 +1739,11 @@ bool linkObject(const std::string& objPath, const std::string& outExePath) {
         std::cerr << "kardc: cannot find 'clang' on PATH for linking\n";
         return false;
     }
+    // -lm: the f64 math builtins (Phase 73) lower to LLVM float intrinsics that
+    // the backend turns into libm calls (floor/ceil are not inlined like sqrt /
+    // fabs), so the AOT link needs the math library. Harmless when unused.
     llvm::SmallVector<llvm::StringRef, 8> argv{
-        *clangPath, objPath, "-o", outExePath, "-lpthread"};
+        *clangPath, objPath, "-o", outExePath, "-lpthread", "-lm"};
     std::string errMsg;
     int rc = llvm::sys::ExecuteAndWait(*clangPath, argv, std::nullopt, {}, 0, 0,
                                        &errMsg);
