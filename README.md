@@ -517,9 +517,24 @@ Each shipped green before the next, exactly as v1–v4 did.
 >   (sentinel −1). JIT + AOT; pinned by `tests/smoke_test_phase105.sh`.
 >
 >   **lex → parse → type-check → code-generate → execute, every stage written in
->   kardashev — a complete compiler front-to-back, running real functions.** Two
->   real host-compiler bugs (the field-move double-free, the unit-tail-`match`
->   miscompile) were found *and fixed* by dogfooding this self-hosting work.
+>   kardashev — a complete compiler front-to-back, running real functions.**
+>
+> - **Phase 106 — field-level (partial) move tracking in the borrow checker
+>   (done).** An adversarial review of the field-move work surfaced a remaining
+>   double-free: the borrow checker tracked WHOLE-binding moves but not
+>   field-level ones, so moving the same non-Copy struct field by value twice
+>   (`vec_push(&mut v, s.name); vec_push(&mut v, s.name);`) — or a partial move
+>   then a whole-struct move — was *accepted*, aliasing one heap buffer into two
+>   owners (deterministic double-free under `MALLOC_CHECK_=3`). Fixed by tracking
+>   moved fields PER-name (`Binding::movedFields`): a second move of the same
+>   field, or a whole-struct use after a partial move, is now rejected, while
+>   moving two DIFFERENT fields stays legal (no over-rejection). The set is
+>   joined across `if` branches (union), checked at loop back-edges, and reset on
+>   reassignment; calling a fn-value through a field stays a read (not a move).
+>   Pinned by four borrow-checker cases (49 total). **The third real bug found by
+>   dogfooding self-hosting** — completing the field-move soundness story (Phase
+>   99 stopped the single-move double-free, 100 made siblings leak-free, 106
+>   rejects the double/partial-then-whole move at compile time).
 
 ## Roadmap v16 — shipped
 
