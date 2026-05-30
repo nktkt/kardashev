@@ -409,6 +409,31 @@ generic keys; 29 plugged the Drop leaks 27–28's new droppable values made load
 hole; 31 integrated 27–30 into the self-written capstones; 32 documented the result last.
 Each shipped green before the next, exactly as v1–v4 did.
 
+## Roadmap v17 — in progress
+
+> **Status: in progress** on `feat/roadmap-v17`. "Self-hosting, continued" — unify
+> v15's signatures and v16's body interpreter into a complete `Fn`, then push
+> toward a type checker and codegen. Each phase a real, tested kardashev program
+> in `examples/selfhost/`.
+>
+> - **Phase 98 — a whole-function parser + interpreter (done).** `examples/selfhost/func.kd`
+>   parses a complete `fn NAME ( PARAMS ) -> RET { BODY }` into an `Fn { name,
+>   params, ret, body }` AST (v15's signature + v16's body block) and INTERPRETS
+>   it: scope-check the body against the parameters, bind the call arguments, and
+>   evaluate the body. `fn f(a: i64, b: i64) -> i64 { let x = a + b ; x * 2 }`
+>   called with `(3, 4)` → `x = 7`, `x * 2` = `14`, JIT + AOT.
+>
+> Writing this surfaced a real **compiler soundness bug** (documented, with a
+> repro, for a focused fix): moving a non-Copy struct field by value *inside a
+> loop* (`vec_push(&mut v, p.name)`) double-frees — `emitFieldAccess`
+> (codegen.cpp) shallow-copies the field's `{ptr,len,cap}` without marking the
+> source moved, and `clearDropFlagIfMoved` only handles bare identifiers, so the
+> struct's drop frees the field again. The self-hosting code works around it with
+> `clone`; the fix is the next priority.
+>
+> Planned: fix the field-move double-free; a real type checker (i64-typed) over
+> the body; eventually emit IR/code — toward a bootstrap.
+
 ## Roadmap v16 — shipped
 
 > **Status: shipped.** "Self-hosting, continued" — grow the self-hosted front from
