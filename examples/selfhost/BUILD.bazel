@@ -2,7 +2,7 @@ load("//bazel/rules_kardashev:defs.bzl", "kardashev_binary")
 
 # Readable by //tests:smoke_test_phase88..93.
 exports_files(
-    ["lexer.kd", "tokens.kd", "parser.kd", "printer.kd", "checker.kd", "front.kd", "expr.kd", "stmt.kd", "scopechk.kd", "interp.kd", "func.kd", "typeck.kd", "funcheck.kd"],
+    ["lexer.kd", "tokens.kd", "parser.kd", "printer.kd", "checker.kd", "front.kd", "expr.kd", "stmt.kd", "scopechk.kd", "interp.kd", "func.kd", "typeck.kd", "funcheck.kd", "emit.kd"],
     visibility = ["//visibility:public"],
 )
 
@@ -30,3 +30,6 @@ kardashev_binary(name = "func", src = "func.kd")
 kardashev_binary(name = "typeck", src = "typeck.kd")
 # v17 Phase 102: a whole-FUNCTION type checker (params, lets, body vs return type).
 kardashev_binary(name = "funcheck", src = "funcheck.kd")
+# v17 Phase 103: the CODEGEN step — AST -> stack-machine bytecode -> VM, cross-
+# checked against a reference interpreter (the compiler back-end shape).
+kardashev_binary(name = "emit", src = "emit.kd")

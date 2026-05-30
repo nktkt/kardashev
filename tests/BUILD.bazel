@@ -942,6 +942,17 @@ sh_test(
     ],
 )
 
+# v17 Phase 103 (self-hosting, cont.): the CODEGEN step — AST -> stack-machine
+# bytecode -> VM, cross-checked against a reference interpreter for correctness.
+sh_test(
+    name = "smoke_test_phase103",
+    srcs = ["smoke_test_phase103.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:emit.kd",
+    ],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

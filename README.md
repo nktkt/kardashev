@@ -476,8 +476,24 @@ Each shipped green before the next, exactly as v1–v4 did.
 >   JIT + AOT; pinned by `tests/smoke_test_phase102.sh`. This is the real check a
 >   compiler runs on a function definition — name resolution *plus* type agreement.
 >
-> Planned: emit IR / a tiny bytecode for the checked function — the first codegen
-> step toward a bootstrap.
+> - **Phase 103 — the CODEGEN step, self-hosted (done).** The compiler back-end
+>   shape, in kardashev (`examples/selfhost/emit.kd`): after parse + type-check,
+>   `emit` lowers the `Expr` AST to a flat STACK-MACHINE BYTECODE
+>   (`PUSH/LOAD/ADD/MUL/LT/EQ/SELECT`), and `run` executes it on an operand stack
+>   against a register file (the parameter values). The codegen is *proven*
+>   correct by cross-checking every program against a direct tree-walking `eval` —
+>   the compiled (VM) result must equal the interpreted result. `if` lowers to a
+>   branch-free `SELECT` (sound because these expressions are pure). Checked:
+>   `a + b * 2` → 11 (precedence preserved through lowering), `if a < b { a + 1 }
+>   else { a * b }` → 4, `if a == b { 100 } else { (a + b) * b }` → 28 — all three
+>   match the reference interpreter. JIT + AOT; pinned by
+>   `tests/smoke_test_phase103.sh`. Lexer → parser → type checker → **code
+>   generator + VM**, every stage written in kardashev. (Writing it surfaced — and
+>   the next phase fixes — a host miscompile of a `match` in tail position of a
+>   unit-returning function; another bug found by dogfooding self-hosting.)
+>
+> Planned: fix the unit-tail-`match` miscompile; widen the codegen toward whole
+> functions — continuing toward a bootstrap.
 
 ## Roadmap v16 — shipped
 
