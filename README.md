@@ -434,10 +434,15 @@ Each shipped green before the next, exactly as v1–v4 did.
 >   body. Over `let x = a + 1 ; let y = x * 2 ; y` with `{ a: 3 }`: `x = 4`,
 >   `y = 8` (a `let` references both the outer `a` and the earlier `x`), result
 >   `8`, JIT + AOT.
+> - **Phase 96 — a scope/semantic checker (done).** `examples/selfhost/scopechk.kd`
+>   walks the block AST and verifies every VARIABLE REFERENCE is bound — an outer
+>   parameter or an earlier `let` — reporting UNDEFINED variables (a `let` RHS is
+>   checked before its own name binds; each `let` extends the scope). With params
+>   `{ a, b }`: `let x = a + 1 ; x + b` → 0 undefined; `let x = a + 1 ; x + c` → 1
+>   (the undeclared `c`), JIT + AOT.
 >
-> Planned: a function body of statements wired to the v15 `FnSig` → `Fn { sig,
-> body }`; a real type checker over the body; eventually emit code — closing
-> language gaps as they surface.
+> Planned: a capstone interpreter (parse → scope-check → evaluate a function body
+> with arguments); then wiring to the v15 `FnSig` and, eventually, codegen.
 
 ## Roadmap v15 — shipped
 

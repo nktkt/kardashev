@@ -875,6 +875,17 @@ sh_test(
     ],
 )
 
+# v16 Phase 96 (self-hosting, cont.): a scope/semantic checker — walks the block
+# AST verifying every variable reference is bound; reports undefined variables.
+sh_test(
+    name = "smoke_test_phase96",
+    srcs = ["smoke_test_phase96.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:scopechk.kd",
+    ],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the
