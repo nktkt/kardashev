@@ -52,9 +52,20 @@ Effect sets are unioned across the call graph and checked at definition sites; n
 
 ## Status
 
-All twelve roadmaps (Phases 0–74, **v1–v12**) have shipped and are merged to
+All thirteen roadmaps (Phases 0–81, **v1–v13**) have shipped and are merged to
 `main` — 6 unit suites plus the full smoke-test aggregate pass **JIT and AOT**
-on a cleared clean build. v12 ("real stdlib") made kardashev able to *get data
+on a cleared clean build. v13 ("concurrency") made thread-safety a *checked
+property*: the **`share` effect** (a pure-declared trait can't launder a
+`thread_spawn`), **typed MPSC channels** that MOVE a real `T` across threads
+guarded by the structural **`Send`** rule, and `Rc<T>` as the legible non-`Send`
+witness — capped by a parallel map-reduce capstone (`examples/parstats`). A
+pre-merge adversarial multi-agent review (3 reviewers, ~600 stress runs) found
+a use-after-free in the borrow-returning builtins (`rc_get`/`vec_get_ref`) and
+two channel-lifecycle defects (an unbounded block/node leak and multi-producer
+`chan_close` data loss); all three are fixed by refcounted, move-only channel
+endpoints + borrow-provenance tracking, pinned by
+`tests/smoke_test_v13_review.sh`. The Send/`share` soundness surface came back
+clean. v12 ("real stdlib") made kardashev able to *get data
 in and out*: string→number parsing (`parse_int` / `parse_f64` → `Option`), Vec
 mutation + query (`vec_pop` / `vec_remove` / `vec_insert` / `vec_reverse` /
 `vec_contains`), HashMap/HashSet enumeration + membership, string methods
@@ -388,6 +399,18 @@ generic keys; 29 plugged the Drop leaks 27–28's new droppable values made load
 30's `Result<String, IoError>` drops cleanly on the error path *because* 29 closed that
 hole; 31 integrated 27–30 into the self-written capstones; 32 documented the result last.
 Each shipped green before the next, exactly as v1–v4 did.
+
+## Roadmap v13 — shipped
+
+> **Status: shipped.** "Concurrency" — make thread-safety a CHECKED property, not a library convention. All of v13 (Phases 75–81) is implemented and fully green — 6 unit suites + the smoke-test aggregate (incl. ~600 concurrency stress runs), JIT **and** AOT, on a cleared clean build.
+>
+> - **The `share` effect** (75): `thread_spawn` carries `share`, so a fn that spawns must declare `! { share }`; it rides the effect-SUBSET rule, so a pure-declared trait method can NEVER have an impl that spawns — concurrent work can't be smuggled past a `<T: Task>` / `&dyn Task` interface.
+> - **Typed MPSC channels** (76–77): `channel<T>() -> (Sender<T>, Receiver<T>)` over a pthread mutex+condvar queue that MOVES a real `T` across threads (`String`, `Vec`, structs), with ownership transferring sender → node → receiver. The structural **`Send`** rule gets teeth at `chan_send` — a `&T` borrow / `Receiver` / `Rc` (or any aggregate containing one) can't cross; the `Receiver` is single-consumer and not `Send`.
+> - **`Rc<T>`** (78): a non-atomic refcounted shared owner — drop-once, no leak, and the legible **non-`Send` witness** (sending one on a channel names `Rc` as the error).
+> - **Fork-join + capstone** (79–80): the primitives compose into real parallelism — `chan_try_recv` (non-blocking) and a parallel map-reduce (`examples/parstats`) split across 4 worker threads, gathered + merged, checked against the sequential answer.
+> - **Refcounted move-only endpoints** (81, from the review): the Rust ownership model — `chan_send`/`chan_recv` borrow the endpoint, `sender_clone` makes a second producer, the channel closes when the last `Sender` drops, and the block + queue are freed when the last endpoint drops.
+>
+> **A pre-merge adversarial multi-agent review (3 reviewers, ~600 stress runs) found + fixed a BLOCKER and two MAJORs the green suite missed** (pinned by `tests/smoke_test_v13_review.sh`): a **use-after-free** (`rc_get`/`vec_get_ref` returned a `&T` whose lifetime wasn't tied to the owner, so the owner could be moved while the borrow was live — now a borrow error); an **unbounded channel leak** (Copy handles owned nothing, so each `channel()` leaked its block + undrained nodes — now reclaimed at last-endpoint drop, RSS flat over 1M channels); and **multi-producer `chan_close` data loss** (a single boolean close let one producer end the stream for others — 84/100 runs lost data; now refcounted, closing only on the last sender). The Send/`share` soundness surface the review hammered came back **clean**. **As with v6–v12: a green smoke suite ≠ sound; review before merge.**
 
 ## Roadmap v12 — shipped
 

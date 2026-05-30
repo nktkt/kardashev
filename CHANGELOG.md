@@ -18,13 +18,16 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
-## [Unreleased] — Roadmap v13 "concurrency" (Phases 75–80, in progress)
+## [0.13.0] — Roadmap v13 "concurrency" (Phases 75–81)
 
 Theme: make concurrency SAFE BY CONSTRUCTION — typed channels that move data
 between threads, with thread-safety enforced *through the effect system* (the
 language's differentiator). Designed via a 3-proposal / 3-judge multi-agent
 panel (MVP-first won, grafting the structural Send/Sync rule + an `Rc` negative
-witness).
+witness). A pre-merge adversarial multi-agent review (3 reviewers, ~600 stress
+runs) then found a use-after-free in the borrow-returning builtins and two
+channel-lifecycle defects the green suite had missed — all fixed in Phase 81
+(see Fixed); the Send/`share` soundness surface it hammered came back clean.
 
 ### Added
 - The **`share` effect** (Phase 75) — the concurrency effect that makes
@@ -40,13 +43,16 @@ witness).
   Receiver<i64>)`, `chan_send` / `chan_recv` (→ `Option`, `None` once closed
   AND drained) / `chan_close`. The runtime is an unbounded linked-list queue
   guarded by a **pthread mutex + condition variable** (`chan_recv` blocks on
-  the condvar while the channel is empty and open; `chan_close` broadcasts to
-  wake blocked receivers). A producer thread sending 1..=100 and the main
-  thread draining sums to exactly 5050, deterministic across runs, JIT and
-  AOT. `Sender`/`Receiver` are named generic structs that lower to a Copy i64
-  handle, so a `Sender` (multi-producer, `Send`) is captured by value into a
-  worker thread — while a `Receiver` is the single-consumer endpoint and is
-  **not** `Send`: moving one into a thread is a compile error.
+  the condvar while the channel is empty and open). A producer thread sending
+  1..=100 and the main thread draining sums to exactly 5050, deterministic
+  across runs, JIT and AOT. `Sender`/`Receiver` are named generic structs that
+  lower to an i64 handle into the channel block; a `Sender` (multi-producer,
+  `Send`) crosses into a worker thread, while a `Receiver` is the
+  single-consumer endpoint and is **not** `Send` (moving one into a thread is a
+  compile error). *(Phase 81 made the endpoints refcounted, move-only owners so
+  the block is reclaimed and the channel closes on the last sender — see
+  Fixed; `chan_send`/`chan_recv` now borrow the endpoint, `sender_clone` makes
+  a second producer.)*
 - **Generic channels + the `Send` rule** (Phase 77) — `channel<T>` now MOVES a
   real `T` across threads (the queue node carries a `T`-sized cell, specialized
   per `T`), so an owned `String` or `Vec<i64>` is sent from one thread and
@@ -80,6 +86,43 @@ witness).
   count 10000, min 0, max 999). Exercises the whole v13 line at once:
   `thread_spawn` (`share`), channels moving a `Stats` struct across threads,
   the `Send` rule, fork-join, and the v12 `i64_min`/`i64_max` helpers.
+- **Refcounted, move-only channel endpoints** (Phase 81, from the review) —
+  the channel block now carries a mutex-guarded live-**sender** count and a
+  live-**endpoint** count, and `Sender`/`Receiver` are move-only owners (not
+  Copy) with drop glue. `chan_send`/`chan_recv`/`chan_try_recv` BORROW the
+  endpoint (`&Sender` / `&Receiver`), so a single owner still sends/recvs in a
+  loop; `sender_clone(&Sender) -> Sender` makes an additional producer, and
+  capturing a `Sender` into a thread clones it automatically (each thread gets
+  its own refcounted handle, dropped by the worker's by-value param). This is
+  the Rust ownership model: the channel **closes when the last `Sender` drops**
+  (so one producer finishing can't end the stream for the others), and the
+  block — plus any queued nodes and undrained droppable payloads — is **drained
+  and freed when the last endpoint drops**. `chan_close(Sender)` now consumes
+  the sender (an explicit "this producer is done").
+
+### Fixed
+*(All found by the v13 pre-merge adversarial review; pinned by
+`tests/smoke_test_v13_review.sh`.)*
+- **Use-after-free via a borrow-returning builtin (BLOCKER).** `rc_get(&a)` and
+  `vec_get_ref(&v, i)` return a `&T` that aliases the owner, but the borrow was
+  not tracked against it — so `let r = rc_get(&a); consume(a); *r` compiled and
+  read freed memory. The borrow checker now ties such a `let`-bound borrow to
+  the owner (exactly like `let r = &a;`), so moving or dropping the owner while
+  the borrow is live is a borrow error. (Closes the same hole on the
+  stale-`vec_get_ref`-after-`vec_push` path.)
+- **Unbounded channel leak (MAJOR).** Endpoints were Copy handles that nothing
+  owned, so every `channel()` leaked its ~172-byte block (plus undrained nodes
+  and their payloads) — unbounded in a channel-per-task loop. The refcounted
+  move-only endpoints (Phase 81) reclaim the block, drain the queue, and drop
+  remaining payloads when the last endpoint drops: RSS is now flat over
+  1,000,000 created+drained channels and 200k dropped-with-undrained-`Vec`
+  channels. Moving an owned value across a channel still drops it exactly once.
+- **Multi-producer `chan_close` data loss (MAJOR).** Close set a single boolean,
+  so any one producer closing made `chan_recv` return `None` while other live
+  producers were still sending — 84/100 runs lost an entire producer's data.
+  Close is now refcounted: the channel ends only when the **last** `Sender` is
+  gone, so a producer finishing never abandons another's queued items (2
+  producers × 300, one closing early → exactly 600 every run).
 
 ## [0.12.0] — Roadmap v12 "real stdlib" (Phases 69–74)
 
