@@ -413,13 +413,27 @@ Each shipped green before the next, exactly as v1–v4 did.
 >   `/usr/bin/time -v`, so on macOS (BSD `time`) they failed the build under
 >   `set -euo pipefail` — the bulk of the long-standing macOS-CI red (11 of 12
 >   failures). A shared portable `peak_rss_kb` (GNU `time -v` *or* BSD `time -l`,
->   else a clean SKIP) keeps the gate **running** on both platforms. Plus a CI
->   step that dumps any failing test's `test.log` so a red run is diagnosable
->   from the log alone.
+>   else a clean SKIP) keeps the gate **running** on both platforms. This took
+>   macOS CI from 12 failures to GREEN for the first time. Plus a CI step that
+>   dumps any failing test's `test.log` so a red run is diagnosable from the log
+>   alone.
+> - **Phase 83 — jmp_buf hardening + the `codegen_test` flake, investigated
+>   honestly.** The one remaining macOS failure, `codegen_test (Aborted)`, is
+>   *flaky*, not deterministic — its crash point varies run to run (one run
+>   completes the 50k-unwind panic test, the next crashes before any output). The
+>   catch-stack `_setjmp` jmp_buf is now a generously-sized, 16-byte-aligned cell
+>   (was a 1-aligned `[256 x i8]`) — correct defensive hardening, Linux-verified
+>   (154 unit cases + the full suite), and monotonically safer. But it did **not**
+>   clear the flake (3/3 macOS runs still aborted), and `codegen_test` built with
+>   `-fsanitize=address,undefined` on Linux is 154/154 clean with **zero** findings.
+>   So the flake is an **arm64-JIT-execution** issue (codegen_test JITs OS-thread
+>   and setjmp/longjmp cases), not heap/UB corruption — undiagnosable on x86 Linux;
+>   it needs a macOS-arm64 environment. Documented as the remaining blocker to a
+>   *guaranteed-stable* green macOS, rather than papered over.
 >
-> Planned: macOS `codegen_test` abort (the remaining macOS failure); the channel
-> capture-and-keep footgun → compile error; smoke-harness `| tail` SIGPIPE
-> robustness; JIT-vs-AOT differential / property testing.
+> Planned: the channel capture-and-keep footgun → compile error; smoke-harness
+> `| tail` SIGPIPE robustness; JIT-vs-AOT differential / property testing; the
+> macOS `codegen_test` flake (needs a macOS-arm64 runner to diagnose).
 
 ## Roadmap v13 — shipped
 
