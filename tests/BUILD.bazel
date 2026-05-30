@@ -916,6 +916,17 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v17 Phase 101 (self-hosting, cont.): a real TYPE CHECKER over an i64/bool
+# expression language — arithmetic/comparison/if typing with error propagation.
+sh_test(
+    name = "smoke_test_phase101",
+    srcs = ["smoke_test_phase101.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:typeck.kd",
+    ],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

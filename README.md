@@ -452,8 +452,20 @@ Each shipped green before the next, exactly as v1–v4 did.
 >   including the panic/unwind path. Pinned by `tests/smoke_test_fieldmove.sh`
 >   (sibling-drop case).
 >
-> Planned: a real type checker (i64-typed) over the body; eventually emit IR/code
-> — toward a bootstrap.
+ - **Phase 101 — a real type checker, self-hosted (done).** Past scope-checking:
+>   the self-hosted expression language now has TWO types — `i64` and `bool` — so
+>   `examples/selfhost/typeck.kd` does genuine type inference. A recursive-descent
+>   parser builds an `enum Expr` (numbers, vars, `+ * < ==`, `if/else`); `type_of`
+>   infers each node's type against a type environment (var → type tag), enforcing
+>   arithmetic on `int×int→int`, comparison on `int×int→bool`, and that an `if`
+>   condition is `bool` with equal branch types — propagating a `TErr` tag on any
+>   mismatch. Checked on a well-typed `if` (→`TInt`), an `int + bool` mismatch
+>   (→`TErr`), a non-`bool` `if` condition (→`TErr`), and a bare comparison
+>   (→`TBool`). JIT + AOT; pinned by `tests/smoke_test_phase101.sh`. A type
+>   checker for kardashev, written in kardashev.
+>
+> Planned: thread the type checker through whole functions; eventually emit
+> IR/code — toward a bootstrap.
 
 ## Roadmap v16 — shipped
 
