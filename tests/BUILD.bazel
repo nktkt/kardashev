@@ -587,6 +587,65 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 63 (v11 — the numeric tower): sized signed machine integers i8/i16/i32,
+# width-correct LLVM lowering, a non-coercive lattice (no implicit widening).
+sh_test(
+    name = "smoke_test_phase63",
+    srcs = ["smoke_test_phase63.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 64 (v11 — the numeric tower): integer-literal width suffixes (5i32) and
+# radix prefixes (0xFF / 0b1010), incl. radix+suffix combos and match patterns.
+sh_test(
+    name = "smoke_test_phase64",
+    srcs = ["smoke_test_phase64.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 65 (v11 — the numeric tower): the `as` cast operator + conversion matrix
+# (sext/trunc/sitofp/fptosi), precedence, chaining, const-fold, non-numeric reject.
+sh_test(
+    name = "smoke_test_phase65",
+    srcs = ["smoke_test_phase65.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 66 (v11 — the numeric tower): unsigned ints u8..u64 + bitwise ops
+# (& | ^ << >> ~); unsigned div/cmp/lshr vs signed sdiv/cmp/ashr; FNV-1a step.
+sh_test(
+    name = "smoke_test_phase66",
+    srcs = ["smoke_test_phase66.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 67 (v11 — the numeric tower): defined two's-complement wrapping overflow
+# + the f32 float (LLVM `float`, fpext/fptrunc casts); negative narrow literals.
+sh_test(
+    name = "smoke_test_phase67",
+    srcs = ["smoke_test_phase67.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# Phase 68 (v11) CAPSTONE: FNV-1a + CRC-32 + a binary parser in kardashev, each
+# checked against its known answer. Builds the real examples/checksum/main.kd.
+sh_test(
+    name = "smoke_test_phase68",
+    srcs = ["smoke_test_phase68.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/checksum:main.kd",
+    ],
+)
+
+# v11 pre-merge adversarial-review regressions: const-eval width/sign agreement
+# with runtime, the `expr as Type <<`/`<` cast-parse fix, the tuple-index suffix.
+sh_test(
+    name = "smoke_test_v11_review",
+    srcs = ["smoke_test_v11_review.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

@@ -246,6 +246,10 @@ private:
             prePass(*un->operand);
             return;
         }
+        if (auto* ce = dynamic_cast<const ast::CastExpr*>(&e)) {
+            prePass(*ce->operand);
+            return;
+        }
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
             for (const auto& a : call->args) prePass(*a);
             return;
@@ -609,6 +613,12 @@ private:
             }
             return std::max(lastInSubtree,
                             consume(*un->operand, expectExpire));
+        }
+        if (auto* ce = dynamic_cast<const ast::CastExpr*>(&e)) {
+            // Phase 65: `operand as T` reads a numeric (always-Copy) operand
+            // and produces a fresh value — a plain read of the operand.
+            return std::max(lastInSubtree,
+                            consume(*ce->operand, expectExpire));
         }
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
             for (std::size_t i = 0; i < call->args.size(); ++i) {

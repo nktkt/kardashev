@@ -275,6 +275,8 @@ public:
             return exprMayPanic(*x->lhs) || exprMayPanic(*x->rhs);
         if (auto* x = dynamic_cast<const ast::UnaryExpr*>(&e))
             return exprMayPanic(*x->operand);
+        if (auto* x = dynamic_cast<const ast::CastExpr*>(&e))
+            return exprMayPanic(*x->operand); // Phase 65: a cast never panics
         if (auto* x = dynamic_cast<const ast::CallValueExpr*>(&e)) {
             if (exprMayPanic(*x->callee)) return true;
             for (const auto& a : x->args)
@@ -5579,9 +5581,15 @@ private:
         // structFields inside a `make_pair<X,Y>` body) get pinned to
         // concrete types before LLVM-mapping.
         TypePtr r = resolveInInstance(t);
+        // v11: an unconstrained integer-literal var defaults to i64.
+        if (r->kind == TypeKind::Var && r->intLitVar)
+            return llvm::Type::getInt64Ty(*ctx_);
         switch (r->kind) {
-            case TypeKind::Int:  return llvm::Type::getInt64Ty(*ctx_);
-            case TypeKind::Float: return llvm::Type::getDoubleTy(*ctx_);
+            case TypeKind::Int: // v11: sized machine int (default i64)
+                return llvm::Type::getIntNTy(*ctx_, r->intWidth);
+            case TypeKind::Float: // Phase 67: f32 -> float, f64 -> double
+                return r->floatWidth == 32 ? llvm::Type::getFloatTy(*ctx_)
+                                           : llvm::Type::getDoubleTy(*ctx_);
             case TypeKind::Bool: return llvm::Type::getInt1Ty(*ctx_);
             case TypeKind::Unit: return llvm::Type::getVoidTy(*ctx_);
             case TypeKind::Ref: {
@@ -5827,7 +5835,15 @@ private:
             return it->second;
         }
         if (tr.name == "i64") return makeInt();
+        if (tr.name == "i8") return makeIntW(8, true);   // v11
+        if (tr.name == "i16") return makeIntW(16, true); // v11
+        if (tr.name == "i32") return makeIntW(32, true); // v11
+        if (tr.name == "u8") return makeIntW(8, false);    // Phase 66
+        if (tr.name == "u16") return makeIntW(16, false);  // Phase 66
+        if (tr.name == "u32") return makeIntW(32, false);  // Phase 66
+        if (tr.name == "u64") return makeIntW(64, false);  // Phase 66
         if (tr.name == "f64") return makeFloat(); // Phase 39/44
+        if (tr.name == "f32") return makeFloatW(32); // Phase 67
         if (tr.name == "bool") return makeBool();
         // Phase 16: a fn with no `-> T` annotation returns unit (parser
         // synthesizes a "unit" TypeRef). Mirrors typecheck's resolveTypeRef.
@@ -5894,7 +5910,9 @@ private:
         TypePtr r = resolve(astTypeRefToConcrete(tr));
         switch (r->kind) {
             case TypeKind::Int:  return llvm::Type::getInt64Ty(*ctx_);
-            case TypeKind::Float: return llvm::Type::getDoubleTy(*ctx_);
+            case TypeKind::Float: // Phase 67: f32 -> float, f64 -> double
+                return r->floatWidth == 32 ? llvm::Type::getFloatTy(*ctx_)
+                                           : llvm::Type::getDoubleTy(*ctx_);
             case TypeKind::Bool: return llvm::Type::getInt1Ty(*ctx_);
             case TypeKind::Unit: return llvm::Type::getVoidTy(*ctx_);
             case TypeKind::Ref:
@@ -6057,14 +6075,18 @@ private:
             // `Mat<3>` (`Mat__c3`) and `Mat<5>` (`Mat__c5`) become distinct
             // monomorphized instances / LLVM types. Lexer literals are
             // non-negative, so `c<value>` is always a valid symbol fragment.
+            // v11: an ordinary sized int mangles by name (i8..u64).
             return r->isConstValue ? ("c" + std::to_string(r->constValue))
-                                   : "i64";
-        case TypeKind::Float:  return "f64";
+                                   : intTypeName(r->intWidth, r->intSigned);
+        case TypeKind::Float:  return floatTypeName(r->floatWidth); // Phase 67
         case TypeKind::Bool:   return "bool";
         case TypeKind::Unit:   return "unit";
         case TypeKind::Struct: return r->structName + mangleTypeArgs(r->typeArgs);
         case TypeKind::Enum:   return r->enumName + mangleTypeArgs(r->typeArgs);
-        case TypeKind::Var:    return "_var" + std::to_string(r->varId);
+        case TypeKind::Var:
+            // v11: an unconstrained integer-literal var defaults to i64.
+            if (r->intLitVar) return "i64";
+            return "_var" + std::to_string(r->varId);
         case TypeKind::Function: return "_fn";
         case TypeKind::Ref:    return std::string(r->refIsMut ? "refmut_"
                                                               : "ref_") +
@@ -6625,6 +6647,10 @@ private:
             collectAsyncLocalTypes(*ue->operand, out, seen);
             return;
         }
+        if (auto* ce = dynamic_cast<const ast::CastExpr*>(&e)) {
+            collectAsyncLocalTypes(*ce->operand, out, seen);
+            return;
+        }
         if (auto* mc = dynamic_cast<const ast::MethodCallExpr*>(&e)) {
             collectAsyncLocalTypes(*mc->receiver, out, seen);
             for (const auto& a : mc->args) collectAsyncLocalTypes(*a, out, seen);
@@ -6724,6 +6750,10 @@ private:
         }
         if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
             asyncLivenessWalk(*ue->operand, boundAt, awaitCounter, promoted);
+            return;
+        }
+        if (auto* ce = dynamic_cast<const ast::CastExpr*>(&e)) {
+            asyncLivenessWalk(*ce->operand, boundAt, awaitCounter, promoted);
             return;
         }
         if (auto* mc = dynamic_cast<const ast::MethodCallExpr*>(&e)) {
@@ -8112,14 +8142,28 @@ private:
 
     llvm::Value* emitExprRaw(const ast::Expr& e) {
         if (auto* lit = dynamic_cast<const ast::IntLitExpr*>(&e)) {
+            // v11: emit the literal at its RESOLVED width (an i64 default, or
+            // the int type it adapted to — `let x: u8 = 5` emits an i8).
+            llvm::Type* ity = llvm::Type::getInt64Ty(*ctx_);
+            if (TypePtr t = lookupExprType(*lit)) {
+                TypePtr r = resolveInInstance(t);
+                if (r->kind == TypeKind::Int && !r->isConstValue)
+                    ity = llvm::Type::getIntNTy(*ctx_, r->intWidth);
+            }
             return llvm::ConstantInt::get(
-                llvm::Type::getInt64Ty(*ctx_),
-                static_cast<uint64_t>(lit->value), /*isSigned=*/true);
+                ity, static_cast<uint64_t>(lit->value), /*isSigned=*/true);
         }
-        // Phase 39: f64 literal -> double ConstantFP.
+        // Phase 39/67: float literal -> ConstantFP at its RESOLVED width (f64
+        // by default, or the f32 it adapted to in context — `let x: f32 = 1.5`
+        // narrows the literal so it emits a `float`).
         if (auto* fl = dynamic_cast<const ast::FloatLitExpr*>(&e)) {
-            return llvm::ConstantFP::get(llvm::Type::getDoubleTy(*ctx_),
-                                         fl->value);
+            llvm::Type* fty = llvm::Type::getDoubleTy(*ctx_);
+            if (TypePtr t = lookupExprType(*fl)) {
+                TypePtr r = resolveInInstance(t);
+                if (r->kind == TypeKind::Float && r->floatWidth == 32)
+                    fty = llvm::Type::getFloatTy(*ctx_);
+            }
+            return llvm::ConstantFP::get(fty, fl->value);
         }
         // Phase 15: boolean literal -> i1 constant (1/0).
         if (auto* bl = dynamic_cast<const ast::BoolLitExpr*>(&e)) {
@@ -8129,6 +8173,10 @@ private:
         // Phase 15: prefix unary operators.
         if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
             return emitUnary(*un);
+        }
+        // Phase 65: `operand as Type` numeric cast.
+        if (auto* ce = dynamic_cast<const ast::CastExpr*>(&e)) {
+            return emitCast(*ce);
         }
         if (auto* sl = dynamic_cast<const ast::StringLitExpr*>(&e)) {
             return emitStringLit(*sl);
@@ -8145,9 +8193,20 @@ private:
                     if (cv.isBool)
                         return llvm::ConstantInt::get(
                             llvm::Type::getInt1Ty(*ctx_), cv.value ? 1 : 0);
+                    // v11 fix: emit the folded value at the const's RESOLVED
+                    // int width (a narrow / unsigned const), not always i64 —
+                    // otherwise an i64 immediate flows into an i32/u8 slot and
+                    // produces invalid IR (`call i32 @id(i64 ...)`) or a silent
+                    // out-of-range value. The const evaluator already wrapped
+                    // the value to this width.
+                    llvm::Type* cty = llvm::Type::getInt64Ty(*ctx_);
+                    if (TypePtr t = lookupExprType(*id)) {
+                        TypePtr r = resolveInInstance(t);
+                        if (r->kind == TypeKind::Int && !r->isConstValue)
+                            cty = llvm::Type::getIntNTy(*ctx_, r->intWidth);
+                    }
                     return llvm::ConstantInt::get(
-                        llvm::Type::getInt64Ty(*ctx_),
-                        static_cast<uint64_t>(cv.value), /*isSigned=*/true);
+                        cty, static_cast<uint64_t>(cv.value), /*isSigned=*/true);
                 }
                 // Phase 59: a const-generic param used as a VALUE (`N` in the
                 // body of `dot<const N>`) lowers to this instance's concrete
@@ -8648,11 +8707,16 @@ private:
         llvm::Value* v = emitExpr(*un.operand);
         switch (un.op) {
         case ast::UnaryOp::Neg:
-            // Phase 39: `-x` on an f64 negates with FNeg.
-            return v->getType()->isDoubleTy() ? builder_->CreateFNeg(v, "fneg")
-                                              : builder_->CreateNeg(v, "neg");
+            // Phase 39/67: `-x` on a float (f32 OR f64) negates with FNeg.
+            return v->getType()->isFloatingPointTy()
+                       ? builder_->CreateFNeg(v, "fneg")
+                       : builder_->CreateNeg(v, "neg");
         case ast::UnaryOp::Not:
             return builder_->CreateNot(v, "not");
+        case ast::UnaryOp::BitNot:
+            // Phase 66: `~x` — bitwise complement (LLVM `xor x, -1`), same
+            // width as the operand. `CreateNot` is the all-ones xor.
+            return builder_->CreateNot(v, "bnot");
         case ast::UnaryOp::Deref: {
             // Phase 34: `*r` — `v` is the pointer (a `&T`/Box value); load the
             // pointee, whose type the typechecker recorded for this expr.
@@ -8664,6 +8728,55 @@ private:
         }
         }
         return v; // unreachable
+    }
+
+    // Phase 65: lower `operand as Type` to the width/signedness-correct LLVM
+    // cast — the numeric conversion matrix. The typechecker has constrained
+    // both sides to a numeric type (an int of any width/signedness, or f64).
+    // LLVM integers are sign-agnostic, so signedness comes from the kardashev
+    // types: a widening sext/zext's by the SOURCE's sign, a narrowing truncs,
+    // int<->float uses si/ui<->fp by the relevant sign, and a same-width or
+    // same-float cast is a no-op (a two's-complement reinterpret).
+    llvm::Value* emitCast(const ast::CastExpr& ce) {
+        llvm::Value* v = emitExpr(*ce.operand);
+        TypePtr srcTy = lookupExprType(*ce.operand);
+        if (srcTy) srcTy = resolveInInstance(srcTy);
+        TypePtr dstTy = lookupExprType(ce);
+        if (dstTy) dstTy = resolveInInstance(dstTy);
+        bool srcIsFloat = srcTy ? srcTy->kind == TypeKind::Float
+                                : v->getType()->isFloatingPointTy();
+        bool dstIsFloat = dstTy && dstTy->kind == TypeKind::Float;
+        bool srcSigned = srcTy ? srcTy->intSigned : true;
+        bool dstSigned = dstTy ? dstTy->intSigned : true;
+        llvm::Type* dstLL = dstTy ? mapKardashevType(dstTy)
+                                  : llvm::Type::getInt64Ty(*ctx_);
+
+        if (srcIsFloat && dstIsFloat) {
+            // Phase 67: float -> float. Same width is a no-op; otherwise widen
+            // (fpext, f32 -> f64) or narrow (fptrunc, f64 -> f32).
+            unsigned srcFW = v->getType()->isFloatTy() ? 32 : 64;
+            unsigned dstFW = dstTy->floatWidth;
+            if (dstFW == srcFW) return v;
+            return dstFW > srcFW ? builder_->CreateFPExt(v, dstLL, "fpext")
+                                 : builder_->CreateFPTrunc(v, dstLL, "fptrunc");
+        }
+        if (srcIsFloat) {
+            // float -> int.
+            return dstSigned ? builder_->CreateFPToSI(v, dstLL, "fptosi")
+                             : builder_->CreateFPToUI(v, dstLL, "fptoui");
+        }
+        if (dstIsFloat) {
+            // int -> float.
+            return srcSigned ? builder_->CreateSIToFP(v, dstLL, "sitofp")
+                             : builder_->CreateUIToFP(v, dstLL, "uitofp");
+        }
+        // int -> int.
+        unsigned srcW = v->getType()->getIntegerBitWidth();
+        unsigned dstW = dstLL->getIntegerBitWidth();
+        if (dstW == srcW) return v; // reinterpret — a no-op in two's complement
+        if (dstW < srcW) return builder_->CreateTrunc(v, dstLL, "trunc");
+        return srcSigned ? builder_->CreateSExt(v, dstLL, "sext")
+                         : builder_->CreateZExt(v, dstLL, "zext");
     }
 
     llvm::Value* emitBinary(const ast::BinaryExpr& bin) {
@@ -8691,9 +8804,10 @@ private:
         }
         llvm::Value* L = emitExpr(*bin.lhs);
         llvm::Value* R = emitExpr(*bin.rhs);
-        // Phase 39: f64 operands use floating-point ops (ordered comparisons —
-        // a NaN compares false). `%` never reaches here for f64 (typecheck).
-        if (L->getType()->isDoubleTy()) {
+        // Phase 39/67: float operands (f32 OR f64) use floating-point ops
+        // (ordered comparisons — a NaN compares false). `%` / bitwise never
+        // reach here for a float (typecheck rejects them).
+        if (L->getType()->isFloatingPointTy()) {
             switch (bin.op) {
             case ast::BinOp::Add: return builder_->CreateFAdd(L, R, "fadd");
             case ast::BinOp::Sub: return builder_->CreateFSub(L, R, "fsub");
@@ -8706,24 +8820,70 @@ private:
             case ast::BinOp::Eq:  return builder_->CreateFCmpOEQ(L, R, "feq");
             case ast::BinOp::NotEq: return builder_->CreateFCmpUNE(L, R, "fne");
             case ast::BinOp::Mod:
-            case ast::BinOp::And: return nullptr; // not valid for f64
+            case ast::BinOp::And:
+            case ast::BinOp::BitAnd:
+            case ast::BinOp::BitOr:
+            case ast::BinOp::BitXor:
+            case ast::BinOp::Shl:
+            case ast::BinOp::Shr: return nullptr; // not valid for f64
             }
         }
+        // Phase 66: signedness drives the division / remainder / right-shift /
+        // comparison opcode (LLVM integers are sign-agnostic). Both operands
+        // share one int type (typecheck unified them), so the lhs settles it.
+        bool uns = operandUnsigned(bin);
         switch (bin.op) {
         case ast::BinOp::Add: return builder_->CreateAdd(L, R, "add");
         case ast::BinOp::Sub: return builder_->CreateSub(L, R, "sub");
         case ast::BinOp::Mul: return builder_->CreateMul(L, R, "mul");
-        case ast::BinOp::Div: return builder_->CreateSDiv(L, R, "div");
-        case ast::BinOp::Mod: return builder_->CreateSRem(L, R, "mod");
-        case ast::BinOp::Lt:  return builder_->CreateICmpSLT(L, R, "lt");
-        case ast::BinOp::Le:  return builder_->CreateICmpSLE(L, R, "le");
-        case ast::BinOp::Gt:  return builder_->CreateICmpSGT(L, R, "gt");
-        case ast::BinOp::Ge:  return builder_->CreateICmpSGE(L, R, "ge");
+        case ast::BinOp::Div:
+            return uns ? builder_->CreateUDiv(L, R, "udiv")
+                       : builder_->CreateSDiv(L, R, "div");
+        case ast::BinOp::Mod:
+            return uns ? builder_->CreateURem(L, R, "urem")
+                       : builder_->CreateSRem(L, R, "mod");
+        case ast::BinOp::Lt:
+            return uns ? builder_->CreateICmpULT(L, R, "ult")
+                       : builder_->CreateICmpSLT(L, R, "lt");
+        case ast::BinOp::Le:
+            return uns ? builder_->CreateICmpULE(L, R, "ule")
+                       : builder_->CreateICmpSLE(L, R, "le");
+        case ast::BinOp::Gt:
+            return uns ? builder_->CreateICmpUGT(L, R, "ugt")
+                       : builder_->CreateICmpSGT(L, R, "gt");
+        case ast::BinOp::Ge:
+            return uns ? builder_->CreateICmpUGE(L, R, "uge")
+                       : builder_->CreateICmpSGE(L, R, "ge");
         case ast::BinOp::Eq:  return builder_->CreateICmpEQ(L, R, "eq");
         case ast::BinOp::NotEq: return builder_->CreateICmpNE(L, R, "ne");
+        case ast::BinOp::BitAnd: return builder_->CreateAnd(L, R, "band");
+        case ast::BinOp::BitOr:  return builder_->CreateOr(L, R, "bor");
+        case ast::BinOp::BitXor: return builder_->CreateXor(L, R, "bxor");
+        case ast::BinOp::Shl:    return builder_->CreateShl(L, R, "shl");
+        case ast::BinOp::Shr:
+            // Arithmetic (sign-extending) for signed, logical for unsigned.
+            return uns ? builder_->CreateLShr(L, R, "lshr")
+                       : builder_->CreateAShr(L, R, "ashr");
         case ast::BinOp::And: return nullptr; // handled above
         }
         return nullptr;
+    }
+
+    // Phase 66: is this binary op's (shared) integer operand type unsigned?
+    // Drives udiv/urem/lshr and the unsigned icmp predicates. Reads whichever
+    // operand has a recorded concrete int type (they unify to the same type).
+    bool operandUnsigned(const ast::BinaryExpr& bin) {
+        auto unsignedSide = [&](const ast::Expr& e) -> int {
+            TypePtr t = lookupExprType(e);
+            if (!t) return -1; // unknown
+            t = resolveInInstance(t);
+            if (t->kind != TypeKind::Int || t->isConstValue) return -1;
+            return t->intSigned ? 0 : 1;
+        };
+        int l = unsignedSide(*bin.lhs);
+        if (l >= 0) return l == 1;
+        int r = unsignedSide(*bin.rhs);
+        return r == 1;
     }
 
     // Phase 10b: the env-aware LLVM signature of a fn VALUE whose kardashev

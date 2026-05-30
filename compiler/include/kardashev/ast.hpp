@@ -67,15 +67,24 @@ enum class BinOp {
     Lt, Le, Gt, Ge,
     Eq, NotEq,
     And,          // Phase 33: `&&` short-circuit logical-and (bool -> bool)
+    // Phase 66: integer bitwise operators (int -> int, any width/signedness).
+    // `Shr` is arithmetic (sign-extending) for a signed operand and logical
+    // (zero-filling) for an unsigned one — codegen picks ashr/lshr by type.
+    BitAnd,       // &  (infix; prefix `&` is still borrow)
+    BitOr,        // |  (infix; primary `|...|` is still a closure)
+    BitXor,       // ^
+    Shl,          // <<
+    Shr,          // >>
 };
 
 // Phase 15: prefix unary operators. `Neg` is integer negation (`-x`,
 // i64 -> i64); `Not` is logical not (`!x`, bool -> bool). Both bind
 // tighter than every binary operator.
 enum class UnaryOp {
-    Neg,   // -x
-    Not,   // !x
-    Deref, // *r — Phase 34: read the pointee of a `&T` / `Box<T>` (yields T)
+    Neg,    // -x
+    Not,    // !x
+    Deref,  // *r — Phase 34: read the pointee of a `&T` / `Box<T>` (yields T)
+    BitNot, // ~x — Phase 66: integer bitwise complement (int -> same int)
 };
 
 // Base expression. Polymorphic by design — use `dynamic_cast<...*>` in
@@ -142,6 +151,11 @@ struct TypeRef;
 
 struct IntLitExpr : Expr {
     std::int64_t value = 0;
+    // Phase 64 (v11): an explicit suffix `5i32` / `0xFFu8` pins the literal's
+    // type (width + signedness). `suffixWidth == 0` means no suffix (an
+    // unsuffixed literal is i64 by default and narrows in context).
+    int suffixWidth = 0;
+    bool suffixSigned = true;
 };
 
 // Phase 39: an `f64` floating-point literal (e.g. `1.5`, `-2.0`, `3e8`). The
@@ -149,6 +163,10 @@ struct IntLitExpr : Expr {
 struct FloatLitExpr : Expr {
     std::string lexeme;
     double value = 0.0;
+    // Phase 67 (v11): an explicit `f32` / `f64` suffix pins the literal width.
+    // `suffixWidth == 0` means no suffix (an unsuffixed float is f64 by default
+    // and narrows to f32 in context).
+    int suffixWidth = 0;
 };
 
 // Phase 15: `true` / `false` boolean literal. Codegen lowers to an i1
@@ -519,6 +537,20 @@ struct TypeRef {
     std::vector<std::string> fnEffects; // effect-row labels (concrete + vars)
     std::size_t line = 1;
     std::size_t column = 1;
+};
+
+// Phase 65 (v11): `operand as Type` — an explicit numeric cast, the only way to
+// move between the non-coercive integer/float lattice (`i32` <-> `i64`,
+// `i64` <-> `f64`, ...). Binds tighter than any binary operator but looser than
+// a prefix unary, so `-x as i32` is `(-x) as i32` and `a as i32 * 2` is
+// `(a as i32) * 2` (the Rust precedence). Typecheck: both `operand` and
+// `targetType` must be numeric (int or f64); the result type is `targetType`.
+// Codegen lowers to the width/signedness-correct LLVM cast (trunc / sext / zext
+// / sitofp / uitofp / fptosi / fptoui / fpext / fptrunc). Defined here (after
+// TypeRef) because it holds a TypeRef by value.
+struct CastExpr : Expr {
+    ExprPtr operand;
+    TypeRef targetType;
 };
 
 struct Param {

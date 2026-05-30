@@ -2103,6 +2103,10 @@ private:
             collectEffects(*un->operand, out);
             return;
         }
+        if (auto* ce = dynamic_cast<const ast::CastExpr*>(&e)) {
+            collectEffects(*ce->operand, out); // Phase 65: cast is pure glue
+            return;
+        }
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
             for (const auto& a : call->args) collectEffects(*a, out);
             // Phase 10a: prefer the per-call-site contribution recorded
@@ -3205,10 +3209,34 @@ private:
                 error("i64 takes no type arguments", tr.line, tr.column);
             return makeInt();
         }
+        // v11: the SIZED machine integers — signed i8/i16/i32 (Phase 63) and
+        // unsigned u8/u16/u32/u64 (Phase 66); i64 is the signed default above.
+        // Each is a distinct non-coercive type (unify checks width AND sign);
+        // `as` bridges between them, and codegen picks udiv/urem/lshr/icmp-u
+        // for the unsigned ones.
+        {
+            static const struct { const char* nm; int w; bool sg; } kInts[] = {
+                {"i8", 8, true},  {"i16", 16, true},  {"i32", 32, true},
+                {"u8", 8, false}, {"u16", 16, false}, {"u32", 32, false},
+                {"u64", 64, false}};
+            for (const auto& it : kInts) {
+                if (tr.name == it.nm) {
+                    if (!tr.typeArgs.empty())
+                        error(std::string(it.nm) + " takes no type arguments",
+                              tr.line, tr.column);
+                    return makeIntW(it.w, it.sg);
+                }
+            }
+        }
         if (tr.name == "f64") {
             if (!tr.typeArgs.empty())
                 error("f64 takes no type arguments", tr.line, tr.column);
             return makeFloat();
+        }
+        if (tr.name == "f32") { // Phase 67: single-precision float
+            if (!tr.typeArgs.empty())
+                error("f32 takes no type arguments", tr.line, tr.column);
+            return makeFloatW(32);
         }
         // Phase 16: `unit` is the type of a function with no `-> T` return
         // annotation (the parser synthesizes a "unit" TypeRef there). Maps to
@@ -3550,12 +3578,38 @@ private:
                     constFail("integer overflow in const expr (negating "
                               "i64::MIN)",
                               e);
-                return {false, -v.i};
+                return {false, wrapConstToType(-v.i, e)};
             }
             // Not (bool -> bool).
             if (!v.isBool)
                 constFail("unary `!` requires bool in a const expr", e);
             return {true, v.i ? 0 : 1};
+        }
+        if (auto* ce = dynamic_cast<const ast::CastExpr*>(&e)) {
+            // Phase 65: a numeric `as` cast inside a const expr. Only int->int
+            // is const-foldable (the const evaluator is integer-valued); a
+            // cast to/from f64 is rejected honestly. The value wraps into the
+            // target width with two's-complement semantics, matching codegen.
+            ConstValue v = evalConstExpr(*ce->operand, env, depth);
+            if (v.isBool)
+                constFail("`as` cast requires a numeric operand in a const "
+                          "expr",
+                          e);
+            TypePtr dst = resolve(resolveTypeRef(ce->targetType));
+            if (dst->kind != TypeKind::Int || dst->isConstValue)
+                constFail("`as` to a non-integer type is not allowed in a "
+                          "const expr",
+                          e);
+            long long val = v.i;
+            if (dst->intWidth < 64) {
+                unsigned long long mask = (1ULL << dst->intWidth) - 1;
+                unsigned long long u =
+                    static_cast<unsigned long long>(val) & mask;
+                if (dst->intSigned && (u & (1ULL << (dst->intWidth - 1))))
+                    u |= ~mask; // sign-extend the narrow signed value
+                val = static_cast<long long>(u);
+            }
+            return {false, val};
         }
         if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(&e)) {
             return evalConstBinary(*bin, env, depth);
@@ -3578,6 +3632,28 @@ private:
                   "`if`/`else`, `let`, and calls to `const fn`s are "
                   "const-evaluable)",
                   e);
+    }
+
+    // v11 fix: wrap a const-folded integer value to the width/signedness of
+    // `e`'s recorded type, with two's-complement semantics that MATCH runtime
+    // codegen. A narrow UNSIGNED result becomes a POSITIVE i64 in range, and a
+    // narrow SIGNED result is sign-extended — so every subsequent i64 op
+    // (compare, `/`, `>>`, ...) on the wrapped value gives the type-correct
+    // answer (an unsigned `>>` becomes a logical shift for free). i64/u64 (or
+    // an untyped expr) pass through unchanged. This is what makes a sized/
+    // unsigned `const` fold identically to the same expression at run time.
+    long long wrapConstToType(long long val, const ast::Expr& e) {
+        auto it = exprTypes_.find(&e);
+        if (it == exprTypes_.end()) return val;
+        TypePtr t = resolve(it->second);
+        if (t->kind != TypeKind::Int || t->isConstValue || t->intWidth >= 64)
+            return val;
+        int w = t->intWidth;
+        unsigned long long mask = (1ULL << w) - 1;
+        unsigned long long u = static_cast<unsigned long long>(val) & mask;
+        if (t->intSigned && (u & (1ULL << (w - 1))))
+            u |= ~mask; // sign-extend a narrow signed value
+        return static_cast<long long>(u);
     }
 
     ConstValue evalConstBinary(const ast::BinaryExpr& bin, ConstEnv* env,
@@ -3637,7 +3713,41 @@ private:
                 out = l.i / r.i;
             }
             if (of) constFail("integer overflow in const expr", bin);
-            return {false, out};
+            // Wrap to the result's width so a narrow const folds like runtime.
+            return {false, wrapConstToType(out, bin)};
+        }
+        case Op::BitAnd:
+        case Op::BitOr:
+        case Op::BitXor:
+        case Op::Shl:
+        case Op::Shr: {
+            // Phase 66 + v11 fix: integer bitwise ops fold at const time. Each
+            // operand is already WRAPPED to its own type's width (an unsigned
+            // narrow value is a positive i64, a signed one is sign-extended), so
+            // `l.i >> r.i` is a LOGICAL shift for an unsigned operand and an
+            // ARITHMETIC shift for a signed one — matching runtime — and the
+            // result is re-wrapped to the op's width below.
+            if (l.isBool || r.isBool)
+                constFail("bitwise op requires integer operands in a const "
+                          "expr",
+                          bin);
+            std::int64_t out = 0;
+            if (bin.op == Op::BitAnd) out = l.i & r.i;
+            else if (bin.op == Op::BitOr) out = l.i | r.i;
+            else if (bin.op == Op::BitXor) out = l.i ^ r.i;
+            else if (bin.op == Op::Shl) {
+                if (r.i < 0 || r.i >= 64)
+                    constFail("shift amount out of range (0..63) in const expr",
+                              bin);
+                out = static_cast<std::int64_t>(static_cast<std::uint64_t>(l.i)
+                                                << r.i);
+            } else { // Shr (arithmetic, for the signed const evaluator)
+                if (r.i < 0 || r.i >= 64)
+                    constFail("shift amount out of range (0..63) in const expr",
+                              bin);
+                out = l.i >> r.i;
+            }
+            return {false, wrapConstToType(out, bin)};
         }
         }
         constFail("unsupported operator in const expr", bin);
@@ -3754,10 +3864,14 @@ private:
                   cd.type.line, cd.type.column);
         }
         // Type-check the initializer expression (records exprTypes for codegen
-        // + surfaces ordinary type errors), then unify with the declared type.
+        // + surfaces ordinary type errors), then coerce to the declared type.
         if (cd.value) {
             TypePtr initTy = checkExpr(*cd.value);
-            if (okType && !unify(initTy, declared)) {
+            // v11 fix: route through coerceOrUnify (not a raw unify) so a plain
+            // narrow/unsigned literal initializer narrows just like a `let`
+            // (`const C: i32 = 100`, `const O: u64 = 0xcbf...`) — and so an
+            // out-of-range literal is range-checked here too.
+            if (okType && !coerceOrUnify(*cd.value, initTy, declared)) {
                 error("const initializer has type " + typeToString(initTy) +
                           ", but '" + cd.name + "' is declared " +
                           typeToString(declared),
@@ -3772,6 +3886,10 @@ private:
         try {
             constEvalSteps_ = 0;
             ConstValue v = evalConstByName(cd.name, *cd.value);
+            // v11 fix: wrap the final value to the DECLARED width too, so a
+            // bare-literal or otherwise-unwrapped initializer (`const C: i8 =
+            // 200i8`) is stored at the right width — codegen emits it narrow.
+            if (!v.isBool) v.i = wrapConstToType(v.i, *cd.value);
             constExprValues_[cd.value.get()] = v;
         } catch (const ConstEvalError& ce) {
             // Make sure a half-finished evaluation doesn't wedge the
@@ -3788,10 +3906,33 @@ private:
     }
 
     TypePtr computeExprType(const ast::Expr& e) {
-        if (dynamic_cast<const ast::IntLitExpr*>(&e)) {
+        if (auto* lit = dynamic_cast<const ast::IntLitExpr*>(&e)) {
+            // Phase 64: a SUFFIXED literal (`5i32`) has a fixed concrete width
+            // and signedness — it does not narrow, it IS that type. A range
+            // check at the suffixed width still applies (see below).
+            if (lit->suffixWidth != 0) {
+                // Phase 64/66: a suffixed literal IS its concrete type (signed
+                // i8..i64 or unsigned u8..u64), range-checked at that width.
+                if (!intLitFitsWidth(lit->value, lit->suffixWidth,
+                                     lit->suffixSigned)) {
+                    error("integer literal " + std::to_string(lit->value) +
+                              " out of range for " +
+                              intTypeName(lit->suffixWidth, lit->suffixSigned),
+                          e.line, e.column);
+                }
+                return makeIntW(lit->suffixWidth, lit->suffixSigned);
+            }
+            // v11: an unsuffixed integer literal is i64 by default; a coercion
+            // site (let annotation / fn arg / binary operand / return) may
+            // NARROW it to a concrete int width via narrowIntLiteral(), which
+            // re-records its exprType — see coerceOrUnify.
             return makeInt();
         }
-        if (dynamic_cast<const ast::FloatLitExpr*>(&e)) {
+        if (auto* fl = dynamic_cast<const ast::FloatLitExpr*>(&e)) {
+            // Phase 67: a suffixed float literal (`1.5f32`) IS that width; an
+            // unsuffixed one is f64 by default and narrows to f32 in context
+            // (narrowFloatLiteral, at coercion sites — see coerceOrUnify).
+            if (fl->suffixWidth != 0) return makeFloatW(fl->suffixWidth);
             return makeFloat();
         }
         if (dynamic_cast<const ast::BoolLitExpr*>(&e)) {
@@ -3799,6 +3940,9 @@ private:
         }
         if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
             return checkUnary(*un);
+        }
+        if (auto* ce = dynamic_cast<const ast::CastExpr*>(&e)) {
+            return checkCast(*ce);
         }
         if (dynamic_cast<const ast::StringLitExpr*>(&e)) {
             auto it = structSchemas_.find("String");
@@ -4006,10 +4150,83 @@ private:
     // (`&Concrete` / `Box<Concrete>`) whose pointee impls the trait, record a
     // DynCoercion on `srcExpr` and return true (no unification needed — the
     // shapes deliberately differ). Otherwise fall back to plain `unify`.
+    // v11: narrow an unsuffixed integer LITERAL `srcExpr` to a concrete int
+    // `target` (a literal is i64 by default; in an int context it adopts the
+    // target's width). Records the literal's exprType so codegen emits the
+    // right width; range-checks narrow widths. No-op (false) for non-literals.
+    // Phase 63/64: does `value` fit a signed/unsigned integer of `width` bits?
+    // A 64-bit width always fits (the literal is a `long long`).
+    static bool intLitFitsWidth(long long value, int width, bool isSigned) {
+        if (width >= 64) return true;
+        long long lo = isSigned ? -(1LL << (width - 1)) : 0;
+        long long hi = isSigned ? (1LL << (width - 1)) - 1
+                                : (1LL << width) - 1;
+        return value >= lo && value <= hi;
+    }
+
+    bool narrowIntLiteral(const ast::Expr& srcExpr, const TypePtr& target) {
+        TypePtr t = resolve(target);
+        if (t->kind != TypeKind::Int || t->isConstValue) return false;
+        if (auto* lit = dynamic_cast<const ast::IntLitExpr*>(&srcExpr)) {
+            if (!intLitFitsWidth(lit->value, t->intWidth, t->intSigned))
+                error("integer literal " + std::to_string(lit->value) +
+                          " out of range for " + typeToString(t),
+                      srcExpr.line, srcExpr.column);
+            exprTypes_[&srcExpr] = t;
+            return true;
+        }
+        // Phase 67: a NEGATED literal `-N` narrows too, so a narrow signed type
+        // can hold its minimum (`let x: i8 = -128`). The NEGATED value is the
+        // one range-checked (and `let x: u8 = -1` is correctly rejected). The
+        // inner literal is recorded at the target width as well, so codegen
+        // emits both at that width (the negate wraps in two's complement).
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&srcExpr)) {
+            if (un->op == ast::UnaryOp::Neg) {
+                if (auto* lit = dynamic_cast<const ast::IntLitExpr*>(
+                        un->operand.get())) {
+                    long long neg = -lit->value;
+                    if (!intLitFitsWidth(neg, t->intWidth, t->intSigned))
+                        error("integer literal " + std::to_string(neg) +
+                                  " out of range for " + typeToString(t),
+                              srcExpr.line, srcExpr.column);
+                    exprTypes_[un] = t;
+                    exprTypes_[un->operand.get()] = t;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // Phase 67: narrow an unsuffixed FLOAT literal `srcExpr` to a concrete
+    // float `target` (a float literal is f64 by default; in a context that
+    // wants f32 it adopts f32). Records its exprType so codegen emits the right
+    // width. No-op (false) for non-literals or a non-float target.
+    bool narrowFloatLiteral(const ast::Expr& srcExpr, const TypePtr& target) {
+        auto* lit = dynamic_cast<const ast::FloatLitExpr*>(&srcExpr);
+        if (!lit || lit->suffixWidth != 0) return false;
+        TypePtr t = resolve(target);
+        if (t->kind != TypeKind::Float) return false;
+        exprTypes_[&srcExpr] = t;
+        return true;
+    }
+
     bool coerceOrUnify(const ast::Expr& srcExpr, const TypePtr& actual,
                        const TypePtr& expected) {
         TypePtr e = resolve(expected);
         TypePtr a = resolve(actual);
+        // v11: an integer literal narrows to the expected concrete int width
+        // (`let x: i32 = 5`, `f(5)` with an i32 param). Only when `actual` is
+        // a plain i64 (the literal's default) — never override a real type.
+        if (e->kind == TypeKind::Int && !e->isConstValue &&
+            a->kind == TypeKind::Int && !a->isConstValue && a->intWidth == 64 &&
+            a->intSigned && narrowIntLiteral(srcExpr, e))
+            return true;
+        // Phase 67: an f64-default float literal narrows to an expected f32.
+        if (e->kind == TypeKind::Float && e->floatWidth == 32 &&
+            a->kind == TypeKind::Float && a->floatWidth == 64 &&
+            narrowFloatLiteral(srcExpr, e))
+            return true;
         // Unwrap one pointer layer on each side, tracking whether it's a Box.
         bool expIsBox = e->kind == TypeKind::Box;
         bool expIsRef = e->kind == TypeKind::Ref;
@@ -4819,39 +5036,91 @@ private:
                                   (bin.op == ast::BinOp::Ge) ||
                                   (bin.op == ast::BinOp::Eq) ||
                                   (bin.op == ast::BinOp::NotEq);
-        const char* what = isComparison ? "comparison" : "arithmetic";
-        // Phase 39: f64 arithmetic / comparison. If a side is already f64, both
-        // sides must be f64 — there is NO implicit i64<->f64 coercion (use
-        // to_f64 / float_to_int). `%` is integer-only.
+        // Phase 66: integer bitwise operators (& | ^ << >>). Integer-only (any
+        // width/signedness); like arithmetic they return the operand int type,
+        // but they are NOT defined for f64.
+        const bool isBitwise = (bin.op == ast::BinOp::BitAnd) ||
+                               (bin.op == ast::BinOp::BitOr) ||
+                               (bin.op == ast::BinOp::BitXor) ||
+                               (bin.op == ast::BinOp::Shl) ||
+                               (bin.op == ast::BinOp::Shr);
+        const char* what =
+            isComparison ? "comparison" : isBitwise ? "bitwise" : "arithmetic";
+        // Phase 39/67: float arithmetic / comparison. If a side is a float,
+        // both sides must be the SAME float width (f32 or f64) — there is NO
+        // implicit i64<->float or f32<->f64 coercion (use `as`). `%` and the
+        // bitwise ops are integer-only. An unsuffixed f64-default float literal
+        // narrows to the other operand's width (`x + 1.0` with `x: f32`).
         if (resolve(lhs)->kind == TypeKind::Float ||
             resolve(rhs)->kind == TypeKind::Float) {
             if (bin.op == ast::BinOp::Mod) {
-                error("`%` (modulo) is not defined for f64", bin.line,
+                error("`%` (modulo) is not defined for floats", bin.line,
                       bin.column);
             }
-            if (!unify(lhs, makeFloat())) {
-                error(std::string(what) + " op expects f64 on lhs, got " +
-                          typeToString(lhs),
-                      bin.lhs->line, bin.lhs->column);
+            if (isBitwise) {
+                error("bitwise operators (& | ^ << >>) are not defined for "
+                      "floats",
+                      bin.line, bin.column);
             }
-            if (!unify(rhs, makeFloat())) {
-                error(std::string(what) + " op expects f64 on rhs, got " +
+            TypePtr rl = resolve(lhs), rr = resolve(rhs);
+            // Narrow an f64-default float literal to the other side's f32.
+            if (rl->kind == TypeKind::Float && rl->floatWidth == 32 &&
+                rr->kind == TypeKind::Float && rr->floatWidth == 64 &&
+                narrowFloatLiteral(*bin.rhs, rl))
+                rhs = rl;
+            else if (rr->kind == TypeKind::Float && rr->floatWidth == 32 &&
+                     rl->kind == TypeKind::Float && rl->floatWidth == 64 &&
+                     narrowFloatLiteral(*bin.lhs, rr))
+                lhs = rr;
+            if (!unify(lhs, rhs)) {
+                error(std::string(what) +
+                          " op requires both operands to be the same float "
+                          "type, got " + typeToString(lhs) + " and " +
                           typeToString(rhs),
-                      bin.rhs->line, bin.rhs->column);
+                      bin.line, bin.column);
+                return isComparison ? makeBool() : resolve(lhs);
             }
-            return isComparison ? makeBool() : makeFloat();
+            return isComparison ? makeBool() : resolve(lhs);
         }
-        if (!unify(lhs, makeInt())) {
-            error(std::string(what) + " op expects i64 on lhs, got " +
+        // v11: integer arithmetic/comparison over the sized-int tower. Both
+        // operands must be the SAME int type; an i64 LITERAL operand narrows to
+        // the other side's concrete width (`x + 1` with `x: i32` -> 1 is i32).
+        // Two default operands stay i64. No mixed-width arithmetic.
+        {
+            TypePtr rl = resolve(lhs), rr = resolve(rhs);
+            bool lLit = dynamic_cast<const ast::IntLitExpr*>(bin.lhs.get());
+            bool rLit = dynamic_cast<const ast::IntLitExpr*>(bin.rhs.get());
+            auto concreteNonDefault = [](const TypePtr& t) {
+                return t->kind == TypeKind::Int && !t->isConstValue &&
+                       !(t->intWidth == 64 && t->intSigned);
+            };
+            if (concreteNonDefault(rl) && rLit && narrowIntLiteral(*bin.rhs, rl))
+                rhs = rl;
+            else if (concreteNonDefault(rr) && lLit &&
+                     narrowIntLiteral(*bin.lhs, rr))
+                lhs = rr;
+        }
+        if (!unify(lhs, rhs)) {
+            error(std::string(what) +
+                      " op requires both operands to be the same integer "
+                      "type, got " + typeToString(lhs) + " and " +
+                      typeToString(rhs),
+                  bin.line, bin.column);
+            return isComparison ? makeBool() : makeInt();
+        }
+        TypePtr rl = resolve(lhs);
+        if (rl->kind == TypeKind::Var) {
+            // Both sides were vars (two literals, or generic params): pin i64.
+            unify(lhs, makeInt());
+            rl = resolve(lhs);
+        }
+        if (rl->kind != TypeKind::Int || rl->isConstValue) {
+            error(std::string(what) + " op expects integer operands, got " +
                       typeToString(lhs),
                   bin.lhs->line, bin.lhs->column);
+            return isComparison ? makeBool() : makeInt();
         }
-        if (!unify(rhs, makeInt())) {
-            error(std::string(what) + " op expects i64 on rhs, got " +
-                      typeToString(rhs),
-                  bin.rhs->line, bin.rhs->column);
-        }
-        return isComparison ? makeBool() : makeInt();
+        return isComparison ? makeBool() : rl;
     }
 
     // Phase 10a: build the first-class-value type of a declared fn — its
@@ -4955,6 +5224,10 @@ private:
         }
         if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
             collectFreeVars(*un->operand, bound, order, seen);
+            return;
+        }
+        if (auto* ce = dynamic_cast<const ast::CastExpr*>(&e)) {
+            collectFreeVars(*ce->operand, bound, order, seen);
             return;
         }
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
@@ -5188,6 +5461,8 @@ private:
         }
         if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e))
             return bodyMutatesCapture(*un->operand, name, bound);
+        if (auto* ce = dynamic_cast<const ast::CastExpr*>(&e))
+            return bodyMutatesCapture(*ce->operand, name, bound);
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
             for (const auto& a : call->args)
                 if (bodyMutatesCapture(*a, name, bound)) return true;
@@ -6090,12 +6365,37 @@ private:
 
     // Phase 15: prefix unary operators. `-x` negates an i64; `!x` logically
     // negates a bool. Both are total over their input type and reproduce it.
+    // Phase 65: `operand as Type` — an explicit numeric cast. Both the source
+    // and the target must be a primitive numeric type (an int of any
+    // width/signedness, or f64); the result type is the target. This is the
+    // only bridge across the non-coercive lattice — every other int-width or
+    // int/float crossing is a type error. Casting from/to a non-numeric type
+    // (a struct, bool, String, reference, ...) is rejected.
+    TypePtr checkCast(const ast::CastExpr& ce) {
+        TypePtr src = resolve(checkExpr(*ce.operand));
+        TypePtr dst = resolve(resolveTypeRef(ce.targetType));
+        auto isNumeric = [](const TypePtr& t) {
+            return (t->kind == TypeKind::Int && !t->isConstValue) ||
+                   t->kind == TypeKind::Float;
+        };
+        if (!isNumeric(src) || !isNumeric(dst)) {
+            error("`as` cast is only allowed between numeric types (integers "
+                  "and f64), got " +
+                      typeToString(src) + " as " + typeToString(dst),
+                  ce.line, ce.column);
+            // Recover with the target if it is at least numeric, else i64.
+            return isNumeric(dst) ? dst : makeInt();
+        }
+        return dst;
+    }
+
     TypePtr checkUnary(const ast::UnaryExpr& un) {
         TypePtr operand = checkExpr(*un.operand);
         switch (un.op) {
         case ast::UnaryOp::Neg:
-            // Phase 39: `-x` negates an i64 OR an f64.
-            if (resolve(operand)->kind == TypeKind::Float) return makeFloat();
+            // Phase 39/67: `-x` negates an i64 OR a float of either width.
+            if (resolve(operand)->kind == TypeKind::Float)
+                return resolve(operand);
             if (!unify(operand, makeInt())) {
                 error("unary `-` requires an i64 or f64 operand, got " +
                           typeToString(operand),
@@ -6109,6 +6409,18 @@ private:
                       un.operand->line, un.operand->column);
             }
             return makeBool();
+        case ast::UnaryOp::BitNot: {
+            // Phase 66: `~x` is the bitwise complement of an integer of any
+            // width/signedness; the result is that same int type.
+            TypePtr r = resolve(operand);
+            if (r->kind != TypeKind::Int || r->isConstValue) {
+                error("unary `~` requires an integer operand, got " +
+                          typeToString(operand),
+                      un.operand->line, un.operand->column);
+                return makeInt();
+            }
+            return r;
+        }
         case ast::UnaryOp::Deref: {
             // Phase 34: `*r` reads the pointee of a `&T` / `&mut T` / Box<T>.
             TypePtr r = resolve(operand);

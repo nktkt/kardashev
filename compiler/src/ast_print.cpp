@@ -465,13 +465,22 @@ private:
         case BinOp::Eq:
         case BinOp::NotEq:
             return 2;
+        case BinOp::BitOr:  // Phase 66: bitwise tiers, between comparison & add
+            return 3;
+        case BinOp::BitXor:
+            return 4;
+        case BinOp::BitAnd:
+            return 5;
+        case BinOp::Shl:
+        case BinOp::Shr:
+            return 6;
         case BinOp::Add:
         case BinOp::Sub:
-            return 3;
+            return 7;
         case BinOp::Mul:
         case BinOp::Div:
         case BinOp::Mod:
-            return 4;
+            return 8;
         }
         return 1;
     }
@@ -490,6 +499,11 @@ private:
         case BinOp::Eq: return "==";
         case BinOp::NotEq: return "!=";
         case BinOp::And: return "&&";
+        case BinOp::BitAnd: return "&"; // Phase 66
+        case BinOp::BitOr: return "|";
+        case BinOp::BitXor: return "^";
+        case BinOp::Shl: return "<<";
+        case BinOp::Shr: return ">>";
         }
         return "+";
     }
@@ -545,8 +559,19 @@ private:
         // operator, so wrap a binary operand in parens (`-(a + b)`); atoms and
         // postfix chains print bare (`-x`, `!a.b`, `- -3`).
         if (auto* un = dynamic_cast<const UnaryExpr*>(&e)) {
-            out_ += un->op == UnaryOp::Neg ? "-" : "!";
+            out_ += un->op == UnaryOp::Neg      ? "-"
+                    : un->op == UnaryOp::Not    ? "!"
+                    : un->op == UnaryOp::BitNot ? "~"
+                                                : "*"; // Deref
             printExpr(*un->operand, depth, /*parentPrec=*/100);
+            return;
+        }
+        // Phase 65: `operand as Type`. `as` binds tighter than any binary op but
+        // looser than a prefix unary, so print the operand at unary precedence
+        // (wrapping a binary operand in parens) and append ` as Type`.
+        if (auto* ce = dynamic_cast<const CastExpr*>(&e)) {
+            printExpr(*ce->operand, depth, /*parentPrec=*/90);
+            out_ += " as " + typeToString(ce->targetType);
             return;
         }
         if (auto* sl = dynamic_cast<const StringLitExpr*>(&e)) {

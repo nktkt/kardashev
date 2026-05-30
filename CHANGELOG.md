@@ -18,6 +18,106 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.11.0] — Roadmap v11 "real machine integers" (Phases 63–68)
+
+Theme: the **numeric tower** — make kardashev practical by giving it real
+machine integers (sized + unsigned + f32, `as` casts, bit ops, defined overflow)
+instead of i64-only. The first step toward production use. A pre-merge
+adversarial multi-agent review hardened a const-evaluation width/sign cluster
+(including an invalid-IR blocker) plus two parser/lexer bugs the green suite had
+missed (see Fixed).
+
+### Added
+- Sized SIGNED machine integers `i8` / `i16` / `i32` (Phase 63) — `i64` stays
+  the default. The `Int` type carries a bit width + signedness; codegen lowers
+  to the matching LLVM width (`i32 @add(i32, i32)`, not i64). The lattice is
+  NON-coercive: no implicit widening (`i32` + `i64` is a type error — `as`
+  bridges, Phase 65), and an out-of-range literal for a narrow width is a
+  compile error. An unsuffixed literal is i64 by default and narrows to a
+  concrete width in context (`let x: i32 = 5`); the type system carries zero
+  literal churn (all v10 i64 programs are byte-for-byte unchanged).
+- Integer-literal **width suffixes** and **radix prefixes** (Phase 64). A
+  suffixed literal `5i32` *is* an `i32` with no annotation (it does not narrow,
+  it has that concrete type), so `add(5i32, 3i32)` type-checks against an `i32`
+  parameter directly; an out-of-range suffixed literal (`200i8`) is a compile
+  error. Hexadecimal `0xFF` and binary `0b1010` literals parse to their value
+  (default `i64`), compose with a suffix (`0xFFi32`), and work in `match`
+  patterns (`0xFF => …`). Unsigned suffixes (`u8`..`u64`) are parsed and
+  rejected with a clear "arrives in a later phase" diagnostic until Phase 66
+  lands unsigned integers — never silently mis-typed.
+- The **`as` cast operator** (Phase 65) — the only bridge across the
+  non-coercive lattice. `operand as Type` converts between any two numeric
+  types (an int of any width/signedness, or `f64`): integer widen (`sext`),
+  narrow (`trunc`), and `int`↔`f64` (`sitofp` / `fptosi`, truncating toward
+  zero), lowered to the width/signedness-correct LLVM cast. A cast is the only
+  way to add an `i32` to an `i64` (`a as i64 + b`). `as` binds tighter than
+  every binary operator but looser than a prefix unary (`-x as i32` is
+  `(-x) as i32`, `a as i32 * 2` is `(a as i32) * 2`) and chains left-to-right
+  (`x as i32 as i64`). An `int`→`int` cast is const-foldable and wraps with
+  two's-complement semantics (`300 as i8` == 44) identically at compile time
+  and run time. Casting from/to a non-numeric type (a struct, `bool`, String,
+  reference) is a compile error.
+- **Unsigned integers** `u8` / `u16` / `u32` / `u64` and the integer **bitwise
+  operators** `& | ^ << >> ~` (Phase 66). Each unsigned type is a distinct
+  non-coercive type (`u32` ≠ `i32`; `as` bridges), and codegen lowers its
+  division, remainder, ordering comparison, and right-shift to the UNSIGNED
+  opcode (`udiv` / `urem` / `icmp u…` / `lshr`) — a signed right-shift stays
+  arithmetic (`ashr`). A `u64` literal past `i64::MAX` (e.g. the FNV-1a offset
+  basis `0xcbf29ce484222325`) parses, and a wrapping `u64` multiply yields the
+  textbook hash. Bitwise operators work on any integer width/signedness, fold
+  in const expressions, and are rejected on `f64`. The `&` and `|` tokens are
+  position-disambiguated (prefix `&` is still a borrow, a primary `|…|` is
+  still a closure; infix they are bitwise-and / bitwise-or), and `<<` / `>>`
+  are parsed by token adjacency so nested generics `Vec<Vec<T>>` stay
+  unambiguous. Operator precedence now matches Rust: `&&` < comparison < `|` <
+  `^` < `&` < shift < `+ -` < `* / %`.
+- The **`f32`** single-precision float and **defined overflow semantics**
+  (Phase 67). `f32` is a real type lowering to LLVM `float` (`f64` stays the
+  default `double`); it is a distinct non-coercive type (`f32` ≠ `f64`), so an
+  `as` cast bridges them with `fpext` (`f32`→`f64`) / `fptrunc` (`f64`→`f32`),
+  an unsuffixed float literal is `f64` by default and narrows to `f32` in
+  context, and `1.5f32` pins the width. Integer overflow is now DEFINED as
+  two's-complement **wrapping** at every width (`127i8 + 1 == -128`,
+  `255u8 + 1 == 0`), identically at compile and run time. Negative narrow-int
+  literals narrow in context — `let x: i8 = -128` (i8::MIN) is valid even
+  though `+128` would not fit, while `let x: u8 = -1` is a compile error.
+- **Capstone** `examples/checksum` (Phase 68) — "the numeric tower, applied":
+  three textbook algorithms written in kardashev, each checked against its
+  known answer. **FNV-1a** (64-bit) uses a `u64` offset basis past `i64::MAX`
+  (`0xcbf29ce484222325`) and a wrapping `u64` multiply; **CRC-32** (IEEE) uses
+  a `u32` with a logical `>>`, the bitwise ops, and a branchless mask built by
+  wrapping subtraction (`0 - (crc & 1)`); a **binary parser** assembles `u16`
+  / `u32` from raw `u8` bytes with shifts and casts in both byte orders. Each
+  routine is generic over its input length with a const-generic `[u8; N]`,
+  integrating the v10 const-generic line with the whole v11 numeric tower —
+  none of it is expressible in an i64-only language.
+
+### Fixed
+- A pre-merge adversarial multi-agent review hardened a cluster the green smoke
+  suite had missed — every one with a verified repro, now pinned by
+  `tests/smoke_test_v11_review.sh`:
+  - **(blocker)** a narrow / unsigned `const` flowed into a narrow slot as a
+    64-bit immediate — invalid LLVM IR (`call i32 @id(i64 7)`) / verifier
+    crash. Codegen now emits a folded const at the const-reference's resolved
+    int width.
+  - a sized / unsigned `const`'s folded value disagreed with the same
+    expression at run time — an unsigned `>>` folded as an arithmetic shift, a
+    narrow result was not wrapped to its width (`100i8 + 100i8` → 200 at const
+    time vs −56 at run time), and `1i32 << 31` silently held 2147483648 in an
+    `i32`. The const evaluator now wraps every result to its expression-type
+    width (two's-complement), so an unsigned `>>` is logical and every sized
+    const folds identically to run time.
+  - a plain-literal narrow / unsigned `const` (`const C: i32 = 100`) was
+    rejected though the identical `let` was accepted — `const` now narrows its
+    initializer like any other coercion site.
+  - `expr as Type << ..` / `expr as Type < ..` was a parse error — the cast's
+    target type greedily consumed the `<` / `<<` as a generic-argument list.
+    A cast now parses only a bare (numeric) target, leaving the operator for
+    the expression parser.
+  - an integer/float width suffix was absorbed in tuple-index position
+    (`t.0i32` silently became `t.0`) — the suffix is no longer taken after a
+    `.`.
+
 ## [0.10.0] — Roadmap v10 "sized and sound at compile time" (Phases 57–62)
 
 Theme: **sized and sound at compile time** — const-generic type params + the

@@ -2577,6 +2577,234 @@ void test_const_generic_mixed_struct_ok() {
              "const_generic_mixed_struct_ok");
 }
 
+// Phase 63 (v11): sized signed machine integers.
+void test_sized_int_ok() {
+    expectOk("fn add(a: i32, b: i32) -> i32 { a + b }\n"
+             "fn main() -> i64 { let x: i32 = 5; let y: i32 = add(x, 10) + 1;"
+             " 0 }",
+             "sized_int_ok");
+}
+
+void test_int_width_mismatch_errors() {
+    // No implicit widening: an i32 binding can't take an i64 value.
+    expectErrContains("fn id64(x: i64) -> i64 { x }\n"
+                      "fn main() -> i64 { let w: i32 = id64(5); 0 }",
+                      "i32",
+                      "int_width_mismatch_errors");
+}
+
+void test_int_literal_out_of_range_errors() {
+    expectErrContains("fn main() -> i64 { let x: i8 = 200; 0 }",
+                      "out of range",
+                      "int_literal_out_of_range_errors");
+}
+
+// Phase 64 (v11): integer-literal width suffixes + radix prefixes.
+void test_int_suffix_literal_ok() {
+    // A suffixed literal IS that int type with NO annotation; it must match the
+    // i32 parameter without any widening.
+    expectOk("fn use32(x: i32) -> i32 { x }\n"
+             "fn main() -> i64 { let y = use32(5i32); let z: i32 = y + 1i32;"
+             " 0 }",
+             "int_suffix_literal_ok");
+}
+
+void test_radix_literal_ok() {
+    // Hex / binary literals are default i64 and add up as values.
+    expectOk("fn main() -> i64 { let a = 0xFF; let b = 0b1010; a + b }",
+             "radix_literal_ok");
+}
+
+void test_radix_suffix_combo_ok() {
+    expectOk("fn use32(x: i32) -> i32 { x }\n"
+             "fn main() -> i64 { let m = use32(0xFFi32); 0 }",
+             "radix_suffix_combo_ok");
+}
+
+void test_int_suffix_out_of_range_errors() {
+    expectErrContains("fn main() -> i64 { let x = 200i8; 0 }",
+                      "out of range",
+                      "int_suffix_out_of_range_errors");
+}
+
+void test_int_suffix_width_mismatch_errors() {
+    // A suffixed i32 can't be added to an i64 var (non-coercive lattice).
+    expectErrContains("fn main() -> i64 { let a = 5i32; let b: i64 = 7;"
+                      " let c = a + b; 0 }",
+                      "same integer",
+                      "int_suffix_width_mismatch_errors");
+}
+
+void test_unsigned_suffix_ok() {
+    // Phase 66: an unsigned suffix `5u8` is now a real u8 (Phase 64 deferred it).
+    expectOk("fn use8(x: u8) -> u8 { x }\n"
+             "fn main() -> i64 { let x = use8(5u8); 0 }",
+             "unsigned_suffix_ok");
+}
+
+// Phase 65 (v11): the `as` numeric cast operator.
+void test_cast_bridges_mixed_width_ok() {
+    // A cast is the ONLY bridge across the non-coercive lattice: an i32 widened
+    // to i64 can be added to an i64.
+    expectOk("fn main() -> i64 { let a: i32 = 5; let b: i64 = 7;"
+             " let c: i64 = a as i64 + b; c }",
+             "cast_bridges_mixed_width_ok");
+}
+
+void test_cast_int_float_roundtrip_ok() {
+    expectOk("fn main() -> i64 { let x: i64 = 7; let f: f64 = x as f64 / 2.0;"
+             " let back: i64 = f as i64; back }",
+             "cast_int_float_roundtrip_ok");
+}
+
+void test_cast_narrowing_ok() {
+    // Narrowing is allowed (it truncates) — it is NOT a range error like an
+    // implicit literal narrow; the cast is explicit.
+    expectOk("fn main() -> i64 { let c: i64 = 1000; let d: i32 = c as i32;"
+             " d as i64 }",
+             "cast_narrowing_ok");
+}
+
+void test_cast_chains_ok() {
+    expectOk("fn main() -> i64 { let a: i64 = 10; a as i32 as i64 }",
+             "cast_chains_ok");
+}
+
+void test_cast_struct_rejected() {
+    expectErrContains("struct P { x: i64 }\n"
+                      "fn main() -> i64 { let p = P { x: 1 };"
+                      " let n = p as i32; 0 }",
+                      "numeric",
+                      "cast_struct_rejected");
+}
+
+void test_cast_bool_rejected() {
+    expectErrContains("fn main() -> i64 { let b = true; let n = b as i64; n }",
+                      "numeric",
+                      "cast_bool_rejected");
+}
+
+void test_cast_result_type_is_target() {
+    // The cast result type is exactly the target: `(a as i32)` is an i32, so
+    // assigning it to an i64 binding without a further cast is a type error.
+    expectErrContains("fn main() -> i64 { let a: i64 = 5; let b: i64 = a as i32;"
+                      " b }",
+                      "i32",
+                      "cast_result_type_is_target");
+}
+
+// Phase 66 (v11): unsigned integers + bitwise operators.
+void test_unsigned_types_ok() {
+    expectOk("fn f(a: u8, b: u16, c: u32, d: u64) -> u64 { d }\n"
+             "fn main() -> i64 { let r = f(1u8, 2u16, 3u32, 4u64); 0 }",
+             "unsigned_types_ok");
+}
+
+void test_unsigned_is_distinct_from_signed() {
+    // u32 and i32 are distinct non-coercive types — no implicit crossing.
+    expectErrContains("fn main() -> i64 { let a: u32 = 5; let b: i32 = 7;"
+                      " let c = a + b; 0 }",
+                      "same integer",
+                      "unsigned_is_distinct_from_signed");
+}
+
+void test_bitwise_ops_ok() {
+    expectOk("fn main() -> i64 { let x: u32 = 240; let y: u32 = 15;"
+             " let a = x & y; let b = x | y; let c = x ^ y;"
+             " let d = x << 2; let e = x >> 1; (a | b | c | d | e) as i64 }",
+             "bitwise_ops_ok");
+}
+
+void test_bitnot_ok() {
+    expectOk("fn main() -> i64 { let x: u8 = 15; let y = ~x; y as i64 }",
+             "bitnot_ok");
+}
+
+void test_bitwise_on_float_rejected() {
+    expectErrContains("fn main() -> i64 { let x: f64 = 1.0; let y = x & x;"
+                      " 0 }",
+                      "bitwise",
+                      "bitwise_on_float_rejected");
+}
+
+void test_unsigned_literal_range_checked() {
+    // u8 max is 255 — an out-of-range annotated literal is an error.
+    expectErrContains("fn main() -> i64 { let x: u8 = 300; 0 }",
+                      "out of range",
+                      "unsigned_literal_range_checked");
+}
+
+void test_u64_large_literal_ok() {
+    // A u64 literal past i64::MAX (the FNV offset basis) is valid.
+    expectOk("fn main() -> i64 { let x: u64 = 0xcbf29ce484222325; 0 }",
+             "u64_large_literal_ok");
+}
+
+// Phase 67 (v11): f32 + defined overflow + negative narrow-int literals.
+void test_f32_ok() {
+    expectOk("fn scale(x: f32, k: f32) -> f32 { x * k }\n"
+             "fn main() -> i64 { let a: f32 = 1.5; let b = scale(a, 4.0f32);"
+             " b as i64 }",
+             "f32_ok");
+}
+
+void test_f32_f64_distinct() {
+    // f32 and f64 are distinct non-coercive types — no implicit crossing.
+    expectErrContains("fn main() -> i64 { let a: f32 = 1.0; let b: f64 = 2.0;"
+                      " let c = a + b; 0 }",
+                      "same float",
+                      "f32_f64_distinct");
+}
+
+void test_f32_f64_cast_ok() {
+    expectOk("fn main() -> i64 { let d: f64 = 3.5; let s: f32 = d as f32;"
+             " let back: f64 = s as f64; back as i64 }",
+             "f32_f64_cast_ok");
+}
+
+void test_negative_narrow_literal_ok() {
+    // i8::MIN (-128) narrows even though +128 would not fit i8.
+    expectOk("fn main() -> i64 { let a: i8 = -100; let b: i8 = -128;"
+             " (a as i64) + (b as i64) }",
+             "negative_narrow_literal_ok");
+}
+
+void test_negative_unsigned_literal_rejected() {
+    expectErrContains("fn main() -> i64 { let x: u8 = -1; 0 }",
+                      "out of range",
+                      "negative_unsigned_literal_rejected");
+}
+
+void test_unsuffixed_float_narrows_to_f32() {
+    // An f64-default literal narrows to an f32 binding / operand.
+    expectOk("fn main() -> i64 { let x: f32 = 2.5; let y: f32 = x + 1.0;"
+             " y as i64 }",
+             "unsuffixed_float_narrows_to_f32");
+}
+
+// v11 pre-merge review fixes (const items with sized/unsigned types).
+void test_plain_literal_narrow_const_ok() {
+    // BUG F: a plain narrow / unsigned const literal narrows like a `let`
+    // (previously a raw unify rejected it).
+    expectOk("const C: i32 = 100;\nconst O: u64 = 0xcbf29ce484222325;\n"
+             "fn main() -> i64 { (C as i64) + ((O >> 60) as i64) }",
+             "plain_literal_narrow_const_ok");
+}
+
+void test_out_of_range_const_rejected() {
+    // The narrowing path range-checks a const initializer too.
+    expectErrContains("const C: i8 = 200;\nfn main() -> i64 { C as i64 }",
+                      "out of range",
+                      "out_of_range_const_rejected");
+}
+
+void test_cast_then_shift_parses() {
+    // PARSE regression: `(x as i32) << 2` — the cast target must not eat the
+    // `<<` as a generic-arg list.
+    expectOk("fn main() -> i64 { let x: i64 = 3; ((x as i32) << 2) as i64 }",
+             "cast_then_shift_parses");
+}
+
 } // namespace
 
 int main() {
@@ -2857,6 +3085,38 @@ int main() {
     // Phase 61 (v10): non-Copy arrays + mixed type+const generics.
     test_noncopy_array_ok();
     test_const_generic_mixed_struct_ok();
+    test_sized_int_ok();
+    test_int_width_mismatch_errors();
+    test_int_literal_out_of_range_errors();
+    test_int_suffix_literal_ok();
+    test_radix_literal_ok();
+    test_radix_suffix_combo_ok();
+    test_int_suffix_out_of_range_errors();
+    test_int_suffix_width_mismatch_errors();
+    test_unsigned_suffix_ok();
+    test_cast_bridges_mixed_width_ok();
+    test_cast_int_float_roundtrip_ok();
+    test_cast_narrowing_ok();
+    test_cast_chains_ok();
+    test_cast_struct_rejected();
+    test_cast_bool_rejected();
+    test_cast_result_type_is_target();
+    test_unsigned_types_ok();
+    test_unsigned_is_distinct_from_signed();
+    test_bitwise_ops_ok();
+    test_bitnot_ok();
+    test_bitwise_on_float_rejected();
+    test_unsigned_literal_range_checked();
+    test_u64_large_literal_ok();
+    test_f32_ok();
+    test_f32_f64_distinct();
+    test_f32_f64_cast_ok();
+    test_negative_narrow_literal_ok();
+    test_negative_unsigned_literal_rejected();
+    test_unsuffixed_float_narrows_to_f32();
+    test_plain_literal_narrow_const_ok();
+    test_out_of_range_const_rejected();
+    test_cast_then_shift_parses();
     test_const_fn_array_len_ok();
     test_const_div_by_zero_errors();
     test_const_overflow_errors();
@@ -2865,6 +3125,6 @@ int main() {
     test_const_type_mismatch_errors();
     test_const_array_len_bool_errors();
     test_const_array_len_calls_nonconst_fn_errors();
-    std::cout << "All typecheck tests passed (260 cases)\n";
+    std::cout << "All typecheck tests passed (292 cases)\n";
     return 0;
 }

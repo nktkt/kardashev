@@ -1,0 +1,100 @@
+// Roadmap v11 CAPSTONE — "the numeric tower, applied."
+//
+// Hashes and binary formats are the canonical reason a systems language needs
+// REAL machine integers: sized + unsigned types, wrapping arithmetic, bit
+// operators, radix literals, and width casts. None of this is expressible with
+// an i64-only language. This program is three textbook algorithms written in
+// kardashev, each checked against its known answer:
+//
+//   1. FNV-1a (64-bit)  — u64 with a literal past i64::MAX (the offset basis
+//                         0xcbf29ce484222325) and a WRAPPING u64 multiply.
+//   2. CRC-32 (IEEE)    — u32 with a logical right-shift, xor, and a branchless
+//                         mask built by WRAPPING subtraction (`0 - (crc & 1)`).
+//   3. Binary parser    — assemble u16 / u32 from raw u8 bytes with shifts and
+//                         casts, in both little- and big-endian byte order.
+//
+// Each routine is generic over the input length with a const-generic array
+// `[u8; N]` (the v10 const-generic line), so one definition hashes any size.
+
+// --- 1. FNV-1a, the 64-bit variant ------------------------------------------
+// h = OFFSET; for each byte b: h = (h XOR b) * PRIME  (all mod 2^64).
+// The multiply OVERFLOWS on almost every byte — that is the algorithm, and it
+// only works because kardashev defines integer overflow as two's-complement
+// wrapping. The offset basis does not fit i64; it is a genuine u64 literal.
+fn fnv1a<const N: i64>(data: [u8; N]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;        // FNV offset basis (> i64::MAX)
+    let mut i: i64 = 0;
+    while i < N {
+        h = (h ^ (data[i] as u64)) * 0x100000001b3;   // XOR byte, then * PRIME
+        i = i + 1;
+    }
+    h
+}
+
+// --- 2. CRC-32 (IEEE 802.3 / zlib), bit-at-a-time ---------------------------
+// The reflected polynomial is 0xEDB88320. Instead of an `if` per bit we build a
+// MASK from the low bit: `0u32 - (crc & 1)` wraps to 0xFFFFFFFF when the bit is
+// set and is 0 otherwise (wrapping subtraction again), so the conditional xor
+// becomes `(crc >> 1) ^ (mask & POLY)`. The `>>` is a LOGICAL shift because
+// `crc` is unsigned — a signed `>>` would smear the sign bit and corrupt it.
+fn crc32<const N: i64>(data: [u8; N]) -> u32 {
+    let mut crc: u32 = 0xFFFFFFFF;
+    let mut i: i64 = 0;
+    while i < N {
+        crc = crc ^ (data[i] as u32);
+        let mut bit: i64 = 0;
+        while bit < 8 {
+            let mask: u32 = 0u32 - (crc & 1u32);          // 0xFFFFFFFF or 0
+            crc = (crc >> 1) ^ (mask & 0xEDB88320);
+            bit = bit + 1;
+        }
+        i = i + 1;
+    }
+    crc ^ 0xFFFFFFFF
+}
+
+// --- 3. Binary parsing — bytes into wider words -----------------------------
+// Reading a binary format means packing little- or big-endian bytes into a
+// wider unsigned integer: cast each u8 up, shift it into place, OR them. This
+// is the exact inverse of serialization and the daily work of a parser.
+fn read_u32_le(b: [u8; 4]) -> u32 {
+    (b[0] as u32)
+        | ((b[1] as u32) << 8)
+        | ((b[2] as u32) << 16)
+        | ((b[3] as u32) << 24)
+}
+
+fn read_u16_be(b: [u8; 2]) -> u16 {
+    ((b[0] as u16) << 8) | (b[1] as u16)
+}
+
+fn main() -> i64 ! { io } {
+    // 1. FNV-1a over "abc" — the textbook 64-bit digest is 0xe71fa2190541574b.
+    //    We print its low 32 bits (0x0541574b = 88168267) as a stable witness.
+    let abc: [u8; 3] = [97u8, 98u8, 99u8];
+    let h: u64 = fnv1a(abc);
+    let h_lo: i64 = (h & 0xFFFFFFFF) as i64;     // 88168267
+    print(h_lo);
+
+    // 2. CRC-32 of "abc" is 0x352441c2 = 891568578, and of "123456789"
+    //    (the canonical CRC test vector) is 0xcbf43926 = 3421780262.
+    let crc_abc: i64 = crc32(abc) as i64;        // 891568578
+    print(crc_abc);
+    let nums: [u8; 9] =
+        [49u8, 50u8, 51u8, 52u8, 53u8, 54u8, 55u8, 56u8, 57u8];  // "123456789"
+    let crc_nums: i64 = crc32(nums) as i64;      // 3421780262
+    print(crc_nums);
+
+    // 3. Parse 0x12345678 from little-endian bytes and 0xCAFE from big-endian.
+    let le: [u8; 4] = [0x78u8, 0x56u8, 0x34u8, 0x12u8];
+    let be: [u8; 2] = [0xCAu8, 0xFEu8];
+    let word: i64 = read_u32_le(le) as i64;      // 305419896 (0x12345678)
+    let half: i64 = read_u16_be(be) as i64;      // 51966     (0xCAFE)
+    print(word);
+    print(half);
+
+    // A single witness that is correct only if every step is: each known answer
+    // contributes, so any wrong bit anywhere changes the total.
+    //   88168267 + 891568578 + 3421780262 + 305419896 + 51966 = 4706988969
+    h_lo + crc_abc + crc_nums + word + half
+}

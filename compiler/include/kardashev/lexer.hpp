@@ -48,6 +48,7 @@ enum class TokenKind {
     KwFalse, // Phase 15: `false` boolean literal
     KwExtern, // Phase 24: `extern "C" fn ...;` FFI declaration
     KwConst,  // Phase 25: `const NAME: T = ...;` item + `const fn` qualifier
+    KwAs,     // Phase 65: `expr as Type` numeric cast operator
     // Note: `async` / `await` stay as Identifiers — they appear in
     // effect rows (`! { async }`) and need lexeme-level lookup in the
     // parser's top-level / postfix logic anyway. Making them keywords
@@ -79,9 +80,11 @@ enum class TokenKind {
     Ampersand, // & — Phase 2.4b shared borrow / reference type
     Bang, // ! — Phase 4 effect-row introducer (the `!=` two-char form has
           // its own token so this is unambiguous)
-    Pipe,     // | — Phase 10b closure-param delimiter (no bitwise-or yet, so
-              //     this token is unambiguous outside closure syntax)
+    Pipe,     // | — Phase 10b closure-param delimiter; Phase 66 infix bitwise-or
+              //     (position disambiguates: primary `|...|` = closure, infix = or)
     PipePipe, // || — Phase 10b zero-param closure `|| expr`
+    Caret,    // ^ — Phase 66 bitwise xor
+    Tilde,    // ~ — Phase 66 bitwise not (prefix unary)
 
     // Punctuation
     LParen,

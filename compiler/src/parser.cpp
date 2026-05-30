@@ -158,6 +158,75 @@ private:
         errors_.push_back({std::move(msg), line, column});
     }
 
+    // Phase 64: parse an integer-literal lexeme that may carry an optional
+    // width suffix (`5i32`) and/or a `0x`/`0b` radix prefix (`0xFF`, `0b1010`).
+    // Returns the numeric value; `*outWidth`/`*outSigned` receive the suffix
+    // (outWidth==0 when there is no suffix — an i64-default literal that
+    // narrows in context). `tok` is only used for error reporting.
+    long long parseIntLitLexeme(const Token& tok, int* outWidth,
+                                bool* outSigned) {
+        std::string lex = tok.lexeme;
+        int width = 0;
+        bool isSigned = true;
+        // A width suffix is an `i`/`u` followed by 8/16/32/64. The parser
+        // records it faithfully (signedness included); whether an *unsigned*
+        // suffix is usable yet is a typecheck question (Phase 66 lands unsigned
+        // integers — until then typecheck rejects a `u*` suffix honestly).
+        static const struct { const char* s; int w; bool sg; } kSuffixes[] = {
+            {"i8", 8, true},   {"i16", 16, true},  {"i32", 32, true},
+            {"i64", 64, true}, {"u8", 8, false},   {"u16", 16, false},
+            {"u32", 32, false}, {"u64", 64, false},
+        };
+        for (const auto& sx : kSuffixes) {
+            std::string s = sx.s;
+            if (lex.size() > s.size() &&
+                lex.compare(lex.size() - s.size(), s.size(), s) == 0) {
+                width = sx.w;
+                isSigned = sx.sg;
+                lex = lex.substr(0, lex.size() - s.size());
+                break;
+            }
+        }
+        int base = 10;
+        if (lex.size() > 2 && lex[0] == '0' &&
+            (lex[1] == 'x' || lex[1] == 'X')) {
+            base = 16;
+            lex = lex.substr(2);
+        } else if (lex.size() > 2 && lex[0] == '0' &&
+                   (lex[1] == 'b' || lex[1] == 'B')) {
+            base = 2;
+            lex = lex.substr(2);
+        }
+        long long value = 0;
+        try {
+            value = std::stoll(lex, nullptr, base);
+        } catch (const std::out_of_range&) {
+            // Phase 66: a value past i64::MAX is still valid for u64 (the FNV
+            // offset basis `0xcbf29ce484222325`, etc.) — parse it as unsigned
+            // and keep the 64-bit pattern (codegen emits it as a u64 constant).
+            try {
+                value = static_cast<long long>(std::stoull(lex, nullptr, base));
+            } catch (const std::exception&) {
+                errorHere("integer literal out of range: " + tok.lexeme);
+                value = 0;
+            }
+        } catch (const std::exception&) {
+            errorHere("integer literal out of range: " + tok.lexeme);
+            value = 0;
+        }
+        if (outWidth) *outWidth = width;
+        if (outSigned) *outSigned = isSigned;
+        return value;
+    }
+
+    void fillIntLit(const Token& tok, ast::IntLitExpr& e) {
+        int width = 0;
+        bool isSigned = true;
+        e.value = parseIntLitLexeme(tok, &width, &isSigned);
+        e.suffixWidth = width;
+        e.suffixSigned = isSigned;
+    }
+
     // --- Top-level ---
 
     ast::ModDecl parseModDecl() {
@@ -1241,9 +1310,14 @@ private:
 
     // --- Expressions ---
 
+    // Precedence tiers (tighter = larger). Phase 66 inserts the bitwise tiers
+    // BETWEEN comparison and additive, matching Rust: `&&` < comparison <
+    // `|` < `^` < `&` < shift < `+ -` < `* / %`. Shift (`<< >>`) is a two-token
+    // operator handled by adjacency in parseExprPrec (kShiftPrec).
+    static constexpr int kShiftPrec = 6;
     static int binPrec(TokenKind k) {
         switch (k) {
-        case TokenKind::AmpAmp: // Phase 33: `&&` binds loosest (below comparisons)
+        case TokenKind::AmpAmp: // `&&` binds loosest (below comparisons)
             return 1;
         case TokenKind::EqEq:
         case TokenKind::NotEq:
@@ -1252,13 +1326,20 @@ private:
         case TokenKind::Gt:
         case TokenKind::Ge:
             return 2;
+        case TokenKind::Pipe: // Phase 66: infix bitwise-or
+            return 3;
+        case TokenKind::Caret: // Phase 66: bitwise-xor
+            return 4;
+        case TokenKind::Ampersand: // Phase 66: infix bitwise-and
+            return 5;
+        // kShiftPrec == 6 (handled by adjacency, not a single token)
         case TokenKind::Plus:
         case TokenKind::Minus:
-            return 3;
+            return 7;
         case TokenKind::Star:
         case TokenKind::Slash:
-        case TokenKind::Percent: // Phase 33: `%` at the multiplicative tier
-            return 4;
+        case TokenKind::Percent: // `%` at the multiplicative tier
+            return 8;
         default:
             return 0; // not a binop
         }
@@ -1278,6 +1359,9 @@ private:
         case TokenKind::Ge: return ast::BinOp::Ge;
         case TokenKind::EqEq: return ast::BinOp::Eq;
         case TokenKind::NotEq: return ast::BinOp::NotEq;
+        case TokenKind::Pipe: return ast::BinOp::BitOr;      // Phase 66
+        case TokenKind::Caret: return ast::BinOp::BitXor;    // Phase 66
+        case TokenKind::Ampersand: return ast::BinOp::BitAnd; // Phase 66
         default: return ast::BinOp::Add; // unreachable
         }
     }
@@ -1303,9 +1387,68 @@ private:
         return lhs;
     }
 
+    // Phase 65: `operand as Type` casts. `as` binds tighter than every binary
+    // operator (so it sits below the precedence loop) but looser than a prefix
+    // unary (so the operand is a full parseUnary): `-x as i32` is `(-x) as i32`
+    // and `a as i32 * 2` is `(a as i32) * 2`. Casts chain left-to-right
+    // (`x as i32 as i64`).
+    ast::ExprPtr parseCast() {
+        auto expr = parseUnary();
+        while (check(TokenKind::KwAs)) {
+            Token asTok = consume();
+            // The cast target is a bare numeric type NAME (`i8`..`u64`, `f32`,
+            // `f64`). We deliberately do NOT call parseTypeRef here: in
+            // expression position a trailing `<` / `<<` is a comparison / shift,
+            // not a generic-argument list, but parseTypeRef would greedily eat
+            // it as `Name<...>` (it assumes a type only ever appears after
+            // `:` / `->` / `(` / `,`). So `x as i32 << 2` must parse as
+            // `(x as i32) << 2`, not `x as (i32 << ...)`. Reading just the name
+            // leaves the operator for the precedence loop. (Casts are
+            // numeric-only — typecheck rejects a non-numeric target — so a bare
+            // scalar name covers every valid target.)
+            Token nameTok = expect(TokenKind::Identifier, "a type name after `as`");
+            ast::TypeRef ty;
+            ty.name = nameTok.lexeme;
+            ty.line = nameTok.line;
+            ty.column = nameTok.column;
+            auto ce = std::make_unique<ast::CastExpr>();
+            ce->line = asTok.line;
+            ce->column = asTok.column;
+            ce->operand = std::move(expr);
+            ce->targetType = std::move(ty);
+            expr = std::move(ce);
+        }
+        return expr;
+    }
+
     ast::ExprPtr parseExprPrec(int minPrec) {
-        auto lhs = parseUnary();
+        auto lhs = parseCast();
         while (true) {
+            // Phase 66: a shift operator is two column-adjacent `<`/`>` tokens.
+            // Detecting it by adjacency (not a dedicated lexer token) keeps a
+            // nested-generic close `Vec<Vec<T>>` — which is also two adjacent
+            // `>` but only ever parsed in TYPE context — unambiguous, since the
+            // expression parser never parses a type.
+            bool isShl = peek().kind == TokenKind::Lt &&
+                         peek(1).kind == TokenKind::Lt &&
+                         peek(1).column == peek().column + 1;
+            bool isShr = peek().kind == TokenKind::Gt &&
+                         peek(1).kind == TokenKind::Gt &&
+                         peek(1).column == peek().column + 1;
+            if (isShl || isShr) {
+                if (kShiftPrec < minPrec) break;
+                Token opTok = consume(); // first '<' / '>'
+                consume();               // second '<' / '>'
+                auto rhs = parseExprPrec(kShiftPrec + 1); // left-associative
+                auto bin = std::make_unique<ast::BinaryExpr>();
+                bin->line = opTok.line;
+                bin->column = opTok.column;
+                bin->op = isShl ? ast::BinOp::Shl : ast::BinOp::Shr;
+                bin->lhs = std::move(lhs);
+                bin->rhs = std::move(rhs);
+                lhs = std::move(bin);
+                continue;
+            }
             int prec = binPrec(peek().kind);
             if (prec == 0 || prec < minPrec) break;
             Token opTok = consume();
@@ -1334,7 +1477,7 @@ private:
         // multiplication, handled in the precedence parser — position
         // disambiguates, the standard prefix/infix split).
         if (check(TokenKind::Minus) || check(TokenKind::Bang) ||
-            check(TokenKind::Star)) {
+            check(TokenKind::Star) || check(TokenKind::Tilde)) {
             Token opTok = consume();
             auto operand = parseUnary();
             auto ue = std::make_unique<ast::UnaryExpr>();
@@ -1342,7 +1485,8 @@ private:
             ue->column = opTok.column;
             ue->op = opTok.kind == TokenKind::Minus  ? ast::UnaryOp::Neg
                      : opTok.kind == TokenKind::Bang ? ast::UnaryOp::Not
-                                                     : ast::UnaryOp::Deref;
+                     : opTok.kind == TokenKind::Tilde ? ast::UnaryOp::BitNot
+                                                      : ast::UnaryOp::Deref;
             ue->operand = std::move(operand);
             return ue;
         }
@@ -1560,12 +1704,7 @@ private:
             auto e = std::make_unique<ast::IntLitExpr>();
             e->line = tok.line;
             e->column = tok.column;
-            try {
-                e->value = std::stoll(tok.lexeme);
-            } catch (const std::exception&) {
-                errorHere("integer literal out of range: " + tok.lexeme);
-                e->value = 0;
-            }
+            fillIntLit(tok, *e);
             return e;
         }
 
@@ -1575,9 +1714,19 @@ private:
             auto e = std::make_unique<ast::FloatLitExpr>();
             e->line = tok.line;
             e->column = tok.column;
-            e->lexeme = tok.lexeme;
+            // Phase 67: strip a trailing `f32`/`f64` suffix (the lexeme may be
+            // `5f32` with no decimal point — still a float). std::stod parses
+            // the numeric prefix and ignores the suffix, but we record the
+            // width and keep a clean lexeme for the formatter.
+            std::string lex = tok.lexeme;
+            if (lex.size() > 3) {
+                std::string tail = lex.substr(lex.size() - 3);
+                if (tail == "f32") { e->suffixWidth = 32; lex.resize(lex.size() - 3); }
+                else if (tail == "f64") { e->suffixWidth = 64; lex.resize(lex.size() - 3); }
+            }
+            e->lexeme = lex;
             try {
-                e->value = std::stod(tok.lexeme);
+                e->value = std::stod(lex);
             } catch (const std::exception&) {
                 errorHere("float literal out of range: " + tok.lexeme);
                 e->value = 0.0;
@@ -1943,12 +2092,7 @@ private:
             auto p = std::make_unique<ast::LitIntPat>();
             p->line = tok.line;
             p->column = tok.column;
-            try {
-                p->value = std::stoll(tok.lexeme);
-            } catch (const std::exception&) {
-                errorHere("integer literal out of range: " + tok.lexeme);
-                p->value = 0;
-            }
+            p->value = parseIntLitLexeme(tok, nullptr, nullptr);
             return p;
         }
         if (t.kind == TokenKind::Underscore) {

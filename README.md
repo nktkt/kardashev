@@ -52,13 +52,21 @@ Effect sets are unioned across the call graph and checked at definition sites; n
 
 ## Status
 
-All ten roadmaps (Phases 0–62, **v1–v10**) have shipped and are merged to
-`main` — 6 unit suites plus the full smoke-test aggregate (71 smoke tests) pass
-**JIT and AOT** on a cleared clean build. v10 ("sized and sound at compile
-time") added const-generic type params, a dimension-checked linear-algebra
-capstone, and the effect-subset soundness floor; a pre-merge adversarial
-multi-agent review hardened **5 blockers + 5 majors** the green suite had
-missed (pinned by `tests/smoke_test_v10_review.sh`). Built locally with `bazel build //...
+All eleven roadmaps (Phases 0–68, **v1–v11**) have shipped and are merged to
+`main` — 6 unit suites plus the full smoke-test aggregate pass **JIT and AOT**
+on a cleared clean build. v11 ("real machine integers" — the **numeric tower**)
+made kardashev practical: sized signed/unsigned integers `i8`…`i64` / `u8`…`u64`
+and `f32`/`f64` over a NON-coercive lattice, the `as` cast operator, literal
+width suffixes + hex/binary radix, the bitwise operators `& | ^ << >> ~`,
+defined two's-complement wrapping overflow, and a checksum/binary-parser
+capstone (`examples/checksum` — FNV-1a, CRC-32, an endian byte parser). A
+pre-merge adversarial multi-agent review hardened a const-evaluation
+width/sign cluster (incl. an invalid-IR blocker) + two parser/lexer bugs the
+green suite had missed (pinned by `tests/smoke_test_v11_review.sh`). v10
+("sized and sound at compile time") added const-generic type params, a
+dimension-checked linear-algebra capstone, and the effect-subset soundness
+floor; its review hardened **5 blockers + 5 majors** (pinned by
+`tests/smoke_test_v10_review.sh`). Built locally with `bazel build //...
 && bazel test //...` or, when Bazel isn't available, the `Makefile.local` shim
 (LLVM + clang). The CI matrix runs both ubuntu-latest and macos-latest via Bazel
 on every push; every commit goes in green.
@@ -372,6 +380,19 @@ generic keys; 29 plugged the Drop leaks 27–28's new droppable values made load
 30's `Result<String, IoError>` drops cleanly on the error path *because* 29 closed that
 hole; 31 integrated 27–30 into the self-written capstones; 32 documented the result last.
 Each shipped green before the next, exactly as v1–v4 did.
+
+## Roadmap v11 — shipped
+
+> **Status: shipped.** "Real machine integers" — the **numeric tower** that turns kardashev from an i64-only toy into something you can write a hash or a binary format in. All of v11 (Phases 63–68) is implemented and fully green — 6 unit suites + the smoke-test aggregate, JIT **and** AOT, on a cleared clean build. Each phase shipped green before the next.
+>
+> - **Sized integers** (63): signed `i8`/`i16`/`i32`/`i64`, lowering to the matching LLVM width over a NON-coercive lattice — no implicit widening (`i32 + i64` is a type error), only an explicit `as` bridges.
+> - **Literal suffixes + radix** (64): `5i32`, `0xFF`, `0b1010`, `0xFFi32`; hex/binary work in `match` patterns; `u64` literals past `i64::MAX`.
+> - **The `as` cast operator** (65): the conversion matrix — `trunc`/`sext`/`zext`, `sitofp`/`fptosi`, `fpext`/`fptrunc` — width- and sign-correct, const-foldable.
+> - **Unsigned integers + bitwise ops** (66): `u8`…`u64` with sign-correct `udiv`/`urem`/`lshr`/`icmp-u`, and `& | ^ << >> ~` at any width.
+> - **Defined overflow + f32** (67): two's-complement wrapping at every width; `f32` single-precision over the same non-coercive lattice.
+> - **Capstone** (68) `examples/checksum`: **FNV-1a**, **CRC-32**, and an endian **binary parser** — each checked against its known answer, none expressible in an i64-only language.
+>
+> **A pre-merge adversarial multi-agent review found + fixed a const-evaluation width/sign cluster (incl. an invalid-IR BLOCKER — a narrow const flowed into a narrow slot as an i64 immediate) plus a `expr as Type <<` cast-parse bug and a tuple-index suffix lex bug** — each with a verified repro, all pinned by `tests/smoke_test_v11_review.sh`. **As with v6–v10: a green smoke suite ≠ sound; review before merge.**
 
 ## Roadmap v10 — shipped
 

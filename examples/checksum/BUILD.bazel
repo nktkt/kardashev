@@ -1,0 +1,22 @@
+load("//bazel/rules_kardashev:defs.bzl", "kardashev_binary")
+
+# Make the capstone source readable by //tests:smoke_test_phase68, which builds
+# the real file (rather than an inlined copy) so the test doubles as a build
+# check of the shipped example.
+exports_files(
+    ["main.kd"],
+    visibility = ["//visibility:public"],
+)
+
+# Phase 68 (v11) CAPSTONE — "the numeric tower, applied." Three textbook
+# algorithms in kardashev, each checked against its known answer: FNV-1a (u64,
+# a literal past i64::MAX, wrapping multiply), CRC-32 (u32, logical >>, a
+# wrapping-subtraction mask, the bitwise ops), and a binary parser (u8 -> u16/
+# u32 via shifts + casts, little- and big-endian). Generic over input length
+# with a const-generic `[u8; N]`. None of it is expressible in an i64-only
+# language. AOT-compiled via //compiler:kardc and exercised by
+# //tests:smoke_test_phase68.
+kardashev_binary(
+    name = "checksum",
+    src = "main.kd",
+)

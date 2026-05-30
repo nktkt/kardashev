@@ -36,6 +36,7 @@ TokenKind keywordOrIdent(std::string_view s) {
     if (s == "false") return TokenKind::KwFalse;
     if (s == "extern") return TokenKind::KwExtern;
     if (s == "const") return TokenKind::KwConst; // Phase 25
+    if (s == "as") return TokenKind::KwAs;        // Phase 65 numeric cast
     // A bare `_` is the wildcard pattern; `_foo` stays an Identifier.
     if (s == "_") return TokenKind::Underscore;
     return TokenKind::Identifier;
@@ -134,6 +135,46 @@ std::vector<Token> lex(std::string_view source) {
             // still lexes as a float.
             bool afterDot =
                 !tokens.empty() && tokens.back().kind == TokenKind::Dot;
+            // Phase 64 (v11): consume an optional integer SUFFIX `i8/i16/i32/
+            // i64/u8/u16/u32/u64` into the token (the parser splits it back
+            // out). Shared by the decimal / hex / binary paths below.
+            auto consumeIntSuffix = [&]() {
+                if (i < source.size() &&
+                    (source[i] == 'i' || source[i] == 'u')) {
+                    std::size_t j = i + 1, digits = 0;
+                    while (j < source.size() &&
+                           std::isdigit(static_cast<unsigned char>(source[j]))) {
+                        ++j;
+                        ++digits;
+                    }
+                    if (digits > 0) { // e.g. i32, u8
+                        col += static_cast<int>(j - i);
+                        i = j;
+                    }
+                }
+            };
+            // Phase 64: hex `0x..` / binary `0b..` integer literals (never
+            // floats; not in tuple-index position).
+            if (!afterDot && source[i] == '0' && i + 1 < source.size() &&
+                (source[i + 1] == 'x' || source[i + 1] == 'X' ||
+                 source[i + 1] == 'b' || source[i + 1] == 'B')) {
+                bool hex = (source[i + 1] == 'x' || source[i + 1] == 'X');
+                i += 2;
+                col += 2;
+                auto isDig = [&](char ch) {
+                    return hex ? std::isxdigit(static_cast<unsigned char>(ch))
+                               : (ch == '0' || ch == '1');
+                };
+                while (i < source.size() && isDig(source[i])) {
+                    ++i;
+                    ++col;
+                }
+                consumeIntSuffix();
+                tokens.push_back({TokenKind::Integer,
+                                  std::string(source.substr(start, i - start)),
+                                  line, startCol});
+                continue;
+            }
             while (i < source.size() &&
                    std::isdigit(static_cast<unsigned char>(source[i]))) {
                 ++i;
@@ -171,6 +212,29 @@ std::vector<Token> lex(std::string_view source) {
                     }
                 }
             }
+            // Phase 67: a trailing `f32`/`f64` suffix. It makes ANY numeric
+            // literal a float — even an otherwise-integer one (`5f32` == 5.0f32),
+            // mirroring Rust — so it is tried before the integer suffix.
+            auto consumeFloatSuffix = [&]() -> bool {
+                if (i + 2 < source.size() && source[i] == 'f' &&
+                    ((source[i + 1] == '3' && source[i + 2] == '2') ||
+                     (source[i + 1] == '6' && source[i + 2] == '4'))) {
+                    i += 3;
+                    col += 3;
+                    return true;
+                }
+                return false;
+            };
+            // Phase 64/67: a trailing width suffix. `i`/`u` keeps an integer an
+            // integer; `f32`/`f64` makes it a float. NOT after a `.`: a tuple
+            // index (`t.0`, `t.0.1`) is a plain integer and must never absorb a
+            // following `i`/`u`/`f` (which begins the next field access or an
+            // invalid suffix) — same `afterDot` guard the radix/float scanning
+            // above uses.
+            if (!afterDot && consumeFloatSuffix())
+                isFloat = true;
+            else if (!afterDot && !isFloat)
+                consumeIntSuffix();
             tokens.push_back({isFloat ? TokenKind::Float : TokenKind::Integer,
                               std::string(source.substr(start, i - start)),
                               line, startCol});
@@ -271,6 +335,8 @@ std::vector<Token> lex(std::string_view source) {
         case '&': push1(TokenKind::Ampersand, startCol); continue;
         case '!': push1(TokenKind::Bang, startCol); continue;
         case '|': push1(TokenKind::Pipe, startCol); continue;
+        case '^': push1(TokenKind::Caret, startCol); continue; // Phase 66 bit-xor
+        case '~': push1(TokenKind::Tilde, startCol); continue; // Phase 66 bit-not
         default: break;
         }
 
@@ -311,6 +377,7 @@ std::string_view tokenKindName(TokenKind kind) {
     case TokenKind::KwFalse: return "KwFalse";
     case TokenKind::KwExtern: return "KwExtern";
     case TokenKind::KwConst: return "KwConst";
+    case TokenKind::KwAs: return "KwAs";
     case TokenKind::DoubleColon: return "DoubleColon";
     case TokenKind::Plus: return "Plus";
     case TokenKind::Minus: return "Minus";
@@ -345,6 +412,8 @@ std::string_view tokenKindName(TokenKind kind) {
     case TokenKind::Bang: return "Bang";
     case TokenKind::Pipe: return "Pipe";
     case TokenKind::PipePipe: return "PipePipe";
+    case TokenKind::Caret: return "Caret";
+    case TokenKind::Tilde: return "Tilde";
     case TokenKind::Underscore: return "Underscore";
     case TokenKind::EndOfInput: return "EndOfInput";
     case TokenKind::Invalid: return "Invalid";
