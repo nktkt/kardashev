@@ -18,11 +18,13 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
-## [Unreleased] — Roadmap v12 "real stdlib" (Phases 69–74, in progress)
+## [0.12.0] — Roadmap v12 "real stdlib" (Phases 69–74)
 
 Theme: turn a language you can *compute* in into one you can *get data in and
 out of* — parsing, richer collections, string and numeric methods. The second
-step toward production use.
+step toward production use. A pre-merge adversarial multi-agent review fixed a
+`parse_int` integer-overflow and a discarded-owned-temporary leak the green
+suite had missed (see Fixed).
 
 ### Added
 - **String → number parsing** (Phase 69): `parse_int(&String) -> Option<i64>`
@@ -67,6 +69,21 @@ step toward production use.
   `parse_int` (with an `Option`-driven skip of a malformed row), `str_split`,
   HashMap aggregation, `i64_max`, `sort`, and `int_to_string` + `str_concat`
   formatting.
+
+### Fixed
+- A pre-merge adversarial multi-agent review found + fixed two MAJORs the green
+  smoke suite had missed — both pinned by `tests/smoke_test_v12_review.sh`:
+  - `parse_int` of a value PAST the `i64` range returned a silently-clamped
+    `Some(i64::MAX/MIN)` instead of `None` (C `strtoll`'s `ERANGE` was
+    unchecked). It now clears `errno` and rejects on `ERANGE`; `i64::MAX` /
+    `i64::MIN` themselves still parse. (`parse_f64` keeps `strtod`'s
+    overflow-to-`inf` — a valid `f64` parse, like Rust.)
+  - a DISCARDED owned temporary leaked: a value moved out by
+    `vec_remove(&mut v, 0);` (or any call result like `int_to_string(n);`) used
+    as an expression-STATEMENT was never dropped, orphaning its heap. The
+    codegen now drops a discarded droppable call-result via an entry-block temp
+    — exactly once (the drop / dropleaks / soundness suites confirm no
+    double-free).
 
 ## [0.11.0] — Roadmap v11 "real machine integers" (Phases 63–68)
 

@@ -52,17 +52,25 @@ Effect sets are unioned across the call graph and checked at definition sites; n
 
 ## Status
 
-All eleven roadmaps (Phases 0–68, **v1–v11**) have shipped and are merged to
+All twelve roadmaps (Phases 0–74, **v1–v12**) have shipped and are merged to
 `main` — 6 unit suites plus the full smoke-test aggregate pass **JIT and AOT**
-on a cleared clean build. v11 ("real machine integers" — the **numeric tower**)
-made kardashev practical: sized signed/unsigned integers `i8`…`i64` / `u8`…`u64`
-and `f32`/`f64` over a NON-coercive lattice, the `as` cast operator, literal
-width suffixes + hex/binary radix, the bitwise operators `& | ^ << >> ~`,
-defined two's-complement wrapping overflow, and a checksum/binary-parser
-capstone (`examples/checksum` — FNV-1a, CRC-32, an endian byte parser). A
-pre-merge adversarial multi-agent review hardened a const-evaluation
-width/sign cluster (incl. an invalid-IR blocker) + two parser/lexer bugs the
-green suite had missed (pinned by `tests/smoke_test_v11_review.sh`). v10
+on a cleared clean build. v12 ("real stdlib") made kardashev able to *get data
+in and out*: string→number parsing (`parse_int` / `parse_f64` → `Option`), Vec
+mutation + query (`vec_pop` / `vec_remove` / `vec_insert` / `vec_reverse` /
+`vec_contains`), HashMap/HashSet enumeration + membership, string methods
+(`str_contains` / `str_index_of` / `str_to_upper` / `str_concat` / …), and
+integer + f64 math helpers — capped by a CSV-statistics capstone
+(`examples/csvstats`). A pre-merge adversarial multi-agent review fixed a
+`parse_int` integer-overflow (silently clamped instead of `None`) and a
+discarded-owned-temporary leak (pinned by `tests/smoke_test_v12_review.sh`).
+v11 ("real machine integers" — the **numeric tower**) made kardashev practical:
+sized signed/unsigned integers `i8`…`i64` / `u8`…`u64` and `f32`/`f64` over a
+NON-coercive lattice, the `as` cast operator, literal width suffixes +
+hex/binary radix, the bitwise operators `& | ^ << >> ~`, defined two's-
+complement wrapping overflow, and a checksum/binary-parser capstone
+(`examples/checksum` — FNV-1a, CRC-32, an endian byte parser); its review
+hardened a const-evaluation width/sign cluster (incl. an invalid-IR blocker) +
+two parser/lexer bugs (pinned by `tests/smoke_test_v11_review.sh`). v10
 ("sized and sound at compile time") added const-generic type params, a
 dimension-checked linear-algebra capstone, and the effect-subset soundness
 floor; its review hardened **5 blockers + 5 majors** (pinned by
@@ -380,6 +388,19 @@ generic keys; 29 plugged the Drop leaks 27–28's new droppable values made load
 30's `Result<String, IoError>` drops cleanly on the error path *because* 29 closed that
 hole; 31 integrated 27–30 into the self-written capstones; 32 documented the result last.
 Each shipped green before the next, exactly as v1–v4 did.
+
+## Roadmap v12 — shipped
+
+> **Status: shipped.** "Real stdlib" — turn a language you can *compute* in into one you can *get data in and out of*. All of v12 (Phases 69–74) is implemented and fully green — 6 unit suites + the smoke-test aggregate, JIT **and** AOT, on a cleared clean build.
+>
+> - **String → number parsing** (69): `parse_int` / `parse_f64` returning `Option` (all-or-nothing, ERANGE-checked), `int_to_hex`. The #1 gap — reading data — closed.
+> - **Vec mutation + query** (70): `vec_pop` / `vec_remove` (MOVE the element out, sound for non-Copy) / `vec_insert` / `vec_reverse` / `vec_contains` / `vec_index_of`.
+> - **HashMap/HashSet enumeration** (71): `hashmap_contains` / `hashmap_values` / `hashset_items`.
+> - **String methods** (72): `str_starts_with` / `str_ends_with` / `str_contains` / `str_index_of` / `str_to_upper` / `str_to_lower` / `str_concat` / `str_repeat`.
+> - **Numeric + math** (73): `i64_abs` / `min` / `max` / `pow`; `f64_sqrt` / `floor` / `ceil` / `abs` (LLVM intrinsics, `-lm`); more `Option`/`Result` inspectors.
+> - **Capstone** (74) `examples/csvstats`: a CSV statistics aggregator that READS data — grouping `category,value` rows into per-category count + sum + global max, sorted — exercising the whole v12 line at once.
+>
+> **A pre-merge adversarial multi-agent review found + fixed two MAJORs the green suite missed** (pinned by `tests/smoke_test_v12_review.sh`): a `parse_int` integer overflow (a value past `i64` range returned a silently-clamped `Some` instead of `None`), and a discarded-owned-temporary leak (`vec_remove(&mut v, 0);` as a statement never dropped its moved-out value). **As with v6–v11: a green smoke suite ≠ sound; review before merge.**
 
 ## Roadmap v11 — shipped
 
