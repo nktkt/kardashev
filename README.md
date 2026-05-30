@@ -409,6 +409,28 @@ generic keys; 29 plugged the Drop leaks 27–28's new droppable values made load
 hole; 31 integrated 27–30 into the self-written capstones; 32 documented the result last.
 Each shipped green before the next, exactly as v1–v4 did.
 
+## Roadmap v16 — in progress
+
+> **Status: in progress** on `feat/roadmap-v16`. "Self-hosting, continued" — grow
+> the self-hosted front from signatures (v15) toward a full compiler: expressions,
+> statements, a fuller AST, a real type checker, and eventually codegen. Each
+> phase a real, tested kardashev program in `examples/selfhost/`.
+>
+> - **Phase 94 — an expression parser + evaluator (done).** `examples/selfhost/expr.kd`
+>   is a recursive-descent parser for the body grammar: it builds an `enum Expr`
+>   AST (`Num` / `Var` / `Add` / `Mul`, recursive via `Box`) for an arithmetic
+>   expression with VARIABLE REFERENCES (the step beyond `examples/calc`'s
+>   variable-free arithmetic), then EVALUATES it against a `HashMap<String, i64>`
+>   environment `{ a: 3, b: 4 }`. Proves `*` binds tighter than `+`
+>   (`a + b * 2` = 11) and that parentheses override it (`(a + b) * 2` = 14),
+>   JIT + AOT. (`eval` walks the Box-recursive tree via the `&(**child)` borrow;
+>   the cursor threads as a `&mut Pos` cell since kardashev has no `&mut i64`
+>   deref-assign — a candidate ergonomics improvement.)
+>
+> Planned: parse statements (`let`, `return`) + a function body of statements →
+> `Fn { sig, body }`; a real type checker over the body; eventually emit code —
+> closing language gaps as they surface.
+
 ## Roadmap v15 — shipped
 
 > **Status: shipped.** "Self-hosting" — the north-star arc toward a bootstrap.
