@@ -1,0 +1,14 @@
+load("//bazel/rules_kardashev:defs.bzl", "kardashev_binary")
+
+# Readable by //tests:smoke_test_phase88 (builds the real lexer).
+exports_files(
+    ["lexer.kd"],
+    visibility = ["//visibility:public"],
+)
+
+# Roadmap v15 (self-hosting) Phase 88: a lexer for kardashev, written IN
+# kardashev — the foundation proof for a future bootstrap.
+kardashev_binary(
+    name = "lexer",
+    src = "lexer.kd",
+)

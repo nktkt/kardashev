@@ -405,6 +405,33 @@ generic keys; 29 plugged the Drop leaks 27–28's new droppable values made load
 hole; 31 integrated 27–30 into the self-written capstones; 32 documented the result last.
 Each shipped green before the next, exactly as v1–v4 did.
 
+## Roadmap v15 — in progress
+
+> **Status: in progress** on `feat/roadmap-v15`. "Self-hosting" — the north-star
+> arc: grow kardashev until a kardashev compiler can be written *in* kardashev,
+> toward a bootstrap. The language already has the gating primitives — file I/O
+> (`fs_read_to_string` → `Result<String, IoError>`, `fs_write`), byte-level
+> string access (`str_char_at` / `str_push_byte` / `str_substring`), recursive
+> data (`enum` + `Box`), and symbol tables (`HashMap`) — so the front of the
+> pipeline is expressible today. This is a multi-roadmap effort, built the same
+> way: each phase a real, tested kardashev program, validated against the C++
+> reference.
+>
+> - **Phase 88 — the lexer foundation proof (done).** `examples/selfhost/lexer.kd`
+>   is a lexer *written in kardashev*: it scans a kardashev snippet
+>   (`fn add(a: i64, b: i64) -> i64 { a + b + 42 }`) byte-by-byte and groups the
+>   bytes into real tokens with correct boundaries — identifiers (`is_alpha` then
+>   `is_alnum*`), integer literals, the multi-char `->`, and single-char
+>   punctuation, whitespace skipped — reporting 9 idents / 1 number / 1 arrow /
+>   9 punct and a position-weighted witness (9010109), checked JIT + AOT. Proves
+>   the compiler front is expressible in the language itself.
+>
+> Planned: a token-stream lexer (`Vec<Token>` with kind + text + span); a
+> recursive-descent parser for a kardashev subset → an `enum` AST; an AST printer
+> + a scope/type checker for the subset; a capstone that self-lexes/parses a real
+> kardashev source file — closing language gaps (richer errors, string ops) as
+> self-hosting surfaces them.
+
 ## Roadmap v14 — shipped
 
 > **Status: shipped.** "Hardening" — make the toolchain trustworthy across

@@ -787,6 +787,17 @@ sh_test(
     ],
 )
 
+# v15 Phase 88 (self-hosting): a lexer for kardashev written IN kardashev — the
+# foundation proof that the compiler front can be expressed in the language.
+sh_test(
+    name = "smoke_test_phase88",
+    srcs = ["smoke_test_phase88.sh"],
+    data = [
+        "//compiler:kardc",
+        "//examples/selfhost:lexer.kd",
+    ],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the
