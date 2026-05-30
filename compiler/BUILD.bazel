@@ -8,6 +8,17 @@ cc_library(
     deps = [":types"],
 )
 
+# Header-only: the single-source-of-truth toolchain version (kardc --version).
+# Declared as its own lib so the Bazel sandbox can find `kardashev/version.hpp`
+# (the Makefile.local shim sees it via -Icompiler/include; Bazel needs it as an
+# explicit hdrs dep, or main.cpp fails to compile under //compiler:kardc).
+cc_library(
+    name = "version",
+    hdrs = ["include/kardashev/version.hpp"],
+    strip_include_prefix = "include",
+    visibility = ["//visibility:public"],
+)
+
 cc_library(
     name = "lexer",
     srcs = ["src/lexer.cpp"],
@@ -109,6 +120,7 @@ cc_binary(
         ":codegen",
         ":parser",
         ":typecheck",
+        ":version",
         "@llvm//:llvm",
     ],
 )

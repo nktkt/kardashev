@@ -24,7 +24,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git clone --depth 1 -b "$GITHUB_REF_NAME" \
+          # For a `pull_request` event, $GITHUB_REF_NAME is the synthetic
+          # `<PR#>/merge` ref, which is not a cloneable branch — clone the PR's
+          # HEAD branch instead. For a `push` event $GITHUB_HEAD_REF is empty,
+          # so we fall back to $GITHUB_REF_NAME (the pushed branch, e.g. main).
+          REF="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          echo "Cloning branch: $REF"
+          git clone --depth 1 -b "$REF" \
             "https://github.com/$GITHUB_REPOSITORY.git" .
           echo "--- workspace contents ---"
           ls -la
