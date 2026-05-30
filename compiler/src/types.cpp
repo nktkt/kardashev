@@ -12,7 +12,25 @@ int gNextVarId = 0;
 TypePtr makeInt() {
     auto t = std::make_shared<Type>();
     t->kind = TypeKind::Int;
+    return t; // default i64-signed (intWidth=64, intSigned=true)
+}
+
+TypePtr makeIntW(int width, bool isSigned) {
+    auto t = std::make_shared<Type>();
+    t->kind = TypeKind::Int;
+    t->intWidth = width;
+    t->intSigned = isSigned;
     return t;
+}
+
+TypePtr makeIntLitVar() {
+    TypePtr v = makeFreshVar(); // a Var, so it links via union-find
+    v->intLitVar = true;
+    return v;
+}
+
+std::string intTypeName(int width, bool isSigned) {
+    return std::string(isSigned ? "i" : "u") + std::to_string(width);
 }
 
 TypePtr makeFloat() {
@@ -624,6 +642,14 @@ bool unify(const TypePtr& a, const TypePtr& b) {
     }
     if (ra->kind != rb->kind) return false;
 
+    // v11: two CONCRETE machine integers unify iff same width AND signedness
+    // (no implicit widening; `as` bridges). Const-value args (Phase 58) keep
+    // their own guard below.
+    if (ra->kind == TypeKind::Int && !ra->isConstValue && !rb->isConstValue) {
+        if (ra->intWidth != rb->intWidth || ra->intSigned != rb->intSigned)
+            return false;
+    }
+
     if (ra->kind == TypeKind::Function) {
         if (ra->args.size() != rb->args.size()) return false;
         for (std::size_t i = 0; i < ra->args.size(); ++i) {
@@ -863,10 +889,13 @@ std::string typeToString(const TypePtr& t) {
         if (r->isConstValue)
             return r->constValueName.empty() ? std::to_string(r->constValue)
                                              : r->constValueName;
-        return "i64";
+        return intTypeName(r->intWidth, r->intSigned); // v11: i8..u64
     case TypeKind::Bool: return "bool";
     case TypeKind::Unit: return "()";
-    case TypeKind::Var: return "'" + std::to_string(r->varId);
+    case TypeKind::Var:
+        // v11: an unconstrained integer-literal var defaults to i64.
+        if (r->intLitVar) return "i64";
+        return "'" + std::to_string(r->varId);
     case TypeKind::Function: {
         std::string s = "fn(";
         for (std::size_t i = 0; i < r->args.size(); ++i) {

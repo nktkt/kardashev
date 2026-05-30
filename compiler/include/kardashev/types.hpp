@@ -70,6 +70,19 @@ struct EnumVariantType {
 struct Type {
     TypeKind kind = TypeKind::Unit;
 
+    // Int (v11 — the numeric tower): a machine integer's BIT WIDTH (8/16/32/64)
+    // and SIGNEDNESS. The default `makeInt()` is i64-signed, so every pre-v11
+    // site is byte-for-byte the same i64 it always was; other widths/signs are
+    // DISTINCT types — there is NO implicit widening, only an explicit `as`
+    // cast bridges them (Phase 65). An unsuffixed integer literal is i64 by
+    // default and NARROWS to a concrete width at a coercion site
+    // (`narrowIntLiteral`), so the type system carries zero literal churn.
+    int intWidth = 64;
+    bool intSigned = true;
+    // Reserved for a future inference-var literal scheme (set only on a Var);
+    // unused in Phase 63 — the narrowing approach above is used instead.
+    bool intLitVar = false;
+
     // Function:
     std::vector<TypePtr> args;
     TypePtr ret;
@@ -155,6 +168,13 @@ struct Type {
 };
 
 TypePtr makeInt();
+// v11: a sized/signed machine integer. makeInt() == makeIntW(64, true) == i64.
+TypePtr makeIntW(int width, bool isSigned);
+// v11: a fresh integer-LITERAL inference var (unifies with any concrete int,
+// defaults to i64). The type of an unsuffixed integer literal.
+TypePtr makeIntLitVar();
+// v11: the canonical name (`i32`, `u8`, ...) of an Int type, for diagnostics.
+std::string intTypeName(int width, bool isSigned);
 TypePtr makeFloat();
 TypePtr makeBool();
 TypePtr makeUnit();

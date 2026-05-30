@@ -18,6 +18,22 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [Unreleased] — Roadmap v11 "real machine integers" (Phases 63–68, in progress)
+
+Theme: the **numeric tower** — make kardashev practical by giving it real
+machine integers (sized + unsigned + f32, `as` casts, bit ops, defined overflow)
+instead of i64-only. The first step toward production use.
+
+### Added
+- Sized SIGNED machine integers `i8` / `i16` / `i32` (Phase 63) — `i64` stays
+  the default. The `Int` type carries a bit width + signedness; codegen lowers
+  to the matching LLVM width (`i32 @add(i32, i32)`, not i64). The lattice is
+  NON-coercive: no implicit widening (`i32` + `i64` is a type error — `as`
+  bridges, Phase 65), and an out-of-range literal for a narrow width is a
+  compile error. An unsuffixed literal is i64 by default and narrows to a
+  concrete width in context (`let x: i32 = 5`); the type system carries zero
+  literal churn (all v10 i64 programs are byte-for-byte unchanged).
+
 ## [0.10.0] — Roadmap v10 "sized and sound at compile time" (Phases 57–62)
 
 Theme: **sized and sound at compile time** — const-generic type params + the

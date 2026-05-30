@@ -3205,6 +3205,21 @@ private:
                 error("i64 takes no type arguments", tr.line, tr.column);
             return makeInt();
         }
+        // v11 Phase 63: the SIZED SIGNED machine integers i8/i16/i32 (i64 is
+        // the default above). Unsigned u8..u64 land in Phase 66 with their own
+        // division/shift/comparison semantics.
+        {
+            static const std::pair<const char*, int> kInts[] = {
+                {"i8", 8}, {"i16", 16}, {"i32", 32}};
+            for (const auto& [nm, w] : kInts) {
+                if (tr.name == nm) {
+                    if (!tr.typeArgs.empty())
+                        error(std::string(nm) + " takes no type arguments",
+                              tr.line, tr.column);
+                    return makeIntW(w, /*isSigned=*/true);
+                }
+            }
+        }
         if (tr.name == "f64") {
             if (!tr.typeArgs.empty())
                 error("f64 takes no type arguments", tr.line, tr.column);
@@ -3789,6 +3804,10 @@ private:
 
     TypePtr computeExprType(const ast::Expr& e) {
         if (dynamic_cast<const ast::IntLitExpr*>(&e)) {
+            // v11: an unsuffixed integer literal is i64 by default; a coercion
+            // site (let annotation / fn arg / binary operand / return) may
+            // NARROW it to a concrete int width via narrowIntLiteral(), which
+            // re-records its exprType — see coerceOrUnify.
             return makeInt();
         }
         if (dynamic_cast<const ast::FloatLitExpr*>(&e)) {
@@ -4006,10 +4025,39 @@ private:
     // (`&Concrete` / `Box<Concrete>`) whose pointee impls the trait, record a
     // DynCoercion on `srcExpr` and return true (no unification needed — the
     // shapes deliberately differ). Otherwise fall back to plain `unify`.
+    // v11: narrow an unsuffixed integer LITERAL `srcExpr` to a concrete int
+    // `target` (a literal is i64 by default; in an int context it adopts the
+    // target's width). Records the literal's exprType so codegen emits the
+    // right width; range-checks narrow widths. No-op (false) for non-literals.
+    bool narrowIntLiteral(const ast::Expr& srcExpr, const TypePtr& target) {
+        auto* lit = dynamic_cast<const ast::IntLitExpr*>(&srcExpr);
+        if (!lit) return false;
+        TypePtr t = resolve(target);
+        if (t->kind != TypeKind::Int || t->isConstValue) return false;
+        if (t->intWidth < 64) {
+            long long lo = t->intSigned ? -(1LL << (t->intWidth - 1)) : 0;
+            long long hi = t->intSigned ? (1LL << (t->intWidth - 1)) - 1
+                                        : (1LL << t->intWidth) - 1;
+            if (lit->value < lo || lit->value > hi)
+                error("integer literal " + std::to_string(lit->value) +
+                          " out of range for " + typeToString(t),
+                      srcExpr.line, srcExpr.column);
+        }
+        exprTypes_[&srcExpr] = t;
+        return true;
+    }
+
     bool coerceOrUnify(const ast::Expr& srcExpr, const TypePtr& actual,
                        const TypePtr& expected) {
         TypePtr e = resolve(expected);
         TypePtr a = resolve(actual);
+        // v11: an integer literal narrows to the expected concrete int width
+        // (`let x: i32 = 5`, `f(5)` with an i32 param). Only when `actual` is
+        // a plain i64 (the literal's default) — never override a real type.
+        if (e->kind == TypeKind::Int && !e->isConstValue &&
+            a->kind == TypeKind::Int && !a->isConstValue && a->intWidth == 64 &&
+            a->intSigned && narrowIntLiteral(srcExpr, e))
+            return true;
         // Unwrap one pointer layer on each side, tracking whether it's a Box.
         bool expIsBox = e->kind == TypeKind::Box;
         bool expIsRef = e->kind == TypeKind::Ref;
@@ -4841,17 +4889,45 @@ private:
             }
             return isComparison ? makeBool() : makeFloat();
         }
-        if (!unify(lhs, makeInt())) {
-            error(std::string(what) + " op expects i64 on lhs, got " +
+        // v11: integer arithmetic/comparison over the sized-int tower. Both
+        // operands must be the SAME int type; an i64 LITERAL operand narrows to
+        // the other side's concrete width (`x + 1` with `x: i32` -> 1 is i32).
+        // Two default operands stay i64. No mixed-width arithmetic.
+        {
+            TypePtr rl = resolve(lhs), rr = resolve(rhs);
+            bool lLit = dynamic_cast<const ast::IntLitExpr*>(bin.lhs.get());
+            bool rLit = dynamic_cast<const ast::IntLitExpr*>(bin.rhs.get());
+            auto concreteNonDefault = [](const TypePtr& t) {
+                return t->kind == TypeKind::Int && !t->isConstValue &&
+                       !(t->intWidth == 64 && t->intSigned);
+            };
+            if (concreteNonDefault(rl) && rLit && narrowIntLiteral(*bin.rhs, rl))
+                rhs = rl;
+            else if (concreteNonDefault(rr) && lLit &&
+                     narrowIntLiteral(*bin.lhs, rr))
+                lhs = rr;
+        }
+        if (!unify(lhs, rhs)) {
+            error(std::string(what) +
+                      " op requires both operands to be the same integer "
+                      "type, got " + typeToString(lhs) + " and " +
+                      typeToString(rhs),
+                  bin.line, bin.column);
+            return isComparison ? makeBool() : makeInt();
+        }
+        TypePtr rl = resolve(lhs);
+        if (rl->kind == TypeKind::Var) {
+            // Both sides were vars (two literals, or generic params): pin i64.
+            unify(lhs, makeInt());
+            rl = resolve(lhs);
+        }
+        if (rl->kind != TypeKind::Int || rl->isConstValue) {
+            error(std::string(what) + " op expects integer operands, got " +
                       typeToString(lhs),
                   bin.lhs->line, bin.lhs->column);
+            return isComparison ? makeBool() : makeInt();
         }
-        if (!unify(rhs, makeInt())) {
-            error(std::string(what) + " op expects i64 on rhs, got " +
-                      typeToString(rhs),
-                  bin.rhs->line, bin.rhs->column);
-        }
-        return isComparison ? makeBool() : makeInt();
+        return isComparison ? makeBool() : rl;
     }
 
     // Phase 10a: build the first-class-value type of a declared fn — its

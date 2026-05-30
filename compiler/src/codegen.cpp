@@ -5579,8 +5579,12 @@ private:
         // structFields inside a `make_pair<X,Y>` body) get pinned to
         // concrete types before LLVM-mapping.
         TypePtr r = resolveInInstance(t);
+        // v11: an unconstrained integer-literal var defaults to i64.
+        if (r->kind == TypeKind::Var && r->intLitVar)
+            return llvm::Type::getInt64Ty(*ctx_);
         switch (r->kind) {
-            case TypeKind::Int:  return llvm::Type::getInt64Ty(*ctx_);
+            case TypeKind::Int: // v11: sized machine int (default i64)
+                return llvm::Type::getIntNTy(*ctx_, r->intWidth);
             case TypeKind::Float: return llvm::Type::getDoubleTy(*ctx_);
             case TypeKind::Bool: return llvm::Type::getInt1Ty(*ctx_);
             case TypeKind::Unit: return llvm::Type::getVoidTy(*ctx_);
@@ -5827,6 +5831,9 @@ private:
             return it->second;
         }
         if (tr.name == "i64") return makeInt();
+        if (tr.name == "i8") return makeIntW(8, true);   // v11
+        if (tr.name == "i16") return makeIntW(16, true); // v11
+        if (tr.name == "i32") return makeIntW(32, true); // v11
         if (tr.name == "f64") return makeFloat(); // Phase 39/44
         if (tr.name == "bool") return makeBool();
         // Phase 16: a fn with no `-> T` annotation returns unit (parser
@@ -6057,14 +6064,18 @@ private:
             // `Mat<3>` (`Mat__c3`) and `Mat<5>` (`Mat__c5`) become distinct
             // monomorphized instances / LLVM types. Lexer literals are
             // non-negative, so `c<value>` is always a valid symbol fragment.
+            // v11: an ordinary sized int mangles by name (i8..u64).
             return r->isConstValue ? ("c" + std::to_string(r->constValue))
-                                   : "i64";
+                                   : intTypeName(r->intWidth, r->intSigned);
         case TypeKind::Float:  return "f64";
         case TypeKind::Bool:   return "bool";
         case TypeKind::Unit:   return "unit";
         case TypeKind::Struct: return r->structName + mangleTypeArgs(r->typeArgs);
         case TypeKind::Enum:   return r->enumName + mangleTypeArgs(r->typeArgs);
-        case TypeKind::Var:    return "_var" + std::to_string(r->varId);
+        case TypeKind::Var:
+            // v11: an unconstrained integer-literal var defaults to i64.
+            if (r->intLitVar) return "i64";
+            return "_var" + std::to_string(r->varId);
         case TypeKind::Function: return "_fn";
         case TypeKind::Ref:    return std::string(r->refIsMut ? "refmut_"
                                                               : "ref_") +
@@ -8112,9 +8123,16 @@ private:
 
     llvm::Value* emitExprRaw(const ast::Expr& e) {
         if (auto* lit = dynamic_cast<const ast::IntLitExpr*>(&e)) {
+            // v11: emit the literal at its RESOLVED width (an i64 default, or
+            // the int type it adapted to — `let x: u8 = 5` emits an i8).
+            llvm::Type* ity = llvm::Type::getInt64Ty(*ctx_);
+            if (TypePtr t = lookupExprType(*lit)) {
+                TypePtr r = resolveInInstance(t);
+                if (r->kind == TypeKind::Int && !r->isConstValue)
+                    ity = llvm::Type::getIntNTy(*ctx_, r->intWidth);
+            }
             return llvm::ConstantInt::get(
-                llvm::Type::getInt64Ty(*ctx_),
-                static_cast<uint64_t>(lit->value), /*isSigned=*/true);
+                ity, static_cast<uint64_t>(lit->value), /*isSigned=*/true);
         }
         // Phase 39: f64 literal -> double ConstantFP.
         if (auto* fl = dynamic_cast<const ast::FloatLitExpr*>(&e)) {

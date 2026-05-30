@@ -2577,6 +2577,28 @@ void test_const_generic_mixed_struct_ok() {
              "const_generic_mixed_struct_ok");
 }
 
+// Phase 63 (v11): sized signed machine integers.
+void test_sized_int_ok() {
+    expectOk("fn add(a: i32, b: i32) -> i32 { a + b }\n"
+             "fn main() -> i64 { let x: i32 = 5; let y: i32 = add(x, 10) + 1;"
+             " 0 }",
+             "sized_int_ok");
+}
+
+void test_int_width_mismatch_errors() {
+    // No implicit widening: an i32 binding can't take an i64 value.
+    expectErrContains("fn id64(x: i64) -> i64 { x }\n"
+                      "fn main() -> i64 { let w: i32 = id64(5); 0 }",
+                      "i32",
+                      "int_width_mismatch_errors");
+}
+
+void test_int_literal_out_of_range_errors() {
+    expectErrContains("fn main() -> i64 { let x: i8 = 200; 0 }",
+                      "out of range",
+                      "int_literal_out_of_range_errors");
+}
+
 } // namespace
 
 int main() {
@@ -2857,6 +2879,9 @@ int main() {
     // Phase 61 (v10): non-Copy arrays + mixed type+const generics.
     test_noncopy_array_ok();
     test_const_generic_mixed_struct_ok();
+    test_sized_int_ok();
+    test_int_width_mismatch_errors();
+    test_int_literal_out_of_range_errors();
     test_const_fn_array_len_ok();
     test_const_div_by_zero_errors();
     test_const_overflow_errors();
@@ -2865,6 +2890,6 @@ int main() {
     test_const_type_mismatch_errors();
     test_const_array_len_bool_errors();
     test_const_array_len_calls_nonconst_fn_errors();
-    std::cout << "All typecheck tests passed (260 cases)\n";
+    std::cout << "All typecheck tests passed (263 cases)\n";
     return 0;
 }
