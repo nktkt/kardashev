@@ -91,7 +91,13 @@ std::string applyPrelude(const std::string& userSrc) {
     // (generic or not) suppresses the prelude one entirely.
     if (userSrc.find("trait Iterator") == std::string::npos) {
         prelude +=
-            "trait Iterator<T> { fn next(&mut self) -> Option<T>; }\n"
+            // Phase 60: `next` declares `! { alloc }` so an iterator that
+            // allocates per element (e.g. yielding owned Strings) is expressible
+            // under the effect-subset rule. A concrete `for` loop attributes its
+            // CONCRETE `next` impl's effects (see ForExpr in collectEffects), so
+            // pure iterators (Range::next) keep pure loops pure — only generic
+            // iteration over an abstract `I: Iterator` conservatively gets alloc.
+            "trait Iterator<T> { fn next(&mut self) -> Option<T> ! { alloc }; }\n"
             "impl Iterator<i64> for Range {\n"
             "    fn next(&mut self) -> Option<i64> {\n"
             "        if self.inclusive != 0 {\n"
@@ -131,7 +137,14 @@ std::string applyPrelude(const std::string& userSrc) {
     }
     if (userSrc.find("trait Eq") == std::string::npos) {
         prelude +=
-            "trait Eq { fn eq(&self, other: &Self) -> bool; }\n"
+            // Phase 60: `Eq::eq` declares `! { alloc }`. Equality over the
+            // container impls (HashMap enumerates + clones keys, Vec/Box recurse
+            // into element `eq`) genuinely allocates; the effect-subset rule
+            // needs the trait's declared effects to bound every impl so a
+            // `<T: Eq>` / `dyn Eq` call attributes `alloc`. Pure impls (i64,
+            // String, plain structs) carry FEWER effects, which the subset rule
+            // permits — so scalar equality stays effect-free in practice.
+            "trait Eq { fn eq(&self, other: &Self) -> bool ! { alloc }; }\n"
             "impl Eq for i64"
             " { fn eq(&self, other: &i64) -> bool { int_eq(self, other) } }\n"
             "impl Eq for String"
@@ -158,7 +171,11 @@ std::string applyPrelude(const std::string& userSrc) {
     // nothing. Guarded so a user-defined `Display` wins.
     if (userSrc.find("trait Display") == std::string::npos) {
         prelude +=
-            "trait Display { fn to_string(&self) -> String; }\n"
+            // Phase 60: `to_string` allocates a String, so the TRAIT method
+            // declares `! { alloc }` — its impls already do, and the effect-
+            // subset rule needs the trait's declared effects to bound every
+            // impl so a `<T: Display>` / `dyn Display` call attributes `alloc`.
+            "trait Display { fn to_string(&self) -> String ! { alloc }; }\n"
             "impl Display for i64"
             " { fn to_string(&self) -> String ! { alloc }"
             " { int_to_string(*self) } }\n"
@@ -239,7 +256,7 @@ std::string applyPrelude(const std::string& userSrc) {
     if (userSrc.find("trait Eq") == std::string::npos) {
         prelude +=
             "impl<T: Eq> Eq for Vec<T> {\n"
-            "    fn eq(&self, other: &Vec<T>) -> bool {\n"
+            "    fn eq(&self, other: &Vec<T>) -> bool ! { alloc } {\n"
             "        if vec_len(self) != vec_len(other) { false }\n"
             "        else {\n"
             "            let mut i = 0;\n"
@@ -288,7 +305,8 @@ std::string applyPrelude(const std::string& userSrc) {
             // values through T's own Eq (`&(**other)` is the `&*` deref that now
             // lowers to the box pointer). Lets `#[derive(Eq)]` cover a Box field.
             "impl<T: Eq> Eq for Box<T> {\n"
-            "    fn eq(&self, other: &Box<T>) -> bool { (**self).eq(&(**other)) }\n"
+            "    fn eq(&self, other: &Box<T>) -> bool ! { alloc }"
+            " { (**self).eq(&(**other)) }\n"
             "}\n";
     }
     // Phase 47 (v8): the `Ord` trait — `cmp(&self, &Self) -> i64` returning
@@ -663,11 +681,23 @@ std::string applyPrelude(const std::string& userSrc) {
 // already known (via the fixpoint below) to derive an allocating `eq`.
 static bool typeRefAllocEq(
     const kardashev::ast::TypeRef& tr,
-    const std::unordered_set<std::string>& allocEqUserTypes) {
-    if (tr.name == "HashMap" || tr.name == "HashSet") return true;
+    const std::unordered_set<std::string>& allocEqUserTypes,
+    const std::unordered_set<std::string>& genericParams) {
+    // Phase 60: a derived `eq` over this field allocates iff the field's own
+    // `eq` declares `alloc`. That now holds for every container whose Eq impl
+    // is the generic, element-recursing form — HashMap/HashSet (enumerate +
+    // clone keys), Vec and Box (their `eq` calls the element `eq`, which the
+    // Eq trait permits to alloc) — and for a generic-PARAM field `T`, whose
+    // `T.eq()` attributes the Eq trait's declared `alloc`. Scalars (i64/bool/
+    // f64) and String stay pure, so a map-/Vec-/generic-free struct's derived
+    // `eq` is still effect-free (no alloc context needed to compare it).
+    if (tr.name == "HashMap" || tr.name == "HashSet" || tr.name == "Vec" ||
+        tr.name == "Box")
+        return true;
+    if (genericParams.count(tr.name)) return true;
     if (allocEqUserTypes.count(tr.name)) return true;
     for (const auto& a : tr.typeArgs)
-        if (typeRefAllocEq(a, allocEqUserTypes)) return true;
+        if (typeRefAllocEq(a, allocEqUserTypes, genericParams)) return true;
     return false;
 }
 
@@ -693,8 +723,10 @@ std::string deriveImplSource(const kardashev::ast::Program& prog) {
             for (const auto& s : prog.structs) {
                 if (allocEq.count(s.name) || !hasDerive(s.derives, "Eq"))
                     continue;
+                std::unordered_set<std::string> gps;
+                for (const auto& p : s.genericParams) gps.insert(p.name);
                 for (const auto& f : s.fields)
-                    if (typeRefAllocEq(f.type, allocEq)) {
+                    if (typeRefAllocEq(f.type, allocEq, gps)) {
                         allocEq.insert(s.name);
                         changed = true;
                         break;
@@ -703,10 +735,12 @@ std::string deriveImplSource(const kardashev::ast::Program& prog) {
             for (const auto& e : prog.enums) {
                 if (allocEq.count(e.name) || !hasDerive(e.derives, "Eq"))
                     continue;
+                std::unordered_set<std::string> gps;
+                for (const auto& p : e.genericParams) gps.insert(p.name);
                 bool hit = false;
                 for (const auto& v : e.variants) {
                     for (const auto& pt : v.payloadTypes)
-                        if (typeRefAllocEq(pt, allocEq)) {
+                        if (typeRefAllocEq(pt, allocEq, gps)) {
                             hit = true;
                             break;
                         }

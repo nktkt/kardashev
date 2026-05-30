@@ -41,6 +41,19 @@ effect system's last soundness floor.
   (`dot([i64;3], [i64;2])`) and a const param that appears in no argument array
   type are compile errors.
 
+### Changed
+- The **effect-subset rule** (Phase 60), the effect system's last soundness
+  floor: a trait impl method's effects must be a SUBSET of the trait method's
+  declared effects, so a `dyn Trait` / `<T: Trait>` dispatch (which attributes
+  the TRAIT's effects) can never under-count what an impl actually does. A
+  super-effecting impl is a compile error. `Drop` is exempt (static drop glue,
+  never dyn-dispatched). To make the prelude honest, `Eq::eq`,
+  `Iterator::next`, `Display::to_string` and `Default::default` now declare
+  `! { alloc }` (their container/heap impls allocate); a concrete `for` loop
+  still attributes its concrete `next`'s effects, so pure (Range) loops stay
+  pure, and `derive(Eq)` annotates `! { alloc }` only when a field's `eq`
+  actually allocates (a map-/Vec-/generic-free struct's derived `eq` is pure).
+
 ## [0.9.0] — Roadmap v9 "data in motion" (Phases 51–56)
 
 ### Added

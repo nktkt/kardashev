@@ -546,6 +546,15 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 60 (v10): the effect-subset rule — a trait impl method's effects must be
+# a SUBSET of the trait method's, so dyn/generic effect attribution is sound by
+# construction. Drop (static drop glue) is exempt. JIT.
+sh_test(
+    name = "smoke_test_phase60",
+    srcs = ["smoke_test_phase60.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

@@ -1593,6 +1593,61 @@ public:
             }
         }
 
+        // Pass 1d2 (Phase 60, v10): the EFFECT-SUBSET RULE — a trait impl
+        // method's effects must be a SUBSET of the trait method's declared
+        // effects. This is the effect system's last soundness floor: a `dyn
+        // Trait` / generic-bound call attributes the TRAIT method's declared
+        // effects (there is no concrete impl to mangle), so if an impl could
+        // secretly do `io`/`alloc`/`panic` the trait didn't declare, a
+        // pure-looking dispatch would silently perform them. Since `checkEffects`
+        // already proves each impl body's effects ⊆ its declared effects, the
+        // trait's declared set then bounds every impl body — attribution is
+        // sound by construction. (Effect-row VARIABLES are polymorphic
+        // placeholders, not concrete obligations, so only built-in labels are
+        // compared.)
+        for (const auto& impl : program.impls) {
+            if (impl.isInherent()) continue; // inherent impls answer to no trait
+            // `Drop` is exempt: it is STATICALLY-RESOLVED drop glue (a value's
+            // destructor runs by concrete type at the drop site, never through
+            // `dyn Drop`), so its effects are already attributed where the value
+            // is dropped — there is no trait-dispatch attribution to keep sound.
+            if (impl.traitName == "Drop") continue;
+            auto trIt = traits_.find(impl.traitName);
+            if (trIt == traits_.end()) continue; // unknown trait (reported)
+            for (const auto& fn : impl.methods) {
+                const ast::MethodSig* tm = nullptr;
+                for (const auto& m : trIt->second)
+                    if (m.name == fn.name) { tm = &m; break; }
+                if (!tm) continue; // not-in-trait already reported
+                std::unordered_set<std::string> allowed;
+                for (const auto& l : tm->effects.labels)
+                    if (isBuiltinEffect(l)) allowed.insert(l);
+                auto mit = implMethodMangled_.find(&fn);
+                if (mit == implMethodMangled_.end()) continue;
+                auto sit = fnSchemas_.find(mit->second);
+                if (sit == fnSchemas_.end()) continue;
+                for (const auto& l : sit->second.declaredEffects.labels) {
+                    if (!isBuiltinEffect(l)) continue; // skip row vars
+                    if (!allowed.count(l)) {
+                        std::string allowedStr;
+                        for (const auto& a : allowed)
+                            allowedStr += (allowedStr.empty() ? "" : ", ") + a;
+                        error("impl of trait '" + impl.traitName + "' for '" +
+                                  impl.forType.name + "': method '" + fn.name +
+                                  "' declares effect `" + l +
+                                  "` that the trait method does not permit "
+                                  "(trait allows: { " +
+                                  (allowedStr.empty() ? "" : allowedStr + " ") +
+                                  "}). A trait impl's effects must be a SUBSET "
+                                  "of the trait's, so dyn/generic dispatch stays "
+                                  "sound — declare `" + l +
+                                  "` on the trait method, or remove it here",
+                              fn.line, fn.column);
+                    }
+                }
+            }
+        }
+
         // Pass 2: type-check each fn body.
         for (const auto& fn : program.functions) {
             checkFunction(fn);
