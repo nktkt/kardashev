@@ -423,16 +423,25 @@ Each shipped green before the next, exactly as v1–v4 did.
 >   evaluate the body. `fn f(a: i64, b: i64) -> i64 { let x = a + b ; x * 2 }`
 >   called with `(3, 4)` → `x = 7`, `x * 2` = `14`, JIT + AOT.
 >
-> Writing this surfaced a real **compiler soundness bug** (documented, with a
-> repro, for a focused fix): moving a non-Copy struct field by value *inside a
-> loop* (`vec_push(&mut v, p.name)`) double-frees — `emitFieldAccess`
-> (codegen.cpp) shallow-copies the field's `{ptr,len,cap}` without marking the
-> source moved, and `clearDropFlagIfMoved` only handles bare identifiers, so the
-> struct's drop frees the field again. The self-hosting code works around it with
-> `clone`; the fix is the next priority.
+ - **Phase 99 — fixed a memory-safety bug self-hosting surfaced (done).** Writing
+>   Phase 98 hit a real **double-free**: moving a non-Copy struct field by value
+>   (`vec_push(&mut v, p.name)`) double-frees — the borrow checker modeled
+>   `s.field` as a read while codegen extracted it as an uncleared move, so the
+>   struct's drop freed the field again (proven with a Drop counter: the field
+>   dropped *twice*). Fixed by clearing the **root binding's** drop flag on a
+>   field/index partial move, conservatively disabling the whole struct's drop so
+>   the moved field can't be double-freed — eliminating the double-free for all
+>   field types with no compile-error regression. Verified: the field now drops
+>   exactly once; a loop of String field-moves is heap-clean (MALLOC_CHECK_=3);
+>   all unit + smoke suites green. Pinned by `tests/smoke_test_fieldmove.sh`.
+>   (Trade-off, not UB: a struct's other still-owned droppable fields leak after a
+>   partial move — the complete leak-free fix is per-field move tracking, a
+>   follow-up; `examples/selfhost/` uses `clone` to avoid even the leak.) **This
+>   is the payoff of self-hosting: dogfooding the compiler found a real
+>   memory-safety bug.**
 >
-> Planned: fix the field-move double-free; a real type checker (i64-typed) over
-> the body; eventually emit IR/code — toward a bootstrap.
+> Planned: per-field partial-move tracking (the leak-free fix); a real type
+> checker (i64-typed) over the body; eventually emit IR/code — toward a bootstrap.
 
 ## Roadmap v16 — shipped
 

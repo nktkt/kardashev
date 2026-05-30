@@ -8735,7 +8735,30 @@ private:
     // inner one). Walks innermost-out so shadowing resolves to the nearest.
     void clearDropFlagIfMoved(const ast::Expr& e) {
         if (inAsyncFn_) return;
-        const auto* id = dynamic_cast<const ast::IdentExpr*>(&e);
+        // v17 soundness fix: a consumed-by-value FIELD / tuple-field / index
+        // projection is a PARTIAL MOVE of its root binding (e.g.
+        // `vec_push(&mut v, p.name)` moves `p.name` out). Codegen copies the
+        // field's bits without a per-field move flag, so the root struct's drop
+        // would free it AGAIN — a double-free. Walk to the root binding and
+        // clear ITS drop flag, conservatively disabling the whole struct's drop
+        // so the moved field can't be double-freed. (Trade-off until per-field
+        // tracking lands: a struct's OTHER still-owned droppable fields then leak
+        // rather than being freed — safe, not memory-unsafety. See the
+        // field-move bug note.)
+        const ast::Expr* cur = &e;
+        while (true) {
+            if (auto* fe = dynamic_cast<const ast::FieldExpr*>(cur)) {
+                cur = fe->object.get();
+            } else if (auto* tf =
+                           dynamic_cast<const ast::TupleFieldExpr*>(cur)) {
+                cur = tf->object.get();
+            } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(cur)) {
+                cur = ix->object.get();
+            } else {
+                break;
+            }
+        }
+        const auto* id = dynamic_cast<const ast::IdentExpr*>(cur);
         if (!id) return;
         for (auto sit = dropScopes_.rbegin(); sit != dropScopes_.rend(); ++sit) {
             for (auto it = sit->rbegin(); it != sit->rend(); ++it) {

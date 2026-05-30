@@ -908,6 +908,14 @@ sh_test(
     ],
 )
 
+# v17 Phase 99: regression for the field-move double-free fix (found by
+# self-hosting) — a moved-out non-Copy field is dropped exactly once.
+sh_test(
+    name = "smoke_test_fieldmove",
+    srcs = ["smoke_test_fieldmove.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

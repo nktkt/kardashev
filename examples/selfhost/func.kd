@@ -194,9 +194,11 @@ fn check_block(block: &Block, params: &Vec<String>) -> i64 ! { alloc } {
 
 // Interpret a whole Fn: scope-check the body against the params, then bind the
 // call arguments to the params and evaluate the body. -1 if the body is ill-scoped.
-// (Uses `clone(&p.name)` rather than the field-MOVE `p.name`: moving a non-Copy
-// struct field by value inside a loop currently double-frees — a real compiler
-// soundness bug this self-hosting code surfaced, documented for a focused fix.)
+// (Uses `clone(&p.name)` rather than the field-MOVE `p.name`. The field-move
+// double-FREE this self-hosting code surfaced is now fixed at the compiler level
+// (v17 Phase 99); clone is still preferred here because the conservative fix
+// leaks a struct's sibling droppable fields after a partial move — the leak-free
+// per-field fix is a follow-up.)
 fn interpret_fn(f: &Fn, args: &Vec<i64>) -> i64 ! { alloc } {
     let np = vec_len(&f.params);
     let mut pnames = vec_new();
