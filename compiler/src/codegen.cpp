@@ -1645,6 +1645,129 @@ private:
             declaredFns_["f64_to_string"] = fn;
         }
 
+        // --- v12 Phase 69: int_to_hex(n: i64) -> String ---
+        // The dual of int_to_string with "%llx": lowercase hex, no prefix, the
+        // two's-complement pattern for a negative n. 17 bytes (16 nibbles + NUL).
+        {
+            auto* fnTy = llvm::FunctionType::get(strTy, {i64Ty}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, "int_to_hex",
+                module_.get());
+            fn->getArg(0)->setName("n");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* cap = llvm::ConstantInt::get(i64Ty, 24);
+            auto* buf = b.CreateCall(mallocFn_, {cap}, "ith_buf");
+            auto* snprintfTy = llvm::FunctionType::get(
+                i32Ty, {i8PtrTy, i64Ty, i8PtrTy}, /*isVarArg=*/true);
+            auto snprintfFn =
+                module_->getOrInsertFunction("snprintf", snprintfTy);
+            auto* fmt = b.CreateGlobalString("%llx", "kd_itoh_fmt", 0,
+                                             module_.get());
+            auto* written = b.CreateCall(
+                snprintfFn, {buf, cap, fmt, fn->getArg(0)}, "ith_written");
+            auto* len = b.CreateSExt(written, i64Ty, "ith_len");
+            llvm::Value* v = llvm::UndefValue::get(strTy);
+            v = b.CreateInsertValue(v, buf, {0}, "ith_data");
+            v = b.CreateInsertValue(v, len, {1}, "ith_len_f");
+            v = b.CreateInsertValue(v, cap, {2}, "ith_cap");
+            b.CreateRet(v);
+            declaredFns_["int_to_hex"] = fn;
+        }
+
+        // --- v12 Phase 69: str_parse_i64 / str_parse_f64 ---
+        // Copy the (possibly non-NUL-terminated) String bytes into a transient
+        // stack buffer, NUL-terminate, run the C strtoll/strtod, and report
+        // success iff the WHOLE string was consumed (endptr at the NUL) and was
+        // non-empty. The value is written through the out-pointer. Inputs longer
+        // than the buffer fail (no number is that long). Pure — the buffer is on
+        // the stack and nothing escapes.
+        auto emitStrParse = [&](const char* name, llvm::Type* valTy,
+                                bool isFloat) {
+            auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+            auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+            constexpr unsigned kBufLen = 512;
+            auto* fnTy =
+                llvm::FunctionType::get(i1Ty, {i8PtrTy, i8PtrTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, name, module_.get());
+            fn->getArg(0)->setName("s");
+            fn->getArg(1)->setName("out");
+            auto* sArg = fn->getArg(0);
+            auto* outArg = fn->getArg(1);
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* parseBB = llvm::BasicBlock::Create(ctx, "parse", fn);
+            auto* failBB = llvm::BasicBlock::Create(ctx, "fail", fn);
+            auto* mergeBB = llvm::BasicBlock::Create(ctx, "merge", fn);
+            llvm::IRBuilder<> b(entry);
+            // Stack buffer + endptr slot, allocated in the entry block.
+            auto* bufArrTy = llvm::ArrayType::get(i8Ty, kBufLen);
+            auto* bufAlloca = b.CreateAlloca(bufArrTy, nullptr, "pbuf");
+            auto* buf = b.CreateConstInBoundsGEP2_64(bufArrTy, bufAlloca, 0, 0,
+                                                     "pbuf_p");
+            auto* endSlot = b.CreateAlloca(i8PtrTy, nullptr, "endp");
+            // data, len from the &String.
+            auto* dataPtr = b.CreateStructGEP(strTy, sArg, 0, "s_data_p");
+            auto* data = b.CreateLoad(i8PtrTy, dataPtr, "s_data");
+            auto* lenPtr = b.CreateStructGEP(strTy, sArg, 1, "s_len_p");
+            auto* len = b.CreateLoad(i64Ty, lenPtr, "s_len");
+            // len > 0 && len < kBufLen (leave room for the NUL).
+            auto* gt0 = b.CreateICmpSGT(len, llvm::ConstantInt::get(i64Ty, 0));
+            auto* lt = b.CreateICmpSLT(
+                len, llvm::ConstantInt::get(i64Ty, kBufLen));
+            b.CreateCondBr(b.CreateAnd(gt0, lt), parseBB, failBB);
+
+            b.SetInsertPoint(parseBB);
+            b.CreateMemCpy(buf, llvm::MaybeAlign(1), data, llvm::MaybeAlign(1),
+                           len);
+            auto* nulP = b.CreateInBoundsGEP(i8Ty, buf, len, "nul_p");
+            b.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulP);
+            llvm::Value* val;
+            if (isFloat) {
+                auto* strtodTy = llvm::FunctionType::get(
+                    valTy, {i8PtrTy, i8PtrTy}, false);
+                auto strtod = module_->getOrInsertFunction("strtod", strtodTy);
+                val = b.CreateCall(strtod, {buf, endSlot}, "pval");
+            } else {
+                auto* strtollTy = llvm::FunctionType::get(
+                    valTy, {i8PtrTy, i8PtrTy, i32Ty}, false);
+                auto strtoll =
+                    module_->getOrInsertFunction("strtoll", strtollTy);
+                val = b.CreateCall(
+                    strtoll,
+                    {buf, endSlot, llvm::ConstantInt::get(i32Ty, 10)}, "pval");
+            }
+            // Valid iff (a) the whole string was consumed (endptr at the NUL)
+            // AND (b) there was no leading whitespace. strtoll/strtod silently
+            // skip leading whitespace; for a predictable stdlib `parse_int(" 5")`
+            // should be None, like Rust — so reject a first byte <= ' ' (0x20),
+            // which excludes every whitespace/control char while admitting the
+            // sign and digits (all > 0x20).
+            auto* endv = b.CreateLoad(i8PtrTy, endSlot, "endv");
+            auto* expectedEnd = b.CreateInBoundsGEP(i8Ty, buf, len, "exp_end");
+            auto* consumed = b.CreateICmpEQ(endv, expectedEnd, "consumed");
+            auto* first = b.CreateLoad(i8Ty, buf, "first");
+            auto* firstU = b.CreateZExt(first, i32Ty, "first_u");
+            auto* notWs = b.CreateICmpUGT(
+                firstU, llvm::ConstantInt::get(i32Ty, 32), "not_ws");
+            consumed = b.CreateAnd(consumed, notWs, "valid");
+            b.CreateStore(val, outArg);
+            b.CreateBr(mergeBB);
+
+            b.SetInsertPoint(failBB);
+            b.CreateBr(mergeBB);
+
+            b.SetInsertPoint(mergeBB);
+            auto* ok = b.CreatePHI(i1Ty, 2, "ok");
+            ok->addIncoming(consumed, parseBB);
+            ok->addIncoming(llvm::ConstantInt::getFalse(ctx), failBB);
+            b.CreateRet(ok);
+            declaredFns_[name] = fn;
+        };
+        emitStrParse("str_parse_i64", i64Ty, /*isFloat=*/false);
+        emitStrParse("str_parse_f64", llvm::Type::getDoubleTy(ctx),
+                     /*isFloat=*/true);
+
         // --- Phase 27: print_no_nl(s: &String) -> i64 (no trailing newline) ---
         {
             auto* fnTy = llvm::FunctionType::get(i64Ty, {i8PtrTy}, false);

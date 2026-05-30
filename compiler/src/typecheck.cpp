@@ -239,6 +239,39 @@ public:
             sch.declaredEffects.add("alloc");
             fnSchemas_["f64_to_string"] = std::move(sch);
         }
+        // v12 Phase 69: int_to_hex(n: i64) -> String ! { alloc } — lowercase
+        // hexadecimal (no `0x` prefix; the two's-complement bit pattern for a
+        // negative n, like Rust's `{:x}`). snprintf "%llx".
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({makeInt()}, stringTy);
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["int_to_hex"] = std::move(sch);
+        }
+        // v12 Phase 69: the low-level string->number parse primitives. Each
+        // writes the parsed value through an out-pointer and returns whether the
+        // ENTIRE string was a valid number (no leftover characters). The
+        // Option-returning `parse_int` / `parse_f64` are kardashev prelude
+        // wrappers over these (see applyPrelude). Pure: they only read the
+        // input and use a transient stack buffer.
+        //   str_parse_i64(s: &String, out: &mut i64) -> bool
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(stringTy, /*isMut=*/false),
+                 makeRef(makeInt(), /*isMut=*/true)},
+                makeBool());
+            fnSchemas_["str_parse_i64"] = std::move(sch);
+        }
+        //   str_parse_f64(s: &String, out: &mut f64) -> bool
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(stringTy, /*isMut=*/false),
+                 makeRef(makeFloat(), /*isMut=*/true)},
+                makeBool());
+            fnSchemas_["str_parse_f64"] = std::move(sch);
+        }
         // print_no_nl(s: &String) -> i64 ! { io } — writes s with NO trailing
         // newline (print_str / print_string / println all force one), so
         // output can be composed piece by piece on a single line.

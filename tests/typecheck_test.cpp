@@ -2805,6 +2805,19 @@ void test_cast_then_shift_parses() {
              "cast_then_shift_parses");
 }
 
+// v12 Phase 69: string->number parse builtins + hex formatting.
+void test_str_parse_builtin_ok() {
+    expectOk("fn main() -> i64 { let s = \"5\"; let mut out: i64 = 0;"
+             " if str_parse_i64(&s, &mut out) { out } else { 0 } }",
+             "str_parse_builtin_ok");
+}
+
+void test_int_to_hex_ok() {
+    expectOk("fn main() -> i64 ! { alloc } { let h = int_to_hex(255);"
+             " str_len(&h) }",
+             "int_to_hex_ok");
+}
+
 } // namespace
 
 int main() {
@@ -3117,6 +3130,8 @@ int main() {
     test_plain_literal_narrow_const_ok();
     test_out_of_range_const_rejected();
     test_cast_then_shift_parses();
+    test_str_parse_builtin_ok();
+    test_int_to_hex_ok();
     test_const_fn_array_len_ok();
     test_const_div_by_zero_errors();
     test_const_overflow_errors();
@@ -3125,6 +3140,6 @@ int main() {
     test_const_type_mismatch_errors();
     test_const_array_len_bool_errors();
     test_const_array_len_calls_nonconst_fn_errors();
-    std::cout << "All typecheck tests passed (292 cases)\n";
+    std::cout << "All typecheck tests passed (294 cases)\n";
     return 0;
 }

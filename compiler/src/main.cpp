@@ -571,6 +571,25 @@ std::string applyPrelude(const std::string& userSrc) {
             "    match o { Some(x) => Some(f(x)), None => None }\n"
             "}\n";
     }
+    // v12 Phase 69: string -> number parsing. The Option-returning public API,
+    // wrapping the low-level out-param builtins (str_parse_i64 / str_parse_f64).
+    // `parse_int("42")` is `Some(42)`; a string that is not WHOLLY a valid
+    // number (`"42x"`, `""`, `"  1 "`) is `None`. The #1 gap a real stdlib fills
+    // — reading data no longer needs a hand-rolled digit loop.
+    if (userSrc.find("fn parse_int") == std::string::npos) {
+        prelude +=
+            "fn parse_int(s: &String) -> Option<i64> {\n"
+            "    let mut out: i64 = 0;\n"
+            "    if str_parse_i64(s, &mut out) { Some(out) } else { None }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn parse_f64") == std::string::npos) {
+        prelude +=
+            "fn parse_f64(s: &String) -> Option<f64> {\n"
+            "    let mut out: f64 = 0.0;\n"
+            "    if str_parse_f64(s, &mut out) { Some(out) } else { None }\n"
+            "}\n";
+    }
     // Phase 53 (v9): generic Vec higher-order combinators over closures, each
     // effect-polymorphic in the closure's effect row `e` (so a pure mapper
     // keeps the caller pure, an allocating one adds `alloc`). The closure

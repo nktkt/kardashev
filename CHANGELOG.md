@@ -18,6 +18,23 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [Unreleased] — Roadmap v12 "real stdlib" (Phases 69–74, in progress)
+
+Theme: turn a language you can *compute* in into one you can *get data in and
+out of* — parsing, richer collections, string and numeric methods. The second
+step toward production use.
+
+### Added
+- **String → number parsing** (Phase 69): `parse_int(&String) -> Option<i64>`
+  and `parse_f64(&String) -> Option<f64>` — the all-or-nothing parse a real
+  stdlib needs (a string that is not *wholly* a valid number, including one
+  with leading/trailing junk or whitespace, is `None`). Built on low-level
+  `str_parse_i64` / `str_parse_f64` out-param primitives (C `strtoll`/`strtod`
+  over a transient stack buffer, with strict full-consume + no-leading-
+  whitespace validation). Plus `int_to_hex(i64) -> String` (lowercase hex, the
+  two's-complement pattern for a negative). Reading data no longer needs a
+  hand-rolled digit loop.
+
 ## [0.11.0] — Roadmap v11 "real machine integers" (Phases 63–68)
 
 Theme: the **numeric tower** — make kardashev practical by giving it real

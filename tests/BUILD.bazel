@@ -646,6 +646,14 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# Phase 69 (v12 — real stdlib): string->number parsing (parse_int / parse_f64
+# returning Option, all-or-nothing) + int_to_hex formatting.
+sh_test(
+    name = "smoke_test_phase69",
+    srcs = ["smoke_test_phase69.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the
