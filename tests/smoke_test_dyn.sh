@@ -138,7 +138,7 @@ if [[ "$rc" -eq 0 ]]; then
     echo "FAIL: a non-dyn-safe trait used as dyn should be rejected"
     exit 1
 fi
-if ! echo "$ERR_OUT" | grep -q 'not dyn-safe'; then
+if ! grep -q 'not dyn-safe' <<< "$ERR_OUT"; then
     echo "FAIL: expected a dyn-safety diagnostic, got:"
     echo "$ERR_OUT"
     exit 1

@@ -71,8 +71,8 @@ fn main() -> i64 ! { io, alloc } {
 }
 EOF
 out=$("$KARDC" "$TMP/disp.kd")
-echo "$out" | grep -qx "P { x: 3, y: 4 }" || { echo "FAIL [disp]: struct text"; echo "$out"; exit 1; }
-echo "$out" | grep -qx "C(7, true)" || { echo "FAIL [disp]: enum text"; echo "$out"; exit 1; }
+grep -qx "P { x: 3, y: 4 }" <<< "$out" || { echo "FAIL [disp]: struct text"; echo "$out"; exit 1; }
+grep -qx "C(7, true)" <<< "$out" || { echo "FAIL [disp]: enum text"; echo "$out"; exit 1; }
 echo "$out" | tail -1 | grep -qx "26" || { echo "FAIL [disp]: signal not 26"; exit 1; }
 "$KARDC" --no-cache -o "$TMP/disp" "$TMP/disp.kd" >/dev/null
 set +e; "$TMP/disp" >/dev/null; dr=$?; set -e

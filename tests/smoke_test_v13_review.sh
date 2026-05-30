@@ -76,7 +76,7 @@ fn main() -> i64 ! { io, alloc } {
     0
 }
 EOF
-got=$("$KARDC" "$TMP/ok_rc.kd" 2>/dev/null | head -2)
+got=$("$KARDC" "$TMP/ok_rc.kd" 2>/dev/null); got=$(head -2 <<< "$got")
 [[ "$got" == $'42\n1' ]] || { echo "FAIL [ok-rc]: legit rc_get use broke: $got"; exit 1; }
 echo "PASS [ok-rc]: a live rc_get borrow without a move still compiles + runs"
 

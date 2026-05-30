@@ -40,7 +40,7 @@ fn main() -> i64 ! { io } {
 }
 EOF
 want=$'7\n3\n9\n1024\n12\n3\n4\n5\n1\n0\n7\n0\n1'
-got=$("$KARDC" "$TMP/n.kd" 2>/dev/null | head -13)
+got=$("$KARDC" "$TMP/n.kd" 2>/dev/null); got=$(head -13 <<< "$got")
 [[ "$got" == "$want" ]] || { echo "FAIL [num/jit]:"; diff <(echo "$want") <(echo "$got"); exit 1; }
 echo "PASS [num/jit]: i64 abs/min/max/pow, f64 sqrt/floor/ceil/abs, Option/Result inspectors"
 

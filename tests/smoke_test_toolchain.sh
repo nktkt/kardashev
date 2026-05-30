@@ -309,13 +309,13 @@ echo "$MIXED_OUT"
 if [[ "$MIXED_RC" -eq 0 ]]; then
     echo "FAIL [test-mixed]: exit code 0 (expected nonzero — a test failed)"; exit 1
 fi
-if ! echo "$MIXED_OUT" | grep -q '^running 3 tests$'; then
+if ! grep -q '^running 3 tests$' <<< "$MIXED_OUT"; then
     echo "FAIL [test-mixed]: expected 'running 3 tests' (helper must be excluded)"; exit 1
 fi
-if ! echo "$MIXED_OUT" | grep -q 'test test_deliberately_fails ... FAILED (returned 3)'; then
+if ! grep -q 'test test_deliberately_fails ... FAILED (returned 3)' <<< "$MIXED_OUT"; then
     echo "FAIL [test-mixed]: missing the expected FAILED line"; exit 1
 fi
-if ! echo "$MIXED_OUT" | grep -q '^test result: 2 passed, 1 failed$'; then
+if ! grep -q '^test result: 2 passed, 1 failed$' <<< "$MIXED_OUT"; then
     echo "FAIL [test-mixed]: expected 'test result: 2 passed, 1 failed'"; exit 1
 fi
 echo "PASS [test-mixed]: 2 passed, 1 failed, exit $MIXED_RC, no main() required"
@@ -338,7 +338,7 @@ if [[ "$PASS_RC" -ne 0 ]]; then
     echo "FAIL [test-pass]: all-pass fixture exited $PASS_RC (expected 0)"
     echo "$PASS_OUT"; exit 1
 fi
-if ! echo "$PASS_OUT" | grep -q '^test result: 2 passed, 0 failed$'; then
+if ! grep -q '^test result: 2 passed, 0 failed$' <<< "$PASS_OUT"; then
     echo "FAIL [test-pass]: expected 'test result: 2 passed, 0 failed'"
     echo "$PASS_OUT"; exit 1
 fi

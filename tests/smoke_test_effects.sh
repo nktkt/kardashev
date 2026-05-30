@@ -50,7 +50,7 @@ EOF
 # JIT: apply(ioInc) prints 10 (inside ioInc), returns 11; main prints 11;
 # kardc then prints main's return value (0) on a final line.
 JIT_OUT=$("$KARDC" "$TMP/effects.kd")
-JIT_PRINT_OUT=$(echo "$JIT_OUT" | head -n 2)
+JIT_PRINT_OUT=$(head -n 2 <<< "$JIT_OUT")
 EXPECTED=$'10\n11'
 if [[ "$JIT_PRINT_OUT" != "$EXPECTED" ]]; then
     echo "FAIL: JIT effect-poly output mismatch"
@@ -86,7 +86,7 @@ if [[ "$rc" -eq 0 ]]; then
     echo "FAIL: pure main leaking io through apply(ioInc) should be rejected"
     exit 1
 fi
-if ! echo "$ERR_OUT" | grep -q 'effect `io`'; then
+if ! grep -q 'effect `io`' <<< "$ERR_OUT"; then
     echo 'FAIL: expected an `io` effect-undeclared diagnostic, got:'
     echo "$ERR_OUT"
     exit 1

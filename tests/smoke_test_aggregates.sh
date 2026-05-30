@@ -86,7 +86,7 @@ reject_expect() {
         echo "FAIL [$label]: expected a compile error, but it compiled"
         exit 1
     fi
-    if ! echo "$out" | grep -q "$pattern"; then
+    if ! grep -q "$pattern" <<< "$out"; then
         echo "FAIL [$label]: expected a diagnostic matching '$pattern', got:"
         echo "$out"
         exit 1

@@ -46,7 +46,7 @@ EXPECTED=$'42\n123\n-7'
 # (0) on a final line. We compare just the print output.
 JIT_OUT=$("$KARDC" "$TMP/print.kd")
 # The last line is main's return value (`0`) printed by kardc itself.
-JIT_PRINT_OUT=$(echo "$JIT_OUT" | head -n 3)
+JIT_PRINT_OUT=$(head -n 3 <<< "$JIT_OUT")
 if [[ "$JIT_PRINT_OUT" != "$EXPECTED" ]]; then
     echo "FAIL: JIT print output mismatch"
     echo "expected:"; echo "$EXPECTED"
@@ -78,7 +78,7 @@ if [[ "$rc" -eq 0 ]]; then
     echo "FAIL: pure caller of print should be a typecheck error"
     exit 1
 fi
-if ! echo "$ERR_OUT" | grep -q 'effect `io`'; then
+if ! grep -q 'effect `io`' <<< "$ERR_OUT"; then
     echo 'FAIL: expected `io` effect-undeclared diagnostic, got:'
     echo "$ERR_OUT"
     exit 1

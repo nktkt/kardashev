@@ -42,7 +42,7 @@ fn main() -> i64 ! { io, alloc } {
     // scope drops c(3->2), b(2->1), a(1->0 -> drop Noisy{7} EXACTLY once)
 }
 EOF
-got=$("$KARDC" "$TMP/rc.kd" 2>/dev/null | head -4)
+got=$("$KARDC" "$TMP/rc.kd" 2>/dev/null); got=$(head -4 <<< "$got")
 [[ "$got" == $'3\n7\n100\n7' ]] || { echo "FAIL [rc/jit]: expected 3,7,100,7 got: $got"; exit 1; }
 "$KARDC" --no-cache -o "$TMP/rc" "$TMP/rc.kd" >/dev/null 2>&1
 set +e; aout=$("$TMP/rc"); rc=$?; set -e

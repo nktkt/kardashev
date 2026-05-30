@@ -222,7 +222,7 @@ if [[ "$DYN_RC" -eq 0 ]]; then
     echo "FAIL [dyn_generic_arity]: bare `dyn Iterator` (missing <T>) should be rejected"
     exit 1
 fi
-if ! echo "$DYN_OUT" | grep -qi 'trait type arg'; then
+if ! grep -qi 'trait type arg' <<< "$DYN_OUT"; then
     echo "FAIL [dyn_generic_arity]: expected a 'trait type arg' arity diagnostic, got:"
     echo "$DYN_OUT"
     exit 1

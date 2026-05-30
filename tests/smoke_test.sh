@@ -39,7 +39,7 @@ echo "--- REPL output ---"
 echo "$OUTPUT"
 echo "-------------------"
 
-if echo "$OUTPUT" | grep -qx '55'; then
+if grep -qx '55' <<< "$OUTPUT"; then
     echo "PASS: kardashev REPL computed fib(10) == 55 via JIT"
     exit 0
 fi

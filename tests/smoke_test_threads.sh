@@ -60,7 +60,7 @@ fn main() -> i64 ! { io, share } {
 }
 EOF
 
-JIT_OUT=$("$KARDC" "$TMP/spawn.kd" | head -3)
+JIT_OUT=$("$KARDC" "$TMP/spawn.kd"); JIT_OUT=$(head -3 <<< "$JIT_OUT")
 if [[ "$JIT_OUT" != $'21\n123\n144' ]]; then
     echo "FAIL (1) JIT spawn/join: got:"; printf '%s\n' "$JIT_OUT"; exit 1
 fi
@@ -81,7 +81,7 @@ fn main() -> i64 ! { io, share } {
     0
 }
 EOF
-JIT_OUT=$("$KARDC" "$TMP/spawn_cl.kd" | head -1)
+JIT_OUT=$("$KARDC" "$TMP/spawn_cl.kd"); JIT_OUT=$(head -1 <<< "$JIT_OUT")
 if [[ "$JIT_OUT" != "2044" ]]; then
     echo "FAIL (1b) JIT closure spawn: expected 2044, got '$JIT_OUT'"; exit 1
 fi
@@ -122,7 +122,7 @@ EOF
 
 # JIT: run several times — must be deterministic 200000 every time.
 for run in 1 2 3 4 5; do
-    OUT=$("$KARDC" "$TMP/mutex.kd" | head -1)
+    OUT=$("$KARDC" "$TMP/mutex.kd"); OUT=$(head -1 <<< "$OUT")
     if [[ "$OUT" != "200000" ]]; then
         echo "FAIL (2) JIT mutex run $run: expected 200000, got '$OUT'"; exit 1
     fi
@@ -157,7 +157,7 @@ if [[ $RC -eq 0 ]]; then
     echo "FAIL (3): by-ref capture into thread_spawn compiled (should be rejected)"
     echo "$ERR"; exit 1
 fi
-if ! printf '%s\n' "$ERR" | grep -qi "by-reference capture across a thread"; then
+if ! grep -qi "by-reference capture across a thread" <<< "$ERR"; then
     echo "FAIL (3): rejection message did not mention the thread-boundary Send rule:"
     printf '%s\n' "$ERR"; exit 1
 fi
@@ -185,7 +185,7 @@ fn main() -> i64 ! { io, share } {
     0
 }
 EOF
-JIT_OUT=$("$KARDC" "$TMP/byval.kd" | head -1)
+JIT_OUT=$("$KARDC" "$TMP/byval.kd"); JIT_OUT=$(head -1 <<< "$JIT_OUT")
 if [[ "$JIT_OUT" != "42" ]]; then
     echo "FAIL (3c) JIT by-value: expected 42, got '$JIT_OUT'"; exit 1
 fi

@@ -90,7 +90,7 @@ cat > "$TMP/e.kd" <<'EOF'
 const BIG: i32 = 1i32 << 31;
 fn main() -> i64 ! { io } { let z: i32 = BIG; print(z as i64); 0 }
 EOF
-[[ "$("$KARDC" "$TMP/e.kd" 2>/dev/null | head -1)" == "-2147483648" ]] || { echo "FAIL [E]: silent out-of-range i32"; exit 1; }
+_eout=$("$KARDC" "$TMP/e.kd" 2>/dev/null); [[ "$(head -1 <<<"$_eout")" == "-2147483648" ]] || { echo "FAIL [E]: silent out-of-range i32"; exit 1; }
 echo "PASS [E-no-silent-out-of-range]: i32 const holds -2147483648"
 
 # BUG F — a plain-literal narrow / unsigned const is accepted (like `let`).
@@ -110,7 +110,7 @@ EOF
 # the unparenthesized shift form must also parse now (type error is fine; a
 # PARSE error is the regression).
 printf 'fn main() -> i64 { let x: i64 = 3; (x as i32 << 2) as i64 }\n' > "$TMP/p3.kd"
-"$KARDC" "$TMP/p3.kd" 2>&1 | grep -qi "parse error" && { echo "FAIL [parse-as-shl-bare]: still a parse error"; exit 1; }
+_p3out=$("$KARDC" "$TMP/p3.kd" 2>&1) || true; grep -qi "parse error" <<<"$_p3out" && { echo "FAIL [parse-as-shl-bare]: still a parse error"; exit 1; }
 echo "PASS [parse-as-cast-then-shift/compare]: (x as i32) << 2 == 12, (a as i32) < (b as i32)"
 
 # LEX — a width suffix is NOT taken in tuple-index position; a plain `t.0`

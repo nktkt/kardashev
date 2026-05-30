@@ -222,7 +222,7 @@ if [[ "$NEG_RC" -eq 0 ]]; then
     echo "FAIL [fold_io negative]: a pure fn leaking io should be rejected"
     exit 1
 fi
-if ! echo "$NEG_OUT" | grep -q 'io'; then
+if ! grep -q 'io' <<< "$NEG_OUT"; then
     echo "FAIL [fold_io negative]: expected an io-effect diagnostic, got:"
     echo "$NEG_OUT"
     exit 1

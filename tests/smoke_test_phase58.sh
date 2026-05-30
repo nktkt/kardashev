@@ -35,7 +35,7 @@ rejects() { # name file needle
     if "$KARDC" "$f" >/dev/null 2>&1; then
         echo "FAIL [$n]: expected REJECTION, but it compiled"; exit 1
     fi
-    if [[ -n "$needle" ]] && ! echo "$out" | grep -qi "$needle"; then
+    if [[ -n "$needle" ]] && ! grep -qi "$needle" <<< "$out"; then
         echo "FAIL [$n]: rejected but missing '$needle'; got: $out"; exit 1
     fi
     echo "PASS [$n]: rejected as expected"

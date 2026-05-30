@@ -55,7 +55,7 @@ fn main() -> i64 ! {io} {
 EOF
 
 JIT_OUT=$("$KARDC" "$TMP/closures.kd")
-JIT_PRINTS=$(echo "$JIT_OUT" | head -n 3)
+JIT_PRINTS=$(head -n 3 <<< "$JIT_OUT")
 EXPECTED=$'15\n17\n17'
 if [[ "$JIT_PRINTS" != "$EXPECTED" ]]; then
     echo "FAIL: JIT closure output mismatch"
@@ -85,7 +85,7 @@ fn main() -> i64 ! {io} {
     0
 }
 EOF
-EFF_JIT=$("$KARDC" "$TMP/eff_ok.kd" | head -n 1)
+EFF_JIT=$("$KARDC" "$TMP/eff_ok.kd"); EFF_JIT=$(head -n 1 <<< "$EFF_JIT")
 if [[ "$EFF_JIT" != "105" ]]; then
     echo "FAIL: io closure (positive) JIT expected 105, got: $EFF_JIT"
     exit 1
@@ -114,7 +114,7 @@ if [[ "$rc" -eq 0 ]]; then
     echo "FAIL: pure main calling an io closure should be rejected"
     exit 1
 fi
-if ! echo "$ERR_OUT" | grep -q 'effect `io`'; then
+if ! grep -q 'effect `io`' <<< "$ERR_OUT"; then
     echo 'FAIL: expected an `io` effect-undeclared diagnostic, got:'
     echo "$ERR_OUT"
     exit 1

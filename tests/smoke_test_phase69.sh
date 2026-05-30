@@ -50,7 +50,7 @@ EOF
 # The 12 explicit print lines. JIT also echoes main's i64 return (0) as a final
 # line; AOT does not (it is the exit code). Compare accordingly.
 want=$'42\n-7\n0\n-999\n-999\n-999\n350\n-25\n100000\n-999\nff\n1000'
-got=$("$KARDC" "$TMP/parse.kd" 2>/dev/null | head -12)
+got=$("$KARDC" "$TMP/parse.kd" 2>/dev/null); got=$(head -12 <<< "$got")
 [[ "$got" == "$want" ]] || { echo "FAIL [parse/jit]:"; diff <(echo "$want") <(echo "$got"); exit 1; }
 echo "PASS [parse/jit]: parse_int / parse_f64 (Option, all-or-nothing) + int_to_hex"
 
@@ -68,7 +68,7 @@ fn main() -> i64 ! { io } {
     0
 }
 EOF
-[[ "$("$KARDC" "$TMP/big.kd" 2>/dev/null | head -1)" == "9223372036854775807" ]] || { echo "FAIL [big]: i64::MAX did not round-parse"; exit 1; }
+_hbig=$("$KARDC" "$TMP/big.kd" 2>/dev/null); [[ "$(head -1 <<< "$_hbig")" == "9223372036854775807" ]] || { echo "FAIL [big]: i64::MAX did not round-parse"; exit 1; }
 echo "PASS [big]: parse_int handles i64::MAX"
 
 # Review fix: a value that OVERFLOWS i64 is None, not a silently-clamped Some.
@@ -83,7 +83,7 @@ fn main() -> i64 ! { io } {
     0
 }
 EOF
-[[ "$("$KARDC" "$TMP/ovf.kd" 2>/dev/null | head -4)" == $'-1\n-1\n-1\n-9223372036854775808' ]] || { echo "FAIL [overflow]: i64 overflow not rejected"; exit 1; }
+_hovf=$("$KARDC" "$TMP/ovf.kd" 2>/dev/null); [[ "$(head -4 <<< "$_hovf")" == $'-1\n-1\n-1\n-9223372036854775808' ]] || { echo "FAIL [overflow]: i64 overflow not rejected"; exit 1; }
 echo "PASS [overflow]: parse_int rejects values past i64 range (ERANGE), accepts i64::MIN"
 
 echo "ALL PHASE 69 SMOKE TESTS PASSED"

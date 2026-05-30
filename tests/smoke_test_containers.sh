@@ -173,7 +173,7 @@ if [[ "$rc" -eq 0 ]]; then
     echo "FAIL [combinators_neg]: io closure via option_map from pure main should be rejected"
     exit 1
 fi
-if ! echo "$ERR_OUT" | grep -q 'effect `io`'; then
+if ! grep -q 'effect `io`' <<< "$ERR_OUT"; then
     echo "FAIL [combinators_neg]: expected an io-effect diagnostic, got:"
     echo "$ERR_OUT"
     exit 1

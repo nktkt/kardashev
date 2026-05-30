@@ -101,7 +101,7 @@ fi
 # Assert the print order is genuinely interleaved, not segregated. The first
 # six prints (the ids) must be 1,2,1,2,1,2; a non-cooperative "run task 1 to
 # completion then task 2" would print 1,1,1,2,2,2.
-IDS=$(printf '%s\n' "$JIT_OUT" | head -6 | tr '\n' ',')
+_ids_src=$(printf '%s\n' "$JIT_OUT"); IDS=$(head -6 <<< "$_ids_src" | tr '\n' ',')
 if [[ "$IDS" != "1,2,1,2,1,2," ]]; then
     echo "FAIL (1): task prints not interleaved (got '$IDS') — not cooperative"
     exit 1

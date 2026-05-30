@@ -87,9 +87,9 @@ fn main() -> i64 ! { io } {
 }
 EOF
 jit=$("$KARDC" "$TMP/print.kd")
-echo "$jit" | grep -qx "3.14159" || { echo "FAIL [print]: missing 3.14159"; exit 1; }
-echo "$jit" | grep -qx "6.28318" || { echo "FAIL [print]: missing 6.28318"; exit 1; }
-echo "$jit" | tail -1 | grep -qx "314" || { echo "FAIL [print]: signal not 314"; exit 1; }
+grep -qx "3.14159" <<< "$jit" || { echo "FAIL [print]: missing 3.14159"; exit 1; }
+grep -qx "6.28318" <<< "$jit" || { echo "FAIL [print]: missing 6.28318"; exit 1; }
+_last=$(echo "$jit" | tail -1); grep -qx "314" <<< "$_last" || { echo "FAIL [print]: signal not 314"; exit 1; }
 "$KARDC" --no-cache -o "$TMP/print" "$TMP/print.kd" >/dev/null
 set +e; "$TMP/print" >/dev/null; r=$?; set -e
 [[ "$r" -ne $((314 % 256)) ]] && { echo "FAIL [print/aot]: exit $r"; exit 1; }

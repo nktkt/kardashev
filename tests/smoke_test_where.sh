@@ -130,7 +130,7 @@ if [[ "$WU_RC" -eq 0 ]]; then
     echo "FAIL [where_unknown_rejected]: a where clause on an unknown param should be rejected"
     exit 1
 fi
-if ! echo "$WU_OUT" | grep -qi 'unknown generic parameter'; then
+if ! grep -qi 'unknown generic parameter' <<< "$WU_OUT"; then
     echo "FAIL [where_unknown_rejected]: expected an 'unknown generic parameter' diagnostic, got:"
     echo "$WU_OUT"
     exit 1

@@ -42,7 +42,7 @@ fn main() -> i64 ! { io, alloc } {
 }
 EOF
 want=$'1\n0\n1\n0\n1\n0\n7\n-1\nHELLO, WORLD\nhello, world\nHelloWorld\nababab'
-got=$("$KARDC" "$TMP/s.kd" 2>/dev/null | head -12)
+got=$("$KARDC" "$TMP/s.kd" 2>/dev/null); got=$(head -12 <<< "$got")
 [[ "$got" == "$want" ]] || { echo "FAIL [str/jit]:"; diff <(echo "$want") <(echo "$got"); exit 1; }
 echo "PASS [str/jit]: starts/ends/contains/index_of + upper/lower/concat/repeat"
 

@@ -59,8 +59,8 @@ peak_rss_kb() {
 # 1. correctness: round-trips via derived Eq; signal = serialized length (51).
 jit=$("$KARDC" "$SRC")
 echo "$jit"
-echo "$jit" | grep -q "round-trips = yes" || { echo "FAIL: round-trip not confirmed"; exit 1; }
-echo "$jit" | grep -q 'serialized = {"a":\[1,2.5\],"b":2,"c":"x\\ny"}' \
+grep -q "round-trips = yes" <<< "$jit" || { echo "FAIL: round-trip not confirmed"; exit 1; }
+grep -q 'serialized = {"a":\[1,2.5\],"b":2,"c":"x\\ny"}' <<< "$jit" \
     || { echo "FAIL: canonical (sorted-key) serialized form unexpected"; exit 1; }
 sig=$(echo "$jit" | tail -1)
 echo "$jit" | tail -1 | grep -qx "30" || { echo "FAIL: expected signal 30, got $sig"; exit 1; }

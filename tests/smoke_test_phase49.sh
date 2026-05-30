@@ -67,7 +67,7 @@ EOF
 
 jit=$("$KARDC" "$TMP/p49.kd")
 echo "$jit"
-echo "$jit" | grep -q "phase49: ok" || { echo "FAIL: missing ok line"; exit 1; }
+grep -q "phase49: ok" <<< "$jit" || { echo "FAIL: missing ok line"; exit 1; }
 sig=$(echo "$jit" | tail -1)
 [[ "$sig" == "5303" ]] || { echo "FAIL [jit]: expected 5303 got $sig"; exit 1; }
 "$KARDC" --no-cache -o "$TMP/p49" "$TMP/p49.kd" >/dev/null

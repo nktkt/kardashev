@@ -43,7 +43,7 @@ fn main() -> i64 ! { io } {
     0
 }
 EOF
-got=$("$KARDC" "$TMP/ovf.kd" 2>/dev/null | head -5)
+got=$("$KARDC" "$TMP/ovf.kd" 2>/dev/null); got=$(head -5 <<< "$got")
 want=$'-1\n-1\n-1\n9223372036854775807\n-9223372036854775808'
 [[ "$got" == "$want" ]] || { echo "FAIL [overflow]:"; diff <(echo "$want") <(echo "$got"); exit 1; }
 echo "PASS [parse-overflow]: out-of-i64-range -> None; i64::MAX / i64::MIN still Some"

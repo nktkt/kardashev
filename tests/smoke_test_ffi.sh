@@ -147,7 +147,7 @@ if [[ "$rc" -eq 0 ]]; then
     echo "FAIL: a pure fn calling an extern (io) should be rejected"
     exit 1
 fi
-if ! echo "$ERR_OUT" | grep -q 'effect `io`'; then
+if ! grep -q 'effect `io`' <<< "$ERR_OUT"; then
     echo 'FAIL: expected an `io` effect-undeclared diagnostic, got:'
     echo "$ERR_OUT"
     exit 1
@@ -195,7 +195,7 @@ if [[ "$rc" -eq 0 ]]; then
     echo "FAIL: a non-\"C\" ABI extern should be rejected"
     exit 1
 fi
-if ! echo "$ABI_ERR" | grep -q 'unsupported ABI'; then
+if ! grep -q 'unsupported ABI' <<< "$ABI_ERR"; then
     echo 'FAIL: expected an `unsupported ABI` diagnostic, got:'
     echo "$ABI_ERR"
     exit 1

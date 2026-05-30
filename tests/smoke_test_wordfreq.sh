@@ -42,9 +42,9 @@ trap 'rm -rf "$TMP"' EXIT
 # 1. correctness: top-3 lines + the packed signal (321).
 jit=$("$KARDC" "$SRC")
 echo "$jit"
-echo "$jit" | grep -qx "the 3" || { echo "FAIL: expected 'the 3'"; exit 1; }
-echo "$jit" | grep -qx "cat 2" || { echo "FAIL: expected 'cat 2'"; exit 1; }
-echo "$jit" | grep -qx "mat 1" || { echo "FAIL: expected 'mat 1'"; exit 1; }
+grep -qx "the 3" <<< "$jit" || { echo "FAIL: expected 'the 3'"; exit 1; }
+grep -qx "cat 2" <<< "$jit" || { echo "FAIL: expected 'cat 2'"; exit 1; }
+grep -qx "mat 1" <<< "$jit" || { echo "FAIL: expected 'mat 1'"; exit 1; }
 echo "$jit" | tail -1 | grep -qx "321" || { echo "FAIL: expected signal 321, got $(echo "$jit" | tail -1)"; exit 1; }
 "$KARDC" --no-cache -o "$TMP/wf" "$SRC" >/dev/null
 set +e; "$TMP/wf" >/dev/null; rc=$?; set -e

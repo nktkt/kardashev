@@ -47,7 +47,7 @@ trap 'rm -rf "$TMP"' EXIT
 run_jit_aot() {
     local name="$1" expected="$2"
     local jit
-    jit=$("$KARDC" "$TMP/$name.kd" | head -n "$(echo "$expected" | wc -l)")
+    jit=$("$KARDC" "$TMP/$name.kd"); jit=$(head -n "$(echo "$expected" | wc -l)" <<< "$jit")
     if [[ "$jit" != "$expected" ]]; then
         echo "FAIL: $name JIT output mismatch"
         echo "expected:"; echo "$expected"
@@ -179,7 +179,7 @@ if [[ "$ESC_RC" -eq 0 ]]; then
     echo "FAIL: returning a by-ref capturing closure should be rejected"
     exit 1
 fi
-if ! echo "$ESC_OUT" | grep -q "by reference"; then
+if ! grep -q "by reference" <<< "$ESC_OUT"; then
     echo "FAIL: expected an escape diagnostic mentioning by-reference capture"
     echo "$ESC_OUT"
     exit 1
@@ -203,7 +203,7 @@ if [[ "$NOMUT_RC" -eq 0 ]]; then
     echo "FAIL: mutating a non-mut captured binding should be rejected"
     exit 1
 fi
-if ! echo "$NOMUT_OUT" | grep -q "not declared \`let mut\`"; then
+if ! grep -q "not declared \`let mut\`" <<< "$NOMUT_OUT"; then
     echo "FAIL: expected a 'not declared let mut' diagnostic"
     echo "$NOMUT_OUT"
     exit 1
