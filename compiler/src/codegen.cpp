@@ -3875,7 +3875,16 @@ private:
         // Entry struct layouts.
         cleanupEntTy_ = llvm::StructType::create(
             ctx, {i8PtrTy, i8PtrTy, i8PtrTy}, "kd.cleanup_ent");
-        auto* jmpBufArrTy = llvm::ArrayType::get(i8Ty, 256); // >= any jmp_buf
+        // A jmp_buf is platform-specific in BOTH size and alignment. Use a
+        // generously-sized, 16-byte-aligned cell: an i128 array is 16-aligned,
+        // so every catch entry's jmp_buf (field 0 of a malloc-16-aligned buffer
+        // whose stride is a 16-multiple) is 16-aligned — vs. a byte array, which
+        // is only 1-aligned and put entries past the first at non-16 offsets.
+        // 512 bytes clears any platform's `_setjmp` jmp_buf (macOS/arm64 saves
+        // the callee-saved SIMD regs d8-d15 and is larger than glibc/x86's ~200).
+        // (v14 hardening: the macOS-arm64 codegen_test panic-unwind abort.)
+        auto* jmpBufArrTy =
+            llvm::ArrayType::get(llvm::Type::getInt128Ty(ctx), 32); // 512B, a16
         catchEntTy_ = llvm::StructType::create(
             ctx, {jmpBufArrTy, i64Ty}, "kd.catch_ent");
 
