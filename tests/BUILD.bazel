@@ -342,6 +342,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v29 Phase 161: randomized C-vs-LLVM differential oracle.
+sh_test(
+    name = "smoke_test_phase161",
+    srcs = ["smoke_test_phase161.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v29 Phase 160: C backend for/loop-with-value + modules (gated vs LLVM).
 sh_test(
     name = "smoke_test_phase160",
