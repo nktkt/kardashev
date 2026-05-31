@@ -440,6 +440,16 @@ Each shipped green before the next, exactly as v1–v4 did.
 >   load, and the `block_on` call is left unnamed. All three drivers now compile
 >   **and** run (JIT + AOT). Pinned by `tests/smoke_test_unitasync.sh`. A
 >   production compiler must never crash on valid input.
+>
+> - **Phase 110 — a differential fuzzer for the codegen path (done).** The v14
+>   deferral: hunt miscompiles systematically (the class of bug the v17 review
+>   found by hand). `tests/smoke_test_fuzz_arith.sh` generates many random,
+>   always-valid `i64` expression programs (`+ - * ( )` over small literals,
+>   bounded depth) and checks three oracles agree — the JIT-printed value, the
+>   AOT exit code (`value & 255`), and a Python reference evaluating the *same*
+>   expression as wrapped 64-bit arithmetic. Seeded for reproducibility. 300
+>   programs across 5 seeds agree exactly (no miscompile found — confidence in the
+>   arithmetic/codegen lowering).
 
 ## Roadmap v17 — shipped
 
