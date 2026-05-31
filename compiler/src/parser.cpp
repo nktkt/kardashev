@@ -1187,6 +1187,33 @@ private:
 
     // --- Block & statements ---
 
+    // v24 Phase 131: panic-mode recovery. Skip the malformed remainder of a
+    // statement — advance to and consume the next `;`, or stop just before a
+    // `}` / statement keyword / EOF — so the next statement parses cleanly
+    // instead of the parser cascading off the leftover tokens.
+    void synchronizeStmt() {
+        while (!check(TokenKind::EndOfInput)) {
+            if (check(TokenKind::Semi)) {
+                consume();
+                return;
+            }
+            if (check(TokenKind::RBrace) || check(TokenKind::KwLet) ||
+                check(TokenKind::KwReturn))
+                return;
+            consume();
+        }
+    }
+
+    // v24 Phase 131: terminate a statement. If the value parsed cleanly, require
+    // the `;`; if it already reported an error, resynchronize instead of adding
+    // a spurious "expected ;" on top of the real diagnostic.
+    void expectSemiOrSync(std::size_t errBefore) {
+        if (errors_.size() > errBefore)
+            synchronizeStmt();
+        else
+            expect(TokenKind::Semi, ";");
+    }
+
     std::unique_ptr<ast::BlockExpr> parseBlockExpr() {
         Token lbrace = expect(TokenKind::LBrace, "{");
         auto block = std::make_unique<ast::BlockExpr>();
@@ -1195,8 +1222,19 @@ private:
         bool prevBlockRestrict = restrictStructLit_;
         restrictStructLit_ = false;
 
+        std::size_t syncErrCount = errors_.size();
+        std::size_t syncPos = static_cast<std::size_t>(-1);
         while (!check(TokenKind::RBrace) && !check(TokenKind::EndOfInput)) {
             if (errors_.size() > 20) break;
+            // v24 Phase 131: if the previous statement errored (or made no
+            // progress), resynchronize before parsing the next one.
+            if (errors_.size() > syncErrCount || pos_ == syncPos) {
+                synchronizeStmt();
+                if (check(TokenKind::RBrace) || check(TokenKind::EndOfInput))
+                    break;
+            }
+            syncErrCount = errors_.size();
+            syncPos = pos_;
 
             if (check(TokenKind::KwLet)) {
                 block->stmts.push_back(parseLetStmt());
@@ -1311,8 +1349,9 @@ private:
                     std::make_shared<ast::TypeRef>(parseTypeRef());
             }
             expect(TokenKind::Eq, "=");
+            std::size_t eb = errors_.size();
             stmt->value = parseExpr();
-            expect(TokenKind::Semi, ";");
+            expectSemiOrSync(eb);
             return stmt;
         }
         Token nameTok = expect(TokenKind::Identifier, "identifier after 'let'");
@@ -1323,8 +1362,9 @@ private:
             annotation = std::make_shared<ast::TypeRef>(parseTypeRef());
         }
         expect(TokenKind::Eq, "=");
+        std::size_t eb = errors_.size();
         auto value = parseExpr();
-        expect(TokenKind::Semi, ";");
+        expectSemiOrSync(eb);
         stmt->name = nameTok.lexeme;
         stmt->value = std::move(value);
         stmt->annotation = std::move(annotation);
@@ -1336,10 +1376,11 @@ private:
         auto stmt = std::make_unique<ast::ReturnStmt>();
         stmt->line = retTok.line;
         stmt->column = retTok.column;
+        std::size_t eb = errors_.size();
         if (!check(TokenKind::Semi)) {
             stmt->value = parseExpr();
         }
-        expect(TokenKind::Semi, ";");
+        expectSemiOrSync(eb);
         return stmt;
     }
 
