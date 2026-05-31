@@ -980,10 +980,50 @@ private:
                 decl.assocTypes.push_back(std::move(at));
                 continue;
             }
+            // v25 Phase 139: a trait associated const `const N: T;` desugars to
+            // a no-self method signature `fn N() -> T;`.
+            if (check(TokenKind::KwConst) && peek(1).kind != TokenKind::KwFn) {
+                decl.methods.push_back(parseTraitAssocConst());
+                continue;
+            }
             decl.methods.push_back(parseMethodSig());
         }
         expect(TokenKind::RBrace, "}");
         return decl;
+    }
+
+    // v25 Phase 139: `const N: T;` in a trait -> a no-self method sig.
+    ast::MethodSig parseTraitAssocConst() {
+        Token c = expect(TokenKind::KwConst, "const");
+        Token name = expect(TokenKind::Identifier, "associated const name");
+        expect(TokenKind::Colon, ":");
+        ast::MethodSig sig;
+        sig.name = name.lexeme;
+        sig.returnType = parseTypeRef();
+        sig.line = c.line;
+        sig.column = c.column;
+        expect(TokenKind::Semi, ";");
+        return sig;
+    }
+
+    // v25 Phase 139: `const N: T = expr;` in an impl -> `fn N() -> T { expr }`.
+    ast::FnDecl parseImplAssocConst() {
+        Token c = expect(TokenKind::KwConst, "const");
+        Token name = expect(TokenKind::Identifier, "associated const name");
+        expect(TokenKind::Colon, ":");
+        ast::FnDecl fn;
+        fn.name = name.lexeme;
+        fn.returnType = parseTypeRef();
+        fn.line = c.line;
+        fn.column = c.column;
+        expect(TokenKind::Eq, "=");
+        auto body = std::make_unique<ast::BlockExpr>();
+        body->line = c.line;
+        body->column = c.column;
+        body->tail = parseExpr();
+        expect(TokenKind::Semi, ";");
+        fn.body = std::move(body);
+        return fn;
     }
 
     ast::MethodSig parseMethodSig() {
@@ -1157,6 +1197,13 @@ private:
                 at.type = parseTypeRef();
                 expect(TokenKind::Semi, ";");
                 decl.assocTypes.push_back(std::move(at));
+                continue;
+            }
+            // v25 Phase 139: an associated const `const N: T = expr;` desugars
+            // to a no-self method `fn N() -> T { expr }`, read as `Type::N()`.
+            // (`const fn` is a function — disambiguate on the token after.)
+            if (check(TokenKind::KwConst) && peek(1).kind != TokenKind::KwFn) {
+                decl.methods.push_back(parseImplAssocConst());
                 continue;
             }
             decl.methods.push_back(parseImplFnDecl());
