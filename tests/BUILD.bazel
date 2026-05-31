@@ -220,6 +220,14 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v19 Phase 113: a differential fuzzer for the DIVISION / MODULO / BITWISE codegen
+# (C-semantics: truncating sdiv, dividend-signed srem, arithmetic >>).
+sh_test(
+    name = "smoke_test_fuzz_div",
+    srcs = ["smoke_test_fuzz_div.sh"],
+    data = ["//compiler:kardc"],
+)
+
 sh_test(
     name = "smoke_test_threads",
     srcs = ["smoke_test_threads.sh"],

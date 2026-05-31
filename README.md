@@ -434,6 +434,17 @@ Each shipped green before the next, exactly as v1–v4 did.
 >   variant gates on RSS-flatness (a per-iteration leak balloons it). 75 programs
 >   across 3 seeds are all sound — strong evidence the per-field move/drop
 >   machinery holds across varied programs.
+>
+> - **Phase 113 — fuzzing the division / modulo / bitwise codegen (done).** The
+>   paths the arithmetic fuzzer skipped, and a classic miscompile source: signed
+>   division *truncates* toward zero (not floors) and `%` takes the sign of the
+>   *dividend* (C / Rust / LLVM semantics, not Python's floor-mod).
+>   `tests/smoke_test_fuzz_div.sh` generates random `+ - * / % & | ^ << >>`
+>   programs (non-zero literal divisors/shift amounts; negative dividends), with
+>   the kardashev source and a C-semantics Python reference emitted in lockstep.
+>   200 programs across 4 seeds agree (JIT == AOT == reference) — confirming the
+>   `sdiv`/`srem`/bitwise/arithmetic-shift lowering is correct. (Writing it
+>   confirmed the compiler follows C/Rust `%` semantics, not Python's.)
 
 ## Roadmap v18 — shipped
 
