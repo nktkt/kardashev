@@ -1,0 +1,273 @@
+// Roadmap v17 — "self-hosting, cont.", Phase 102. A whole-FUNCTION type checker
+// written in kardashev — threads the Phase-101 expression type checker through an
+// entire `fn NAME ( PARAMS ) -> RET { LETS ; RESULT }` (the Phase-98 function
+// grammar). It parses params WITH their declared types (i64 / bool), builds a
+// type environment from them, type-checks each `let` (binding the inferred type
+// of its RHS, rejecting an ill-typed one), and finally requires the body's result
+// type to EQUAL the function's declared return type. This is the real check a
+// compiler runs on a function definition — name resolution PLUS type agreement —
+// done in the language it checks. Checked on a well-typed i64 function, a
+// well-typed bool function, a body/return-type MISMATCH, and a let that makes the
+// body ill-typed.
+
+// Type tags: 0 TErr, 1 TInt (i64), 2 TBool (bool).
+// Bin op codes: 10 '+', 11 '*' (arithmetic) ; 20 '<', 21 '==' (comparison).
+enum Expr {
+    Num(i64),
+    Var(String),
+    Bin(i64, Box<Expr>, Box<Expr>),
+    If(Box<Expr>, Box<Expr>, Box<Expr>),
+}
+enum Stmt { Let(String, Box<Expr>) }
+
+// kind: 1 num, 2 ident, 3 '->', 10 '+', 11 '*', 12 '(', 13 ')', 14 '=', 15 ';',
+//       16 ':', 17 ',', 18 '{', 19 '}', 20 '<', 21 '=='
+struct Token { kind: i64, start: i64, len: i64, value: i64 }
+struct Pos { i: i64 }
+struct Param { name: String, ty: i64 }              // ty is a type TAG
+struct Block { lets: Vec<Stmt>, result: Box<Expr> }
+struct Fn { name: String, params: Vec<Param>, ret: i64, body: Block }
+
+fn is_alpha(b: i64) -> i64 {
+    if b >= 97 { if b <= 122 { 1 } else { 0 } }
+    else { if b >= 65 { if b <= 90 { 1 } else { 0 } } else { if b == 95 { 1 } else { 0 } } }
+}
+fn is_digit(b: i64) -> i64 { if b >= 48 { if b <= 57 { 1 } else { 0 } } else { 0 } }
+fn is_alnum(b: i64) -> i64 { if is_alpha(b) == 1 { 1 } else { is_digit(b) } }
+fn is_space(b: i64) -> i64 {
+    if b == 32 { 1 } else { if b == 10 { 1 } else { if b == 9 { 1 } else { 0 } } }
+}
+
+fn lex(src: &String) -> Vec<Token> ! { alloc } {
+    let n = str_len(src);
+    let mut toks = vec_new();
+    let mut i = 0;
+    while i < n {
+        let b = str_char_at(src, i);
+        if is_space(b) == 1 { i = i + 1; }
+        else {
+            if is_alpha(b) == 1 {
+                let start = i; i = i + 1;
+                let mut go = true;
+                while go {
+                    if i >= n { go = false; }
+                    else { let c = str_char_at(src, i); if is_alnum(c) == 1 { i = i + 1; } else { go = false; } }
+                }
+                vec_push(&mut toks, Token { kind: 2, start: start, len: i - start, value: 0 });
+            } else {
+                if is_digit(b) == 1 {
+                    let start = i; let mut v = 0;
+                    let mut go = true;
+                    while go {
+                        if i >= n { go = false; }
+                        else { let c = str_char_at(src, i); if is_digit(c) == 1 { v = v * 10 + (c - 48); i = i + 1; } else { go = false; } }
+                    }
+                    vec_push(&mut toks, Token { kind: 1, start: start, len: i - start, value: v });
+                } else {
+                    let is_arrow = if b == 45 {
+                        if i + 1 < n { if str_char_at(src, i + 1) == 62 { 1 } else { 0 } } else { 0 }
+                    } else { 0 };
+                    let is_eq2 = if b == 61 {
+                        if i + 1 < n { if str_char_at(src, i + 1) == 61 { 1 } else { 0 } } else { 0 }
+                    } else { 0 };
+                    if is_arrow == 1 {
+                        vec_push(&mut toks, Token { kind: 3, start: i, len: 2, value: 0 }); i = i + 2;
+                    } else { if is_eq2 == 1 {
+                        vec_push(&mut toks, Token { kind: 21, start: i, len: 2, value: 0 }); i = i + 2;
+                    } else {
+                        let k = if b == 43 { 10 } else { if b == 42 { 11 } else { if b == 40 { 12 } else { if b == 41 { 13 } else { if b == 61 { 14 } else { if b == 59 { 15 } else { if b == 58 { 16 } else { if b == 44 { 17 } else { if b == 123 { 18 } else { if b == 125 { 19 } else { if b == 60 { 20 } else { 0 - 1 } } } } } } } } } } };
+                        vec_push(&mut toks, Token { kind: k, start: i, len: 1, value: 0 });
+                        i = i + 1;
+                    } }
+                }
+            }
+        }
+    }
+    toks
+}
+
+fn tok_text(src: &String, t: &Token) -> String ! { alloc } { str_substring(src, t.start, t.len) }
+fn peek_kind(toks: &Vec<Token>, pos: &Pos) -> i64 {
+    if pos.i < vec_len(toks) { let t = vec_get(toks, pos.i); t.kind } else { 0 - 9 }
+}
+// Map a type NAME token to a tag: "bool" -> 2, anything else (incl. "i64") -> 1.
+fn ty_tag(src: &String, t: &Token) -> i64 ! { alloc } {
+    let txt = tok_text(src, t); let kw_bool = "bool";
+    if str_eq(&txt, &kw_bool) { 2 } else { 1 }
+}
+
+// ---- expression parser (precedence: cmp < sum < term < factor) ----
+fn parse_factor(src: &String, toks: &Vec<Token>, pos: &mut Pos) -> Box<Expr> ! { alloc } {
+    let t = vec_get(toks, pos.i);
+    if t.kind == 1 { pos.i = pos.i + 1; Box::new(Num(t.value)) }
+    else { if t.kind == 2 {
+        let txt = tok_text(src, &t); let kw_if = "if";
+        if str_eq(&txt, &kw_if) {
+            pos.i = pos.i + 1;                          // 'if'
+            let c = parse_expr(src, toks, pos);
+            pos.i = pos.i + 1;                          // '{'
+            let th = parse_expr(src, toks, pos);
+            pos.i = pos.i + 1;                          // '}'
+            pos.i = pos.i + 1;                          // 'else'
+            pos.i = pos.i + 1;                          // '{'
+            let el = parse_expr(src, toks, pos);
+            pos.i = pos.i + 1;                          // '}'
+            Box::new(If(c, th, el))
+        } else { pos.i = pos.i + 1; Box::new(Var(txt)) }
+    } else {
+        pos.i = pos.i + 1;                              // '('
+        let e = parse_expr(src, toks, pos);
+        pos.i = pos.i + 1;                              // ')'
+        e
+    } }
+}
+fn parse_term(src: &String, toks: &Vec<Token>, pos: &mut Pos) -> Box<Expr> ! { alloc } {
+    let mut left = parse_factor(src, toks, pos);
+    let mut go = true;
+    while go {
+        if peek_kind(toks, pos) == 11 { pos.i = pos.i + 1; let r = parse_factor(src, toks, pos); left = Box::new(Bin(11, left, r)); }
+        else { go = false; }
+    }
+    left
+}
+fn parse_sum(src: &String, toks: &Vec<Token>, pos: &mut Pos) -> Box<Expr> ! { alloc } {
+    let mut left = parse_term(src, toks, pos);
+    let mut go = true;
+    while go {
+        if peek_kind(toks, pos) == 10 { pos.i = pos.i + 1; let r = parse_term(src, toks, pos); left = Box::new(Bin(10, left, r)); }
+        else { go = false; }
+    }
+    left
+}
+fn parse_expr(src: &String, toks: &Vec<Token>, pos: &mut Pos) -> Box<Expr> ! { alloc } {
+    let left = parse_sum(src, toks, pos);
+    let k = peek_kind(toks, pos);
+    if k == 20 { pos.i = pos.i + 1; let r = parse_sum(src, toks, pos); Box::new(Bin(20, left, r)) }
+    else { if k == 21 { pos.i = pos.i + 1; let r = parse_sum(src, toks, pos); Box::new(Bin(21, left, r)) }
+    else { left } }
+}
+
+fn at_let(src: &String, toks: &Vec<Token>, pos: &Pos) -> i64 ! { alloc } {
+    if peek_kind(toks, pos) == 2 {
+        let t = vec_get(toks, pos.i); let txt = tok_text(src, &t); let kw = "let";
+        if str_eq(&txt, &kw) { 1 } else { 0 }
+    } else { 0 }
+}
+fn parse_block(src: &String, toks: &Vec<Token>, pos: &mut Pos) -> Block ! { alloc } {
+    let mut lets = vec_new();
+    let mut go = true;
+    while go {
+        if at_let(src, toks, pos) == 1 {
+            pos.i = pos.i + 1;                          // 'let'
+            let nt = vec_get(toks, pos.i); let name = tok_text(src, &nt); pos.i = pos.i + 1;
+            pos.i = pos.i + 1;                          // '='
+            let e = parse_expr(src, toks, pos);
+            pos.i = pos.i + 1;                          // ';'
+            vec_push(&mut lets, Let(name, e));
+        } else { go = false; }
+    }
+    let result = parse_expr(src, toks, pos);
+    Block { lets: lets, result: result }
+}
+
+// Parse a whole `fn NAME ( p: TY , ... ) -> RET { BODY }`.
+fn parse_fn(src: &String, toks: &Vec<Token>) -> Fn ! { alloc } {
+    let mut pos = Pos { i: 0 };
+    pos.i = pos.i + 1;                                  // 'fn'
+    let nt = vec_get(toks, pos.i); let name = tok_text(src, &nt); pos.i = pos.i + 1;
+    pos.i = pos.i + 1;                                  // '('
+    let mut params = vec_new();
+    let mut go = true;
+    while go {
+        if peek_kind(toks, &pos) == 2 {
+            let pnt = vec_get(toks, pos.i); let pn = tok_text(src, &pnt); pos.i = pos.i + 1;
+            pos.i = pos.i + 1;                          // ':'
+            let ptt = vec_get(toks, pos.i); let pty = ty_tag(src, &ptt); pos.i = pos.i + 1;
+            vec_push(&mut params, Param { name: pn, ty: pty });
+            if peek_kind(toks, &pos) == 17 { pos.i = pos.i + 1; } else { go = false; }  // ','
+        } else { go = false; }
+    }
+    pos.i = pos.i + 1;                                  // ')'
+    pos.i = pos.i + 1;                                  // '->'
+    let rtt = vec_get(toks, pos.i); let ret = ty_tag(src, &rtt); pos.i = pos.i + 1;
+    pos.i = pos.i + 1;                                  // '{'
+    let body = parse_block(src, toks, &mut pos);
+    Fn { name: name, params: params, ret: ret, body: body }
+}
+
+// ---- the type checker ----
+fn type_of(e: &Expr, env: &HashMap<String, i64>) -> i64 ! { alloc } {
+    match e {
+        Num(_) => 1,
+        Var(name) => match hashmap_get(env, clone(name)) { Some(t) => t, None => 0 },
+        Bin(op, a, b) => {
+            let ta = type_of(&(**a), env);
+            let tb = type_of(&(**b), env);
+            if ta == 1 { if tb == 1 { if *op <= 11 { 1 } else { 2 } } else { 0 } } else { 0 }
+        },
+        If(c, t, e2) => {
+            let tc = type_of(&(**c), env);
+            let tt = type_of(&(**t), env);
+            let te = type_of(&(**e2), env);
+            if tc == 2 { if tt == te { if tt == 0 { 0 } else { tt } } else { 0 } } else { 0 }
+        },
+    }
+}
+
+// Type-check a whole function: 1 if well-typed AND the body's type equals the
+// declared return type, else 0. Each `let` binds the inferred type of its RHS
+// (an ill-typed RHS makes the whole function ill-typed).
+fn check_fn(f: &Fn) -> i64 ! { alloc } {
+    let mut env = hashmap_new();
+    let np = vec_len(&f.params);
+    let mut p = 0;
+    while p < np { let pm = vec_get(&f.params, p); hashmap_insert(&mut env, clone(&pm.name), pm.ty); p = p + 1; }
+    let nl = vec_len(&f.body.lets);
+    let mut bad = 0;
+    let mut k = 0;
+    while k < nl {
+        let s = vec_get(&f.body.lets, k);
+        match s {
+            Let(name, e) => {
+                let t = type_of(&(*e), &env);
+                bad = if t == 0 { 1 } else { bad };
+                hashmap_insert(&mut env, name, t);
+            },
+        }
+        k = k + 1;
+    }
+    let rt = type_of(&(*f.body.result), &env);
+    // well-typed body, no ill-typed let, and body type == declared return type.
+    if bad == 1 { 0 } else { if rt == 0 { 0 } else { if rt == f.ret { 1 } else { 0 } } }
+}
+
+fn check(src: &String) -> i64 ! { alloc } {
+    let toks = lex(src);
+    let f = parse_fn(src, &toks);
+    check_fn(&f)
+}
+
+fn main() -> i64 ! { io, alloc } {
+    // 1. well-typed i64 function: body `x * 2` : i64 == ret i64
+    let s1 = "fn f(a: i64, b: i64) -> i64 { let x = a + b ; x * 2 }";
+    let r1 = check(&s1);
+    print(r1);                                          // 1
+
+    // 2. well-typed bool function: body `a < b` : bool == ret bool
+    let s2 = "fn g(a: i64, b: i64) -> bool { a < b }";
+    let r2 = check(&s2);
+    print(r2);                                          // 1
+
+    // 3. return-type MISMATCH: body `a < a` : bool, but declared ret i64
+    let s3 = "fn bad(a: i64) -> i64 { a < a }";
+    let r3 = check(&s3);
+    print(r3);                                          // 0
+
+    // 4. a `let` makes the body ill-typed: y : bool, then `y + 1` is bool + int
+    let s4 = "fn bad2(a: i64) -> i64 { let y = a < a ; y + 1 }";
+    let r4 = check(&s4);
+    print(r4);                                          // 0
+
+    // witness: r1*1000 + r2*100 + r3*10 + r4 = 1100
+    r1 * 1000 + r2 * 100 + r3 * 10 + r4
+}

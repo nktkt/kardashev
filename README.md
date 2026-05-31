@@ -52,13 +52,17 @@ Effect sets are unioned across the call graph and checked at definition sites; n
 
 ## Status
 
-All sixteen roadmaps (Phases 0–97, **v1–v16**) have shipped and are merged to
+All seventeen roadmaps (Phases 0–107, **v1–v17**) have shipped and are merged to
 `main` — 6 unit suites plus the full smoke-test aggregate pass **JIT and AOT**
-on a cleared clean build. v15–v16 ("self-hosting") build a self-hosted compiler
-front *in* kardashev — the north-star arc toward a bootstrap: v15 the front-end
+on a cleared clean build. v15–v17 ("self-hosting") build a complete compiler
+*in* kardashev — the north-star arc toward a bootstrap: v15 the front-end
 (lexer + parser + signature checker), v16 the BODY (expression/statement parser,
-scope checker, and a function-body interpreter; `examples/selfhost/`, capstone
-`interp.kd`). v14 ("hardening") made the toolchain trustworthy
+scope checker, and a function-body interpreter), and v17 the **type checker AND
+code generator** — capstone `examples/selfhost/compile.kd` type-checks a whole
+function and compiles + runs its body (lex → parse → type-check → codegen → VM,
+every stage in kardashev). Dogfooding self-hosting found and fixed three real
+host-compiler bugs (a field-move double-free, a unit-tail-`match` miscompile, a
+field-assignment leak). v14 ("hardening") made the toolchain trustworthy
 across platforms: **macOS CI went green for the first time** (portable leak
 gates), the smoke harness is SIGPIPE-robust, the channel capture-and-keep footgun
 is now a precise compile error, and a JIT-vs-AOT differential sweep over the 9
@@ -408,6 +412,146 @@ generic keys; 29 plugged the Drop leaks 27–28's new droppable values made load
 30's `Result<String, IoError>` drops cleanly on the error path *because* 29 closed that
 hole; 31 integrated 27–30 into the self-written capstones; 32 documented the result last.
 Each shipped green before the next, exactly as v1–v4 did.
+
+## Roadmap v17 — shipped
+
+> **Status: shipped** (`0.17.0`). "Self-hosting, continued" — unify v15's
+> signatures and v16's body interpreter into a complete `Fn`, then push all the
+> way to a type checker AND a code generator: a mini compiler written in
+> kardashev. Each phase a real, tested kardashev program in `examples/selfhost/`;
+> dogfooding it found and fixed three real host-compiler bugs.
+>
+> - **Phase 98 — a whole-function parser + interpreter (done).** `examples/selfhost/func.kd`
+>   parses a complete `fn NAME ( PARAMS ) -> RET { BODY }` into an `Fn { name,
+>   params, ret, body }` AST (v15's signature + v16's body block) and INTERPRETS
+>   it: scope-check the body against the parameters, bind the call arguments, and
+>   evaluate the body. `fn f(a: i64, b: i64) -> i64 { let x = a + b ; x * 2 }`
+>   called with `(3, 4)` → `x = 7`, `x * 2` = `14`, JIT + AOT.
+>
+ - **Phase 99 — fixed a memory-safety bug self-hosting surfaced (done).** Writing
+>   Phase 98 hit a real **double-free**: moving a non-Copy struct field by value
+>   (`vec_push(&mut v, p.name)`) double-frees — the borrow checker modeled
+>   `s.field` as a read while codegen extracted it as an uncleared move, so the
+>   struct's drop freed the field again (proven with a Drop counter: the field
+>   dropped *twice*). Fixed by clearing the **root binding's** drop flag on a
+>   field/index partial move, conservatively disabling the whole struct's drop so
+>   the moved field can't be double-freed — eliminating the double-free for all
+>   field types with no compile-error regression. Verified: the field now drops
+>   exactly once; a loop of String field-moves is heap-clean (MALLOC_CHECK_=3);
+>   all unit + smoke suites green. Pinned by `tests/smoke_test_fieldmove.sh`.
+>   **This is the payoff of self-hosting: dogfooding the compiler found a real
+>   memory-safety bug.**
+>
+> - **Phase 100 — per-field partial-move tracking, leak-free (done).** Phase 99's
+>   fix was conservative: disabling the whole struct's drop after a partial move
+>   left the *sibling* fields leaked (safe, but a leak). Phase 100 makes it
+>   precise — an eligible plain struct local (no user `Drop`, non-panic program)
+>   gets one drop flag **per droppable field**; moving a field out clears only
+>   that field's flag, so its siblings are still freed at scope exit. Gated off
+>   in may-panic programs (the unwind cleanup thunk drops the whole struct via a
+>   single flag, which per-field flags would desync into a double-free on unwind)
+>   and for structs with a user destructor (a partial move must not skip it) —
+>   those keep the conservative whole-disable, leak-but-safe. Verified: after
+>   `vec_push(&mut v, s.a)`, field `a` drops exactly once **and** sibling `b`
+>   drops exactly once (was 0 — leaked); all unit + smoke suites stay green
+>   including the panic/unwind path. Pinned by `tests/smoke_test_fieldmove.sh`
+>   (sibling-drop case).
+>
+ - **Phase 101 — a real type checker, self-hosted (done).** Past scope-checking:
+>   the self-hosted expression language now has TWO types — `i64` and `bool` — so
+>   `examples/selfhost/typeck.kd` does genuine type inference. A recursive-descent
+>   parser builds an `enum Expr` (numbers, vars, `+ * < ==`, `if/else`); `type_of`
+>   infers each node's type against a type environment (var → type tag), enforcing
+>   arithmetic on `int×int→int`, comparison on `int×int→bool`, and that an `if`
+>   condition is `bool` with equal branch types — propagating a `TErr` tag on any
+>   mismatch. Checked on a well-typed `if` (→`TInt`), an `int + bool` mismatch
+>   (→`TErr`), a non-`bool` `if` condition (→`TErr`), and a bare comparison
+>   (→`TBool`). JIT + AOT; pinned by `tests/smoke_test_phase101.sh`. A type
+>   checker for kardashev, written in kardashev.
+>
+> - **Phase 102 — a whole-FUNCTION type checker, self-hosted (done).** Threads the
+>   Phase-101 checker through an entire `fn NAME(PARAMS) -> RET { LETS ; RESULT }`
+>   (`examples/selfhost/funcheck.kd`). It parses params with their declared types
+>   (`i64` / `bool`), builds a type environment from them, type-checks each `let`
+>   (binding the inferred type of its RHS, rejecting an ill-typed one), and
+>   requires the body's result type to EQUAL the declared return type. Checked on
+>   a well-typed `i64` function (→ok), a well-typed `bool` function (→ok), a
+>   body/return-type mismatch (`a < a` returned where `i64` is declared → rejected),
+>   and a `let` that makes the body ill-typed (`let y = a < a ; y + 1` → rejected).
+>   JIT + AOT; pinned by `tests/smoke_test_phase102.sh`. This is the real check a
+>   compiler runs on a function definition — name resolution *plus* type agreement.
+>
+> - **Phase 103 — the CODEGEN step, self-hosted (done).** The compiler back-end
+>   shape, in kardashev (`examples/selfhost/emit.kd`): after parse + type-check,
+>   `emit` lowers the `Expr` AST to a flat STACK-MACHINE BYTECODE
+>   (`PUSH/LOAD/ADD/MUL/LT/EQ/SELECT`), and `run` executes it on an operand stack
+>   against a register file (the parameter values). The codegen is *proven*
+>   correct by cross-checking every program against a direct tree-walking `eval` —
+>   the compiled (VM) result must equal the interpreted result. `if` lowers to a
+>   branch-free `SELECT` (sound because these expressions are pure). Checked:
+>   `a + b * 2` → 11 (precedence preserved through lowering), `if a < b { a + 1 }
+>   else { a * b }` → 4, `if a == b { 100 } else { (a + b) * b }` → 28 — all three
+>   match the reference interpreter. JIT + AOT; pinned by
+>   `tests/smoke_test_phase103.sh`. Lexer → parser → type checker → **code
+>   generator + VM**, every stage written in kardashev. (Writing it surfaced — and
+>   the next phase fixes — a host miscompile of a `match` in tail position of a
+>   unit-returning function; another bug found by dogfooding self-hosting.)
+>
+> - **Phase 104 — fixed the unit-tail-`match` miscompile (done).** The bug Phase
+>   103 surfaced: a `match` (or any value-producing expression) in tail position
+>   of a UNIT-returning function emitted `ret i64` into a void function — invalid
+>   IR, rejected by the verifier — because codegen chose `ret` vs `ret void` on
+>   "did the tail produce a value" instead of the function's actual return type.
+>   Fixed in `codegen.cpp`'s function epilogue: a void-returning function always
+>   emits `ret void`, discarding any value its tail materializes. Proven by
+>   reverting `emit.kd`'s `-> i64` workaround back to the natural unit-returning
+>   `emit` (still passes, JIT + AOT) and by a focused codegen unit test
+>   (`unit_fn_tail_match_returns_void`, 155 cases). Another bug found *and* fixed
+>   by dogfooding self-hosting.
+>
+> - **Phase 105 — CAPSTONE: a self-hosted mini-compiler, end-to-end (done).**
+>   `examples/selfhost/compile.kd` ties every stage together: it takes a whole
+>   `fn NAME(PARAMS) -> RET { LETS ; RESULT }`, TYPE-CHECKS it, and — only if
+>   well-typed — COMPILES the body to stack-machine bytecode and EXECUTES it on a
+>   set of argument values. The codegen now handles `let` LOCALS: each `let`
+>   lowers to a `STORE` into a register slot (params + lets share a slot-keyed
+>   register file), so functions with local variables compile and run. Checked:
+>   `f(a,b){ let x=a+b ; x*2 }` → f(3,4)=14; `g(a){ let y=a*a ; let z=y+a ; z }` →
+>   g(5)=30; a `bool` function `h(a,b){ a<b }` → h(3,4)=1; and an ill-typed
+>   function (`fn bad(a)->i64 { a<a }`) is REJECTED before any code is emitted
+>   (sentinel −1). JIT + AOT; pinned by `tests/smoke_test_phase105.sh`.
+>
+>   **lex → parse → type-check → code-generate → execute, every stage written in
+>   kardashev — a complete compiler front-to-back, running real functions.**
+>
+> - **Phase 106 — field-level (partial) move tracking in the borrow checker
+>   (done).** An adversarial review of the field-move work surfaced a remaining
+>   double-free: the borrow checker tracked WHOLE-binding moves but not
+>   field-level ones, so moving the same non-Copy struct field by value twice
+>   (`vec_push(&mut v, s.name); vec_push(&mut v, s.name);`) — or a partial move
+>   then a whole-struct move — was *accepted*, aliasing one heap buffer into two
+>   owners (deterministic double-free under `MALLOC_CHECK_=3`). Fixed by tracking
+>   moved fields PER-name (`Binding::movedFields`): a second move of the same
+>   field, or a whole-struct use after a partial move, is now rejected, while
+>   moving two DIFFERENT fields stays legal (no over-rejection). The set is
+>   joined across `if` branches (union), checked at loop back-edges, and reset on
+>   reassignment; calling a fn-value through a field stays a read (not a move).
+>   Pinned by four borrow-checker cases (49 total). **The third real bug found by
+>   dogfooding self-hosting** — completing the field-move soundness story (Phase
+>   99 stopped the single-move double-free, 100 made siblings leak-free, 106
+>   rejects the double/partial-then-whole move at compile time).
+>
+> - **Phase 107 — field-assignment no longer leaks the overwritten value (done).**
+>   The same review found a leak: `s.a = new` overwrote a droppable struct field
+>   without freeing the old value (`emitAssign` only dropped-before-overwrite for
+>   a bare-binding target, not a field target) — a loop reassigning a heap String
+>   field ballooned RSS to ~64 MB over 2 M iterations. Fixed in codegen: for a
+>   `root.field = v` assignment where `root` is a per-field-tracked local, the old
+>   field value is dropped — **guarded by the field's drop flag**, so a
+>   previously moved-out field is not double-freed — then the new value is stored
+>   and the flag re-armed. RSS now flat at ~2 MB; heap-clean under
+>   `MALLOC_CHECK_=3`. Pinned by `tests/smoke_test_fieldmove.sh` (field-assign
+>   case). Both bugs the adversarial review surfaced are now fixed.
 
 ## Roadmap v16 — shipped
 

@@ -1,0 +1,345 @@
+// Roadmap v17 — "self-hosting, cont.", Phase 105 (CAPSTONE). A self-hosted
+// mini-COMPILER end-to-end: it takes a whole `fn NAME(PARAMS) -> RET { LETS ;
+// RESULT }`, TYPE-CHECKS it (params, `let` typing, body type vs declared return),
+// and — only if well-typed — COMPILES the body to stack-machine bytecode and
+// EXECUTES it against a set of argument values, returning the function's result.
+// It extends the Phase-103 codegen with `let` LOCALS: each `let` lowers to a
+// STORE into a register slot, so the body's locals live in a register file
+// (params + lets), keyed by slot. lex -> parse -> typecheck -> codegen -> VM,
+// every stage written in kardashev — a complete compiler front-to-back, running
+// real functions. Ill-typed functions are REJECTED (sentinel -1) before any code
+// is emitted. Checked on two well-typed i64 functions with locals, a well-typed
+// bool function, and a return-type-mismatch rejection.
+//
+// Instr.op: 1 PUSH(arg) | 2 LOAD(slot) | 3 ADD | 4 MUL | 5 LT | 6 EQ | 7 SELECT
+//         | 8 STORE(slot)   ; type tags: 0 TErr, 1 TInt, 2 TBool
+
+enum Expr {
+    Num(i64),
+    Var(String),
+    Bin(i64, Box<Expr>, Box<Expr>),     // op: 10 '+', 11 '*', 20 '<', 21 '=='
+    If(Box<Expr>, Box<Expr>, Box<Expr>),
+}
+enum Stmt { Let(String, Box<Expr>) }
+struct Instr { op: i64, arg: i64 }
+struct Token { kind: i64, start: i64, len: i64, value: i64 }
+struct Pos { i: i64 }
+struct Param { name: String, ty: i64 }
+struct Block { lets: Vec<Stmt>, result: Box<Expr> }
+struct Fn { name: String, params: Vec<Param>, ret: i64, body: Block }
+
+fn is_alpha(b: i64) -> i64 {
+    if b >= 97 { if b <= 122 { 1 } else { 0 } }
+    else { if b >= 65 { if b <= 90 { 1 } else { 0 } } else { if b == 95 { 1 } else { 0 } } }
+}
+fn is_digit(b: i64) -> i64 { if b >= 48 { if b <= 57 { 1 } else { 0 } } else { 0 } }
+fn is_alnum(b: i64) -> i64 { if is_alpha(b) == 1 { 1 } else { is_digit(b) } }
+fn is_space(b: i64) -> i64 {
+    if b == 32 { 1 } else { if b == 10 { 1 } else { if b == 9 { 1 } else { 0 } } }
+}
+
+fn lex(src: &String) -> Vec<Token> ! { alloc } {
+    let n = str_len(src);
+    let mut toks = vec_new();
+    let mut i = 0;
+    while i < n {
+        let b = str_char_at(src, i);
+        if is_space(b) == 1 { i = i + 1; }
+        else {
+            if is_alpha(b) == 1 {
+                let start = i; i = i + 1;
+                let mut go = true;
+                while go {
+                    if i >= n { go = false; }
+                    else { let c = str_char_at(src, i); if is_alnum(c) == 1 { i = i + 1; } else { go = false; } }
+                }
+                vec_push(&mut toks, Token { kind: 2, start: start, len: i - start, value: 0 });
+            } else {
+                if is_digit(b) == 1 {
+                    let start = i; let mut v = 0;
+                    let mut go = true;
+                    while go {
+                        if i >= n { go = false; }
+                        else { let c = str_char_at(src, i); if is_digit(c) == 1 { v = v * 10 + (c - 48); i = i + 1; } else { go = false; } }
+                    }
+                    vec_push(&mut toks, Token { kind: 1, start: start, len: i - start, value: v });
+                } else {
+                    let is_arrow = if b == 45 {
+                        if i + 1 < n { if str_char_at(src, i + 1) == 62 { 1 } else { 0 } } else { 0 }
+                    } else { 0 };
+                    let is_eq2 = if b == 61 {
+                        if i + 1 < n { if str_char_at(src, i + 1) == 61 { 1 } else { 0 } } else { 0 }
+                    } else { 0 };
+                    if is_arrow == 1 {
+                        vec_push(&mut toks, Token { kind: 3, start: i, len: 2, value: 0 }); i = i + 2;
+                    } else { if is_eq2 == 1 {
+                        vec_push(&mut toks, Token { kind: 21, start: i, len: 2, value: 0 }); i = i + 2;
+                    } else {
+                        let k = if b == 43 { 10 } else { if b == 42 { 11 } else { if b == 40 { 12 } else { if b == 41 { 13 } else { if b == 61 { 14 } else { if b == 59 { 15 } else { if b == 58 { 16 } else { if b == 44 { 17 } else { if b == 123 { 18 } else { if b == 125 { 19 } else { if b == 60 { 20 } else { 0 - 1 } } } } } } } } } } };
+                        vec_push(&mut toks, Token { kind: k, start: i, len: 1, value: 0 });
+                        i = i + 1;
+                    } }
+                }
+            }
+        }
+    }
+    toks
+}
+
+fn tok_text(src: &String, t: &Token) -> String ! { alloc } { str_substring(src, t.start, t.len) }
+fn peek_kind(toks: &Vec<Token>, pos: &Pos) -> i64 {
+    if pos.i < vec_len(toks) { let t = vec_get(toks, pos.i); t.kind } else { 0 - 9 }
+}
+fn ty_tag(src: &String, t: &Token) -> i64 ! { alloc } {
+    let txt = tok_text(src, t); let kw_bool = "bool";
+    if str_eq(&txt, &kw_bool) { 2 } else { 1 }
+}
+
+fn parse_factor(src: &String, toks: &Vec<Token>, pos: &mut Pos) -> Box<Expr> ! { alloc } {
+    let t = vec_get(toks, pos.i);
+    if t.kind == 1 { pos.i = pos.i + 1; Box::new(Num(t.value)) }
+    else { if t.kind == 2 {
+        let txt = tok_text(src, &t); let kw_if = "if";
+        if str_eq(&txt, &kw_if) {
+            pos.i = pos.i + 1;
+            let c = parse_expr(src, toks, pos);
+            pos.i = pos.i + 1;                          // '{'
+            let th = parse_expr(src, toks, pos);
+            pos.i = pos.i + 1;                          // '}'
+            pos.i = pos.i + 1;                          // 'else'
+            pos.i = pos.i + 1;                          // '{'
+            let el = parse_expr(src, toks, pos);
+            pos.i = pos.i + 1;                          // '}'
+            Box::new(If(c, th, el))
+        } else { pos.i = pos.i + 1; Box::new(Var(txt)) }
+    } else {
+        pos.i = pos.i + 1;
+        let e = parse_expr(src, toks, pos);
+        pos.i = pos.i + 1;
+        e
+    } }
+}
+fn parse_term(src: &String, toks: &Vec<Token>, pos: &mut Pos) -> Box<Expr> ! { alloc } {
+    let mut left = parse_factor(src, toks, pos);
+    let mut go = true;
+    while go {
+        if peek_kind(toks, pos) == 11 { pos.i = pos.i + 1; let r = parse_factor(src, toks, pos); left = Box::new(Bin(11, left, r)); }
+        else { go = false; }
+    }
+    left
+}
+fn parse_sum(src: &String, toks: &Vec<Token>, pos: &mut Pos) -> Box<Expr> ! { alloc } {
+    let mut left = parse_term(src, toks, pos);
+    let mut go = true;
+    while go {
+        if peek_kind(toks, pos) == 10 { pos.i = pos.i + 1; let r = parse_term(src, toks, pos); left = Box::new(Bin(10, left, r)); }
+        else { go = false; }
+    }
+    left
+}
+fn parse_expr(src: &String, toks: &Vec<Token>, pos: &mut Pos) -> Box<Expr> ! { alloc } {
+    let left = parse_sum(src, toks, pos);
+    let k = peek_kind(toks, pos);
+    if k == 20 { pos.i = pos.i + 1; let r = parse_sum(src, toks, pos); Box::new(Bin(20, left, r)) }
+    else { if k == 21 { pos.i = pos.i + 1; let r = parse_sum(src, toks, pos); Box::new(Bin(21, left, r)) }
+    else { left } }
+}
+fn at_let(src: &String, toks: &Vec<Token>, pos: &Pos) -> i64 ! { alloc } {
+    if peek_kind(toks, pos) == 2 {
+        let t = vec_get(toks, pos.i); let txt = tok_text(src, &t); let kw = "let";
+        if str_eq(&txt, &kw) { 1 } else { 0 }
+    } else { 0 }
+}
+fn parse_block(src: &String, toks: &Vec<Token>, pos: &mut Pos) -> Block ! { alloc } {
+    let mut lets = vec_new();
+    let mut go = true;
+    while go {
+        if at_let(src, toks, pos) == 1 {
+            pos.i = pos.i + 1;                          // 'let'
+            let nt = vec_get(toks, pos.i); let name = tok_text(src, &nt); pos.i = pos.i + 1;
+            pos.i = pos.i + 1;                          // '='
+            let e = parse_expr(src, toks, pos);
+            pos.i = pos.i + 1;                          // ';'
+            vec_push(&mut lets, Let(name, e));
+        } else { go = false; }
+    }
+    let result = parse_expr(src, toks, pos);
+    Block { lets: lets, result: result }
+}
+fn parse_fn(src: &String, toks: &Vec<Token>) -> Fn ! { alloc } {
+    let mut pos = Pos { i: 0 };
+    pos.i = pos.i + 1;                                  // 'fn'
+    let nt = vec_get(toks, pos.i); let name = tok_text(src, &nt); pos.i = pos.i + 1;
+    pos.i = pos.i + 1;                                  // '('
+    let mut params = vec_new();
+    let mut go = true;
+    while go {
+        if peek_kind(toks, &pos) == 2 {
+            let pnt = vec_get(toks, pos.i); let pn = tok_text(src, &pnt); pos.i = pos.i + 1;
+            pos.i = pos.i + 1;                          // ':'
+            let ptt = vec_get(toks, pos.i); let pty = ty_tag(src, &ptt); pos.i = pos.i + 1;
+            vec_push(&mut params, Param { name: pn, ty: pty });
+            if peek_kind(toks, &pos) == 17 { pos.i = pos.i + 1; } else { go = false; }
+        } else { go = false; }
+    }
+    pos.i = pos.i + 1;                                  // ')'
+    pos.i = pos.i + 1;                                  // '->'
+    let rtt = vec_get(toks, pos.i); let ret = ty_tag(src, &rtt); pos.i = pos.i + 1;
+    pos.i = pos.i + 1;                                  // '{'
+    let body = parse_block(src, toks, &mut pos);
+    Fn { name: name, params: params, ret: ret, body: body }
+}
+
+// ---- type checker (Phase 101/102) ----
+fn type_of(e: &Expr, env: &HashMap<String, i64>) -> i64 ! { alloc } {
+    match e {
+        Num(_) => 1,
+        Var(name) => match hashmap_get(env, clone(name)) { Some(t) => t, None => 0 },
+        Bin(op, a, b) => {
+            let ta = type_of(&(**a), env);
+            let tb = type_of(&(**b), env);
+            if ta == 1 { if tb == 1 { if *op <= 11 { 1 } else { 2 } } else { 0 } } else { 0 }
+        },
+        If(c, t, e2) => {
+            let tc = type_of(&(**c), env);
+            let tt = type_of(&(**t), env);
+            let te = type_of(&(**e2), env);
+            if tc == 2 { if tt == te { if tt == 0 { 0 } else { tt } } else { 0 } } else { 0 }
+        },
+    }
+}
+fn check_fn(f: &Fn) -> i64 ! { alloc } {
+    let mut env = hashmap_new();
+    let np = vec_len(&f.params);
+    let mut p = 0;
+    while p < np { let pm = vec_get(&f.params, p); hashmap_insert(&mut env, clone(&pm.name), pm.ty); p = p + 1; }
+    let nl = vec_len(&f.body.lets);
+    let mut bad = 0;
+    let mut k = 0;
+    while k < nl {
+        let s = vec_get(&f.body.lets, k);
+        match s { Let(name, e) => { let t = type_of(&(*e), &env); bad = if t == 0 { 1 } else { bad }; hashmap_insert(&mut env, name, t); }, }
+        k = k + 1;
+    }
+    let rt = type_of(&(*f.body.result), &env);
+    if bad == 1 { 0 } else { if rt == 0 { 0 } else { if rt == f.ret { 1 } else { 0 } } }
+}
+
+// ---- codegen (Phase 103 + STORE for `let` locals) ----
+fn slot_of(slots: &HashMap<String, i64>, name: &String) -> i64 ! { alloc } {
+    match hashmap_get(slots, clone(name)) { Some(s) => s, None => 0 }
+}
+fn emit(e: &Expr, slots: &HashMap<String, i64>, code: &mut Vec<Instr>) ! { alloc } {
+    match e {
+        Num(v) => { vec_push(code, Instr { op: 1, arg: *v }); },
+        Var(name) => { vec_push(code, Instr { op: 2, arg: slot_of(slots, name) }); },
+        Bin(op, a, b) => {
+            emit(&(**a), slots, code);
+            emit(&(**b), slots, code);
+            let oc = if *op == 10 { 3 } else { if *op == 11 { 4 } else { if *op == 20 { 5 } else { 6 } } };
+            vec_push(code, Instr { op: oc, arg: 0 });
+        },
+        If(c, t, e2) => {
+            emit(&(**t), slots, code);
+            emit(&(**e2), slots, code);
+            emit(&(**c), slots, code);
+            vec_push(code, Instr { op: 7, arg: 0 });
+        },
+    }
+}
+// Lower the body: each `let x = e` emits `e` then STORE to x's slot; finally the
+// result expression. (Locals live in the register file alongside params.)
+fn emit_block(block: &Block, slots: &HashMap<String, i64>, code: &mut Vec<Instr>) ! { alloc } {
+    let nl = vec_len(&block.lets);
+    let mut k = 0;
+    while k < nl {
+        let s = vec_get(&block.lets, k);
+        match s { Let(name, e) => { emit(&(*e), slots, code); vec_push(code, Instr { op: 8, arg: slot_of(slots, &name) }); }, }
+        k = k + 1;
+    }
+    emit(&(*block.result), slots, code);
+}
+
+// Assign register slots: params 0..np, then each `let` the next index.
+fn build_slots(f: &Fn) -> HashMap<String, i64> ! { alloc } {
+    let mut slots = hashmap_new();
+    let np = vec_len(&f.params);
+    let mut i = 0;
+    while i < np { let p = vec_get(&f.params, i); hashmap_insert(&mut slots, clone(&p.name), i); i = i + 1; }
+    let nl = vec_len(&f.body.lets);
+    let mut k = 0;
+    while k < nl {
+        let s = vec_get(&f.body.lets, k);
+        match s { Let(name, e) => { hashmap_insert(&mut slots, name, np + k); }, }
+        k = k + 1;
+    }
+    slots
+}
+
+// VM: operand stack + a register file (slot -> value) as a HashMap, so STORE can
+// write any slot without an indexed-set primitive.
+fn run(code: &Vec<Instr>, regs: &mut HashMap<i64, i64>) -> i64 ! { alloc } {
+    let mut stack = vec_new();
+    let n = vec_len(code);
+    let mut i = 0;
+    while i < n {
+        let ins = vec_get(code, i);
+        if ins.op == 1 { vec_push(&mut stack, ins.arg); }
+        else { if ins.op == 2 { let v = match hashmap_get(regs, ins.arg) { Some(x) => x, None => 0 }; vec_push(&mut stack, v); }
+        else { if ins.op == 3 { let b = vec_pop(&mut stack); let a = vec_pop(&mut stack); vec_push(&mut stack, a + b); }
+        else { if ins.op == 4 { let b = vec_pop(&mut stack); let a = vec_pop(&mut stack); vec_push(&mut stack, a * b); }
+        else { if ins.op == 5 { let b = vec_pop(&mut stack); let a = vec_pop(&mut stack); vec_push(&mut stack, if a < b { 1 } else { 0 }); }
+        else { if ins.op == 6 { let b = vec_pop(&mut stack); let a = vec_pop(&mut stack); vec_push(&mut stack, if a == b { 1 } else { 0 }); }
+        else { if ins.op == 7 { let c = vec_pop(&mut stack); let e = vec_pop(&mut stack); let t = vec_pop(&mut stack); vec_push(&mut stack, if c != 0 { t } else { e }); }
+        else { let v = vec_pop(&mut stack); hashmap_insert(regs, ins.arg, v); } } } } } } }
+        i = i + 1;
+    }
+    vec_pop(&mut stack)
+}
+
+// The whole pipeline: parse -> type-check -> (reject if ill-typed) -> codegen ->
+// run with `args`. Returns the function's result, or -1 if it does not type-check.
+fn compile_run(src: &String, args: &Vec<i64>) -> i64 ! { alloc } {
+    let toks = lex(src);
+    let f = parse_fn(src, &toks);
+    if check_fn(&f) == 0 { 0 - 1 }
+    else {
+        let slots = build_slots(&f);
+        let mut code = vec_new();
+        emit_block(&f.body, &slots, &mut code);
+        let mut regs = hashmap_new();
+        let np = vec_len(&f.params);
+        let mut i = 0;
+        while i < np { let av = vec_get(args, i); hashmap_insert(&mut regs, i, av); i = i + 1; }
+        run(&code, &mut regs)
+    }
+}
+
+fn main() -> i64 ! { io, alloc } {
+    // 1. i64 fn with a local: f(a,b) = { let x = a+b ; x*2 } ; f(3,4) = 14
+    let s1 = "fn f(a: i64, b: i64) -> i64 { let x = a + b ; x * 2 }";
+    let mut a1 = vec_new(); vec_push(&mut a1, 3); vec_push(&mut a1, 4);
+    let r1 = compile_run(&s1, &a1);
+    print(r1);                                          // 14
+
+    // 2. two locals: g(a) = { let y = a*a ; let z = y + a ; z } ; g(5) = 30
+    let s2 = "fn g(a: i64) -> i64 { let y = a * a ; let z = y + a ; z }";
+    let mut a2 = vec_new(); vec_push(&mut a2, 5);
+    let r2 = compile_run(&s2, &a2);
+    print(r2);                                          // 30
+
+    // 3. bool fn executed: h(a,b) = { a < b } ; h(3,4) = 1 (true)
+    let s3 = "fn h(a: i64, b: i64) -> bool { a < b }";
+    let mut a3 = vec_new(); vec_push(&mut a3, 3); vec_push(&mut a3, 4);
+    let r3 = compile_run(&s3, &a3);
+    print(r3);                                          // 1
+
+    // 4. ill-typed (return mismatch) is REJECTED before codegen -> sentinel -1
+    let s4 = "fn bad(a: i64) -> i64 { a < a }";
+    let mut a4 = vec_new(); vec_push(&mut a4, 7);
+    let r4 = compile_run(&s4, &a4);
+    print(r4);                                          // -1
+
+    // witness: r1*1000 + r2*10 + r3 + (r4 + 1) = 14000 + 300 + 1 + 0 = 14301
+    r1 * 1000 + r2 * 10 + r3 + (r4 + 1)
+}

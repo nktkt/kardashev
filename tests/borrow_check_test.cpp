@@ -620,6 +620,65 @@ void test_fnmut_closure_borrow_ok() {
              "fnmut_closure_borrow_ok");
 }
 
+// --- Phase 106: field-level (partial) move tracking. ---
+
+// Moving the SAME non-Copy field by value twice is rejected (else two owners
+// alias one field's heap buffer — a double-free). `Inner` is a struct, hence
+// non-Copy / move-typed.
+void test_field_move_twice_errors() {
+    expectErr("struct Inner { x: i64 }\n"
+              "struct S { a: Inner, b: Inner }\n"
+              "fn take(i: Inner) -> i64 { i.x }\n"
+              "fn main() -> i64 {\n"
+              "    let s = S { a: Inner { x: 1 }, b: Inner { x: 2 } };\n"
+              "    let p = take(s.a);\n"
+              "    let q = take(s.a);\n"   // s.a already moved
+              "    p + q\n"
+              "}",
+              "field_move_twice_errors");
+}
+
+// Moving the WHOLE struct after a field was partially moved is rejected (it
+// would re-take ownership of the already-moved field).
+void test_field_move_then_whole_move_errors() {
+    expectErr("struct Inner { x: i64 }\n"
+              "struct S { a: Inner, b: Inner }\n"
+              "fn take(i: Inner) -> i64 { i.x }\n"
+              "fn whole(s: S) -> i64 { 0 }\n"
+              "fn main() -> i64 {\n"
+              "    let s = S { a: Inner { x: 1 }, b: Inner { x: 2 } };\n"
+              "    let p = take(s.a);\n"
+              "    let q = whole(s);\n"    // s partially moved
+              "    p + q\n"
+              "}",
+              "field_move_then_whole_move_errors");
+}
+
+// Moving TWO DIFFERENT non-Copy fields is LEGAL (not an over-rejection) — each
+// field is a distinct owned value.
+void test_two_distinct_field_moves_ok() {
+    expectOk("struct Inner { x: i64 }\n"
+             "struct S { a: Inner, b: Inner }\n"
+             "fn take(i: Inner) -> i64 { i.x }\n"
+             "fn main() -> i64 {\n"
+             "    let s = S { a: Inner { x: 1 }, b: Inner { x: 2 } };\n"
+             "    take(s.a) + take(s.b)\n"
+             "}",
+             "two_distinct_field_moves_ok");
+}
+
+// Moving ONE field once (and not using the struct afterwards) is fine.
+void test_single_field_move_ok() {
+    expectOk("struct Inner { x: i64 }\n"
+             "struct S { a: Inner, b: Inner }\n"
+             "fn take(i: Inner) -> i64 { i.x }\n"
+             "fn main() -> i64 {\n"
+             "    let s = S { a: Inner { x: 1 }, b: Inner { x: 2 } };\n"
+             "    take(s.a)\n"
+             "}",
+             "single_field_move_ok");
+}
+
 } // namespace
 
 int main() {
@@ -672,10 +731,17 @@ int main() {
     // Phase 17a: richer closures & first-class fn values
     test_call_value_through_field_ok();
     test_fnmut_closure_borrow_ok();
-    std::cout << "All borrow_check tests passed (45 cases) — Phase 2.4c "
+    // Phase 106: field-level (partial) move tracking
+    test_field_move_twice_errors();
+    test_field_move_then_whole_move_errors();
+    test_two_distinct_field_moves_ok();
+    test_single_field_move_ok();
+    std::cout << "All borrow_check tests passed (49 cases) — Phase 2.4c "
                  "NLL + mutable references; Phase 9 loops; Phase 13a "
                  "method-receiver autoref; Phase 15 inherent &mut self + "
                  "unary operands; Phase 16 Drop-typed move tracking; "
-                 "Phase 17a fn-value calls + FnMut captures\n";
+                 "Phase 17a fn-value calls + FnMut captures; Phase 106 "
+                 "field-level partial-move tracking (same-field-twice + "
+                 "partial-then-whole rejected, distinct fields ok)\n";
     return 0;
 }

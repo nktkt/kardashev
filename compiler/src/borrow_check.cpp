@@ -1,6 +1,7 @@
 #include "kardashev/borrow_check.hpp"
 
 #include <algorithm>
+#include <set>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -28,6 +29,12 @@ struct Binding {
     bool mutLoanActive = false;
     std::size_t moveLine = 0;
     std::size_t moveCol = 0;
+    // v17 Phase 106: names of this binding's fields that have been moved out BY
+    // VALUE (a partial move). Distinct from `state == Moved` (the WHOLE binding
+    // moved): moving two DIFFERENT non-Copy fields is legal, but moving the same
+    // field twice — or the whole struct while a field is moved — is rejected.
+    // Joined across `if` branches (union) and reset on reassignment.
+    std::set<std::string> movedFields;
     // Last position (in the source-order walk) at which any IdentExpr or
     // RefExpr-of-Ident refers to this binding. Filled by the pre-pass.
     int lastUsePos = -1;
@@ -450,7 +457,10 @@ private:
         // re-walk with checks. We DON'T reset `pos_` because we want the
         // exact same position numbers — Pass 2 increments through them
         // identically.
-        for (auto& [_dp, b] : bindings_) b.state = OwnState::Owned;
+        for (auto& [_dp, b] : bindings_) {
+            b.state = OwnState::Owned;
+            b.movedFields.clear(); // Phase 106
+        }
         scopes_.clear();
         scopes_.push_back({});
         // Re-bind params at the same declPos numbers used in pass 1. We
@@ -636,11 +646,15 @@ private:
             return lastInSubtree;
         }
         if (auto* cv = dynamic_cast<const ast::CallValueExpr*>(&e)) {
-            // Phase 17a: the callee expression is read (its fn value is used),
+            // Phase 17a: the callee expression is READ (its fn value is used),
             // then each arg is moved by value. The fn-value's own type carries
-            // the param types (for the reborrow-mutability decision).
+            // the param types (for the reborrow-mutability decision). v17 Phase
+            // 106: consume the callee as a PLACE (read) — calling a fn-value
+            // through a field `s.f(..)` must NOT count as moving `s.f` out (a
+            // fn-value type is non-Copy, so a plain `consume` would now flag it
+            // as a partial move; `call_value_through_field_ok` relies on this).
             lastInSubtree = std::max(lastInSubtree,
-                                       consume(*cv->callee, expectExpire));
+                                       consumePlace(*cv->callee, expectExpire));
             TypePtr fnTy = typeOf(*cv->callee);
             for (std::size_t i = 0; i < cv->args.size(); ++i) {
                 TypePtr pt = nullptr;
@@ -695,14 +709,16 @@ private:
             struct MS {
                 Binding* b;
                 OwnState pre; std::size_t pml, pmc;
+                std::set<std::string> preFields;          // Phase 106
                 OwnState thenSt; std::size_t tml, tmc;
+                std::set<std::string> thenFields;         // Phase 106
             };
             std::vector<MS> snap;
             snap.reserve(bindings_.size());
             for (auto& [dp, bnd] : bindings_) {
                 (void)dp;
                 snap.push_back({&bnd, bnd.state, bnd.moveLine, bnd.moveCol,
-                                OwnState::Owned, 0, 0});
+                                bnd.movedFields, OwnState::Owned, 0, 0, {}});
             }
             lastInSubtree = std::max(lastInSubtree,
                                        consume(*ie->thenBranch, expectExpire));
@@ -710,10 +726,12 @@ private:
                 s.thenSt = s.b->state;
                 s.tml = s.b->moveLine;
                 s.tmc = s.b->moveCol;
+                s.thenFields = s.b->movedFields;          // Phase 106
                 // restore pre-`if` state so ELSE sees the unmoved bindings.
                 s.b->state = s.pre;
                 s.b->moveLine = s.pml;
                 s.b->moveCol = s.pmc;
+                s.b->movedFields = s.preFields;           // Phase 106
             }
             lastInSubtree = std::max(lastInSubtree,
                                        consume(*ie->elseBranch, expectExpire));
@@ -724,6 +742,15 @@ private:
                     s.b->state = OwnState::Moved;
                     s.b->moveLine = s.tml;
                     s.b->moveCol = s.tmc;
+                }
+                // Phase 106: a field moved in EITHER branch is moved after the
+                // `if` (union) — so a later same-field move / whole-struct use
+                // is still rejected on the merged path.
+                for (const auto& f : s.thenFields) {
+                    if (s.b->movedFields.insert(f).second) {
+                        s.b->moveLine = s.tml;
+                        s.b->moveCol = s.tmc;
+                    }
                 }
             }
             return lastInSubtree;
@@ -741,7 +768,18 @@ private:
         if (auto* fe = dynamic_cast<const ast::FieldExpr*>(&e)) {
             if (auto* ido = dynamic_cast<const ast::IdentExpr*>(
                     fe->object.get())) {
-                checkRead(*ido);
+                // v17 Phase 106: a by-VALUE consume of a NON-Copy field in a
+                // genuine move position (`vec_push(&mut v, s.name)`, `let x =
+                // s.name`, returning `s.name`, …) is a PARTIAL MOVE of THAT field.
+                // Track moved fields PER-name so two DIFFERENT fields can be moved
+                // (legal — Rust allows it) but the SAME field moved twice, or the
+                // whole struct used after a field move, is rejected — closing a
+                // double-free where two owners alias one field's heap buffer. In
+                // a READ/place context (derefMoveCheckSuppressed_ — a call callee
+                // `s.f(..)`, `&s.f`, a field-access base) or for a Copy field,
+                // it's just a read.
+                consumeField(*ido, fe->fieldName, typeOf(e), fe->line,
+                             fe->column);
                 // Field access still bumps the IdentExpr's pos counter
                 // (mirroring pass 1's walk) so subsequent positions stay
                 // in sync.
@@ -983,6 +1021,7 @@ private:
             OwnState state;
             std::size_t moveLine;
             std::size_t moveCol;
+            std::set<std::string> movedFields;        // Phase 106
         };
         std::vector<Snap> snaps;
         for (auto& scope : scopes_) {
@@ -990,15 +1029,21 @@ private:
                 (void)name;
                 Binding* b = lookupBindingByDeclPos(declPos);
                 if (!b) continue;
-                snaps.push_back({b, b->state, b->moveLine, b->moveCol});
+                snaps.push_back(
+                    {b, b->state, b->moveLine, b->moveCol, b->movedFields});
             }
         }
 
         walkBody();
 
         for (const auto& s : snaps) {
-            if (s.binding->isMoveTyped && s.state != OwnState::Moved &&
-                s.binding->state == OwnState::Moved) {
+            // A whole-value move OR a new partial field move that escaped the
+            // body would double-move on the next iteration — reject either.
+            bool newWholeMove = s.state != OwnState::Moved &&
+                                s.binding->state == OwnState::Moved;
+            bool newFieldMove =
+                s.binding->movedFields.size() > s.movedFields.size();
+            if (s.binding->isMoveTyped && (newWholeMove || newFieldMove)) {
                 error("cannot move captured value out of a loop body",
                       loopExpr.line, loopExpr.column);
                 break;
@@ -1010,6 +1055,7 @@ private:
             s.binding->state = s.state;
             s.binding->moveLine = s.moveLine;
             s.binding->moveCol = s.moveCol;
+            s.binding->movedFields = s.movedFields;   // Phase 106
         }
     }
 
@@ -1085,8 +1131,11 @@ private:
                     // the old value out (e.g. `acc = f(acc, x)`). Without this,
                     // a move-and-reassign in a loop tripped the loop-backedge
                     // move check (the value looked moved at the back edge).
-                    if (Binding* tb = lookupBinding(tid->name))
+                    if (Binding* tb = lookupBinding(tid->name)) {
                         tb->state = OwnState::Owned;
+                        tb->movedFields.clear(); // Phase 106: fresh value, all
+                                                 // fields owned again
+                    }
                 } else {
                     // Review fix (Phase 61): the LHS of `a[i] = x` / `t.0 = x`
                     // is a WRITE place, not a move — consume it as a PLACE so
@@ -1291,6 +1340,17 @@ private:
                   id.line, id.column);
             return;
         }
+        // v17 Phase 106: cannot move the WHOLE struct once a field was moved out
+        // of it (a partial move) — that would re-take ownership of the
+        // already-moved field. (Reading remaining fields stays fine; only a
+        // whole-value move is rejected.)
+        if (!b->movedFields.empty()) {
+            error("use of partially-moved value `" + id.name + "` (a field was "
+                  "moved at " + std::to_string(b->moveLine) + ":" +
+                      std::to_string(b->moveCol) + ")",
+                  id.line, id.column);
+            return;
+        }
         // Phase 2.4c: can't move while borrowed.
         if (b->sharedLoans > 0 || b->mutLoanActive) {
             error("cannot move `" + id.name +
@@ -1301,6 +1361,44 @@ private:
         b->state = OwnState::Moved;
         b->moveLine = id.line;
         b->moveCol = id.column;
+    }
+
+    // v17 Phase 106: consume `root.field`. If the field is non-Copy and we are in
+    // a genuine MOVE position (not a read/place context), record it as a partial
+    // move of `root`; reject a second move of the same field (or a move from an
+    // already-wholly-moved root). A Copy field, or a read/place context, is just
+    // a read.
+    void consumeField(const ast::IdentExpr& root, const std::string& field,
+                      const TypePtr& fieldTy, std::size_t line,
+                      std::size_t col) {
+        Binding* b = lookupBinding(root.name);
+        if (!b || !b->isMoveTyped) return;
+        if (b->state == OwnState::Moved) {
+            error("field access on moved value `" + root.name + "` (moved at " +
+                      std::to_string(b->moveLine) + ":" +
+                      std::to_string(b->moveCol) + ")",
+                  line, col);
+            return;
+        }
+        if (b->movedFields.count(field)) {
+            error("use of moved field `" + root.name + "." + field +
+                      "` (moved at " + std::to_string(b->moveLine) + ":" +
+                      std::to_string(b->moveCol) + ")",
+                  line, col);
+            return;
+        }
+        // A READ (place context / Copy field) leaves ownership untouched.
+        if (derefMoveCheckSuppressed_ || !fieldTy || isCopyType(fieldTy)) return;
+        // Genuine partial move of a non-Copy field.
+        if (b->sharedLoans > 0 || b->mutLoanActive) {
+            error("cannot move `" + root.name + "." + field + "` while `" +
+                      root.name + "` is borrowed",
+                  line, col);
+            return;
+        }
+        b->movedFields.insert(field);
+        b->moveLine = line;
+        b->moveCol = col;
     }
 
     void checkRead(const ast::IdentExpr& id) {
