@@ -1475,6 +1475,9 @@ bool resolveModules(const std::string& srcRaw,
     // Phase 25: carry top-level `const` items across the module merge.
     for (auto& cd : pr.program.consts)
         out.consts.push_back(std::move(cd));
+    // v26 Phase 144: carry top-level type aliases across the module merge.
+    for (auto& ta : pr.program.typeAliases)
+        out.typeAliases.push_back(std::move(ta));
 
     // Recurse into each `mod foo;` reference.
     for (const auto& m : pr.program.mods) {

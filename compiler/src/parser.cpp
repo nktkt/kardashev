@@ -68,6 +68,17 @@ public:
                 } else {
                     prog.consts.push_back(parseConstDecl());
                 }
+            } else if (check(TokenKind::Identifier) &&
+                       peek().lexeme == "type") {
+                // v26 Phase 144: a top-level type alias `type Name = Target;`.
+                consume(); // `type`
+                Token aliasName = expect(TokenKind::Identifier,
+                                         "type alias name after `type`");
+                expect(TokenKind::Eq, "=");
+                ast::TypeRef target = parseTypeRef();
+                expect(TokenKind::Semi, ";");
+                prog.typeAliases.emplace_back(aliasName.lexeme,
+                                              std::move(target));
             } else if (check(TokenKind::KwPub)) {
                 // Phase 7.3b: `pub` sticks to fn decls and is enforced on
                 // path-qualified call sites. Bare-name calls keep working

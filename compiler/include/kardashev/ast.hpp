@@ -904,6 +904,9 @@ struct Program {
     std::vector<ExternFn> externFns;
     // Phase 25: top-level `const NAME: T = ...;` items.
     std::vector<ConstDecl> consts;
+    // v26 Phase 144: top-level type aliases `type Name = Target;` (name -> the
+    // aliased TypeRef). The typechecker resolves an alias name to its target.
+    std::vector<std::pair<std::string, TypeRef>> typeAliases;
 };
 
 } // namespace kardashev::ast

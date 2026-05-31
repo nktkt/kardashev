@@ -1028,6 +1028,12 @@ public:
         }
 #endif
 
+        // v26 Phase 144: register top-level type aliases BEFORE anything that
+        // resolves a TypeRef (struct fields below), so an alias name resolves to
+        // its target everywhere it appears.
+        for (const auto& [name, target] : program.typeAliases)
+            typeAliases_[name] = target;
+
         // Pass 1a: register every struct and enum decl. To allow free
         // cross-references (struct field of enum type, enum payload of
         // struct type), we do this in two phases:
@@ -2229,6 +2235,8 @@ private:
     std::unordered_map<std::string, std::vector<std::string>> traitAssocTypes_;
     // v25 Phase 136: trait -> its supertrait names.
     std::unordered_map<std::string, std::vector<std::string>> traitSupertraits_;
+    // v26 Phase 144: top-level type aliases (name -> aliased TypeRef).
+    std::unordered_map<std::string, ast::TypeRef> typeAliases_;
     // Phase 21b: per (implementing-type-name, trait-name), the concrete type
     // each associated type resolves to in that impl. Resolved with `Self` bound
     // to the impl's forType (and the trait's generic params bound to the impl's
@@ -3428,6 +3436,29 @@ private:
                 return makeConstValue(0);
             }
             return makeConstValue(tr.constArgValue);
+        }
+        // v26 Phase 144: a plain name (no type-args / assoc / fn) that names a
+        // type alias resolves to its target; `&Meters` keeps the `&`. The alias
+        // chain is followed iteratively with a cycle guard.
+        if (!tr.isFn && tr.assocName.empty() && tr.typeArgs.empty() &&
+            typeAliases_.count(tr.name)) {
+            ast::TypeRef cur = tr;
+            std::unordered_set<std::string> seen;
+            while (!cur.isFn && cur.assocName.empty() && cur.typeArgs.empty() &&
+                   typeAliases_.count(cur.name)) {
+                if (!seen.insert(cur.name).second) {
+                    error("cyclic type alias '" + cur.name + "'", tr.line,
+                          tr.column);
+                    return makeInt();
+                }
+                bool wasRef = cur.isRef, wasMut = cur.refIsMut;
+                cur = typeAliases_[cur.name];
+                if (wasRef) {
+                    cur.isRef = true;
+                    cur.refIsMut = wasMut;
+                }
+            }
+            return resolveTypeRef(cur);
         }
         // Phase 61: a bare const-generic param used as a type argument — the
         // `CAP` in `RingBuffer<T, CAP>` or `C`/`R` in `Matrix<C, R>`. It is a

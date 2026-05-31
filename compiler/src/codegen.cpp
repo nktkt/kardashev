@@ -86,6 +86,10 @@ public:
     }
 
     void run(const ast::Program& program) {
+        // v26 Phase 144: register type aliases so astTypeRefToConcrete resolves
+        // an alias name to its target (matching the typechecker).
+        for (const auto& [name, target] : program.typeAliases)
+            typeAliases_[name] = target;
         // Phase 34: register the built-in container struct layouts first (see
         // ensureCoreStructTypes) so user types referencing them get the
         // canonical instances.
@@ -626,6 +630,8 @@ private:
     // method's AST to its impl, so the method is monomorphized per concrete T
     // (like a generic fn) instead of emitted once with `T` unbound.
     std::unordered_map<const ast::FnDecl*, const ast::ImplDecl*> genericImplOf_;
+    // v26 Phase 144: top-level type aliases (name -> aliased TypeRef).
+    std::unordered_map<std::string, ast::TypeRef> typeAliases_;
 
     // Active during emission of a generic fn instance. Maps the source's
     // generic-param name (`T`) to the concrete TypePtr for this instance,
@@ -7008,6 +7014,23 @@ private:
     // the current generic-instance substitution and recursively
     // instantiating generic struct / enum references like `Pair<X, Y>`.
     TypePtr astTypeRefToConcrete(const ast::TypeRef& tr) {
+        // v26 Phase 144: substitute a type alias (mirrors typecheck's
+        // resolveTypeRef) so codegen agrees on the underlying type.
+        if (!tr.isFn && tr.assocName.empty() && tr.typeArgs.empty() &&
+            typeAliases_.count(tr.name)) {
+            ast::TypeRef cur = tr;
+            int guard = 0;
+            while (!cur.isFn && cur.assocName.empty() && cur.typeArgs.empty() &&
+                   typeAliases_.count(cur.name) && guard++ < 100) {
+                bool wasRef = cur.isRef, wasMut = cur.refIsMut;
+                cur = typeAliases_[cur.name];
+                if (wasRef) {
+                    cur.isRef = true;
+                    cur.refIsMut = wasMut;
+                }
+            }
+            return astTypeRefToConcrete(cur);
+        }
         // Phase 58 (v10): a const-generic VALUE argument — the `3` in
         // `Mat<3>`. Mirror typecheck's resolveTypeRef so codegen agrees on the
         // monomorphic identity (otherwise the signature would mangle to

@@ -314,6 +314,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v26 Phase 144: type aliases (type Name = Target).
+sh_test(
+    name = "smoke_test_phase144",
+    srcs = ["smoke_test_phase144.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v24 Phase 132: opt-in lint (-W) — unused vars + unreachable code, non-fatal,
 # no false positives (closure / fn-ptr / method / match uses recognized).
 sh_test(
