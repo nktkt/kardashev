@@ -1,0 +1,753 @@
+# Roadmap enumeration — the complete grounded gap list
+
+Every item that separates kardashev (v0.23.0) from a production systems
+language, enumerated from a seven-dimension survey of the codebase plus a
+completeness critic. This is the exhaustive source; **[ROADMAP.md](../ROADMAP.md)**
+organizes these into the sequenced v24→v36 plan + Mega-arcs. Size: S = a phase,
+M = a couple phases, L = most of a roadmap, XL = a dedicated multi-roadmap arc.
+
+## Language surface & type system (25)
+
+**Total enumerated: 174 items** across 7 dimensions + the critic pass.
+
+- **[L] Const-evaluation restricted to i64/bool scalars**
+  - *What:* Const-evaluable expressions and const fn bodies only support i64 and bool types. No struct/enum const eval, no const-generic type parameters (only const i64 parameters). Array lengths can be const-exprs but not const-generic type params like struct Arr<const N: i64>.
+  - *Gap:* Production languages support arbitrary const types and full const-generic type parameters. Current MVP blocks abstractions like const-generic matrix layouts with non-i64 element types or per-type const initialization.
+  - *Evidence:* typecheck.cpp:2113-2120 ('const-evaluated value is i64 or bool (the MVP scalar set)'), typecheck.cpp:4206-4219 (const must be i64/bool), docs/language-reference.md:335-336 ('not in scope'), ROADMAP.md:36-37 ('const-eval scalar set (i64/bool only)')
+- **[M] OS-thread return type fixed to i64**
+  - *What:* thread_spawn/thread_join only support closures returning i64. Generic return types are not supported for OS threads; async/await is the generic path, but requires Future<T>.
+  - *Gap:* Blocks returning non-i64 values from spawned threads. Production languages thread arbitrary T through thread handles with proper type safety. Generic join<T> exists but not for OS threads.
+  - *Evidence:* typecheck.cpp:820-860 (thread fn signature restricted), ROADMAP.md:37-39 ('OS-thread return value (fn() -> i64 only — async/await is the generic path) are still i64-shaped')
+- **[M] Pattern matching gaps: no guards, or-patterns, slice patterns**
+  - *What:* Match arms support only literal int, wildcards, constructors, and tuple destructuring. Missing: guard expressions (match arms with conditions), or-patterns (p1 | p2), slice patterns ([x, y, ..]), nested pattern exhaustiveness for infinite types.
+  - *Gap:* Limits expressiveness in pattern matching. Guards and or-patterns are standard in modern languages for conditional matching and DRY arm grouping. Slice patterns are needed for Vec element-level matching.
+  - *Evidence:* pattern_match.cpp:1-100 (Maranget algorithm normalizes Wild/Lit/Ctor only, no guard/or/slice), docs/language-reference.md:144-146 ('Tuple patterns inside a match are not supported'), CHANGELOG.md:656 (Phase 66 deferred bitwise until later)
+- **[M] No generic-TYPE static/associated const calls**
+  - *What:* Associated constants (const items on traits/impls) are not implemented. Generic trait parameters can carry associated types (Phase 21b) but not associated const values. Type::CONST::call patterns don't work.
+  - *Gap:* Blocks compile-time polymorphic constants and factory patterns. Production languages (Rust, Haskell) use associated consts for value-level generic programming.
+  - *Depends on:* Trait associated types (Phase 21b complete)
+  - *Evidence:* ast.hpp:738-755 (AssocTypeDecl/AssocTypeDef only for types, no ConstDecl equivalent), typecheck.cpp:1346-1370 (only associated types registered, no consts), no test for associated consts in tests/
+- **[L] Generic Associated Types (GATs) not supported**
+  - *What:* Trait associated types take no generic parameters. Pattern like trait Iterator { type Item<N>; } is invalid. Associated types can only name concrete types, not parameterized ones.
+  - *Gap:* Higher-rank polymorphism for associated types (e.g., borrowing lifetime parameters) blocks HKT-style abstractions. Production languages reserve this for advanced generics.
+  - *Depends on:* Associated type projection (Phase 21b complete)
+  - *Evidence:* ast.hpp:738-755 (AssocTypeDecl has name only, no generic params), typecheck.cpp:1346-1360 (no param parsing/registration for assoc types), docs/language-reference.md:221-228 (no mention of parameterized assoc types)
+- **[M] No default trait methods; all trait methods are abstract**
+  - *What:* Trait methods must be signatures (no body in trait decls). Every impl must provide every method. No default impl fallback.
+  - *Gap:* Reduces trait reusability; requires every impl to redefine common logic. Production languages (Rust, Scala) support optional default trait methods with override in impls.
+  - *Depends on:* Trait system (Phase 3.3+)
+  - *Evidence:* ast.hpp:729-736 (MethodSig has no body), parser.cpp pattern (method sig ends with semicolon, not {..}), docs/language-reference.md:196-200 (trait methods shown as signatures)
+- **[M] No blanket impls or impl-for-where-clause bounds**
+  - *What:* impl Trait for Type must name a concrete type or simple generic param. No where-clause bounds on impls (impl<T: Bound> Trait for T). No blanket like impl<T> Clone for T.
+  - *Gap:* Blocks generic impl patterns like blanket Clone/Debug for all types, or impl Trait for Box<dyn OtherTrait>. Production languages rely on blanket impls for standard library coverage.
+  - *Depends on:* Generic impls (Phase 40)
+  - *Evidence:* typecheck.cpp:1401 ('monomorphic-only in Phase 3.3 MVP: forType must resolve to a concrete type or generic var'), ast.hpp:788-813 (ImplDecl.forType is TypeRef, no bounds binding)
+- **[M] No supertraits or trait inheritance**
+  - *What:* Traits cannot declare dependencies on other traits (e.g., trait Ord: Eq { ... }). No multi-trait inheritance hierarchy.
+  - *Gap:* Blocks organizing related traits into hierarchies. Rust's Eq: PartialEq and Ord: Eq patterns are impossible. Must enumerate all bounds manually in generic params.
+  - *Depends on:* Trait system (Phase 3.3+)
+  - *Evidence:* ast.hpp:757-775 (TraitDecl has no supertrait field), parser doesn't parse colon after trait name, no test for trait inheritance
+- **[L] No coherence/overlap checking for trait impls**
+  - *What:* Two impls for the same trait on different types don't conflict-check. No Rust-style 'impl<T> Foo for T' vs 'impl Foo for i64' overlap detection or overlap rules (negative impls don't exist).
+  - *Gap:* Allows conflicting impls to slip through (monomorphization is silent on shadowing). Production languages enforce coherence + overlap rules to prevent ambiguity at call sites.
+  - *Depends on:* Impl resolution (Phase 3.3+)
+  - *Evidence:* typecheck.cpp:2720-2850 (impl resolution just looks up by name, no overlap check), ROADMAP.md (coherence not mentioned as planned)
+- **[M] Type inference incomplete for generic params and complex expressions**
+  - *What:* Generic type parameters sometimes require explicit annotations even when context is clear. Complex nested expressions (closures, match arms) may not infer T through all uses.
+  - *Gap:* Requires verbose annotations in call sites. Production languages (Rust, Haskell) use bidirectional type inference to propagate context deep into expressions.
+  - *Evidence:* typecheck.cpp:1700-1750 (generic env setup during fn registration, no bidirectional inference at call), docs/language-reference.md:217-219 (bound-type args omitted for inference but no detail on propagation)
+- **[L] Closures capture only by value or by-reference; no FnOnce/FnMut/Fn hierarchy**
+  - *What:* Closures are classified by the typechecker as by-value (Phase 10b) or by-ref (Phase 17a FnMut). No FnOnce trait for move-taking closures. No Fn (shared borrow) vs FnMut vs FnOnce trait distinctions in the type system.
+  - *Gap:* Blocks precise capture semantics in higher-order functions. fn(T)->U takes a closure of unknown capture mode; can't express 'takes ownership of closure' (FnOnce) or 'needs &mut self' (FnMut) vs 'shared' (Fn).
+  - *Depends on:* Closure capture tracking (Phase 17a complete)
+  - *Evidence:* typecheck.cpp:6136-6250 (ClosureCapture tracks byRef bool, no FnOnce/Fn/FnMut marker), ast.hpp:596-610 (ClosureCapture.byRef only), docs/language-reference.md:251-269 (closures capture by value or by-ref, no mention of Fn traits)
+- **[S] No type aliases (type synonym feature)**
+  - *What:* No `type X = T;` declarations at top level. Users must repeat long types everywhere (Vec<Box<HashMap<String, Option<i64>>>>).
+  - *Gap:* Reduces readability and increases cognitive load. Production languages use type aliases for clarity and refactoring. Common for newtype patterns (type UserId = i64).
+  - *Evidence:* ast.hpp:876-887 (Program has no TypeAlias node), parser.cpp doesn't parse type keyword in decls, no type aliases in stdlib.md
+- **[M] No char type; strings are byte arrays with no UTF-8 codec**
+  - *What:* Only String (byte buffer) exists. No char type for Unicode scalars. String indexing returns i64 byte values, not chars. No str/String distinction.
+  - *Gap:* Blocks Unicode-aware string operations. str_char_at returns bytes, not grapheme clusters. Cannot represent character literals like 'a'.
+  - *Evidence:* docs/language-reference.md:456 ('byte at i (0..255), or -1 past end'), docs/language-reference.md:443 ('no NUL terminator'), typecheck.cpp:69-75 (String is a struct, no char builtin), no char tests
+- **[S] Tuple destructuring in let only; not in match or function params**
+  - *What:* Tuple patterns work in let (let (x, y) = t;) but not in match arms or fn parameters. Must destructure at binding time, then pass individual fields.
+  - *Gap:* Blocks concise match patterns over tuples and reduces parameter DRY. fn process(t: (i64, i64)) { let (x, y) = t; } is awkward vs fn process((x, y): (i64, i64)).
+  - *Depends on:* Pattern matching (Phase 22+)
+  - *Evidence:* docs/language-reference.md:145 ('Tuple patterns inside a match are not supported'), ast.hpp:143-145 (TuplePat exists, used in let only), typecheck.cpp pattern handling
+- **[S] Array literals cannot infer element type from context**
+  - *What:* Empty array literal [] is rejected (can't infer T). Array literals require all elements or [value; count] repeat syntax.
+  - *Gap:* Blocks ergonomic empty collections when type is obvious from context. let v: Vec<i64> = []; fails; must use vec_new().
+  - *Evidence:* typecheck.cpp:7342 ('annotate with let a: [T; 0] = []; is not yet supported')
+- **[M] Non-Copy array elements not fully supported**
+  - *What:* Arrays of structs/enums with Drop impls are allowed but move semantics through array elements are incomplete. Partial moves (arr[0].field) are restricted.
+  - *Gap:* Complicates drop tracking. Production languages track per-element moves in arrays, enabling patterns like transferring ownership out of one element.
+  - *Depends on:* Move tracking (borrow_check.cpp complete)
+  - *Evidence:* docs/language-reference.md:314 ('non-Copy array elements are not supported'), typecheck.cpp:7243-7244 ('full move-tracking through aggregates is deferred')
+- **[S] Slice type limited to &[T]; mutable slices &mut [T] not implemented**
+  - *What:* Slice borrowing works via &v[a..b] but &mut v[a..b] is not parsed or typechecked. Cannot mutate through a slice.
+  - *Gap:* Blocks interior mutation patterns. Mutable slices are common in algorithms like sorting in-place over a range.
+  - *Depends on:* Slice implementation (Phase 13b)
+  - *Evidence:* ast.hpp:291-295 (SliceExpr has no isMut flag), docs/language-reference.md (no &mut [T] examples)
+- **[L] Enum payload types cannot be generic (only concrete types in variants)**
+  - *What:* enum Maybe<T> { Some(T), None } works, but enum Box<T> { Owned(T, T), } cannot specify different arities per variant with generic param.
+  - *Gap:* Limits GADT-like patterns. Cannot express enum Expr<T> { Int(i64), if T ~ bool: Bool(bool), Pair(Box<Expr<i64>>, Box<Expr<i64>>) }.
+  - *Evidence:* ast.hpp:708-713 (EnumVariant has payloadTypes, no type params), parser doesn't parse generics on variant arms
+- **[M] Visibility only on pub items; no module-level privacy or re-exports**
+  - *What:* pub fn / pub struct work, but no visibility within modules. No pub(crate), pub(super), or re-export (pub use). Bare-name resolution still uses Phase 7 flat merge, not visibility.
+  - *Gap:* Blocks encapsulation within modules. All private items are accessible via bare names even across files. Re-exports cannot shape public API.
+  - *Depends on:* Module system (Phase 7+)
+  - *Evidence:* parser.cpp:55 ('type-level visibility enforcement is deferred'), typecheck.cpp (phase-7-level flat merge, no privacy checks on bare names), ast.hpp (no Visibility enum beyond isPub bool)
+- **[M] &mut parameter not auto-reborrowed through recursive calls**
+  - *What:* A &mut self parameter cannot be threaded through a recursive call to another method. Must manually pass by-value each time (vec_push(&mut v) works at call site but not down chains).
+  - *Gap:* Blocks recursive descent parsers with mutable state threading. Major ergonomic gap: the calc capstone works around this via return tuples.
+  - *Depends on:* Borrow checker (Phase 2.4c+)
+  - *Evidence:* docs/language-reference.md:385-389 ('cannot thread a &mut self-style parameter down a recursive descent. The calc capstone works around this'), examples/calc/
+- **[S] Borrowing temporaries/rvalues disallowed (except Phase 125 entry-block slots)**
+  - *What:* &some_expr errors unless expr is an lvalue Ident. Phase 125 allows &5 via materializing to entry-block slots, but &(a + b) still errors in many contexts.
+  - *Gap:* Reduces flexibility. Temporary borrows are safe if scoped correctly. Rust supports NLL with temporary borrowing.
+  - *Depends on:* NLL borrow checker (Phase 2.4+)
+  - *Evidence:* docs/language-reference.md:377-383 ('Limitation — no & of a literal or temporary'), Phase 125 mentioned as workaround in ROADMAP.md
+- **[S] No integer type suffixes in full range (MVP: i64/bool, extended: i8..i64/u8..u64/f32)**
+  - *What:* Phase 64 added numeric suffixes (5i32, 3.5f32) but the MVP was i64/bool only. Type narrowing/widening is incomplete—some contexts don't auto-narrow unsuffixed literals.
+  - *Gap:* Integer types beyond i64 (i8, i16, i32, u64, etc.) require manual suffix or context annotation. Production languages auto-narrow based on context.
+  - *Depends on:* Numeric type system (Phase 64+)
+  - *Evidence:* ast.hpp:158-170 (suffixWidth/suffixSigned on int/float), typecheck.cpp:4264-4290 (narrowing in coerceOrUnify)
+- **[M] No raw pointers or unsafe blocks**
+  - *What:* No unsafe { ... } context. No *const T / *mut T raw pointer types. Cannot call C functions with opaque pointer args (only &T / &mut T mapped to C ptr).
+  - *Gap:* Blocks low-level systems programming (intrinsics, pointer manipulation, zero-copy APIs). FFI is limited to reference/primitive mappings.
+  - *Evidence:* docs/language-reference.md:338-358 (FFI maps &String to C ptr, no raw ptr type), ast.hpp (no UnsafeBlock, no RawPtrType)
+- **[M] Effect system: no custom effects, only built-ins (io, alloc, async, panic, unwind)**
+  - *What:* Effect row is fixed to predefined labels. Users cannot define custom effects. Cannot express domain-specific side effects (e.g., effect logging { log }).
+  - *Gap:* Limits domain-specific effect modeling. Production languages (Scala, PureScript) support custom effects. Current 5 effects are not extensible.
+  - *Depends on:* Effect system (Phase 4+)
+  - *Evidence:* docs/language-reference.md:68-70 ('built-in effect labels are pure, alloc, io, panic, async, unwind'), typecheck.cpp:1628 (hardcoded effect names), no custom effect syntax in grammar
+- **[L] Const generics limited to i64; no type-level computation**
+  - *What:* const N: i64 works for array lengths [T; N]. No const N: bool or struct-level const params beyond i64. No const fn that returns a type.
+  - *Gap:* Blocks phantom-type patterns and type-level decidability. Rust supports any type in const generics (with trait bounds).
+  - *Depends on:* Const generics (Phase 57+)
+  - *Evidence:* docs/language-reference.md:335-336 ('not in scope'), typecheck.cpp Phase 57/59/61 (only i64 const params)
+
+## Memory, ownership, effects & concurrency (25)
+
+- **[M] Two-phase borrows not implemented**
+  - *What:* Two-phase mutable borrows (e.g., `arr[i] = arr[i] + 1`) currently rejected; would require NLL-style tracking of loan activation vs. completion phases
+  - *Gap:* Closes a borrow-checker ergonomic gap where the RHS borrow must expire before the LHS write, but the MVP rejects all nested borrows of the same binding. Enables in-place mutations and field updates.
+  - *Evidence:* borrow_check.cpp:47-52 — `mutLoanActive` is a bool flag (not phase-aware); no two-phase split in loan tracking. checkRead/consumeIdent treat borrows monolithically.
+- **[M] Reborrow through recursion and implicit deref coercion gaps**
+  - *What:* The `&mut`-binding implicit reborrow (Phase 47, borrow_check.cpp:500-549) works for direct identifiers passed as arguments, but not for recursive/transitive field-access paths (e.g., `s.f.g(..)` where g borrows `&mut`)
+  - *Gap:* Production languages (Rust) coerce deref chains transparently. The current reborrow only fires on bare idents, missing projection chains. Requires deref-projection walk and transitive reborrow.
+  - *Depends on:* NLL-aware loan tracking
+  - *Evidence:* borrow_check.cpp:500-549 (consumeArg) checks `isMutRef` only on IdentExpr; consumeReceiver (932-977) has a workaround for FieldExpr but limited to one level.
+- **[L] No self-referential struct detection or Pin/Unpin support**
+  - *What:* Language has no way to declare or enforce self-referential structs (fields with pointers/refs to other fields). No Pin<T> / Unpin marker trait. Async frame interior can contain dangling refs after move.
+  - *Gap:* Self-referential structs cause UB without invariant tracking. Pin is essential for safe async combinator composition and prevents unsafe auto-move. Affects Future composability and mem-safety of complex types.
+  - *Evidence:* typecheck.cpp: no TypeKind variant for self-referential constraints; borrow_check.cpp: no pinning analysis. docs/stdlib.md:311 — 'async-frame interior free is deferred'; docs/language-reference.md:293 — documented limitation.
+- **[L] Effect system has no user-defined effects or effect handlers**
+  - *What:* Only five hard-coded effect labels (alloc, io, panic, async, unwind, share); no `effect Foo;` declaration form; no effect handler/resumption mechanism like Koka. Effects are purely type-system tracking with zero runtime cost.
+  - *Gap:* User-defined effects enable domain-specific effect tracking (e.g., 'network', 'database'); effect handlers enable capability-based design. Current row-polymorphism is powerful but limited to the five built-ins.
+  - *Evidence:* docs/effects.md:40-41, 173-180 — explicitly states 'The five built-in labels are hard-coded; user-declared effect form remains a future consideration'; typecheck.cpp:2690-2714 (buildEffectSet) rejects unknown labels unless they are generic params.
+- **[M] Effect polymorphism limited to row variables; no subtyping**
+  - *What:* Effect rows only support direct variable substitution (e.g., `e` in `fn map<e>`) or exact label matching. No effect subtyping (e.g., { io } ⊆ { io, alloc }), no variance, no implicit widening.
+  - *Gap:* Type systems like gradual typing benefit from subsumption: a 'pure' caller passing a pure argument to an effect-polymorphic function. No subtyping requires exact match, limiting code reuse.
+  - *Evidence:* docs/effects.md:174-177 — 'Effect-set membership is concrete: alloc matches alloc, with no subtyping...'; typecheck.cpp checkEffects verifies declared ⊇ inferred with exact EffectSet containment, no partial ordering.
+- **[M] No effect inference from function bodies in all cases**
+  - *What:* Effect inference (Phase 4, typecheck.cpp:2057-2068) runs after type-checking and collects union of callee effects, but doesn't auto-infer the entire row from implementation (e.g., 'alloc' only if malloc is called).
+  - *Gap:* Closes the gap where a developer must manually declare effects; Haskell/Clean auto-infer them. Reduces boilerplate and catches missing declarations earlier.
+  - *Evidence:* typecheck.cpp:2662-2681 (checkEffects) — only VERIFIES declared ⊇ inferred, doesn't compute a minimal row from scratch. ROADMAP.md notes no performance benchmarks on effect-tracking overhead.
+- **[M] No 'share' effect on non-thread primitives; Send trait is structural, not declarable**
+  - *What:* The 'share' effect (added Phase 75) marks thread-spawn calls, but Send (typecheck.cpp:7256-7316) is an implicit rule (isSend checks recursively), not a declared marker trait. Users cannot define `trait Send` or override it.
+  - *Gap:* Production systems let types declare Send/Sync explicitly (Rust) for FFI and custom sync types. Structural-only Send means no newtypes or phantom barriers; users can't express 'this Rc-wrapping type is Send in this context'.
+  - *Evidence:* typecheck.cpp:7256-7316 (isSend/isSendImpl) — hardcoded Struct/Enum recursion checking; no trait lookup. Phase 75 docs (CHANGELOG.md:856) mention 'share' but not Send/Sync trait declarations.
+- **[M] OS thread return type limited to i64; async is the generic path**
+  - *What:* thread_spawn accepts `fn() -> i64` only; thread_join returns i64. To return another type, must use async/await. No `fn() -> T` generic thread spawning.
+  - *Gap:* Limits thread usability for non-i64 results (structs, strings, etc.). Users must layer async on top of threads or manually marshal through i64 handles. Async is the 'correct' path but ergonomically awkward for sync code.
+  - *Evidence:* codegen.cpp:3309-3474 — threadBlkTy_ hardcoded to `{i64 tid, i8* fn, i8* env, i64 result}` (line 3388), result is i64 (3469). ROADMAP.md:37-39 — 'OS-thread return value (fn() -> i64 only — async/await is the generic path) are still i64-shaped'.
+- **[M] Mutex handle is type-erased i64; no named type-safe Mutex<T>**
+  - *What:* mutex_new/get/set now generic over cell type T (Phase 123), but the handle is an opaque i64 (PtrToInt of the block). Type safety depends on context inference or explicit annotation; no `Mutex<T>` value type.
+  - *Gap:* Type-erased handles lose static type safety at the boundary. A fully named `Mutex<T>` type would catch mutex-cell-type mismatches at compile time (e.g., mutex_get returning the wrong T).
+  - *Evidence:* codegen.cpp:3502-3599 — mutex_new/get/set emit per-T but return/take i64 handle; ROADMAP.md:39-41 — 'a fully type-safe named Mutex<T> (vs the current type-erased i64 handle) is also deferred'.
+- **[L] No atomic operations or compare-and-swap primitives**
+  - *What:* Language has no atomic types, atomic loads/stores, CAS (compare-and-swap), memory_order enums, or lock-free operations. All concurrency is via mutex locks and channels.
+  - *Gap:* Atomics are essential for lock-free data structures (wait-free queues, concurrent counters, double-checked locking). Mutex-only is simpler but slower and can deadlock or livelock under contention.
+  - *Evidence:* grep 'atomic\|CAS\|compare.*exchange' returns nothing in compiler/*.cpp. codegen.cpp declares pthread_mutex but no atomic operations. No types like AtomicI64 in stdlib.
+- **[M] No select/choose for multiplexed channel/future waiting**
+  - *What:* Language has no `select!` macro or `try_recv` on channels waiting for *any* of N channels/futures to be ready. Only sequential `recv` (blocks on one), no demultiplexing.
+  - *Gap:* Blocks programs waiting on multiple async sources. Examples: wait for timeout OR data, read from any of N sockets. Workarounds require separate tasks or polling loops.
+  - *Evidence:* codegen.cpp: chan_send/try_recv on Sender/Receiver but no select primitive. CHANGELOG.md:479 — 'typed MPSC channels' but no mention of select/choose. docs show only basic recv/send patterns.
+- **[L] No scoped threads (lifetime-bounded thread spawning)**
+  - *What:* thread_spawn takes an owned closure; cannot borrow from the enclosing scope with a lifetime bound. Requires 'move' and explicit Mutex/Arc for sharing.
+  - *Gap:* Scoped threads (Rayon, crossbeam in Rust) let threads borrow stack data within a scope, avoiding heap allocation for short-lived parallelism. Current model forces heap + Send types for all sharing.
+  - *Evidence:* typecheck.cpp:7306-7314 — 'A borrow can\'t cross a thread boundary in this MVP (its referent\'s lifetime can\'t be proven to outlive the thread)'. thread_spawn signature is `fn(fn() -> i64)`, no lifetime params.
+- **[L] Async runtime is single-threaded executor; no work-stealing or async runtime configuration**
+  - *What:* The executor (declareExecutor, Phase 18) is a single-threaded cooperative scheduler with a task queue and epoll/kqueue reactor. No multi-threaded executor, no work-stealing, no spawning background OS threads from async tasks.
+  - *Gap:* Single-threaded executor bottlenecks on multi-core systems; CPU-bound async tasks block all others. Production async runtimes (tokio, async-std) use work-stealing or are multi-threaded by default.
+  - *Evidence:* codegen.cpp:3268-3272 (declareExecutor) — process-global singleton; ROADMAP.md — no executor config or runtime selection mentioned. docs/architecture.md:200 — 'each async fn lowers to resumable poll function'.
+- **[M] No Future combinators (map, and_then, select, etc.)**
+  - *What:* Language has no combinator library for Future — no `map`, `then`, `and_then`, `select`, `join`, `race`. Users must manually chain .await calls or write explicit poll loops.
+  - *Gap:* Combinators are essential for readable async code. Without them, complex async logic requires manual state machines. See Rust futures library.
+  - *Evidence:* grep -r 'Future.*combinator\|map.*future' returns only Vec combinators (vec_map, vec_filter), not Future. docs/stdlib.md:311-317 lists async limitations but no combinator mention.
+- **[M] Async frame interior contents not freed (documented leak)**
+  - *What:* When an async function completes, its frame (allocated in heap) is not freed; the poll function's local variables and the Future itself persist. Only the executor task slot is reclaimed (Phase 121).
+  - *Gap:* Long-running async workloads accumulate frames unbounded. One-shot async calls (e.g., fetch) don't noticeably leak, but sustained async (spawn 1000 tasks) will accumulate memory.
+  - *Evidence:* docs/language-reference.md:293, 411 — 'Closure-env and async-frame interior contents are a documented leak'; docs/stdlib.md:311-317. ROADMAP.md:40-41 — measurement in v21 'showed both are already clean' (contradicts the docs; unclear if this is fixed).
+- **[M] No Rc<T> or Arc<T> weak references**
+  - *What:* Rc<T> is provided (a non-atomic reference-counted smart pointer, marked !Send). No weak references (Weak<T>) to break circular references or enable deallocation cycles.
+  - *Gap:* Circular data structures (graphs, trees with parent pointers) must use Mutex or manual cycle-breaking. Weak refs enable safe cycles with guaranteed cleanup.
+  - *Evidence:* grep -n 'weak' returns only 'weaker capability' semantic comment. typecheck.cpp isSend (line 7281) lists 'Rc' as !Send but no Weak type. codegen.cpp emits Rc drop (8699) but no Weak ops.
+- **[S] No Drop trait specialization or custom drop order control**
+  - *What:* Drop is a built-in trait (typecheck.cpp:1989) but has no specialization or post-move-reordering control. Fields drop in declared order; no way to change it (e.g., drop a guard before its protected data).
+  - *Gap:* Correct drop order is critical for RAII: guards must drop after the guarded resource. Specialization allows custom cleanup logic per type.
+  - *Evidence:* typecheck.cpp:1989-1993 — Drop is user-declarable but codegen always recurses field order. No phase mention of custom drop order or specialization.
+- **[M] Partial struct field moves tracked but incomplete for complex patterns**
+  - *What:* Phase 106 (borrow_check.cpp:32-37) tracks which fields have been moved out (movedFields set), rejecting double-moves and whole-struct use after field move. But array/slice destructuring and pattern-matching moves are not fully tracked.
+  - *Gap:* Completes the partial-move story: `let (a, b) = s.tup; use(s.tup.0)` should be rejected, but borrow checker only tracks whole bindings and field names, not nested destructuring.
+  - *Evidence:* borrow_check.cpp:32-37, 779-788 — movedFields is a set<string> (field names only); no nested field tracking for patterns like `let Point { x, y } = p; use(p.x)`.
+- **[M] No NLL completeness: lacks reborrow through function calls and implicit reborrows in calls**
+  - *What:* The reborrow mechanism (Phase 47) only works for direct `&mut` bindings passed as call arguments; reborrowing through return values, or a `&mut` ref returned from a function and re-passed, is not fully tracked.
+  - *Gap:* Rust's NLL allows `f(&mut x); use(x)` after a reborrow-returning function without explicit lifetime. Current system doesn't track transitive reborrows across call chains.
+  - *Depends on:* two-phase borrows
+  - *Evidence:* borrow_check.cpp:500-549 (consumeArg) — only direct IdentExpr reborrow; no transitive reborrows through fn returns. ROADMAP.md doesn't mention NLL completeness as a shipped feature.
+- **[M] Closure environment capture is by move only; no mutable captures or capture-by-ref**
+  - *What:* Closures capture all bindings by move (a move-typed env). No `move ||` vs `||` distinction, no explicit capture of `&x` or `&mut x` within the closure.
+  - *Gap:* Restricts closure usability: a closure cannot borrow values for its lifetime, cannot modify captured state. Every use requires Mutex or RefCell wrapper.
+  - *Evidence:* codegen.cpp:3308-3343 — closure is a fat pointer `{i8* fn, i8* env}`, the env is move-typed. typecheck.cpp isSend (line 7306) — 'a closure may capture by reference' is mentioned as future work.
+- **[M] Const-eval scalar set limited to i64 and bool**
+  - *What:* Compile-time const evaluation (Phase 25, typecheck.cpp:2111-2149) only handles i64 and bool. No const f64, const String, const arrays of non-scalar types.
+  - *Gap:* Limits metaprogramming and const contexts: cannot pre-compute string lengths, struct sizes, or complex const values. Array-length params are symbolic only, not compile-time-evaluated.
+  - *Evidence:* typecheck.cpp:2115-2118 — ConstValue only stores isBool and i64; evalConstI64 is called (not evalConst). ROADMAP.md:37 — 'const-eval scalar set (i64/bool only) are still MVP-shaped'.
+- **[S] No logical-or operator (||) due to closure syntax collision**
+  - *What:* The `||` token is reserved for closure syntax; no `a || b` logical-or operator. Must use `if a { true } else { b }`.
+  - *Gap:* Reduces ergonomics for boolean logic. Single-character lookahead or parser restructuring could disambiguate.
+  - *Evidence:* ROADMAP.md:44 — 'no || logical-or (it collides with closure || syntax)'; parser.cpp likely treats || as closure, not binop.
+- **[S] No borrow of temporaries or rvalues; no & of enum literals**
+  - *What:* Cannot borrow an rvalue: `&A(10)` errors; must bind to `let` first. Related miscompile: ref to enum literal passes wrong scalar.
+  - *Gap:* Limits expressiveness: temporary slices `&v[a..b]`, temporary refs for function calls. Enum literal ref bug is correctness issue.
+  - *Evidence:* ROADMAP.md:45 — 'no & of a temporary/rvalue (& A(10) errors — bind to a let first), plus a related miscompile where a ref to an enum literal passes the wrong scalar'.
+- **[S] No macOS/kqueue async fd-readiness; Linux/epoll only**
+  - *What:* Phase 18 stretch declared epoll-based fd reactor (codegen.cpp:3274-3276) but only on Linux. macOS kqueue support is deferred.
+  - *Gap:* Cross-platform async I/O (read/write socket, timer) requires kqueue. Programs using fd reactor fail or hang on macOS.
+  - *Evidence:* codegen.cpp:3273-3277 — `#if defined(__linux__)` guards epoll decl. docs/stdlib.md:317 — 'macOS/kqueue async fd-readiness is deferred'.
+- **[L] No third-party dependency registry; local-path only**
+  - *What:* kard.toml supports only local-path dependencies (`path = "../foo"`). No remote registry, no semantic versioning, no transitive resolution.
+  - *Gap:* Limits code reuse and ecosystem growth. Users must fork or inline libraries. No version pinning across projects.
+  - *Evidence:* ROADMAP.md:49-50 — 'Local-path dependencies only (a third-party registry is deferred)'; docs/stdlib.md:320.
+
+## Standard library & runtime (28)
+
+- **[L] Vector capacity operations and iterator adaptors**
+  - *What:* Implement `vec_capacity(v)`, `vec_reserve(v, additional)`, `vec_with_capacity(cap)`, and lazy iterator adaptors (`map`, `filter`, `fold`, `zip`, `enumerate`, `chain`, `take`, `skip`, `rev`). Currently only `for` iteration is available via `Iterator<T>::next()`.
+  - *Gap:* Vec container is MVP without capacity/allocation control and without the full iterator combinator suite. Rust programs rely heavily on these for performance and expressiveness.
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/docs/stdlib.md:62-73; file:/root/projects/x1/i-2/kardashev/compiler/src/typecheck.cpp:387-483 (vec_* builtins stop at reverse; no capacity ops or adaptors)
+- **[L] String Unicode/UTF-8 handling beyond bytes**
+  - *What:* Implement `str_char_count()` (grapheme/UTF-8 char count), `str_chars()` -> Iterator over actual chars, `str_starts_with()`, `str_ends_with()`, `str_contains()`, `str_split()` iterator, `str_trim()`. Current API is byte-oriented only (`str_char_at` reads a byte; no UTF-8 awareness, no split/trim/contains).
+  - *Gap:* String operations are MVP-level byte-access only. Real string handling needs grapheme iteration, substring matching, and text processing routines (documented gap: strings are 'utf-8-ish' but no actual UTF-8 correctness).
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/docs/stdlib.md:95-154 (no NUL terminator note, but only basic byte ops); file:/root/projects/x1/i-2/kardashev/compiler/src/typecheck.cpp:122-240 (str_len, str_char_at, str_substring, int_to_string only; no split/trim/contains)
+- **[M] Generic `format!()` and format-args macro**
+  - *What:* Implement a generic `format(fmt: &String, args: ...) -> String` or `format!()` macro supporting `{}`, `{:x}` (hex), `{:b}` (binary), `{:?}` (debug) format specs. Currently only `int_to_string()`, `f64_to_string()`, `int_to_hex()` exist as discrete converters.
+  - *Gap:* No string formatting beyond ad-hoc int/float/hex conversion. Every real language needs composable format-args (Rust, Python, Java all have this). MVP gap.
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/docs/stdlib.md:104-154 (only print_*, int_to_string, f64_to_string, int_to_hex; no format macro); file:/root/projects/x1/i-2/kardashev/compiler/src/typecheck.cpp:225-250
+- **[M] HashMap/HashSet interior element drop**
+  - *What:* Fix the documented leak: when a HashMap<K, V> or HashSet<T> is dropped where K or V/T is droppable (e.g., contains a String, Vec, or user struct with Drop), those elements are not individually dropped—only the bucket array is freed. Implement per-bucket drop during table reclamation.
+  - *Gap:* Documented, intentional memory leak (file:/root/projects/x1/i-2/kardashev/docs/stdlib.md:304-310). A long-running program with String-keyed maps will leak unboundedly. Closing this gap improves deterministic memory safety (rest of language is leak-free by Phase 29/100).
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/docs/stdlib.md:304-310 (explicit leak note); file:/root/projects/x1/i-2/kardashev/ROADMAP.md:33-42 (v21 checked interior-drop is already clean); file:/root/projects/x1/i-2/kardashev/CHANGELOG.md:109-161 (Phase 121 fixed spawn/join leak, Phase 122 added remove, Phase 123 generic Mutex)
+- **[S] HashMap/HashSet further operations**
+  - *What:* Add `hashmap_clear(m: &mut HashMap<K,V>) -> i64`, `hashmap_values(m) -> Vec<V>`, `hashmap_is_empty(m) -> bool`, `hashset_is_empty(s) -> bool`, `hashmap_contains_key(m, k) -> bool` (vs only hashmap_get today). Currently only insert/get/remove/keys/len/contains.
+  - *Gap:* Standard container APIs are incomplete. Rust HashMap has clear, is_empty, values, contains_key, entry API (advanced). At minimum, is_empty and clear are expected.
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/docs/stdlib.md:199-217 (only new/insert/get/len); file:/root/projects/x1/i-2/kardashev/compiler/src/typecheck.cpp:531-573 (hashmap_new, hashmap_insert, hashmap_len, hashmap_keys; no clear/values/contains_key/is_empty)
+- **[S] Overflow-checked arithmetic operations**
+  - *What:* Implement `checked_add(a: i64, b: i64) -> Option<i64>`, `checked_sub`, `checked_mul`, `checked_div`, and `saturating_add`, `saturating_sub`, `saturating_mul` (clamp to type bounds on overflow). Currently only wrapping semantics (defined for i64, but no explicit saturating or checked variants).
+  - *Gap:* No way to detect or handle arithmetic overflow at runtime. Real numerics need overflow detection (Option-returning) or saturation. Currently const-eval catches overflow, but runtime overflow wraps silently.
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/ROADMAP.md:113-114 (v12 'real stdlib'); no checked_ or saturating_ builtins in file:/root/projects/x1/i-2/kardashev/compiler/src/typecheck.cpp:3850-4069 (const-eval checks overflow, but no runtime checked_* ops)
+- **[S] Additional f64 intrinsics**
+  - *What:* Implement `f64_sin()`, `f64_cos()`, `f64_tan()`, `f64_ln()`, `f64_log10()`, `f64_exp()`, `f64_pow(x, y)`, `f64_round()`, `f64_trunc()`, `f64_min(a,b)`, `f64_max(a,b)`. Currently only f64_sqrt, f64_floor, f64_ceil, f64_abs exist.
+  - *Gap:* Scientific/numeric workloads need transcendental functions. MVP math is minimal. Real languages ship a full libm interface.
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/compiler/src/typecheck.cpp:275-281 (only sqrt, floor, ceil, abs for f64); file:/root/projects/x1/i-2/kardashev/docs/stdlib.md (no mention of trig/exp/log)
+- **[L] Full numeric tower (sized integers, floats)**
+  - *What:* Implement builtin numeric support for i8, i16, i32, u8, u16, u32, u64, f32 as FIRST-CLASS types (not just AOT const-eval). Today only i64, bool, f64 are runtime. Sized types are available at const-eval (Phase 64-66) but no runtime support.
+  - *Gap:* Modern systems languages need sized numeric types for FFI, packed structs, and memory layout control. Currently only i64 is available at runtime for general code (u8/i8 exist in const-eval but not as operational types in function signatures).
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/ROADMAP.md:36-39 (MVP scalar set is i64/bool); file:/root/projects/x1/i-2/kardashev/compiler/src/typecheck.cpp:3564-3573 (sized ints registered as const-types, not runtime); file:/root/projects/x1/i-2/kardashev/README.md:112-113 (v11 'real machine integers' added bitwise + defined wrapping, but sized types are MVP/const-only)
+- **[M] Buffered I/O (BufReader, BufWriter)**
+  - *What:* Implement `BufReader<T>` and `BufWriter<T>` wrapper types. Provide `buf_read_line()`, `buf_write()`, `buf_flush()`. Currently only unbuffered file I/O via fs_read_to_string, fs_write, fs_exists.
+  - *Gap:* Performance-critical for large I/O workloads. Rust's BufRead/BufWrite are standard. Unbuffered I/O is a practical performance trap.
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/docs/stdlib.md:268-275 (only fs_read_to_string, fs_write, fs_exists, args); no buffered variants in file:/root/projects/x1/i-2/kardashev/compiler/src/typecheck.cpp
+- **[L] File seek and advanced file operations**
+  - *What:* Implement `fs_open(path) -> File`, `file_read(f, buf) -> i64`, `file_seek(f, offset, whence) -> i64`, `file_tell(f) -> i64`, `fs_mkdir(path)`, `fs_remove(path)` (delete file), `fs_read_dir(path) -> Vec<DirEntry>`. Currently only whole-file read/write.
+  - *Gap:* Real file I/O needs random access, directory traversal, and file management. Whole-file API is insufficient for processing large files or traversing filesystems.
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/docs/stdlib.md:268-275 (fs_read_to_string, fs_write, fs_exists only); no file handle / seek / open in file:/root/projects/x1/i-2/kardashev/compiler/src/typecheck.cpp:337-365
+- **[M] Stdin/stdout/stderr as continuous I/O streams**
+  - *What:* Implement `stdin() -> Reader`, `stdout() -> Writer`, `stderr() -> Writer` stream handles, with `read_line()`, `read_exact()`, `write()`, `flush()` methods. Currently only `print()` / `print_str()` / `print_no_nl()` for stdout, no general stream abstraction.
+  - *Gap:* Interactive programs and pipelines need fine-grained control over I/O streams. Current print-only API is insufficient for real CLI tools.
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/docs/stdlib.md:104-124 (only print, print_str, print_no_nl; no stdin/stderr or stream API); file:/root/projects/x1/i-2/kardashev/compiler/src/typecheck.cpp:113-300 (no stdin/stdout/stderr stream types)
+- **[M] Environment variables and full process API**
+  - *What:* Implement `env_var(name: &String) -> Option<String>`, `env_set_var()`, `process_exit(code: i64) -> !`, `process_current_dir()`, `process_set_dir(path)`, `process_wait_child()`. Currently only `args()` / `arg_get()` / `arg_count()`.
+  - *Gap:* Real CLI programs need env var access, process exit control, and directory management. MVP has only argv.
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/docs/stdlib.md:272-275 (only args/arg_count/arg_get); no env or process control in file:/root/projects/x1/i-2/kardashev/compiler/src/typecheck.cpp:366-379
+- **[L] Error type ecosystem (custom errors, Error trait, Display/Debug)**
+  - *What:* Ship `std::error::Error` trait (with `to_string()` / `source()` methods). Support `#[derive(Error)]` for user types. Implement backtrace capture (when panic=unwind). Distinguish between `panic=abort` and `panic=unwind` at compile time (effect system integration).
+  - *Gap:* Current error handling is Result<T, IoError> only. Real languages need composable error types, trait objects, and backtrace support. Effect system should gate unwind behavior.
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/docs/stdlib.md:266-296 (only IoError enum); file:/root/projects/x1/i-2/kardashev/compiler/src/typecheck.cpp:959-996 (panic/catch with `panic` effect, but no Error trait or backtrace)
+- **[S] Time and duration APIs**
+  - *What:* Implement `Duration` type, `Instant::now()`, `Instant::elapsed() -> Duration`, `Duration::from_secs(s)`, `Duration::from_millis(ms)`, `Duration::as_secs() -> i64`, `Duration::as_millis() -> i64`. Currently only `sleep_ms()` exists.
+  - *Gap:* Timing programs (benchmarks, timeouts, delays) need a Duration type and clock API beyond just sleep. Currently only sleep_ms is available.
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/docs/stdlib.md (no time module mentioned); file:/root/projects/x1/i-2/kardashev/compiler/src/typecheck.cpp:790-801 (only sleep_ms builtin; no Duration/Instant types)
+- **[S] Random number generation**
+  - *What:* Implement `rand() -> i64` (pseudo-random), `rand_range(min, max) -> i64`, `Rng` trait, `StdRng` seeded RNG. Currently no randomness support.
+  - *Gap:* Games, simulations, randomized algorithms all need an RNG. MVP stdlib has none.
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/docs/stdlib.md (no randomness mentioned); no rand builtins in file:/root/projects/x1/i-2/kardashev/compiler/src/typecheck.cpp
+- **[L] Serialization support (JSON, binary serde)**
+  - *What:* Implement a generic `Serialize` / `Deserialize` trait pair with #[derive] support. Build JSON codec (`serde_json`) supporting i64, bool, String, Vec, HashMap, structs, enums. For binary: at least a simple `bincode`-style format.
+  - *Gap:* Every modern systems language (Rust, Go) ships serialization. Currently only JSON example (examples/json) is hand-written. No generic serde.
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/docs/stdlib.md:299-327 (JSON capstone is numeric-config only, hand-parsed); no Serialize/Deserialize traits in file:/root/projects/x1/i-2/kardashev/compiler/src/typecheck.cpp
+- **[XL] Ordered collections (BTreeMap, BTreeSet)**
+  - *What:* Implement `BTreeMap<K: Ord, V>` and `BTreeSet<T: Ord>` ordered map/set. Key operations: range queries, in-order iteration, predecessor/successor lookups.
+  - *Gap:* Hash-based collections are unordered. Real workloads often need sorted containers (lexicographic string maps, range scans, ordered stats). MVP stdlib has only HashMap/HashSet.
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/README.md:103-126 (no mention of BTree); file:/root/projects/x1/i-2/kardashev/docs/stdlib.md (only HashMap/HashSet); no BTree* in file:/root/projects/x1/i-2/kardashev/compiler/src/typecheck.cpp
+- **[M] Deque (VecDeque / LinkedList) and stack/queue structures**
+  - *What:* Implement `VecDeque<T>` (double-ended queue, circular buffer), `LinkedList<T>` (doubly-linked list), with push_front/pop_front/push_back/pop_back and O(1) front/back access.
+  - *Gap:* BFS/DFS algorithms, work-stealing queues, and deque-based data structures need front/back access. Only Vec is available (front removal is O(n)).
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/README.md:103-126 (no VecDeque/LinkedList); file:/root/projects/x1/i-2/kardashev/docs/stdlib.md (only Vec); no deque in file:/root/projects/x1/i-2/kardashev/compiler/src/typecheck.cpp
+- **[S] Vec sort stability and stable_sort explicit name**
+  - *What:* Clarify that `sort<T>` is **stable** (documented in Phase 47 as insertion-sort). Add an explicit `stable_sort()` name for clarity, and optionally `unstable_sort()` for in-place heapsort (performance trade-off).
+  - *Gap:* Stability is a critical sort property for reliable stable-sort-dependent code (e.g., multi-key sorts). Currently only insertion-sort exists (stable by nature) but lacks explicit naming. Users expecting quicksort semantics may be surprised.
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/compiler/src/main.cpp:349-367 (insertion sort in prelude, marked stable in comment); no explicit stable_sort / unstable_sort distinction in file:/root/projects/x1/i-2/kardashev/docs/stdlib.md
+- **[S] Vec capacity inspection and optimization hints**
+  - *What:* Add `vec_capacity(v: &Vec<T>) -> i64`, `vec_with_capacity(cap: i64) -> Vec<T>`, `vec_reserve(v: &mut Vec<T>, additional: i64)`, `vec_shrink_to_fit(v: &mut Vec<T>)`. Currently only push/pop/insert/remove on a growth-doubling strategy.
+  - *Gap:* Performance-conscious code needs capacity introspection to avoid repeated allocations. Pre-allocating with capacity is essential for performance. No control over when to shrink.
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/docs/stdlib.md:158-188 (only vec_new/push/get/len; no capacity ops); file:/root/projects/x1/i-2/kardashev/compiler/src/typecheck.cpp:387-483 (no vec_capacity/vec_reserve/vec_with_capacity)
+- **[M] Slice operations beyond get/len**
+  - *What:* Implement generic slice mutability (`&mut [T]`), `slice_get_mut(s: &mut [T], i) -> &mut T`, `slice_copy_from_slice(dst: &mut [T], src: &[T])`, `slice_split_at(s: &[T], mid: i64) -> (&[T], &[T])`. Currently only immutable read-only slice API.
+  - *Gap:* Slices are MVP with read-only access. Real code needs mutable slices and in-place operations on slice ranges.
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/docs/stdlib.md:241-250 (only slice_len, slice_get; element type is i64 MVP); file:/root/projects/x1/i-2/kardashev/compiler/src/typecheck.cpp:721-753 (slice_len, slice_get, slice_get_ref only; no mutable slice)
+- **[M] Platform-specific (Linux-only) async I/O deferred on macOS**
+  - *What:* Implement macOS/kqueue fd-readiness support (parallel to Linux/epoll in file:/root/projects/x1/i-2/kardashev/compiler/src/typecheck.cpp:997-1028). Currently `#if defined(__linux__)` gates pipe_make/pipe_send/read_pipe.
+  - *Gap:* Documented deferral: Linux/epoll only, macOS support is deferred. Full cross-platform async I/O needs kqueue backend.
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/docs/stdlib.md:317-319 (macOS/kqueue deferred); file:/root/projects/x1/i-2/kardashev/compiler/src/typecheck.cpp:997-1029 (#if defined(__linux__) gates pipe/read_pipe)
+- **[L] Async-frame interior memory reclamation**
+  - *What:* Fix the documented leak: a completed `Future`'s heap frame is never freed by `block_on` or the executor. Implement safe per-frame reclamation (read-after-free risk exists on poll slot; needs executor task lifecycle rework).
+  - *Gap:* Documented, intentional leak (file:/root/projects/x1/i-2/kardashev/docs/stdlib.md:311-316). A long-running async workload with many spawned tasks leaks frames. Fixing requires careful ownership rework of the executor.
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/docs/stdlib.md:311-316 (explicit async frame leak documented); file:/root/projects/x1/i-2/kardashev/ROADMAP.md (async is off v5 capstone path, deferral rationalized)
+- **[XL] Third-party package registry (Bazel module registry integration)**
+  - *What:* Integrate with the Bazel module registry or implement an alternative (crates.io-style) package index. Currently only `mod foo;` and local-path `kard.toml` deps ship.
+  - *Gap:* Documented deferral: ecosystem is pre-registry. Real language ecosystems need discoverable, version-managed packages.
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/docs/stdlib.md:319-320 (registry deferred); file:/root/projects/x1/i-2/kardashev/ROADMAP.md:225-229 (third-party package registry deferred)
+- **[S] Option / Result combinators generic over all types**
+  - *What:* Lift `option_map`, `option_and_then`, `option_unwrap_or`, `result_map`, `result_and_then`, `result_unwrap_or` from i64-only payload to generic `<T>` (like Rust). Currently MVP with hardcoded i64 payload.
+  - *Gap:* Combinators are currently i64-specific. Real code needs Option/Result combinators polymorphic over any type T.
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/docs/stdlib.md:32-52 (option_map, option_and_then take i64 payload, 'MVP shape'); file:/root/projects/x1/i-2/kardashev/compiler/src/main.cpp:39-52 (prelude mentions MVP i64 payload)
+- **[S] Generic Option/Result more combinators (or_else, map_or, unwrap_or_else)**
+  - *What:* Add `option_or_else(o, f) -> Option<T>`, `option_map_or(o, default, f) -> T`, `result_or_else(r, f) -> Result<T,E>`, `result_map_or(r, default, f) -> T`, `result_unwrap_or_else(r, f) -> T`. Currently only map/and_then/unwrap_or exist.
+  - *Gap:* Essential Option/Result combinators for ergonomic error handling. Real code heavily uses these.
+  - *Depends on:* generic Option/Result combinators
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/docs/stdlib.md:32-52 (only option_map, option_and_then, option_unwrap_or, result_map, result_unwrap_or listed)
+- **[L] Generic Iterator adaptors in prelude**
+  - *What:* Implement trait Iterator<T> adaptors as prelude methods: `map(i, f) -> Iterator`, `filter(i, pred) -> Iterator`, `take(i, n) -> Iterator`, `skip(i, n) -> Iterator`, `enumerate(i) -> Iterator<(i64, T)>`, `zip(i1, i2) -> Iterator<(T,U)>`, `chain(i1, i2) -> Iterator`. Currently only the trait + Range impl exist; no combinators.
+  - *Gap:* Iterator combinators are foundational for functional code. Rust's iterator adaptor suite is core to expressiveness. MVP has bare trait only.
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/docs/stdlib.md:55-73 (Iterator trait + Range impl only, mentions fold/map/filter as 'adaptors' but none are listed as builtins); file:/root/projects/x1/i-2/kardashev/compiler/src/main.cpp:93-114 (only Iterator trait + Range impl in prelude)
+- **[M] Generic type parameter bounds in const-eval (const-generic constraints)**
+  - *What:* Allow const-generics with trait bounds in const-eval context (e.g., `const C: usize = N where N: SomeConstTrait`). Currently const-generics are unbound values only.
+  - *Gap:* Dimension/matrix checking (dimension-checked matrices capstone, v10) needs const-generic arithmetic constraints at compile time.
+  - *Evidence:* file:/root/projects/x1/i-2/kardashev/README.md:112 (v10 'dimension-checked matrices', suggests const-generic constraints needed); file:/root/projects/x1/i-2/kardashev/compiler/src/typecheck.cpp (no const-trait bounds in Phase 57-61 const-param sections)
+
+## Backends & performance (26)
+
+- **[XL] C backend: extend subset beyond i64/bool scalars**
+  - *What:* Phase 129 (`--emit-c`) currently accepts only i64/bool scalar types, the full operator set, let/mut/assign, if-else as value, while, recursion, and const. Grow it phase-by-phase: structs (fields, literals, field access), enums + match (variant construction, tag-based switching), then strings/Vec (heap-backed containers with the same runtime as LLVM backend), then Drop impls (user destructors), and finally references + generics on the emitted C side.
+  - *Gap:* Breaking the LLVM/Linux monoculture requires proving the i64/bool subset can emit correct C via differential testing. Each growth phase extends this foundation to match larger chunks of kardashev. Roadmap commits structs → enums+match → strings/Vec → Drop as sequential phases post-v23.
+  - *Evidence:* compiler/src/emit_c.cpp:1-129 (the subset enforcement), ROADMAP.md:214-217 (phase ordering), tests/smoke_test_phase129.sh:40-89 (differential gate structure)
+- **[M] C backend: add struct layout and field access**
+  - *What:* Implement struct-literal construction (C aggregate initializers or field-by-field assignment), field reads (GEP lowering), and field writes (store via address-of). Use the same layout as codegen.cpp computes via LLVM datalayout. Reject nested structs/generic structs at this phase; accept only scalar fields.
+  - *Gap:* The most concrete missing feature in emit_c: the smallest growth step from i64/bool, visible in struct literals and field projection. Unblocks user types (the struct tests like smoke_test_phase117 use only i64 fields) and prepares for enum variant payloads.
+  - *Evidence:* compiler/src/emit_c.cpp:225-231 (explicit struct rejection), ROADMAP.md:214-215 (structs as phase 1), tests/smoke_test_phase129.sh:82-89 (reject struct program with clean error)
+- **[L] C backend: enums and match expressions**
+  - *What:* Emit enums as tagged unions: a C struct holding an i64 tag + an i64 payload (matching codegen's layout for scalar variants). Lower match as a switch statement over the tag, extracting the payload when needed. Reject multi-field payloads, nested enums, and dyn types initially.
+  - *Gap:* Match expressions are the control-flow backbone of kardashev; without them the subset is useless for real programs. The self-hosted compiler's Phase 118 proved enums + match can emit via select-chains; translating to C switch is the natural next form.
+  - *Depends on:* C backend: add struct layout and field access
+  - *Evidence:* compiler/src/emit_c.cpp:116-122 (break/continue stubs), ROADMAP.md:214-215 (enums+match as phase 2), BENCHMARKS.md:1-5 (match present in all reference programs but can't be tested via emit-c yet)
+- **[L] C backend: strings and Vec (heap-backed containers)**
+  - *What:* Emit string literals as malloc'd storage with length/capacity fields (mirroring the runtime String struct { data: i8*, len: i64, cap: i64 }). Emit Vec likewise. Lower string/vec ops (indexing, append, iteration) through calls to the same builtins the LLVM backend uses (string_push_str, vec_push, etc.), or emit inline C that matches the builtin semantics.
+  - *Gap:* Without String and Vec, the C backend is confined to pure arithmetic. These containers are heap-allocated but the runtime is already proven correct (v21 measured them leak-free). Reusing builtins avoids reimplementing allocation logic in C.
+  - *Depends on:* C backend: enums and match expressions
+  - *Evidence:* compiler/src/codegen.cpp:1300-1600 (string/vec builtin lowering), ROADMAP.md:214-217 (strings/Vec as phase 3), emit_c.hpp:11-12 (scope states Vec is outside current subset)
+- **[L] C backend: Drop trait impls and RAII**
+  - *What:* Add support for user-defined Drop implementations in the C backend. When a binding goes out of scope, emit a call to the corresponding `__impl_Drop_for_<type>__drop` function (matching the LLVM mangling). Handle cleanup-stack ordering for panics if the program is panic-capable.
+  - *Gap:* Drop is what makes constant-memory loops possible in kardashev; without it the C backend cannot express ownership-critical patterns. The LLVM backend already handles Drop glue and panic unwinding; the C backend must mirror this.
+  - *Depends on:* C backend: strings and Vec (heap-backed containers)
+  - *Evidence:* compiler/src/codegen.cpp:144-152 (Drop impl registration), emit_c.cpp:12 (Drop explicitly listed as outside subset), ROADMAP.md:214-217 (Drop as phase 4)
+- **[M] C backend: references and borrowing**
+  - *What:* Emit references as pointer types. Handle immutable borrows (&T → T*), mutable borrows (&mut T → T*), and dereferencing (*p → *p in C). Emit borrow-check failures as compile-time errors (the C backend runs post-borrow-check, so all borrows are valid). Handle temporary materialization for &<rvalue>.
+  - *Gap:* References are fundamental to kardashev's memory safety; their absence makes the subset non-Turing-complete for many patterns (you can't pass structs to functions efficiently). Phase 125 proved &<temporary> is safe; extending to general references is the natural follow-up.
+  - *Depends on:* C backend: add struct layout and field access
+  - *Evidence:* compiler/src/emit_c.cpp:84 (deref explicitly rejected), emit_c.hpp:11 (references listed outside scope), codegen.cpp:320 (RefExpr panic check)
+- **[L] C backend: generics and monomorphization**
+  - *What:* Emit generic functions by cloning them per type-argument combination (monomorphization), with the same mangling as the LLVM backend uses. Emit generic structs and trait impls likewise. Reject impl constraints (where clauses, trait bounds) in the initial version — emit only the instantiated monomorphs.
+  - *Gap:* Generics are how large programs achieve reuse; the LLVM backend fully monomorphizes them. The C backend needs the same to claim feature parity. The complexity is in the name mangling and ensuring the same monomorphs are emitted for both backends.
+  - *Depends on:* C backend: enums and match expressions
+  - *Evidence:* compiler/src/emit_c.cpp:200-208 (generic fns explicitly rejected), codegen.cpp:219-231 (monomorphization pending queue), ROADMAP.md:214-217 (generics deferred but not explicitly listed)
+- **[L] C backend: closures and function pointers**
+  - *What:* Emit closures as function pointers + an opaque env pointer (mirroring codegen's fn-value representation). Lower closure calls as C indirect calls. Reject captures that require heap allocation initially; accept only captures of scalar locals.
+  - *Gap:* Closures are used in higher-order combinators (map, filter, fold) on Vec and Iterator. Without them the C backend cannot express functional patterns. The env calling-convention is proven in the LLVM backend (Phase 10b).
+  - *Depends on:* C backend: references and borrowing
+  - *Evidence:* compiler/src/emit_c.cpp:95-102 (call handling), emit_c.hpp:11 (closures outside scope), codegen.cpp:3310-3393 (env calling convention)
+- **[XL] C backend: async/await and Futures**
+  - *What:* Emit async fns as poll functions that take a stack-allocated Future state slot and return a Poll<T>. Lower await as a loop-poll over the Future. Emit the executor (or link to it from a C library). This mirrors the LLVM backend's Future and poll-function design.
+  - *Gap:* Async is one of kardashev's headline features; the C backend claiming to compile kardashev without async is incomplete. The executor is already proven correct (v21 measured frame leaks as fixed); the C side just needs to call the same runtime.
+  - *Depends on:* C backend: closures and function pointers
+  - *Evidence:* compiler/src/emit_c.cpp:109-115 (while loops only; async not present), emit_c.hpp:11 (async outside scope), codegen.cpp:8300-8500 (async lowering strategy)
+- **[M] C backend: loop expressions with values and for loops**
+  - *What:* Emit `loop { break <value>; }` as a do-while that breaks with a value. Emit `for x in iter { ... }` by lowering Iterator::next calls and desugaring to while. Handle the value flow from break expressions (currently rejected in emit_c.cpp:117-119).
+  - *Gap:* Loop expressions with values are syntactic sugar but ergonomically important. The C backend currently rejects `break <value>` as a clear limitation. Reachable via for-loop desugaring once Iterator trait support lands.
+  - *Depends on:* C backend: references and borrowing
+  - *Evidence:* compiler/src/emit_c.cpp:116-122 (break value rejected), emit_c.hpp:11 (for/loop-with-value outside scope), codegen.cpp:9800-9900 (loop lowering)
+- **[M] C backend: module system and multi-file compilation**
+  - *What:* Extend --emit-c to emit one .c file per module (or a single module namespace via extern declarations). Handle visibility (`pub`) and module-qualified names. Link the emitted .c files together via the system C compiler.
+  - *Gap:* Kardashev programs use `mod foo;` to organize code. The C backend cannot claim to compile kardashev if it rejects multi-file programs. The borrow-checker and type-checker already handle modules; codegen just needs to emit them.
+  - *Depends on:* C backend: references and borrowing
+  - *Evidence:* compiler/src/emit_c.cpp:225-231 (mods explicitly rejected), ROADMAP.md:214-217 (modules not explicitly listed but implied by full feature parity)
+- **[XL] WASM backend (wasmtime or node.js host)**
+  - *What:* Implement a WebAssembly backend in parallel with the C backend. Target wasm32-unknown-unknown with a minimal runtime (allocator, panic handler, stdio wrapper). Use LLVM's wasm backend or emit text-format WAT manually. Set up CI to run wasmtime or node.js as the verifier (differential gate: WASM exit == LLVM exit).
+  - *Gap:* WASM is a major compilation target (portable, sandboxed, web-capable). The roadmap lists it as a follow-on reach once the C backend proves the AST→target seam (ROADMAP.md:218-220). Breaking the LLVM/Linux monoculture requires multiple targets.
+  - *Depends on:* C backend: extend subset beyond i64/bool scalars
+  - *Evidence:* ROADMAP.md:218-223 (WASM + Windows as follow-on reach), README.md:52 (no WASM listed in honest gaps), compiler/src/codegen.cpp:381-400 (datalayout/target setup is target-agnostic)
+- **[XL] Windows/PE backend and MSVC ABI support**
+  - *What:* Port the LLVM backend to Windows targets (x86_64-pc-windows-msvc, x86_64-pc-windows-gnu). Use clang-cl or clang-lld for linking. Handle platform differences (no POSIX pthreads → use Windows threads, no mmap → use heap allocation for large buffers, PE object format). Ensure ABI compatibility (calling convention, struct layout, exception handling).
+  - *Gap:* Kardashev claims to be a systems language but runs only on Linux/macOS. Windows is 30%+ of the systems market. The roadmap lists Windows as follow-on reach (ROADMAP.md:220-222); LLVM backends on Windows are mature and well-tested.
+  - *Evidence:* ROADMAP.md:52 (no Windows listed), ROADMAP.md:220-222 (Windows target is mostly toolchain/ABI work on LLVM), README.md:52 (CI covers only Linux+macOS)
+- **[L] Cross-compilation infrastructure (host vs target triple)**
+  - *What:* Add a `--target <triple>` flag to kardc. Accept triples like x86_64-linux-gnu, aarch64-linux-gnu, x86_64-apple-darwin, aarch64-apple-darwin, wasm32-unknown-unknown. Set the LLVM TargetTriple and datalayout before codegen. Test that the same source produces correct binaries for different targets (differential gate via QEMU or a cross-compilation CI agent).
+  - *Gap:* Systems languages must support embedded/mobile/server deployments across architectures. The LLVM backend already has the foundation (codegen.cpp:381-400 sets datalayout per target); wiring it to a flag and testing cross-compilation is the next step.
+  - *Evidence:* compiler/src/main.cpp:1676-1701 (target setup hardcoded to getDefaultTargetTriple), codegen.cpp:372-400 (datalayout per target, Phase 35), README.md:36 (Backend: LLVM — single target only)
+- **[M] Link-time optimization (LTO) support**
+  - *What:* Add `--lto=full|thin` flags to kardc. Enable LLVM's LTO passes in the opt pipeline (bitcode emission, whole-program optimization, dead-code elimination across translation units). Set up incremental caching to skip redundant LTO on unchanged source.
+  - *Gap:* LTO can close performance gaps by inlining and optimizing across module boundaries. The benchmarks show a ~2.2× gap on tight loops (BENCHMARKS.md:26); LTO + post-link opts could narrow this. Rust's cargo supports --release with lto=true; kardashev should match.
+  - *Evidence:* BENCHMARKS.md:38-40 (the 2.2× loop gap is a concrete codegen-opt target), compiler/src/codegen.cpp:420-455 (opt pipeline does not mention LTO), README.md:89 (cache is content-addressed; would need LTO-aware cache key)
+- **[L] Profile-guided optimization (PGO) harness**
+  - *What:* Instrument kardc to emit PGO-instrumented binaries (LLVM -fprofile-generate). Run the instrumented binary on representative workloads, collect profiling data, and recompile with -fprofile-use to apply the profile. Integrate into a kard.toml build config.
+  - *Gap:* PGO can significantly improve performance by biasing branch prediction and inlining toward hot paths. The benchmarks are micro-workloads; PGO on real application workloads could narrow the gap to C. No Rust equivalent (cargo handles PGO differently).
+  - *Evidence:* BENCHMARKS.md:34-40 (codegen-opt opportunities), compiler/src/codegen.cpp:420-455 (no PGO support), README.md:89 (no PGO documented)
+- **[M] Better register allocation and instruction selection**
+  - *What:* Profile kardc's output to identify register-spill sites and suboptimal instruction sequences. Add LLVM cost-model hints or custom lowering for hot patterns (e.g., tight-loop accumulators). Experiment with LLVM's RegAllocGreedy vs RegAllocFast. Measure impact on the loop benchmark.
+  - *Gap:* The 2.2× loop gap in BENCHMARKS.md:26 is attributed to alloca-heavy bindings (BENCHMARKS.md:39 — the front-end lowers `let mut` to alloca). The -O2 pipeline includes mem2reg which collapses these, but register allocation may still be suboptimal. Better heuristics could close the gap.
+  - *Evidence:* BENCHMARKS.md:26-40 (2.2× gap, attributed to alloca + register allocation), codegen.cpp:421-422 (mem2reg + inliner mentioned; DCE/GVN but no tuning), no custom cost models in kardashev
+- **[S] LICM and loop-invariant code motion tuning**
+  - *What:* Analyze the loop benchmark's generated IR to identify loop-invariant operations that LLVM's LICM pass could hoist. Experiment with loop-unrolling thresholds and cost-model parameters. Measure whether hoisting reduces the 2.2× gap.
+  - *Gap:* Loop-invariant code motion (e.g., hoisting a constant out of a loop) is a standard opt but LLVM's default cost model may be conservative for kardashev's workloads. Tuning loop opts is a proven lever for closing performance gaps.
+  - *Evidence:* BENCHMARKS.md:26-40 (2.2× gap is in a tight loop), codegen.cpp:433-453 (LLVM PassBuilder; LICM is part of O2 but not tuned), no loop-unroll hints in kardashev IR
+- **[M] Bounds-check elimination (array indexing optimization)**
+  - *What:* When an array index is provably in bounds (e.g., a loop counter i < array.len()), emit a bounds-check-free load. LLVM's ScalarEvolution pass can prove this for simple cases; add custom analysis to catch more patterns (e.g., a loop over a fixed-size array never panics).
+  - *Gap:* Array indexing in kardashev includes a bounds check (codegen.cpp:1283-1297). On tight loops with fixed bounds, this check is redundant and slows down the generated code. Eliminating it could help close the performance gap.
+  - *Evidence:* codegen.cpp:1283-1297 (bounds check lowering with in_bounds BB and panic path), BENCHMARKS.md:39 (tight loop is a concrete target), no bounds-check elimination mentioned
+- **[S] Inlining strategy and cost-model tuning**
+  - *What:* Analyze the loop benchmark's call graph to see if function inlining is limiting perf. Experiment with -inlinethreshold, -inliner-cone-size, and FunctionAttrSynergy. Measure whether more aggressive inlining narrows the 2.2× gap.
+  - *Gap:* Inlining is the lever that LLVM's default O2 uses to expose opportunities for downstream passes (mem2reg, DCE, GVN). If the default cost model is too conservative for kardashev's idioms, tuning it could close gaps.
+  - *Evidence:* BENCHMARKS.md:39 (inliner mentioned as one of the passes), codegen.cpp:421-422 (built-in `print` wrapper inlining mentioned), no custom inlining strategy in kardashev
+- **[M] Datalayout-aware codegen and struct packing**
+  - *What:* The compiler already sets the module datalayout per target (codegen.cpp:372-400, Phase 35). Extend this to emit struct layouts that match the C backend's manual layout (avoiding padding waste when possible). Use LLVM's datalayout queries to compute field offsets correctly for every target.
+  - *Gap:* Phase 35 fixed a miscompile where struct GEP folding happened before datalayout was set (CHANGELOG.md:859, 'An -O1+ miscompile'). Ensuring all targets have correct datalayout is load-bearing for correctness. Optimizing struct layout (e.g., reordering fields to reduce padding) is an added benefit.
+  - *Depends on:* Cross-compilation infrastructure (host vs target triple)
+  - *Evidence:* codegen.cpp:26-27 (Phase 35 datalayout comment), codegen.cpp:372-400 (datalayout setup), CHANGELOG.md:859 (the miscompile history), emit_c.cpp creates struct layouts without explicit datalayout awareness
+- **[M] Debug information completeness (DWARF full or split-dwarf)**
+  - *What:* The current debug-info support (Phase 14a, codegen.cpp:469-580) emits DWARF v4 with DICompileUnit + DIFile + DISubprogram. Extend it to include DILocalVariable for all locals (currently only params and `let` bindings get DILocalVariable). Add source-location tracking for all expressions (not just statements). Consider split-DWARF for faster linking.
+  - *Gap:* Production systems languages have complete debug info for gdb/lldb use. Kardashev's current support is skeletal — line tables + scopes but not full value tracking. Better debuggability improves usability and enables real profiling tools.
+  - *Evidence:* codegen.cpp:553-580 (DILocalVariable emission only for params/let), codegen.cpp:520-524 (debugLocFor exists but may not cover all expressions), tests/smoke_test_debuginfo.sh (some debug-info testing exists)
+- **[M] Benchmark suite expansion and regression detection**
+  - *What:* The current bench/ suite has 3 workloads (fib, collatz, loop). Add 10+ more: string-heavy (JSON parsing, text processing), container-heavy (HashMap churn, Vec growth), recursive (tree traversal), and concurrent (spawn/join scaling). Run on every CI commit and track ratios over time. Set alerts if ratio regresses > 10%.
+  - *Gap:* The 2.2× loop gap is acknowledged but unmeasured for other workloads. A regression suite prevents performance cliffs. Real applications exercise different code paths (allocation, recursion, string ops); 3 micro-benchmarks miss major gaps.
+  - *Evidence:* BENCHMARKS.md:1-45 (current suite is 3 programs), bench/run.sh (harness is flexible; easy to add tests), bench/ contains only fib.kd/c, collatz.kd/c, loop.kd/c, README.md:31 (No performance numbers was an honest gap; v21 added benchmarks but suite remains minimal)
+- **[M] Calling-convention stability and ABI compatibility**
+  - *What:* Document the calling convention for kardashev functions (parameter passing, return values, register clobbering). Ensure it matches LLVM's System V AMD64 ABI (on Linux) / Apple ABI (on macOS) / Windows ABI (on Windows). Write tests that call kardashev from C and vice versa, verifying no ABI mismatches.
+  - *Gap:* Calling-convention bugs can silently corrupt data across FFI boundaries. Kardashev has `extern "C"` support but no explicit ABI stability guarantee. Production systems languages document and test their ABIs (Rust has stable ABI in nightly, C has the System V spec).
+  - *Evidence:* codegen.cpp:106-109 (extern fn ABI coercions mentioned), compiler/src/codegen.cpp:3310-3393 (env calling convention), tests/smoke_test_ffi.sh (FFI exists but no explicit ABI tests), no ABI documentation in docs/
+- **[L] Incremental and distributed compilation (opt-in)**
+  - *What:* Beyond the existing content-addressed cache (main.cpp:1760-1829), add support for caching intermediate artifacts (parsed AST, type-checked IR, codegen modules per function). Wire a build server that can cache across machines. Support incremental recompilation when only one module changes.
+  - *Gap:* Incremental builds speed up development iteration. The existing cache is global; per-module caching would enable faster builds on large projects. Distributed caching (shared across a team) requires careful invalidation.
+  - *Evidence:* main.cpp:1760-1829 (cache is global + content-addressed), ROADMAP.md:226 (no mention of incremental builds; MVP focused), compiler architecture is monolithic (lexer→parse→typecheck→codegen in one pass)
+- **[M] Error messages and diagnostics completeness**
+  - *What:* Extend error reporting to include more context: suggestions for common mistakes, nearby-definition hints for typos, type-mismatch diffs, and better source snippets. Harmonize with rustc's diagnostic style (color, line numbers, caret markers).
+  - *Gap:* Good error messages are a form of performance — faster understanding = faster fixes. Kardashev's diagnostics exist but are less polished than Rust's. Better diagnostics improve developer experience and reduce time-to-correct.
+  - *Evidence:* codegen.cpp uses err() to push error strings (lines 17-18, 84, 118, etc.), no structured diag infrastructure visible, tests/smoke_test_diag.sh exists but is minimal, docs/ do not mention error-message design
+
+## Self-hosting → real bootstrap (13)
+
+- **[L] Expand lexer to full token set**
+  - *What:* Self-hosted lexer currently handles: identifiers, integer literals, multi-char operators (->), single-char punctuation (parentheses, braces, curly braces, operators +*<==;:,). Extend to recognize: keyword set (fn struct enum impl trait pub async match if else while for loop mut const extern, etc.), string literals with escape sequences, comments (// and /* */), all two-char operators (<=, >=, &&, ||, .., .., =>, ::, etc.), character literals, float literals.
+  - *Gap:* The self-hosted lexer is a 2-token mini-language (identifiers, numbers, operators). Full Kardashev requires ~30 token kinds including float literals, strings, all keywords, and comments. This is the barrier to parsing real Kardashev source.
+  - *Evidence:* examples/selfhost/lexer.kd:~100 lines, handles only is_alpha/is_digit/is_space + 13 hardcoded ASCII ops. Real lexer in compiler/src/lexer.cpp has full multichar operator matching and keyword discrimination. See ROADMAP.md Phase 115-119 which gated lexer extension.
+- **[L] Implement full recursive-descent parser for expressions**
+  - *What:* Self-hosted parser currently parses: function signatures (fn NAME(PARAMS) -> RET), arithmetic expressions with precedence (<adds, multiplies, parentheses, if/else as expression). Extend to: all expression forms (match arms, closures fn(x) -> ... { }, method calls via dot, field access, array indexing, tuple unpacking in match patterns, async/await), statement forms (let mut, assignment, while/loop/for), module items (struct/enum/impl/trait decls with full syntax including generics, where clauses, derives).
+  - *Gap:* Parsing is only 1-3% of a compiler by effort but gates everything downstream. The self-hosted parser in examples/selfhost/parser.kd and compile.kd only handles function bodies as expressions + let locals; it cannot parse a struct definition, trait bound, or the module-level decls that kardashev itself uses. Real Kardashev has 50+ expression and statement varieties.
+  - *Depends on:* Expand lexer to full token set
+  - *Evidence:* examples/selfhost/parser.kd parses fn signatures, examples/selfhost/compile.kd parses function bodies (arithmetic + if/else + let). Real parser in compiler/src/parser.cpp (~1900 lines) handles full grammar including generics, traits, derives, match, closures, modules. Current self-hosted is <300 lines of parsing code.
+- **[XL] Build HM unification and generic instantiation in Kardashev**
+  - *What:* Self-hosted type checker currently: checks 2-type language (i64, bool), supports simple unification (equation solving for arithmetic/comparison type constraints), has no generics. Implement: full Hindley-Milner unification with occurs check, fresh type variable generation per function/call site, generic struct/enum instantiation (allocate fresh vars for struct<T> → concrete T instances), associated-type resolution (resolving impl Item = U where trait declares type Item;), where-clause bound checking.
+  - *Gap:* Current self-hosted checker in examples/selfhost/typeck.kd is a hardcoded 2-type system. Real Kardashev has generics across functions (fn map<T, U, e>), structs (Vec<T>, HashMap<K,V>), enums (Option<T>), traits (trait Iterator<T>), and associated types. HM unification is ~500 lines in the host compiler (types.cpp, typecheck.cpp) but fundamentally required to type-check any real Kardashev code.
+  - *Depends on:* Implement full recursive-descent parser for expressions
+  - *Evidence:* examples/selfhost/typeck.kd ~70 lines, hardcodes TInt/TBool/TErr tags. compiler/src/types.cpp ~800 lines, compiler/src/typecheck.cpp ~2200 lines covering HM, generic instantiation (fn instantiate), trait resolution, effect union. ROADMAP notes v15-v17 built only the 2-type subset; full bootstrap requires generic unification.
+- **[L] Implement effect-row type system in self-hosted checker**
+  - *What:* Self-hosted type checker has no effect tracking. Kardashev signatures declare effects: fn f() -> i64 ! { io, alloc }. Implement: effect-row parsing (! { effect1, effect2, ... }), row variables (e for effect-polymorphism), effect-row union across the call graph, effect-subset validation (pure caller cannot call io function), desugaring of where-clause bounds into effect constraints.
+  - *Gap:* Effect labels are Kardashev's signature feature — zero-cost annotation in the type system. Every real Kardashev function carries an effect row; the host compiler's effect inference is ~300 lines in typecheck.cpp. Without it, the self-hosted compiler cannot type-check any real Kardashev program that uses I/O, allocation, async, or panics.
+  - *Depends on:* Build HM unification and generic instantiation in Kardashev
+  - *Evidence:* examples/selfhost/typeck.kd has zero effect handling. compiler/src/typecheck.cpp lines ~1500-1800 handle effect inference (EffectSet, rowVars, effect union in call-site checking). README shows effect syntax in every non-trivial function. ROADMAP v15+ made effects the core semantic challenge alongside HM.
+- **[XL] Implement borrow checker (affine ownership + NLL) in Kardashev**
+  - *What:* Self-hosted compiler has no borrow checking. Kardashev uses affine ownership + non-lexical lifetimes. Implement: binding state tracking (Owned vs Moved), loan tracking (shared vs mutable borrows, expiry at last use, not scope-end), aliasing rule (shared XOR mutable, neither across a move), partial-field moves (moving one field of a struct without losing the whole struct), drop-flag-per-binding tracking, interaction with mutable references (&mut T).
+  - *Gap:* Borrow checking is ~1500 lines in compiler/src/borrow_check.cpp and handles the affine, move-typed semantics that make Kardashev memory-safe. Without it, the self-hosted compiler cannot check ownership and would produce unsafe code. Every real Kardashev program uses borrowing and moves; the checker enforces that in-scope borrows don't alias with moves.
+  - *Depends on:* Build HM unification and generic instantiation in Kardashev
+  - *Evidence:* examples/selfhost/ has zero borrow checking. compiler/src/borrow_check.cpp ~1500 lines implementing Binding/Loan/isCopyType/lastUsePos tracking, two-pass walk (positions + loan checking). ROADMAP v17 Phase 106 added partial-field moves (discovered by dogfooding). No self-hosted tests currently validate borrow correctness.
+- **[L] Add structs and struct layout to LLVM codegen**
+  - *What:* Self-hosted codegen (examples/selfhost/llvmgen.kd) emits i64/bool only, using LLVM i64/i1 types. Extend to: struct definitions (allocate LLVM StructType per struct), field offset calculation, struct literals and construction (insertvalue), field access (extractvalue), struct monomorphization (fn<T> generic structs get specialization per T), struct-in-struct nesting.
+  - *Gap:* Structs are Kardashev's foundational aggregate type. The self-hosted llvmgen.kd (Phase 115-118) added struct support (Phase 117 commit) to emit real code, but only for the i64/bool subset. Real Kardashev programs define their own structs (struct Parser { s: String, pos: i64 }, struct Json { ... }) and the codegen must lay them out, specialize generics, and handle field access. Phase 117 of ROADMAP documents this step.
+  - *Depends on:* Implement full recursive-descent parser for expressions
+  - *Evidence:* examples/selfhost/llvmgen.kd ~300 lines (Phase 115), Phase 117 added struct parsing + insertvalue/extractvalue (~50 more lines). Real codegen in compiler/src/codegen.cpp ~1500-2000 lines cover struct layout, field offset GEP, monomorphization, drop-glue per field. Selfhost currently emits valid structs but doesn't parse full struct syntax (no generics in selfhost structs yet).
+- **[L] Add enums and match-expression lowering to LLVM codegen**
+  - *What:* Self-hosted codegen added enum support (Phase 118). Extend to: full enum lowering including multi-variant enums with payloads, match expressions as a branch-free select-chain (over the tag), pattern extraction (extractvalue for payload), exhaustiveness checking, enum monomorphization over generic type parameters.
+  - *Gap:* Enums are the second core aggregate type in Kardashev (e.g., Result<T, E>, Option<T>, custom ADTs). Phase 118 of ROADMAP added this to the self-hosted codegen; the host compiler uses a decision-tree compiler (pattern_match.cpp ~400 lines) for complex patterns, but match can lower to select-chain for simple variants. Every Kardashev program using Result/Option or custom enums needs enum codegen.
+  - *Depends on:* Add structs and struct layout to LLVM codegen
+  - *Evidence:* examples/selfhost/enumgen.kd added in Phase 118, ~100 lines. Phase 119 (adversarial review) found and fixed a match-arm return-type bug. compiler/src/codegen.cpp ~300 lines handle enum construction/matching via decision tree or select-chain. Selfhost now supports enums (Phase 118 complete) but needs exhaustiveness checking.
+- **[L] Implement string and Vec codegen (allocation + indexing)**
+  - *What:* Self-hosted codegen has no allocation or dynamic containers. Extend to: Vec<T> lowering (malloc call, length/capacity tracking, push/pop/index operations, drop glue), String lowering (immutable utf-8 buffer in static memory or malloc, indexing, substring, concat, escape-sequence handling), proper LLVM layout ({ i8* data, i64 len, i64 cap }).
+  - *Gap:* String and Vec are ubiquitous in real Kardashev programs (examples/selfhost itself uses Vec<Token>, examples/json uses Vec<Json>, HashMap<String, Json>). Without Vec/String codegen, the self-hosted compiler cannot parse source (lexer returns Vec<Token>), cannot build ASTs with String names, and cannot emit real code. Codegen for these is ~500 lines in the host (lazy emission per type).
+  - *Depends on:* Implement full recursive-descent parser for expressions
+  - *Evidence:* examples/selfhost uses Vec<Token>, Vec<Stmt>, HashMap with String keys but codegen doesn't emit the runtime (relying on host stdlib). compiler/src/codegen.cpp ~500-700 lines handle Vec/String layout, specialization, and drop glue. Self-hosted can't yet handle recursive String-in-Enum (would need proper allocation).
+- **[L] Implement Drop and destructors (RAII cleanup)**
+  - *What:* Self-hosted codegen has no cleanup/drop glue. Extend to: per-binding drop flags (i1 alloca tracking whether a value was moved), recursive drop-glue emission for heap-owning types (Vec, String, HashMap, Box, user structs with owned fields), cleanup-stack ordering (drops in reverse declaration order, guarded by drop flags to prevent double-free), unwind path integration.
+  - *Gap:* Drop is Kardashev's memory-safety guarantee — every Vec/String/Box frees its heap exactly once, no leaks or double-free. The self-hosted codegen (currently i64/bool + structures only) has no heap allocation yet, so drop is not critical for the subset. But to compile real Kardashev (which allocates heavily), the self-hosted codegen must emit drop glue. The host compiler has ~300 lines of drop logic (codegen.cpp, emitDropGlue + drop-flag management).
+  - *Depends on:* Implement string and Vec codegen (allocation + indexing)
+  - *Evidence:* examples/selfhost/llvmgen.kd has no drop/cleanup (pure arithmetic + structures on stack). compiler/src/codegen.cpp lines ~2000+ implement emitDropGlue, drop-flag allocation, cleanup-stack entry generation. ROADMAP v1 (Phase 11) added Drop; self-hosting hasn't reached it yet.
+- **[L] Implement closures and higher-order functions**
+  - *What:* Self-hosted compiler has no closure support. Extend to: closure syntax (|| body, |x| x + 1, |x, y| ....), environment capture (by value vs reference), closure calling, fat-pointer function types (fn(T) -> U ! { e }), effect-row polymorphism on closures (map takes fn(T) -> U ! {e} and propagates e), FnMut vs FnOnce distinction, closure lowering to heap env-struct + code pointer.
+  - *Gap:* Closures are used throughout Kardashev (iterator combinators like map/filter/fold all take closures, spawn takes an async closure, trait methods take callback closures). The self-hosted compiler needs closures to express its own typechecker and codegen (which walk ASTs recursively). Host codegen has ~200 lines of closure lowering (env struct allocation, vtable generation).
+  - *Depends on:* Build HM unification and generic instantiation in Kardashev
+  - *Evidence:* examples/selfhost has zero closure support. README shows examples/json using Vec combinators + closures. compiler/src/codegen.cpp ~200-300 lines handle closure env layout, code emission, capture-by-ref / capture-by-value distinction. Effect-row polymorphism on closures is critical for generics over callbacks.
+- **[XL] Implement async/await and Future lowering**
+  - *What:* Self-hosted compiler has no async support. Extend to: async fn syntax, await expressions, Future<T> lowering ({ poll_fn, frame } pair), poll-based state machine compilation (transform async fn body into state machine), task scheduling / executor integration, spawn and join primitives, cancellation (unwind effect).
+  - *Gap:* Async is a full feature in Kardashev (README shows async examples, `spawn(async { ... })` in concurrency examples). The self-hosted compiler doesn't need async to compile itself (sequential), but compiling real Kardashev programs requires it. Host codegen has ~400 lines of async lowering (state machine via poll-function + frame).
+  - *Depends on:* Build HM unification and generic instantiation in Kardashev
+  - *Evidence:* examples/selfhost has zero async. README and ROADMAP v12 (Phase 77) document async as a major feature. compiler/src/codegen.cpp ~400-600 lines handle async fn → state-machine compilation, Future layout, poll-integration. ROADMAP v15+ didn't revisit async in self-hosting; it's a deferred feature.
+- **[XL] Implement traits, impl blocks, and trait dispatch**
+  - *What:* Self-hosted compiler has no trait support. Extend to: trait definitions (trait Name { fn f() -> T ! { e }; }), impl blocks (impl Trait for Type { fn f() -> T { ... } }), trait-method resolution (static dispatch to the right impl's mangled name), trait objects (dyn Trait fat pointers with vtable), associated types (trait assoc type Item;), associated-fn resolution.
+  - *Gap:* Traits are central to Kardashev (Iterator, Clone, Drop, Display, Eq, all generic container operations use trait bounds). Real Kardashev programs heavy on traits; examples/json uses #[derive(Clone, Eq)], Iterator combinators. Host compiler has ~400 lines of trait resolution + ~300 lines of vtable/dyn-dispatch codegen. Self-hosting requires trait semantics to compile anything resembling real Kardashev.
+  - *Depends on:* Build HM unification and generic instantiation in Kardashev
+  - *Evidence:* examples/selfhost has zero traits. Real programs show impl Iterator for Type, trait-bounded generics (fn<T: Trait>). compiler/src/typecheck.cpp ~600-800 lines handle trait resolution; compiler/src/codegen.cpp ~300-400 lines handle dyn dispatch. ROADMAP v1 (Phase 5) added traits; self-hosting deferred.
+- **[XL] Bootstrap: self-hosted compiler compiles itself**
+  - *What:* Final milestone: kardc-in-kardashev (a Kardashev program) successfully parses, type-checks, borrow-checks, and compiles a full Kardashev source file (e.g., a subset of itself or examples/json), emits valid LLVM IR, which clang can compile to a native binary, which runs correctly. Differential testing: the self-hosted-emitted binary's output == the host compiler's output on the same input.
+  - *Gap:* This is the definition of self-hosting: the compiler is written in the language it compiles and can reproduce itself. It closes the loop, proves the language is powerful enough, and breaks dependency on C++. Full bootstrap (v15-v19 current state: 2-type subset) is several roadmaps out; incremental bootstrap-per-subset is the strategy (Phase 115+ showed i64/bool + structs/enums work, next: strings/Vec/generics/traits/borrow-check).
+  - *Depends on:* Implement borrow checker (affine ownership + NLL) in Kardashev, Implement traits, impl blocks, and trait dispatch, Implement async/await and Future lowering, Implement Drop and destructors (RAII cleanup)
+  - *Evidence:* ROADMAP.md "The honest gaps" section: 'Self-hosting is a mini compiler, not a bootstrap... examples/selfhost/compile.kd type-checks and runs a tiny 2-type... mini language... It proves the language can express a compiler-shaped program; it is NOT kardashev compiling kardashev.' Current phases 115-119 achieved i64/bool + structs/enums + LLVM IR emission + differential testing. Full Kardashev bootstrap requires all preceding items (lexer, parser, HM, borrow-check, codegen for all types).
+
+## Tooling & ecosystem (19)
+
+- **[L] Third-party package registry**
+  - *What:* Implement a real registry (not just local-path deps) via Bazel module registry API or a custom HTTP registry. Current state: only `mod foo;` + `kard.toml` local-path deps (documented-deferred in ROADMAP.md, intentional because Bazel can't run in CI)
+  - *Gap:* Single-machine, single-version ecosystem. No way to publish or depend on third-party libraries published elsewhere. Blocks ecosystem growth and shared code reuse at scale.
+  - *Evidence:* kard:109-113 (DEFERRED documented), ROADMAP.md:226-228 (third-party registry deferred), docs/stdlib.md (local-path only)
+- **[L] Dependency versioning + lockfile**
+  - *What:* Add version resolution (semver constraints), lockfile generation (kard.lock), and transitive dependency tracking. Current: only name + path, no versioning or locking.
+  - *Gap:* No reproducible builds across time; no way to pin to known-good transitive deps. Essential for production use.
+  - *Evidence:* kard:84-114 (manifest parsing), no version field in [package] or [dependencies]
+- **[M] LSP completeness: diagnostics-on-type + semantic tokens**
+  - *What:* Add pull-based diagnosticsProvider, semantic token types/modifiers (VARIABLE/PARAMETER/FUNCTION roles), and incremental document sync (partial instead of full-sync). Current: full-sync diagnostics on open/change only; no semantic tokens.
+  - *Gap:* VS Code/LSP editors can show errors as-you-type and highlight types/functions/parameters distinctly. Currently only parse+type errors on save.
+  - *Evidence:* lsp_main.cpp:1109-1122 (capabilities advertise full-sync only, publishDiagnostics fires on didOpen/didChange), no semanticTokensProvider
+- **[M] LSP completeness: code actions**
+  - *What:* Implement textDocument/codeAction (quick-fixes: add import, suggest type annotation, remove unused binding, inline binding). Current: none.
+  - *Gap:* IDE code-fix workflows (lightbulb suggestions). Blocks ergonomic error recovery.
+  - *Evidence:* lsp_main.cpp:1115-1117 (only hover/definition/references/rename advertised, no codeActionProvider)
+- **[S] LSP completeness: inlay hints**
+  - *What:* Implement textDocument/inlayHint for type annotations (e.g. `let x /* : i64 */`), function param names at call sites. Current: none.
+  - *Gap:* IDE ergonomics: inline hints reduce cognitive load when reading code without explicit type annotations.
+  - *Evidence:* lsp_main.cpp advertises 9 capabilities (initialize, hover, definition, references, rename, completion, diagnosticProvider); no inlayHintProvider
+- **[S] LSP completeness: workspace symbols + document symbols**
+  - *What:* Implement textDocument/documentSymbol + workspace/symbol for outline + symbol search. Current: none (no symbol index across file).
+  - *Gap:* IDE outlines, Go > Symbol in File/Workspace commands. Currently no way to see a file's structure.
+  - *Evidence:* lsp_main.cpp builds per-document index but does not advertise documentSymbolProvider or workspaceSymbolProvider
+- **[S] Formatter (kardfmt) coverage gaps**
+  - *What:* Extend kardfmt to format match arms, struct literals, enum variants, generic params, and effect rows with consistent spacing rules (currently basic block/fn/expr formatting works, some constructs may format verbosely).
+  - *Gap:* Code consistency and readability. Incomplete formatter forces hand-formatting of complex types.
+  - *Evidence:* fmt_main.cpp:95 (formatProgram), kardashev/ast_print.hpp (backend); no mention of match-arm, struct-literal-specific rules
+- **[M] Debugger story: DWARF + gdb/lldb integration**
+  - *What:* Wire DWARF emission (Phase 14a implemented: emitDebug flag, compile unit + subprograms) to gdb/lldb integration: pretty-printers for Vec/String/HashMap, breakpoint setting helpers, variable inspection via debug symbols. Current: DWARF emitted with `-g` but no pretty-printer or tooling integration docs.
+  - *Gap:* Users can't debug complex types (Vec/HashMap) without manually inspecting raw memory. No gdb/lldb commands documented for kardashev.
+  - *Evidence:* main.cpp:1444,1480 (emitDebug passed to codegen), Phase 14a described in ROADMAP.md; no gdb/lldb integration or pretty-printer code
+- **[L] Documentation tooling: doc comments → API docs**
+  - *What:* Add support for doc comments (/// or /** */) on functions/types, and a doc extraction tool (like rustdoc) to generate API docs from inline comments. Current: no doc comments in code, docs are hand-written Markdown in docs/.
+  - *Gap:* Scalable API documentation that stays in sync with code. Library authors can't auto-generate docs for their published APIs.
+  - *Evidence:* No ///  or /** in compiler/src/*.cpp; docs/ are hand-written; mdbook.toml has no rustdoc-style API doc generation
+- **[M] Documentation tooling: doctests beyond doclint**
+  - *What:* Add doctest runner: extract code blocks from doc comments (or .md files), compile + run them, ensure they pass. Current: docs are hand-written Markdown with no executable examples.
+  - *Gap:* Documentation examples stay correct; no stale code snippets. Major stdlib projects (std lib, async, etc.) rely on this.
+  - *Evidence:* docs/ are .md files; no doctest runner mentioned in book.toml or main.cpp
+- **[S] REPL statement history + multi-line input**
+  - *What:* Add readline/linenoise for history, multi-line input for complex expressions (e.g. match/if spanning lines), up-arrow navigation. Current: raw stdin with no history, single-line only (enter commits).
+  - *Gap:* REPL usability: users want to re-run / edit prior commands without retyping. No multi-line lambda/match possible inline.
+  - *Evidence:* main.cpp:1548-1599 (runREPL uses std::getline per line, no history, no multi-line buffer)
+- **[M] Editor plugins: VS Code, Vim, Emacs**
+  - *What:* Create official language extensions: VS Code extension (connects to kard-lsp), vim/nvim plugin (lsp-client config), emacs-lsp-mode entry. Current: no plugins shipped.
+  - *Gap:* Editor integration out-of-the-box. Users shouldn't need to manually configure LSP endpoints.
+  - *Evidence:* No editor-plugins/ directory; .github/workflows has no plugin release automation
+- **[M] CI/release automation: artifact publishing + GitHub releases**
+  - *What:* Wire CI to build kardc/kardfmt/kard-lsp binaries for Linux/macOS (and later Windows), publish to GitHub releases, and update homebrew / cargo-binstall entries. Current: only Bazel build+test in CI, no release artifacts published.
+  - *Gap:* End-users can't easily install kardashev; must build from source. Blocks adoption.
+  - *Evidence:* .github/workflows/ci.yml (build/test only), no release job; README lists no download links
+- **[M] Build tool (kard) enhancements: watch mode + incremental**
+  - *What:* Add `kard watch` (re-run on file change), incremental compilation (only recompile changed files), and a daemon mode. Current: kard is a bash shim over kardc; each run is a fresh compile.
+  - *Gap:* IDE-like dev experience. Hot-reload for REPL-driven development.
+  - *Evidence:* kard script (bash, calls kardc once per invocation); no watch/daemon infrastructure
+- **[M] Test framework: property-based testing + test isolation**
+  - *What:* Add quickcheck-style generators for property testing, test grouping/filtering (test mymodule::*), parameterized tests. Current: `--test` discovers test_*() -> i64 functions; no filtering, parameterization, or property testing.
+  - *Gap:* More comprehensive testing. Parameterized tests reduce boilerplate; property tests find edge cases.
+  - *Evidence:* main.cpp:2048-2167 (runTests discovers and calls test_* functions; no filtering, parameterization, or generators)
+- **[L] Performance profiling tooling: perf integration, flame graphs**
+  - *What:* Add CPU profiling (via perf/dtrace), memory profiling (valgrind integration or custom allocator hooks), and flame-graph generation. Current: only BENCHMARKS.md with manual timing; no profiler.
+  - *Gap:* Bottleneck identification. Compiler is LLVM-backed; users need to profile generated code.
+  - *Evidence:* BENCHMARKS.md (hand-timed via time command); no profiling infrastructure in codebase
+- **[M] Compile-time configuration: features / conditional compilation**
+  - *What:* Add feature flags (e.g. `#[cfg(feature = "foo")]`) to kard.toml, similar to Rust. Current: no feature system.
+  - *Gap:* Allows optional stdlib components (e.g. no-alloc mode), test-specific code, platform-specific branches.
+  - *Evidence:* kard.toml has only [package] and [dependencies]; no [features] section
+- **[L] Publishing tool: kard publish**
+  - *What:* Implement `kard publish` command to upload a package to a registry (once registry exists), validate manifest, sign/verify. Current: no publish command.
+  - *Gap:* Ecosystem distribution. Without a publish workflow, even if a registry exists, users can't easily share libraries.
+  - *Evidence:* kard script has build/run/test/fmt/repl; no publish subcommand
+- **[S] Package dependency tree visualization**
+  - *What:* Add `kard tree` / `kard deps` to show transitive dependency graph, flag duplicate versions or conflicts. Current: no such command.
+  - *Gap:* Debugging dependency issues, understanding package size impact. Essential for large projects.
+  - *Evidence:* kard script has no tree/deps subcommand
+
+## Correctness, spec & stability (15)
+
+- **[L] Normative language specification (EBNF / formal semantics)**
+  - *What:* Author a complete, machine-verifiable language specification (EBNF grammar or TLA+/Alloy model for type system / effect rows) covering all shipped features: syntax, type system (HM unification, generics, traits, associated types), borrow checking (NLL, aliasing rules), effect rows (row polymorphism, soundness), Drop / RAII semantics, panic unwinding, async/await, FFI boundaries (integer truncation/extension rules), and semantics of integer overflow (wrapping behavior documented).
+  - *Gap:* ROADMAP.md explicitly defers 'A normative language spec + conformance suite'. Without a formal spec, language semantics rely entirely on implementation (codegen.cpp, typecheck.cpp, borrow_check.cpp) — no independent verification, no contracting-side clarity, impossible to validate third-party implementations or prove soundness of core rules like effect attribution.
+  - *Evidence:* /root/projects/x1/i-2/kardashev/ROADMAP.md lines 224-231; docs/language-reference.md is informal reference only (543 lines); docs/effects.md is guide-level, not normative (179 lines).
+- **[L] Conformance test suite to the specification**
+  - *What:* Build a comprehensive conformance suite (1000+ tests) covering every syntax rule, type rule, effect rule, borrow-check rule, and semantics statement in the spec. Each test is named and cites the spec section (e.g., 'spec-s4.2-effect-subtyping'). Tests cover positive cases (valid programs must pass) and negative cases (invalid programs must reject with a specific error code). A conformance-test runner verifies implementations against the spec, not just 'this version of kardashev'.
+  - *Gap:* No conformance suite exists today — only ~130 manual smoke tests covering feature breadth (async, generics, closures, threads, etc.) but not spec *completeness*. Without conformance tests, a second compiler (the bootstrap path) has no way to prove language compliance. Conformance is essential for ecosystem stability and third-party tooling (LSP, formatters, linters, alternative backends).
+  - *Evidence:* tests/ contains 130+ smoke_test_*.sh files (feature coverage) but no spec-grounded test registry; no test-to-spec traceability matrix.
+- **[M] Stability policy and 1.0 criteria (SemVer + editions model)**
+  - *What:* Document what 1.0 stability means for kardashev: (1) Define feature-completeness criteria (e.g., two working backends, async proven on 3 OS, standard library surface stable). (2) Commit to SemVer 1.0+ with editions (Rust model) — breaking changes only via opt-in edition selection in kard.toml. (3) Establish a deprecation/removal timeline (e.g., features deprecated in v1.1 removed in v2.0). (4) Freeze the public API surface at 1.0 (what stdlib functions / types / traits are public, with explicit stability annotations).
+  - *Gap:* CHANGELOG.md §Versioning states pre-1.0 is unstable ('anything may change'), but 1.0.0 and the editions model are deferred (lines 12-13). Without explicit 1.0 criteria, users cannot trust language stability — code written today may be broken by v0.25 without warning. For a research compiler, this is acceptable; for ecosystem adoption, it is a blocker.
+  - *Evidence:* /root/projects/x1/i-2/kardashev/CHANGELOG.md lines 6-15; ROADMAP.md line 53 ('pre-1.0 with no stability policy'); README.md roadmap table shows v1-v23 shipped but does not define 1.0 criteria.
+- **[L] Property-based testing (fuzzer growth beyond arithmetic/control/div/memsafety)**
+  - *What:* Extend differential fuzzing to uncover miscompiles in: (1) generics (monomorphization edge cases, type instantiation under constraints); (2) trait dispatch (dyn coercion, method resolution, vtable correctness); (3) closures (capture aliasing, environment memory layout, FnMut reborrow soundness); (4) async/await (executor scheduling, wake-ups, panic safety in futures); (5) effect rows (effect inference, row-variable unification, polymorphism correctness); (6) strings and unicode (String append, truncation, field-move interactions); (7) C-backend subset (emit_c.cpp correctness under all operator combinations for the i64/bool subset). Current fuzzers: arith (40 tests), control (30), memsafety (20), div (40); target 500+ differential tests across new axes.
+  - *Gap:* ROADMAP.md v18 Phases 110-113 show differential fuzzing is powerful (found v17 field-move miscompiles by hand). Today's fuzzers cover low-level codegen (arithmetic, memory safety, signed division) but not high-level features (generics, trait dispatch, closures, effects, async schedulers). These are precisely where implementations diverge: monomorphization bugs, vtable corruption, environment leaks, scheduler races. A property-based testing suite would systematically hunt miscompiles in under-tested areas.
+  - *Evidence:* /root/projects/x1/i-2/kardashev/tests/smoke_test_fuzz_*.sh: arith (lines 1-70), control (lines 1-83), memsafety (lines 1-112), div (lines 1-90) — all bounded to small test counts (N=30-40). No fuzzers for generics, traits, closures, async, effects, or strings.
+- **[L] Root-cause diagnosis and permanent fix for macOS arm64 JIT-teardown flake**
+  - *What:* The codegen_test suite exhibits a ~50% non-deterministic failure on macOS arm64 (ORC JIT teardown abort). Current mitigation: raise retry count to 5 and regex-scope to that test only (Phase 127, CHANGELOG.md lines 91-96). Root cause is undiagnosed (needs macOS arm64 hardware to reproduce under lldb/Instruments). Diagnosis path: (1) Reproduce on arm64 hardware with full crash logs. (2) Check for memory corruption (ASan/UBSan on the test harness). (3) Examine ORC v2 JIT teardown code paths in LLVM, check for ASLR sensitivity, ARM-specific register save/restore. (4) Validate drop order and cleanup-stack unwinding in the generated IR. (5) Commit a genuine fix (not a retry band-aid).
+  - *Gap:* Papered-over flakes erode CI confidence and hide real bugs. A flaky test that passes 95% of the time can mask race conditions or memory corruption that manifests under load or different memory layouts. Once fixed, the flake becomes a regression detector for future ORC JIT or ARM codegen changes. Pre-1.0, this is a reliability blocker for CI/CD automation.
+  - *Evidence:* /root/projects/x1/i-2/kardashev/ROADMAP.md line 51-52 ('papered over with retries rather than root-caused'); CHANGELOG.md lines 91-96 document the mitigation ('needs macOS-arm64 hardware'); README.md notes Linux deterministic, macOS arm64 flaky.
+- **[M] Comprehensive UB/soundness audit (non-type-safe corners, unsafe casts, FFI boundaries)**
+  - *What:* Conduct a systematic code audit for unsound corners: (1) codegen.cpp (31K lines): check all casts between llvm::Value types, especially struct/enum aggregate handling (insertvalue/extractvalue indices must be in-bounds for the actual LLVM type). (2) borrow_check.cpp: verify NLL lifetime tracking is truly sound (a borrow expiring at 'last use' doesn't leak due to control flow). (3) FFI boundaries (i32 ↔ int, i64 ↔ long, String ↔ char*): validate truncation/sign-extension rules, ensure no buffer overruns on C boundary. (4) async executor: check for use-after-free in task scheduling, verify wake callbacks don't outlive their task frames. (5) Drop glue: ensure drop flags prevent double-free and UAF under panic unwinding. Commit findings to a SOUNDNESS.md document with mitigations or proofs of safety.
+  - *Gap:* smoke_test_soundness.sh covers 6 known issues fixed (clone deep-copy, dyn coercion, deref-move, mut-aliasing, branch-move join, effect attribution) but does not audit for unknown unsound corners. A 31K-line codegen.cpp is a large surface for integer overflows, type confusion, or out-of-bounds indices in aggregate construction. FFI is a classic source of soundness bugs (truncation rules, pointer lifetime). A comprehensive audit is a pre-1.0 requirement.
+  - *Evidence:* /root/projects/x1/i-2/kardashev/tests/smoke_test_soundness.sh: 6 regression tests covering 6 known fixes; compiler/src/codegen.cpp (645K lines, largest file); no SOUNDNESS.md or UB audit document.
+- **[M] Panic safety / exception-safety contract (Drop during panic unwinding)**
+  - *What:* Prove that Drop glue executes correctly during panic unwinding: (1) Document the panic/catch unwinding semantics (setjmp/longjmp cleanup stack, drop-flag guarding, reverse-order destruction). (2) Formalize the guarantee: 'a value drops exactly once, whether execution is normal or during unwinding'. (3) Cover edge cases: conditional moves (move in if branch, not in else), panic in Drop itself, Drop of a captured closure environment during panic. (4) Add tests: catch a panic inside a block with locals that own heap memory (Vec, String, HashMap); verify all locals drop exactly once (measured via leak detection + drop-count assertions).
+  - *Gap:* The codegen.cpp Drop glue uses per-local drop flags to prevent double-free. But under panic unwinding, the cleanup stack may execute drops out of order or re-drop a value if the drop flag is not properly guarded. A panic in a Drop method could corrupt the cleanup stack. smoke_test_panic.sh has basic panic tests but does not verify Drop safety under panic. This is a correctness blocker for real-world use.
+  - *Evidence:* docs/architecture.md lines 194-199 describe Drop glue + cleanup stack + panic machinery but do not formalize exception safety; tests/smoke_test_panic.sh exists but does not test Drop safety under panic; codegen.cpp emitDropGlue & panic machinery (~800 lines combined) lack documented invariants.
+- **[M] Integer overflow policy documentation and validation**
+  - *What:* Formalize kardashev's integer overflow semantics: (1) Document the policy: i64 arithmetic wraps on overflow (two's-complement wrap-around, not undefined like C). (2) For division: sdiv truncates toward zero (C semantics), not toward negative infinity (Python). (3) For modulo: srem takes the sign of the DIVIDEND (C/LLVM/Rust semantics), not the divisor (Python). (4) Verify this is codegen'd correctly (check LLVM sdiv/srem IR, audit emit_c.cpp for C-semantics compliance using -fwrapv). (5) Add overflow-stress tests: fuzz large multiplications, divisions with negative operands, and verify JIT == AOT == C reference across all bit patterns.
+  - *Gap:* Signed integer semantics are subtle and language-specific. Today's documentation (language-reference.md line 334: 'Integer overflow / div-by-zero in const evaluation are compile errors') only covers const-eval, not runtime overflow. The div fuzzer (Phase 113, smoke_test_fuzz_div.sh) validates sdiv/srem correctness, but there is no explicit policy document. Without clear semantics, a second implementation (bootstrap compiler) could diverge. emit_c.cpp relies on -fwrapv to match semantics but doesn't document the dependency.
+  - *Evidence:* /root/projects/x1/i-2/kardashev/tests/smoke_test_fuzz_div.sh: C-semantics helpers (cdiv, crem, shl, shr); docs/language-reference.md line 334 only covers const-eval overflow; compiler/src/emit_c.cpp line 54 uses -fwrapv but lack policy doc.
+- **[S] Security posture and threat model (compiler security, runtime sandboxing)**
+  - *What:* Define kardashev's security posture: (1) Scope: is this a compiler for trusted code (research, education, controlled builds) or untrusted code (internet-facing services, user-submitted scripts)? (2) Threat model: what attacks are in scope (misuse of `unsafe` features, if any; FFI boundary violations; resource exhaustion via large allocations; denial-of-service via infinite loops)? (3) Mitigations: are there any (array bounds-checks, stack overflow guards, memory limits)? (4) Out of scope: crypto, high-assurance isolation, formal verification (for now). Document in a SECURITY.md file. If untrusted-code use cases are in scope, add fuzzing for malformed input (invalid UTF-8 strings, corrupted JSON config, OOB in borrowed references).
+  - *Gap:* No SECURITY.md or threat model exists. The language has built-in bounds checks (OOB panic) and drop safety, but lacks explicit security guarantees. For a research compiler, it is fine to say 'for trusted code only'; for production adoption, security is a contractual requirement. A clear threat model prevents users from misusing the language and sets expectations for third-party audits.
+  - *Evidence:* No SECURITY.md in the repo; ROADMAP.md and CHANGELOG.md do not mention security model; no security tests or threat-model documentation.
+- **[M] Reproducible / deterministic builds and artifact signing**
+  - *What:* Ensure kardashev compiler builds produce byte-identical artifacts across machines and rebuilds: (1) Audit the build system (Bazel, Makefile.local) for non-deterministic sources (timestamps, tmp paths, hash randomization). (2) Implement deterministic LLVM IR codegen (seeded random number generators for any hash-based optimizations or name generation). (3) Pin LLVM versions and C++ compiler versions. (4) Document build reproducibility: 'kardc built on platform X with LLVM Y produces a byte-identical binary to the same build on platform Z'. (5) Enable artifact signing: compute and publish SHA-256 hashes of released binaries, optionally sign with GPG. (6) For AOT-compiled user programs: document that AOT cache (content-addressed, keyed on source + flags) ensures deterministic output.
+  - *Gap:* No reproducible-build documentation exists. Reproducible builds are a supply-chain security best practice: they allow downstream auditors to verify that a published binary matches the open-source code (not injected malware). For kardashev at research scale, this is nice-to-have; for production, it is essential. The AOT cache is already content-addressed (good), but compiler reproducibility is undocumented.
+  - *Evidence:* No REPRODUCIBLE_BUILDS.md or hash-verification infrastructure in the repo; README.md mentions 'content-addressed incremental AOT compile cache' but not compiler-binary reproducibility.
+- **[S] Supply-chain security (dependency provenance, third-party code audit)**
+  - *What:* Document supply-chain security practices: (1) Identify all build-time dependencies (LLVM version, C++ stdlib, Bazel rules, system tools like clang, Python). (2) Pin versions in MODULE.bazel and Makefile.local. (3) Audit third-party dependencies (LLVM is a large, external codebase — document which LLVM APIs are used and flag any known CVEs in pinned versions). (4) When the third-party registry lands (deferred in ROADMAP.md line 226), design a review gate: all transitive dependencies must be audited before merge. (5) Publish a DEPENDENCIES.md file listing all external code and versions. (6) Consider a signed release checklist: verify LLVM binary matches published checksums, sign kardc releases with a developer key.
+  - *Gap:* kardashev depends on LLVM (a mature but large project with occasional vulnerabilities). No supply-chain audit or dependency manifest exists. Today's dependencies are pinned in build files, but there is no documented audit or vulnerability-response process. Pre-1.0, this is deferred; but as adoption grows, downstream users will ask 'what are the security implications of kardashev's dependencies?'
+  - *Evidence:* ROADMAP.md line 226-227 defers third-party registry; no DEPENDENCIES.md or supply-chain documentation; Makefile.local and MODULE.bazel pin versions but lack audit commentary.
+- **[XL] C-backend extension for structs/enums/strings/Vec/Drop (Phases 130+)**
+  - *What:* The C backend (Phase 129, emit_c.cpp, 11K lines) currently supports only i64/bool. Grow it by subset (per ROADMAP.md): (1) Phase 130 — structs (field access, construction, aggregate passing). (2) Phase 131 — enums + match (tagged-union representation, exhaustiveness checking). (3) Phase 132 — strings and Vec (heap allocation, memory layout, clone semantics). (4) Phase 133 — Drop impl codegen (drop glue as C functions). (5) Each phase: differential gate against LLVM, verify memory safety under malloc_check, add 10+ new smoke tests. Subset grows; out-of-subset features (closures, generics, async, traits) still refuse with clear errors.
+  - *Gap:* ROADMAP.md lines 214-222 explicitly plan this as 'Next subset growth'; it is the path to WASM and Windows targets (lines 218-222). The C backend is verifiable and portable; growing it systematically de-couples kardashev from LLVM. Without this work, kardashev remains LLVM/Linux/x86-64 bound.
+  - *Evidence:* /root/projects/x1/i-2/kardashev/tests/smoke_test_phase129.sh: 12 differential tests for i64/bool; ROADMAP.md lines 214-222 sketch next phases; compiler/src/emit_c.cpp (11K lines) is the starting point.
+- **[L] Integration tests for cross-platform / cross-architecture correctness (WASM, Windows, arm64)**
+  - *What:* When the C backend grows or WASM/Windows targets ship: (1) Build a matrix CI that tests kardashev programs on multiple platforms (Linux x86-64, macOS arm64, Windows x86-64, WASM in wasmtime/node). (2) For each platform: run the full smoke suite, ensure exit codes and output match. (3) Known flakes (macOS arm64 JIT teardown) are fixed before expanding CI matrix. (4) Long-term: upstream differential tests to the conformance suite so any implementation (not just kardashev) can test itself on multiple platforms.
+  - *Gap:* Today CI runs on ubuntu + macOS only (both x86 + arm via GitHub Actions). WASM and Windows are deferred (ROADMAP.md line 218-222). Cross-platform testing is essential to prevent subtly different behavior (e.g., different pointer sizes, endianness, alignment rules). A comprehensive matrix is a pre-1.0 requirement for portability claims.
+  - *Evidence:* README.md: 'CI runs on ubuntu + macOS'; no WASM or Windows CI; ROADMAP.md lines 218-222 defers WASM/Windows; macOS arm64 JIT flake (Phase 127) prevents reliable arm64 testing today.
+- **[S] Documentation of all currently-known limitations and their severity (MVP items, TODOs, workarounds)**
+  - *What:* Create a LIMITATIONS.md document listing every known gap and categorizing by severity/workaround: (1) Intentional (no export-to-C attribute, `&mut` non-reborrow in recursion). (2) MVP (const-eval limited to i64/bool, OS-thread return type i64-only, the 2-variant type-erased Mutex before generic Mutex<T>, closure-env interior drop leak, async-frame interior drop leak). (3) Deferred (third-party registry, WASM, Windows, macOS kqueue fd-readiness). (4) Bugs (none open; known bugs fixed as regression guards in smoke_test_soundness.sh). For each, note the phase when it lands or the workaround. This becomes the user-facing FAQ.
+  - *Gap:* Documentation fragments the truth: ROADMAP.md §Honest gaps, language-reference.md §Surface limitations, CHANGELOG.md release notes, architecture.md §Documented-deferred. Users must read all of these to understand what works and what doesn't. A single LIMITATIONS.md document is a one-stop reference, preventing confused bug reports ('why can't I do X?').
+  - *Evidence:* ROADMAP.md lines 18-53 list gaps; language-reference.md lines 9-16 list surface limitations; CHANGELOG.md v21 and v22 document MVP items (const eval, Mutex, closures, async); no unified LIMITATIONS.md.
+- **[L] Formal verification of select core invariants (HM unification, NLL borrow soundness, effect row subtyping)**
+  - *What:* Formalize and verify critical type-system invariants in a proof assistant (Coq, Agda, or Lean): (1) HM unification always produces a principal type (Hindley's theorem). (2) NLL borrow tracking prevents use-after-free and aliasing violations (a borrow's lifetime does not extend past its last use). (3) Effect rows are a lattice; effect subtyping respects the lattice order (an effect row is a subset of the declared row). (4) Drop flag guarding prevents double-free and UAF (a value drops at most once). These proofs serve as reference implementations and catch subtle bugs in the informal spec.
+  - *Gap:* These invariants are implemented in ~3500 lines of C++ (typecheck.cpp ~1700, borrow_check.cpp ~700, codegen Drop glue ~300). A formal proof would verify the implementations are sound or catch gaps. For pre-1.0, this is aspirational; for post-1.0 stability, it is valuable for third-party implementations and audits.
+  - *Evidence:* No formal proofs exist; type-system design is documented informally in language-reference.md and effects.md; borrow-checking invariants are embedded in borrow_check.cpp without stated theorems.
+
+## Completeness critic — items the surveys missed (23)
+
+- **[M] Error message quality and diagnostic infrastructure** — Current error reporting uses simple struct TypeError { message, line, column } with plain string messages. No source-snippet display, no colored output, no suggested fixes, no diagnostics with span highlighting, no severity levels (warn vs error vs note). *(gap: Production compilers (Rust, Go, Clang) invest heavily in diagnostics: showing code context, multi-line spans, suggested fixes, and grouping related errors. This dramatically improves developer experience. Currently hard to debug complex type errors.)*
+- **[L] Compiler compile-time performance and incremental compilation** — No incremental compilation cache beyond the AOT object-cache keying on full source. Every `kardc file.kd` re-parses, re-typechecks, and re-codegen everything. No per-module incremental checking, no query-based caching of intermediate results (unification, trait resolution), no parallel compilation. *(gap: Production languages (Rust, Go, C++) have incremental compilation so only changed modules recompile. Kardashev's monolithic pipeline re-does all work on any change. As programs grow, compile times will dominate development iteration.)*
+- **[M] No custom operator definitions or precedence control** — Operator precedence and associativity are hardcoded in the parser (Pratt precedence table in parser.cpp). Users cannot define custom operators, overload existing ones (no Deref, Index, IndexMut, Display traits), or adjust precedence. *(gap: Blocks ergonomic DSL-like APIs. Many production languages support operator overloading (Rust), custom operators (Haskell), or precedence directives. Kardashev's fixed precedence is simpler but less flexible.)*
+- **[L] No standard-library trait ecosystem (Clone, Display, Debug, Ord)** — The stdlib lists Hash, Eq, Iterator, and a few combinators, but is missing: Clone (for explicit deep copy), Display/Debug (for user-facing and debug printing), Ord/PartialOrd (for total/partial ordering), Default (for zero-arg construction), Into/From (for conversions), Deref/DerefMut (for smart pointers). *(gap: These traits are foundational in Rust's design and enable enormous code reuse. Without them, users must hand-write every variant. Production stdlibs have 50+ core traits; kardashev has ~3 (Hash, Eq, Iterator).)*
+- **[L] No compile-time evaluation beyond const i64/bool scalars** — The enumeration lists this as 'const-evaluation restricted to i64/bool scalars' but the deeper issue is: no const-fn for non-scalar types, no const-generic type arrays like [T; N] where N is const-computed, no type-level computation (const fn returning a type). *(gap: Blocks GADT and compile-time specialization patterns. Many systems languages use const-eval for zero-cost abstractions (phantom types, array layouts, compile-time configs).)*
+- **[M] No Send/Sync marker traits or thread-safety verification** — Concurrency section mentions a 'checked Send / share rule' but the language has no Send or Sync traits. No mechanism to statically verify thread-safe types or prevent data-race bugs at compile time beyond the effect-row 'share' label. *(gap: Production languages (Rust, Java) use marker traits to enforce thread-safety. Kardashev's 'share' effect is a soft constraint; without compiler enforcement types can leak between threads unsafely.)*
+- **[M] Incomplete FFI story: no C-header binding generation or raw pointers** — FFI is limited to `extern "C" fn` declarations. No `*const T` / `*mut T` raw pointer types, no void/opaque pointer, no mechanism to generate bindings from C headers (no bindgen equivalent), no repr(C) struct/enum layout control. *(gap: C interop is essential for systems programming. Without raw pointers or bindgen, calling C libraries with complex pointer signatures is impossible. Every struct field must be repr(Rust).)*
+- **[M] No inline assembly or SIMD support** — No `asm!` or `llvm_asm!` block. No way to emit inline assembly or use SIMD intrinsics. Codegen only supports LLVM IR lowering. *(gap: Blocks performance-critical code: crypto, math libraries, and embedded systems often need inline asm or SIMD. Rust's `asm!` macro is essential for HPC and kernel work.)*
+- **[L] No no_std / freestanding / allocator trait support** — No way to disable standard library or use a custom allocator. All programs implicitly link libc malloc. No `GlobalAlloc` trait or `#[allocator]` mechanism. Cannot build for bare-metal or embedded targets. *(gap: Blocks embedded systems and kernel programming. Production systems languages (Rust, C) allow no_std + custom allocators for resource-constrained environments.)*
+- **[M] Limited trait object completeness: no lifetime bounds in dyn Trait** — Trait objects (`dyn Trait`) work, but are limited: no `dyn Trait + 'a` lifetime bounds, no `dyn Trait + Send` multiple bounds, no higher-rank trait bounds (HRTB, `for<'a>`). Object safety is checked but restrictively. *(gap: Complex trait-object patterns (borrowed closures, bound-polymorphic callbacks) require proper lifetime and bound support in `dyn`. Rust's system is sophisticated; kardashev's is a subset.)*
+- **[L] No macro system or compile-time metaprogramming** — No declarative macros (`macro_rules!`), procedural macros, or compile-time code generation. Prelude is hard-coded in the compiler; cannot be extended by user code. No `#[derive(Clone)]` mechanism (there is `impl Clone` in source only). *(gap: Macros are essential for reducing boilerplate (serialization, web frameworks, embedded DSLs). Without them, every pattern must be hand-written. Rust's derive ecosystem eliminates 90% of mundane code.)*
+- **[M] Weak or absent documentation generation tooling** — No `karddoc` or doc-comment syntax (like Rust's `///`). No built-in documentation generation from source comments. Docs are hand-maintained in `docs/` markdown. *(gap: Production languages ship doc generators: Rust (`cargo doc`), Go (`godoc`), Java (`javadoc`). Users expect searchable, cross-linked docs auto-built from comments. Currently developers must maintain external docs manually.)*
+- **[M] No RFC (Request for Comments) or language-evolution governance process** — The language is driven by a single roadmap; there is no formal RFC process for major feature proposals, no community input mechanism, no pre-proposal discussion or RFC tracking. *(gap: Production languages (Rust, Python, PEP process) use RFCs to vet major changes before implementation. Builds consensus, surfaces design issues early, and creates a public record. Kardashev is pre-spec.)*
+- **[M] Limited debugging support: no debug symbols, backtrace, or line-number info** — No DWARF debug info generation, no stack trace capture / printing, no line-number debuginfo for post-mortem analysis. Crashes give no context. *(gap: Essential for production reliability. Stack traces and line-number info make bugs traceable. Rust/C++ emit DWARF by default; kardashev does not. Hard to debug production failures.)*
+- **[M] No stabilization / semver policy enforced by compiler** — Language is pre-1.0 with 'no stability policy' (stated in ROADMAP.md). No way to mark items as stable/unstable/deprecated. No feature gates or editions. *(gap: Production languages gate breaking changes behind `#[unstable]` or feature flags, then stabilize them. Kardashev can break any API at any release. Blocks library ecosystems.)*
+- **[S] No module visibility scoping (pub(crate), pub(super))** — The enumeration mentions 'visibility only on pub items; no module-level privacy' — Phase 7 resolves names flat-merged, no namespace hierarchy. pub gates at type level but not at module scope. *(gap: Large codebases need visibility control: `pub(crate)` (private to crate), `pub(super)` (private to parent), etc. Without it, every pub item is globally accessible.)*
+- **[M] String/char type design incomplete: no UTF-8 support or char type** — Already listed but worth emphasizing: String is an opaque byte buffer; no char type for Unicode scalars. No UTF-8 codec or grapheme clustering. str_char_at returns raw bytes. *(gap: Breaks Unicode-correct text handling. Production languages (Rust, Python, Java) treat strings as UTF-8. Kardashev's byte-based model is fine for ASCII but fails for internationalization.)*
+- **[M] Monomorphization code bloat: no generic specialization control** — Every generic instantiation produces a full monomorphic copy (no specialization pragmas, no vtable fallback for large generic types). Large programs will face code-size explosion. *(gap: Monomorphization trades code size for speed. Production languages offer control: Rust's default, C++'s templates with specialization, Java's erasure. Kardashev has no knob.)*
+- **[M] No async/await cancellation or timeout primitives** — async/await exists but no native cancellation (CancellationToken), no timeout combinators, no select!/join! macros. Users must build cancellation manually. *(gap: Cancellation is essential for real async code: servers timing out requests, task supervisors canceling work. Without it, async is incomplete for production systems.)*
+- **[S] No variance annotation system (invariant/covariant/contravariant)** — Generic type parameters are invariant by default. No `#[variance]` or explicit control. Subtyping (e.g., `&'a T` is covariant in `T`) is not exposed to users. *(gap: Restricts generic abstractions. Rust exposes variance so advanced generic code works (streaming iterators, HKTs). Kardashev's invariance is conservative but limits expressiveness.)*
+- **[L] Multi-platform backend exploration stalled: C backend incomplete, no WASM/Windows** — Phase 129 added a C backend but it only supports i64/bool subset. No WASM target, no Windows CI, no ARM64 native Windows support. LLVM is the only serious backend. *(gap: Production languages target multiple platforms: web (WASM), Windows, ARM, etc. Kardashev's single-backend story limits reach. A C backend could unlock portability.)*
+- **[S] No lint system or compiler warnings beyond hard errors** — Compiler emits errors but no warnings, lint rules, or configurable linters. No way to catch common mistakes (unused variables, naming conventions, etc.) without failing the build. *(gap: Linters (Clippy in Rust, ESLint in JS) catch bugs and enforce style. Kardashev's all-or-nothing error model is too strict for development; warnings are needed.)*
+- **[M] Incomplete closure capture semantics: no move, by-ref classification into Fn/FnMut/FnOnce** — Already listed but deeper gap: closures are classified as 'by-ref' or 'by-value' but not as Fn/FnMut/FnOnce traits. No way to pass a closure requiring FnOnce or FnMut to a generic that only knows Fn. *(gap: Rust's three-tier closure classification is essential for generic higher-order functions. Without it, callback APIs are limited. Closures can't carry precise capture semantics in function signatures.)*
+
+## Highest-leverage & dependency ordering (critic synthesis)
+
+**HIGH-LEVERAGE ITEMS (toward production-grade systems language):**
+
+1. **Error message quality / diagnostics infrastructure (M)** — Likely highest ROI. Even a basic improvement (source snippets, multi-line spans, severity levels) would dramatically improve developer experience on day one. Could reuse LLVM's diagnostic library.
+
+2. **Standard-library trait ecosystem (Clone, Display, Debug, Ord, Into, From, Deref) (L)** — Foundational for any ecosystem. Enables code reuse; must be stable early. Design once, implement systematically.
+
+3. **Incremental compilation (L)** — As programs grow (self-hosting, real libraries), monolithic recompile becomes a blocker. Requires query caching (unification, trait resolution) and per-module incremental checking. Pair with (1) to surface errors faster.
+
+4. **No_std / allocator support (L)** — Essential for embedded systems, kernel modules, and constrained environments. Blocks entire category of use case.
+
+5. **FFI maturity (C-header bindgen equivalent, raw pointers) (M)** — Unlocks C interop (OpenSSL, libc, system calls). Raw pointers are a gating item for systems work.
+
+6. **Macro system (L)** — Foundational for reducing boilerplate and enabling libraries (serialization, web frameworks). Many decisions lock in macro design early.
+
+7. **Send/Sync enforcement (M)** — Currently weak (effect-row 'share' is soft). Hard compile-time enforcement (marker traits) is essential for safe concurrency.
+
+**MEDIUM-PRIORITY (unblock design space):**
+
+- String/char design (UTF-8 codec, char type) — affects all text code; locked-in early
+- Module visibility scoping (pub(crate), pub(super)) — architectural; blocks encapsulation
+- Custom operators / overloading (Deref, Index, Display) — enables DSL-like APIs
+- Documentation generation (doc comments, auto-generated docs) — essential for usability
+- RFC/governance process — needed before 1.0 to manage breaking changes
+
+**DEPENDENCY ORDERING:**
+
+1. Diagnostics → Incremental compilation (improve error feedback loops)
+2. Std traits (Clone, Display, Ord, Into) → Macro system (reduce boilerplate)
+3. FFI (raw pointers, bindgen) → No_std (unlocks embedded)
+4. Send/Sync markers → Async cancellation (safe concurrency)
+5. Module visibility → Incremental compilation (logical module boundaries)
+6. String/char design → All text handling (early lock-in)
+7. RFC process → Version 1.0 (stabilization)
+
+**OVERSIZING / MISPRIORITIZATION IN SURVEYS:**
+
+- "Const-evaluation restricted to i64/bool" — This is M, but the deeper systemic gap (no const-generic type params, no const-fns returning types) is already captured under "Const generics limited to i64" → consolidate. Both point to _const type-level computation_; size should be **L** (foundational).
+- "Pattern matching gaps (guards, or-patterns, slice patterns)" — Currently **M**, but guards are **S** (syntactic sugar), or-patterns are **S** (DRY), slice patterns are **M** (structural). Could split or weight toward slice patterns. Many real codebases don't use guards heavily.
+- "Effect system has no user-defined effects" — **L** is right for research, but for production "Effect subtyping limited to row variables" is more immediately blocking (no implicit widening). User effects can wait; row subtyping is a bottleneck.
+- "Two-phase borrows not implemented" — **M** but rare in practice. Should stay M but acknowledge `arr[i] = arr[i] + 1` is an edge case. More common pattern (field update within move) is already captured under "reborrow through recursion".
+
+**ITEMS WITH MINIMAL PRODUCTION RISK (can defer past v1.0):**
+
+- Variance annotation (S) — rarely needed in practice; advanced feature
+- Compiler warnings / linting (S) — nice-to-have; can ship style guide + tooling later
+- Lifetime bounds in dyn Trait (M) — needed for advanced APIs; many programs never hit this
+- Generic associated types (GATs) (L) — advanced; few real-world use cases in MVP-stage languages
+
