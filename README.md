@@ -52,13 +52,17 @@ Effect sets are unioned across the call graph and checked at definition sites; n
 
 ## Status
 
-All sixteen roadmaps (Phases 0–97, **v1–v16**) have shipped and are merged to
+All seventeen roadmaps (Phases 0–107, **v1–v17**) have shipped and are merged to
 `main` — 6 unit suites plus the full smoke-test aggregate pass **JIT and AOT**
-on a cleared clean build. v15–v16 ("self-hosting") build a self-hosted compiler
-front *in* kardashev — the north-star arc toward a bootstrap: v15 the front-end
+on a cleared clean build. v15–v17 ("self-hosting") build a complete compiler
+*in* kardashev — the north-star arc toward a bootstrap: v15 the front-end
 (lexer + parser + signature checker), v16 the BODY (expression/statement parser,
-scope checker, and a function-body interpreter; `examples/selfhost/`, capstone
-`interp.kd`). v14 ("hardening") made the toolchain trustworthy
+scope checker, and a function-body interpreter), and v17 the **type checker AND
+code generator** — capstone `examples/selfhost/compile.kd` type-checks a whole
+function and compiles + runs its body (lex → parse → type-check → codegen → VM,
+every stage in kardashev). Dogfooding self-hosting found and fixed three real
+host-compiler bugs (a field-move double-free, a unit-tail-`match` miscompile, a
+field-assignment leak). v14 ("hardening") made the toolchain trustworthy
 across platforms: **macOS CI went green for the first time** (portable leak
 gates), the smoke harness is SIGPIPE-robust, the channel capture-and-keep footgun
 is now a precise compile error, and a JIT-vs-AOT differential sweep over the 9
@@ -409,12 +413,13 @@ generic keys; 29 plugged the Drop leaks 27–28's new droppable values made load
 hole; 31 integrated 27–30 into the self-written capstones; 32 documented the result last.
 Each shipped green before the next, exactly as v1–v4 did.
 
-## Roadmap v17 — in progress
+## Roadmap v17 — shipped
 
-> **Status: in progress** on `feat/roadmap-v17`. "Self-hosting, continued" — unify
-> v15's signatures and v16's body interpreter into a complete `Fn`, then push
-> toward a type checker and codegen. Each phase a real, tested kardashev program
-> in `examples/selfhost/`.
+> **Status: shipped** (`0.17.0`). "Self-hosting, continued" — unify v15's
+> signatures and v16's body interpreter into a complete `Fn`, then push all the
+> way to a type checker AND a code generator: a mini compiler written in
+> kardashev. Each phase a real, tested kardashev program in `examples/selfhost/`;
+> dogfooding it found and fixed three real host-compiler bugs.
 >
 > - **Phase 98 — a whole-function parser + interpreter (done).** `examples/selfhost/func.kd`
 >   parses a complete `fn NAME ( PARAMS ) -> RET { BODY }` into an `Fn { name,

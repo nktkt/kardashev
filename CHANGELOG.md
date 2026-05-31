@@ -18,6 +18,62 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.17.0] — Roadmap v17 "self-hosting, continued — a compiler in kardashev" (Phases 98–107)
+
+Theme: complete the self-hosted compiler — type checker **and** code generator,
+every stage written in kardashev — and fix the real compiler bugs that
+dogfooding it surfaced. By the end, `examples/selfhost/compile.kd` is a mini
+compiler that type-checks a whole function and compiles + runs its body.
+
+### Added
+- **A whole-function parser + interpreter** (Phase 98, `func.kd`) — parses a
+  complete `fn NAME(PARAMS) -> RET { BODY }` into an `Fn` AST and interprets it
+  (scope-check the body against the params, bind args, evaluate). JIT + AOT.
+- **A real type checker** (Phase 101, `typeck.kd`) — past scope-checking: the
+  self-hosted expression language now has **two** types, `i64` and `bool`.
+  `type_of` infers each node's type against a type environment, enforcing
+  arithmetic on `int×int→int`, comparison on `int×int→bool`, and an `if`
+  condition that is `bool` with equal branch types — propagating a `TErr` tag on
+  any mismatch.
+- **A whole-function type checker** (Phase 102, `funcheck.kd`) — threads the
+  checker through `fn NAME(PARAMS) -> RET { LETS ; RESULT }`: param types, `let`
+  typing, and the body's type checked against the declared return type.
+- **A code generator + VM** (Phase 103, `emit.kd`) — the back-end shape: lowers
+  the `Expr` AST to a flat stack-machine bytecode (`PUSH/LOAD/ADD/MUL/LT/EQ/
+  SELECT`) and executes it on an operand stack + register file. Proven correct
+  by cross-checking every program against a tree-walking `eval`.
+- **CAPSTONE: a self-hosted mini-compiler** (Phase 105, `compile.kd`) — takes a
+  whole function, type-checks it, and (only if well-typed) compiles the body —
+  now with `let` LOCALS lowered to a `STORE` into a register slot — and executes
+  it on argument values. Ill-typed functions are rejected before any codegen.
+  lex → parse → type-check → code-generate → execute, every stage in kardashev.
+
+### Fixed
+- **Field-move double-free** (Phases 99/100/106) — surfaced by self-hosting.
+  Moving a non-Copy struct field by value double-freed. Phase 99 stopped the
+  single-move double-free in codegen (clear the root binding's drop flag on a
+  field/index partial move); Phase 100 made it leak-free with **per-field drop
+  flags** so siblings still drop; Phase 106 closed the remaining **double**-move
+  hole in the **borrow checker** with field-level (partial) move tracking
+  (`Binding::movedFields`) — a second move of the same field, or a whole-struct
+  use after a partial move, is rejected, while moving two distinct fields stays
+  legal. (Found by an adversarial review of the field-move work.)
+- **Unit-tail-`match` miscompile** (Phase 104) — a `match` (or any value-
+  producing expression) in tail position of a unit-returning function emitted
+  `ret i64` into a void function (invalid IR). The epilogue now gates `ret` vs
+  `ret void` on the function's actual return type. (Found writing `emit.kd`.)
+- **Field-assignment leak** (Phase 107) — `s.a = new` overwrote a droppable
+  struct field without freeing the old value (RSS ballooned in a reassigning
+  loop). Codegen now drops the old field value — guarded by the field's drop
+  flag (so a moved-out field isn't double-freed) — before storing.
+
+### CI
+- **macOS reliably green** — the two non-deterministic macOS-only flakes
+  (`codegen_test`'s arm64 ORC-JIT teardown abort, confirmed by a same-commit
+  rerun; `smoke_test_executor`'s timing bounds) are marked `flaky = True` (Bazel
+  retries up to 3×). A no-op on Linux, which stays deterministic, so a real
+  regression is still caught by the ubuntu job.
+
 ## [0.16.0] — Roadmap v16 "self-hosting, continued" (Phases 94–97)
 
 Theme: grow the self-hosted front (v15: lexer + parser + signature checker)
