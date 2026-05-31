@@ -342,6 +342,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v29 Phase 160: C backend for/loop-with-value + modules (gated vs LLVM).
+sh_test(
+    name = "smoke_test_phase160",
+    srcs = ["smoke_test_phase160.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v29 Phase 159: C backend references/borrows + &<temporary> (gated vs LLVM).
 sh_test(
     name = "smoke_test_phase159",

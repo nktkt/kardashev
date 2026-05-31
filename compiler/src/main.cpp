@@ -2691,16 +2691,21 @@ int emitCSource(const std::string& srcRaw, const std::string& srcDir) {
         reportBorrowErrors(bcr, srcRaw);
         return 1;
     }
-    // Emit only the USER's declarations: re-parse the raw source so the
+    // Emit only the USER's declarations: re-resolve the raw source so the
     // auto-injected prelude (Option/Result/traits/combinators) doesn't trip the
-    // subset check. Out-of-subset USER code still errors in emit_c. The program
-    // already type/borrow-checked above, so this re-parse cannot fail.
-    auto pr = kardashev::parse(srcRaw);
-    if (!pr.ok()) {
-        std::cerr << "kardc: internal: re-parse for --emit-c failed\n";
+    // subset check. v29 Phase 160: use resolveModules (not a bare parse) so
+    // multi-file `mod foo;` programs are MERGED — the same flat-merge the LLVM
+    // path uses — minus the prelude. Out-of-subset USER code still errors in
+    // emit_c. The program already type/borrow-checked above, so this can't fail.
+    kardashev::ast::Program merged;
+    std::unordered_set<std::string> visited;
+    std::vector<std::string> merrs;
+    if (!resolveModules(srcRaw, srcDir, visited, merged, merrs)) {
+        std::cerr << "kardc: internal: module resolution for --emit-c failed\n";
+        for (const auto& m : merrs) std::cerr << m << '\n';
         return 1;
     }
-    auto cr = kardashev::emit_c(pr.program);
+    auto cr = kardashev::emit_c(merged);
     if (!cr.ok()) {
         for (const auto& msg : cr.errors) std::cerr << msg << '\n';
         return 1;

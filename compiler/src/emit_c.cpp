@@ -34,7 +34,11 @@ struct CEmitter {
     };
     std::unordered_map<std::string, VariantInfo> variantInfo_;
     std::unordered_map<std::string, const EnumDecl*> enums_;
-    int matchCounter_ = 0; // fresh names for match temporaries
+    int matchCounter_ = 0; // fresh names for match / loop temporaries
+    // v29 Phase 160: the result-variable name of each enclosing `loop` (so a
+    // `break <value>` writes the loop's value). Only `loop` (not for/while) can
+    // break WITH a value, so for/while pushes nothing.
+    std::vector<std::string> loopResultVars_;
 
     void err(const std::string& m) { errors.push_back("emit-c: " + m); }
     bool ok() const { return errors.empty(); }
@@ -284,10 +288,52 @@ struct CEmitter {
             return "({ while (" + expr(*wh->cond) + ") " + blockStmts(*body) +
                    " INT64_C(0); })";
         }
+        // v29 Phase 160: `for x in a..b { body }` (the range fast path) -> a C
+        // `for`. The loop is unit-valued (yields 0). A general-iterator `for`
+        // (over an `Iterator` impl) uses Option/methods — outside the subset.
+        if (auto* fe = dynamic_cast<const ForExpr*>(&e)) {
+            if (fe->iteratorDesugar) {
+                err("`for` over a general iterator is outside the C-backend "
+                    "subset (range loops only)");
+                return "0";
+            }
+            auto* range = dynamic_cast<const RangeExpr*>(fe->iter.get());
+            auto* vp = dynamic_cast<const VarPat*>(fe->pattern.get());
+            auto* body = dynamic_cast<const BlockExpr*>(fe->body.get());
+            if (!range || !vp || !body) {
+                err("`for` over a non-range / complex pattern is outside the "
+                    "C-backend subset");
+                return "0";
+            }
+            const std::string v = vname(vp->name);
+            varCType_[vp->name] = "int64_t";
+            const char* cmp = range->inclusive ? " <= " : " < ";
+            return "({ for (int64_t " + v + " = (" + expr(*range->start) +
+                   "); " + v + cmp + "(" + expr(*range->end) + "); " + v +
+                   "++) " + blockStmts(*body) + " INT64_C(0); })";
+        }
+        // v29 Phase 160: `loop { ... }` — a `while (1)` whose value is whatever a
+        // `break <value>` writes (int64_t result; a struct loop value is rare
+        // and deferred). A breakless `loop` would be infinite (the type checker
+        // keeps it unit / diverging).
+        if (auto* lp = dynamic_cast<const LoopExpr*>(&e)) {
+            auto* body = dynamic_cast<const BlockExpr*>(lp->body.get());
+            if (!body) { err("loop body is not a block"); return "0"; }
+            const std::string lv = "__lv" + std::to_string(matchCounter_++);
+            loopResultVars_.push_back(lv);
+            std::string bodyStr = blockStmts(*body);
+            loopResultVars_.pop_back();
+            return "({ int64_t " + lv + " = 0; while (1) " + bodyStr + " " + lv +
+                   "; })";
+        }
         if (auto* br = dynamic_cast<const BreakExpr*>(&e)) {
             if (br->value) {
-                err("`break <value>` is outside the C-backend subset");
-                return "0";
+                if (loopResultVars_.empty()) {
+                    err("`break <value>` outside a `loop`");
+                    return "0";
+                }
+                return "({ " + loopResultVars_.back() + " = (" +
+                       expr(*br->value) + "); break; INT64_C(0); })";
             }
             return "({ break; INT64_C(0); })";
         }
