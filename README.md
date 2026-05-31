@@ -416,6 +416,25 @@ generic keys; 29 plugged the Drop leaks 27–28's new droppable values made load
 hole; 31 integrated 27–30 into the self-written capstones; 32 documented the result last.
 Each shipped green before the next, exactly as v1–v4 did.
 
+## Roadmap v19 — in progress
+
+> **Status: in progress** on `feat/roadmap-v19`. "Hardening III" — push the
+> differential fuzzing into the memory-safety paths (the bug class that mattered
+> most), and keep closing gaps.
+>
+> - **Phase 112 — a memory-safety fuzzer (done).** Targets the exact bug class
+>   v17/v18 fixed (field-move double-free, leak, per-field drop tracking).
+>   `tests/smoke_test_fuzz_memsafety.sh` generates random but borrow-VALID struct
+>   programs — a struct with K fields, each an `N` that owns a heap `String` and
+>   prints a unique id on `Drop` — and moves a random subset of distinct fields
+>   into a `Vec`, letting the rest drop at scope exit. Two oracles, no reference
+>   needed: (1) heap-clean under `MALLOC_CHECK_=3` (a double-free of a moved
+>   field's buffer aborts), and (2) every id is dropped EXACTLY once (a
+>   double-drop or leaked drop shows as a wrong count). A 1 M-iteration loop
+>   variant gates on RSS-flatness (a per-iteration leak balloons it). 75 programs
+>   across 3 seeds are all sound — strong evidence the per-field move/drop
+>   machinery holds across varied programs.
+
 ## Roadmap v18 — shipped
 
 > **Status: shipped** (`0.18.0`). "Hardening II" — close the concrete gaps that

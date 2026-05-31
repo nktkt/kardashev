@@ -212,6 +212,14 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v19 Phase 112: a MEMORY-SAFETY fuzzer — random struct/Drop/partial-move
+# programs, each heap-clean under MALLOC_CHECK_=3 with every field dropped once.
+sh_test(
+    name = "smoke_test_fuzz_memsafety",
+    srcs = ["smoke_test_fuzz_memsafety.sh"],
+    data = ["//compiler:kardc"],
+)
+
 sh_test(
     name = "smoke_test_threads",
     srcs = ["smoke_test_threads.sh"],
