@@ -31,10 +31,12 @@ the roadmap below can close them in priority order.
   true but type-system-only; the compiler's actual codegen/runtime speed vs a C
   or Rust reference is simply unmeasured.
 - **MVP / leaky stdlib.** `HashMap`/`HashSet` have no `remove` (deferred —
-  open-addressing deletion needs tombstone-aware probing) and do **not** drop
-  interior keys/values (a documented leak, no use-after-free); a completed async
-  `Future`'s heap frame is never reclaimed (long-running async leaks frames);
+  open-addressing deletion needs tombstone-aware probing). The async executor's
+  `spawn` + `join` path leaks a frame per spawned task (RSS grows ~120 B/iter);
   the const-eval scalar set and some library surfaces are still `i64`/`bool`-MVP.
+  *(Earlier drafts also listed HashMap interior-K/V drop and async `Future`-frame
+  reclaim as leaks — measurement in v21 showed both are already clean; only the
+  `spawn`/`join` path leaks.)*
 - **A few real ergonomic gaps** (verified against the current compiler, *not* the
   stale docs): no `||` logical-or (it collides with closure `||` syntax); no `&`
   of a temporary/rvalue (`&A(10)` errors — bind to a `let` first), plus a related
@@ -101,18 +103,23 @@ step past "toy":
 built from, adversarially reviewed (119). Full kardashev-compiles-kardashev
 remains several roadmaps out, but this is well past "toy".
 
-### v21 — prove it, and close the leaks
+### v21 — prove it, and close the leaks — *in progress*
 
-Turn anecdotes into numbers and fix the documented soundness/footprint gaps:
+Turn anecdotes into numbers and fix the real footprint gaps:
 
-- A **benchmark suite**: compile-time + runtime of the capstones (`json`,
-  `wordfreq`, `matrix`, …) vs a C/Rust reference, with **committed numbers** —
-  replacing the "-O2 default" / "flat RSS" anecdotes with reproducible data.
-- Fix the **documented leaks**: drop `HashMap`/`HashSet` interior keys/values;
-  add `remove` via tombstone-aware probing; reclaim completed async `Future`
-  frames in the executor.
-- Generalize the remaining `i64`/`bool`-MVP surfaces (library element types,
-  const-eval scalars) toward arbitrary types.
+- ✅ **Phase 120 (benchmarks, done)** — `bench/` + `BENCHMARKS.md`: each workload
+  written identically in kardashev and C, AOT-compiled (`kardc -O2` / `clang
+  -O2`), run best-of-3 with output checked equal. Result: kardashev is
+  **C-competitive** — `fib` ≈ 1.0×, `collatz` ≈ 1.0×, a tight integer `loop` ≈
+  2.2× C. Correctness pinned by `tests/smoke_test_bench.sh`; perf ratios committed
+  in `BENCHMARKS.md`. (Replaces the "-O2 default"/"flat RSS" anecdote with data;
+  the ~2.2× tight-loop gap is a concrete codegen-opt target.)
+- Fix the **spawn/join frame leak** (the one real leak measurement found — a frame
+  per spawned task is not reclaimed). *(HashMap interior-K/V drop and block_on/
+  await frame reclaim were measured clean — not leaks.)*
+- Add `HashMap`/`HashSet` **`remove`** (tombstone-aware probing) — the one
+  genuinely-missing stdlib operation.
+- Generalize the remaining `i64`/`bool`-MVP surfaces toward arbitrary types.
 
 ### v22 — ergonomics, docs, and platform
 

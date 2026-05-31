@@ -1057,6 +1057,22 @@ sh_test(
     ],
 )
 
+# v21 Phase 120 (prove it): benchmark-correctness guard — each bench's kardashev
+# AOT output must equal the C reference (perf ratios live in BENCHMARKS.md).
+sh_test(
+    name = "smoke_test_bench",
+    srcs = ["smoke_test_bench.sh"],
+    data = [
+        "//compiler:kardc",
+        "//bench:fib.kd",
+        "//bench:loop.kd",
+        "//bench:collatz.kd",
+        "//bench:fib.c",
+        "//bench:loop.c",
+        "//bench:collatz.c",
+    ],
+)
+
 # Phase 56 (v9) capstone: word-frequency histogram — the full data pipeline
 # (tokenize -> count in a HashMap -> rank via derived Ord -> top-N). Builds the
 # real examples/wordfreq/main.kd. JIT + AOT + a constant-memory gate (the

@@ -1,0 +1,6 @@
+// Tight integer-arithmetic throughput: 200M iterations.
+fn main() -> i64 ! { io } {
+    let mut acc = 0; let mut i = 0;
+    while i < 200000000 { acc = acc + i * 3 - (i / 2); i = i + 1; }
+    print(acc); 0                                    // 49999999800000000
+}
