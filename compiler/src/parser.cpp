@@ -954,6 +954,14 @@ private:
         // Phase 21a: trait type params `trait Name<T0, T1> { ... }`. Mirrors
         // struct/enum/fn generics (the `<` after a trait name is unambiguous).
         decl.genericParams = parseOptionalGenericParams();
+        // v25 Phase 136: optional supertrait bounds `trait Ord: Eq + Hash { … }`.
+        if (accept(TokenKind::Colon)) {
+            while (true) {
+                Token superTok = expect(TokenKind::Identifier, "a supertrait name");
+                decl.supertraits.push_back(superTok.lexeme);
+                if (!accept(TokenKind::Plus)) break;
+            }
+        }
         expect(TokenKind::LBrace, "{");
         while (!check(TokenKind::RBrace) && !check(TokenKind::EndOfInput)) {
             if (errors_.size() > 20) break;

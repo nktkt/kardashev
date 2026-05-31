@@ -777,6 +777,10 @@ struct TraitDecl {
     // either, both, or neither).
     std::vector<AssocTypeDecl> assocTypes;
     std::vector<MethodSig> methods;
+    // v25 Phase 136: SUPERTRAITS — `trait Ord: Eq + Hash { … }`. Any type that
+    // impls this trait must also impl every supertrait; the typechecker enforces
+    // that at the impl site. Plain trait names (no generic args in the grammar).
+    std::vector<std::string> supertraits;
     bool isPub = false; // Phase 15: `pub trait` — parsed + stored.
     std::size_t line = 1;
     std::size_t column = 1;

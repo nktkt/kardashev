@@ -1393,6 +1393,32 @@ public:
                 uniqueMethods.push_back(m);
             }
             traits_[td.name] = std::move(uniqueMethods);
+            traitSupertraits_[td.name] = td.supertraits; // v25 Phase 136
+        }
+
+        // v25 Phase 136: a type that impls a trait must also impl each of the
+        // trait's SUPERTRAITS. Compare on the impl's spelled type name (which is
+        // consistent across both the impl set and the supertrait lookup) — the
+        // derive- and default-expansion passes have already populated impls.
+        {
+            std::unordered_set<std::string> implemented;
+            for (const auto& impl : program.impls)
+                if (!impl.traitName.empty())
+                    implemented.insert(impl.forType.name + "/" + impl.traitName);
+            for (const auto& impl : program.impls) {
+                if (impl.traitName.empty()) continue;
+                auto it = traitSupertraits_.find(impl.traitName);
+                if (it == traitSupertraits_.end()) continue;
+                for (const auto& sup : it->second) {
+                    if (!implemented.count(impl.forType.name + "/" + sup)) {
+                        error("impl of '" + impl.traitName + "' for '" +
+                                  impl.forType.name +
+                                  "' requires an impl of its supertrait '" + sup +
+                                  "' for '" + impl.forType.name + "'",
+                              impl.line, impl.column);
+                    }
+                }
+            }
         }
 
         // Pass 1d: register impl blocks. We resolve the implementing type
@@ -2167,6 +2193,8 @@ private:
     // types are chosen per-impl (`type Item = i64;`), not supplied at the use
     // site like generic-trait args.
     std::unordered_map<std::string, std::vector<std::string>> traitAssocTypes_;
+    // v25 Phase 136: trait -> its supertrait names.
+    std::unordered_map<std::string, std::vector<std::string>> traitSupertraits_;
     // Phase 21b: per (implementing-type-name, trait-name), the concrete type
     // each associated type resolves to in that impl. Resolved with `Self` bound
     // to the impl's forType (and the trait's generic params bound to the impl's
