@@ -40,6 +40,11 @@ PatternPtr clonePattern(const Pattern& p) {
         for (const auto& el : t->elements)
             n->elements.push_back(clonePatOpt(el));
         out = std::move(n);
+    } else if (auto* o = dynamic_cast<const OrPat*>(&p)) {
+        auto n = std::make_unique<OrPat>();
+        for (const auto& alt : o->alternatives)
+            n->alternatives.push_back(clonePatOpt(alt));
+        out = std::move(n);
     }
     if (out) {
         out->line = p.line;

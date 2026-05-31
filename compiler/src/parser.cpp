@@ -1,5 +1,6 @@
 #include "kardashev/parser.hpp"
 
+#include "kardashev/ast_clone.hpp"
 #include "kardashev/lexer.hpp"
 
 #include <map>
@@ -2211,6 +2212,28 @@ private:
         }
         restrictStructLit_ = prevArm;
         expect(TokenKind::RBrace, "}");
+        // v26 Phase 141: split each or-pattern arm `p1 | p2 => e` into one arm
+        // per alternative (`p1 => e, p2 => e`), deep-cloning the body so the
+        // match compiler / typechecker only ever see single-pattern arms.
+        std::vector<ast::MatchArm> expanded;
+        for (auto& arm : me->arms) {
+            auto* orp = dynamic_cast<ast::OrPat*>(arm.pattern.get());
+            if (!orp) {
+                expanded.push_back(std::move(arm));
+                continue;
+            }
+            for (std::size_t i = 0; i < orp->alternatives.size(); ++i) {
+                ast::MatchArm a;
+                a.line = arm.line;
+                a.column = arm.column;
+                a.pattern = std::move(orp->alternatives[i]);
+                a.body = (i + 1 == orp->alternatives.size())
+                             ? std::move(arm.body)
+                             : ast::cloneExpr(*arm.body);
+                expanded.push_back(std::move(a));
+            }
+        }
+        me->arms = std::move(expanded);
         return me;
     }
 
@@ -2218,6 +2241,22 @@ private:
         auto pat = parsePattern();
         std::size_t line = pat ? pat->line : peek().line;
         std::size_t col = pat ? pat->column : peek().column;
+        // v26 Phase 141: an or-pattern `p1 | p2 | …`. In pattern position the
+        // `|` is unambiguous (no bitwise-or / closure here). Collect the
+        // alternatives into an OrPat; the expandOrPatterns pass splits the arm.
+        if (check(TokenKind::Pipe) || check(TokenKind::PipePipe)) {
+            auto orp = std::make_unique<ast::OrPat>();
+            orp->line = line;
+            orp->column = col;
+            orp->alternatives.push_back(std::move(pat));
+            while (check(TokenKind::Pipe) || check(TokenKind::PipePipe)) {
+                // `||` here is two pattern separators (an empty alternative is
+                // never valid), so treat it as a single `|`.
+                consume();
+                orp->alternatives.push_back(parsePattern());
+            }
+            pat = std::move(orp);
+        }
         expect(TokenKind::FatArrow, "=>");
         auto body = parseExpr();
         ast::MatchArm arm;

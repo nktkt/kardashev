@@ -144,6 +144,14 @@ struct TuplePat : Pattern {
     std::vector<PatternPtr> elements;
 };
 
+// v26 Phase 141: an or-pattern `p1 | p2 | …` in a match arm. Matches if ANY
+// alternative does. A pre-typecheck pass (expandOrPatterns) splits an arm with
+// an OrPat into one arm per alternative (deep-cloning the body), so the match
+// compiler / typechecker never see this node.
+struct OrPat : Pattern {
+    std::vector<PatternPtr> alternatives;
+};
+
 // --- Expressions ---
 
 // Forward decl: TypeRef is defined in the "Top-level" section below, but
