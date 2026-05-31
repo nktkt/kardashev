@@ -102,6 +102,12 @@ struct CEmitter {
             "println", "int_to_string", "str_eq", "str_substring", "print"};
         return b.count(n) > 0;
     }
+    // v30 Phase 163: the builtins for which the C backend emits a real runtime.
+    // Currently the String set; Vec/HashMap/HashSet etc. are added as their C
+    // runtimes land. A call to anything not here (and not a user fn) is refused.
+    static bool isImplementedBuiltin(const std::string& n) {
+        return isStringBuiltin(n);
+    }
 
     // v29 Phase 157: the C type of a kardashev TypeRef. Scalars -> int64_t, a
     // user struct -> `struct <Name>`. Anything else (refs, generics, enums,
@@ -319,6 +325,20 @@ struct CEmitter {
                     s += ", .p" + std::to_string(i) + " = " +
                          expr(*call->args[i]);
                 return s + " })";
+            }
+            // v30 Phase 163 (soundness): a call must resolve to a user fn, a
+            // variant ctor (handled above), or an IMPLEMENTED builtin. Anything
+            // else (an unimplemented stdlib builtin — vec_*, hashmap_*, thread_*,
+            // async, …) would emit `kd_<name>(...)` with no definition = broken
+            // C. Refuse it instead, preserving "never emit wrong C". (Earlier
+            // phases silently emitted undefined-symbol calls for these; the
+            // phase129 smoke never exercised a builtin so it went unnoticed.)
+            if (!fns_.count(call->callee) &&
+                !isImplementedBuiltin(call->callee)) {
+                err("call to `" + call->callee +
+                    "` is outside the C-backend subset (no C runtime for this "
+                    "builtin yet)");
+                return "0";
             }
             // v30 Phase 162: a String builtin opts the program into the C
             // String runtime (emitted up front as `kd_<name>` definitions).
