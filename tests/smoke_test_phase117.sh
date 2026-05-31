@@ -57,4 +57,13 @@ diff_case "struct P { x: i64, y: i64 } fn f(a: i64, b: i64) -> i64 { let p = P {
 diff_case "struct Pair { p: i64, q: i64, r: i64 } fn f(a: i64, b: i64) -> i64 { let t = Pair { p: a, q: b, r: a * b } ; (t.p + t.q) + t.r }" 3 4 "three-field"
 diff_case "struct Pair { p: i64, q: i64, r: i64 } fn f(a: i64, b: i64) -> i64 { let t = Pair { p: a + 1, q: b * 2, r: a } ; if t.p == t.r { t.q } else { t.p * t.r } }" 5 3 "mixed"
 
+# A struct-RETURNING function (self-only — the host can't wrap a struct return in
+# an i64 main): the self-hosted compiler returns the aggregate and `main` extracts
+# field 0 as the exit code.
+"$TMP/sg" "struct P { x: i64, y: i64 } fn f(a: i64, b: i64) -> P { P { x: a + b, y: a } }" 3 4 > "$TMP/sr.ll" 2>/dev/null
+"$CLANG" "$TMP/sr.ll" -o "$TMP/sr" 2>/dev/null || { echo "FAIL [phase117/struct-return]: clang rejected aggregate-return IR"; cat "$TMP/sr.ll"; exit 1; }
+"$TMP/sr" >/dev/null 2>&1; rsr=$?
+[[ "$rsr" -eq 7 ]] || { echo "FAIL [phase117/struct-return]: exit $rsr (want 7 = field0 = a+b)"; exit 1; }
+echo "PASS [struct-return]: a struct-returning fn returns the aggregate; main extracts field 0 ($rsr)"
+
 echo "ALL PHASE 117 SMOKE TESTS PASSED"

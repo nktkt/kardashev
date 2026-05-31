@@ -451,8 +451,9 @@ fn emit_fn(f: &Fn, structs: &Vec<SDef>, buf: &mut String) ! { alloc } {
     let res = lower(&(*f.body.result), &oenv, &tenv, structs, &mut c, buf);
     app(buf, "  ret "); app(buf, rty); app(buf, " "); app(buf, res.op); app(buf, "\n}\n");
 }
-fn emit_main(f: &Fn, args: &Vec<i64>, buf: &mut String) ! { alloc } {
-    app(buf, "define i64 @main() {\nentry:\n  %r = call i64 @"); app(buf, clone(&f.name)); app(buf, "(");
+fn emit_main(f: &Fn, args: &Vec<i64>, structs: &Vec<SDef>, buf: &mut String) ! { alloc } {
+    let rty = ty_llvm(f.ret, structs);
+    app(buf, "define i64 @main() {\nentry:\n  %r = call "); app(buf, clone(&rty)); app(buf, " @"); app(buf, clone(&f.name)); app(buf, "(");
     let np = vec_len(&f.params);
     let mut i = 0;
     while i < np {
@@ -461,7 +462,10 @@ fn emit_main(f: &Fn, args: &Vec<i64>, buf: &mut String) ! { alloc } {
         app(buf, "i64 "); app(buf, int_to_string(a));
         i = i + 1;
     }
-    app(buf, ")\n  ret i64 %r\n}\n");
+    app(buf, ")\n");
+    // The exit code must be i64. If f returns a struct, use its field 0.
+    if f.ret >= 100 { app(buf, "  %rx = extractvalue "); app(buf, rty); app(buf, " %r, 0\n  ret i64 %rx\n}\n"); }
+    else { app(buf, "  ret i64 %r\n}\n"); }
 }
 
 fn main() -> i64 ! { io, alloc } {
@@ -487,7 +491,7 @@ fn main() -> i64 ! { io, alloc } {
             vec_push(&mut args, v);
             i = i + 1;
         }
-        emit_main(&f, &args, &mut out);
+        emit_main(&f, &args, &structs, &mut out);
         print_str(&out);
         0
     }

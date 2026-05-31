@@ -59,5 +59,9 @@ SEL="enum Sel { A(i64), B(i64), C(i64) } fn f(a: i64, b: i64) -> i64 { let e = i
 diff_case "$SEL" 4 4 "three-variant-A"
 diff_case "$SEL" 2 8 "three-variant-B"
 diff_case "$SEL" 9 3 "three-variant-C"
+# Regression (adversarial review): a `match` whose ARMS return enum values — the
+# match select-chain must use the arm RESULT type ({i64,i64}), not hardcoded i64.
+NEST="enum P2 { L(i64), R(i64) } fn f(a: i64, b: i64) -> i64 { let r = match L(a) { L(x) => R(x) , R(y) => L(y) } ; match r { L(p) => p , R(q) => q + 1000 } }"
+diff_case "$NEST" 5 0 "match-returns-enum"
 
 echo "ALL PHASE 118 SMOKE TESTS PASSED"

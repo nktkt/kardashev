@@ -87,11 +87,19 @@ step past "toy":
   host on two- and three-variant programs across all branches
   (`tests/smoke_test_phase118.sh`).
 
+- ✅ **Phase 119 (adversarial review + fixes, done)** — a 3-way review (~80
+  valid programs vs the host, IR validity via clang/llc, test honesty) found one
+  real bug: a `match` whose ARMS return enum values lowered its select-chain as
+  `i64` instead of the aggregate type (clang-rejected; the host compiled it). Fixed
+  to use the arm result type (mirroring the `if` lowering), plus a latent
+  aggregate-return `main` fix (extract field 0 as the exit code). Both pinned by
+  new regression cases. IR validity + test honesty came back clean.
+
 **v20 is functionally complete:** the self-hosted compiler emits real native code
 (115) that provably matches the host (116) for the i64/bool language, plus
 **structs** (117) and **enums + match** (118) — the shapes kardashev itself is
-built from. Full kardashev-compiles-kardashev remains several roadmaps out, but
-this is well past "toy".
+built from, adversarially reviewed (119). Full kardashev-compiles-kardashev
+remains several roadmaps out, but this is well past "toy".
 
 ### v21 — prove it, and close the leaks
 

@@ -388,17 +388,22 @@ fn lower(e: &Expr, oenv: &mut HashMap<String, String>, tenv: &mut HashMap<String
             let na = vec_len(arms);
             let mut ops = vec_new();      // arm result operands
             let mut tags = vec_new();     // arm tags
+            let mut rty = 1;              // the arm result type (all arms agree)
             let mut i = 0;
             while i < na {
                 let arm = vec_get(arms, i);
                 hashmap_insert(oenv, clone(&arm.bind), reg(payR));
                 hashmap_insert(tenv, clone(&arm.bind), 1);
                 let vb = lower(&(*arm.body), oenv, tenv, enums, c, buf);
+                rty = vb.ty;
                 vec_push(&mut ops, vb.op);
                 vec_push(&mut tags, arm.tag);
                 i = i + 1;
             }
-            // select-chain: res = ops[last]; fold i=last-1..0: res = select (tag==tags[i]) ? ops[i] : res
+            // select-chain over the arm RESULT type (i64 OR a struct/enum
+            // aggregate): res = ops[last]; fold i=last-1..0:
+            //   res = select (tag == tags[i]) ? ops[i] : res
+            let lty = ty_llvm(rty);
             let mut res = vec_get(&ops, na - 1);
             let mut j = na - 2;
             let mut more = if na >= 2 { 1 } else { 0 };
@@ -408,11 +413,11 @@ fn lower(e: &Expr, oenv: &mut HashMap<String, String>, tenv: &mut HashMap<String
                 app(buf, "  "); app(buf, reg(cmpR)); app(buf, " = icmp eq i64 "); app(buf, reg(tagR)); app(buf, ", "); app(buf, int_to_string(tv)); app(buf, "\n");
                 let selR = fresh(c);
                 let oj = vec_get(&ops, j);
-                app(buf, "  "); app(buf, reg(selR)); app(buf, " = select i1 "); app(buf, reg(cmpR)); app(buf, ", i64 "); app(buf, oj); app(buf, ", i64 "); app(buf, res); app(buf, "\n");
+                app(buf, "  "); app(buf, reg(selR)); app(buf, " = select i1 "); app(buf, reg(cmpR)); app(buf, ", "); app(buf, clone(&lty)); app(buf, " "); app(buf, oj); app(buf, ", "); app(buf, clone(&lty)); app(buf, " "); app(buf, res); app(buf, "\n");
                 res = reg(selR);
                 if j == 0 { more = 0; } else { j = j - 1; }
             }
-            Val { op: res, ty: 1 }
+            Val { op: res, ty: rty }
         },
     }
 }
@@ -450,7 +455,8 @@ fn emit_fn(f: &Fn, enums: &Vec<EDef>, buf: &mut String) ! { alloc } {
     app(buf, "  ret "); app(buf, rty); app(buf, " "); app(buf, res.op); app(buf, "\n}\n");
 }
 fn emit_main(f: &Fn, args: &Vec<i64>, buf: &mut String) ! { alloc } {
-    app(buf, "define i64 @main() {\nentry:\n  %r = call i64 @"); app(buf, clone(&f.name)); app(buf, "(");
+    let rty = ty_llvm(f.ret);
+    app(buf, "define i64 @main() {\nentry:\n  %r = call "); app(buf, clone(&rty)); app(buf, " @"); app(buf, clone(&f.name)); app(buf, "(");
     let np = vec_len(&f.params);
     let mut i = 0;
     while i < np {
@@ -459,7 +465,10 @@ fn emit_main(f: &Fn, args: &Vec<i64>, buf: &mut String) ! { alloc } {
         app(buf, "i64 "); app(buf, int_to_string(a));
         i = i + 1;
     }
-    app(buf, ")\n  ret i64 %r\n}\n");
+    app(buf, ")\n");
+    // The exit code must be i64. If f returns an aggregate, use its field 0.
+    if f.ret >= 100 { app(buf, "  %rx = extractvalue "); app(buf, rty); app(buf, " %r, 0\n  ret i64 %rx\n}\n"); }
+    else { app(buf, "  ret i64 %r\n}\n"); }
 }
 
 fn main() -> i64 ! { io, alloc } {
