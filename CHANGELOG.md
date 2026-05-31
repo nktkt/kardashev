@@ -18,6 +18,41 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.24.0] — Roadmap v24 "diagnostics & the developer surface" (Phases 130–134)
+
+Theme: developer experience — the highest-ROI gap on the road to production.
+Errors went from one-line `<kind> error N:M: message` (where N indexed into the
+~450-line prelude-prepended source, so a user error on line 3 reported "455") to
+real, navigable diagnostics, plus a lint pass, error codes, and doc comments.
+
+### Added
+- **Rich diagnostics** (Phase 130) — a rustc-style source snippet with a caret
+  under the offending column, the **user's own line number + file** (the prelude
+  offset is recovered), and positions embedded in messages rewritten to match
+  (`moved at 457:18` → `moved at 5:18`).
+- **An opt-in lint pass `kardc -W`** (Phase 132) — **unused `let`** bindings (a
+  sound complete-AST use-walk: a name used via a closure, fn-pointer call,
+  method/builtin call, or match binding does not warn; `_`-prefixed skipped) and
+  **unreachable code** after `return`/`break`/`continue`. Non-fatal and opt-in,
+  so the existing corpus is unaffected.
+- **Error codes + `kardc --explain Exxxx`** (Phase 133) — a curated table tags
+  the common diagnostics (`E0308` mismatched types, `E0382` use-of-moved, …)
+  rustc-style (`type error[E0308]:`); `--explain` prints an extended explanation.
+- **`///` doc comments** (Phase 134) — captured in the AST and surfaced both by
+  the formatter (`kardfmt` round-trips them) and in **LSP hover** (rendered as
+  prose below the signature).
+
+### Changed
+- **Parser panic-mode error recovery** (Phase 131) — after a statement parse
+  error the parser resynchronizes to the next `;`/boundary, so it reports one
+  diagnostic per real error (two malformed `let`s → 2 errors, not 4) while still
+  surfacing the later errors. Recovery only runs on error; valid programs are
+  byte-for-byte unaffected.
+
+No language-surface changes; the diagnostic header keeps `<kind> error` + the
+message (plus an optional `[Exxxx]`), so message-grepping tooling/tests still
+match. 704 unit cases (6 suites) + the full smoke sweep green, JIT and AOT.
+
 ## [0.23.0] — Roadmap v23 "a second backend" (Phase 129)
 
 Theme: break the LLVM/Linux monoculture. kardashev gains a **second code
