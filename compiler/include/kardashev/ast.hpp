@@ -676,6 +676,7 @@ struct FnDecl {
     // codegen path is unchanged), so calling it at runtime works as before.
     bool isConst = false;
     std::unique_ptr<BlockExpr> body;
+    std::string doc; // v24 Phase 134: the leading `///` doc comment, if any
     std::size_t line = 1;
     std::size_t column = 1;
 };
@@ -701,6 +702,7 @@ struct StructDecl {
     std::vector<Param> fields;
     std::vector<std::string> derives; // Phase 42: `#[derive(Clone, Eq, ...)]`
     bool isPub = false; // Phase 15: `pub struct` — parsed + stored.
+    std::string doc; // v24 Phase 134: the leading `///` doc comment, if any
     std::size_t line = 1;
     std::size_t column = 1;
 };
@@ -718,6 +720,7 @@ struct EnumDecl {
     std::vector<EnumVariant> variants;
     std::vector<std::string> derives; // Phase 42: `#[derive(Clone, Eq, ...)]`
     bool isPub = false; // Phase 15: `pub enum` — parsed + stored.
+    std::string doc; // v24 Phase 134: the leading `///` doc comment, if any
     std::size_t line = 1;
     std::size_t column = 1;
 };

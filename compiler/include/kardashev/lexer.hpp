@@ -100,6 +100,11 @@ enum class TokenKind {
     Dot,
     Underscore,
 
+    // v24 Phase 134: a `///` doc comment. The lexeme is the text after `///`
+    // (one leading space trimmed). The parser filters these out of the token
+    // stream and attaches them to the following declaration.
+    DocComment,
+
     // Sentinel
     EndOfInput,
     Invalid,

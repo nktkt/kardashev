@@ -83,9 +83,11 @@ two differentiators — concurrency and the effect system; (5) the systems-grade
 escape hatches (FFI / `unsafe` / `no_std`); (6) metaprogramming; (7) stdlib
 depth and tooling; (8) the long XL arcs run as dedicated tracks (see *Mega-arcs*).
 
-### v24 — diagnostics & the developer surface
+### v24 — diagnostics & the developer surface — *done (v0.24.0)*
 The highest-ROI gap: error quality. *(Survey: critic "error message quality" =
-top priority; `tooling-ecosystem` LSP items.)*
+top priority; `tooling-ecosystem` LSP items.)* All five phases shipped (130
+snippet+caret with user-relative lines, 131 parser panic-mode recovery, 132 the
+`-W` lint, 133 error codes + `--explain`, 134 `///` doc comments).
 - **130** rich diagnostics — source snippets, multi-line spans with carets,
   `expected … / found …`, secondary notes + hints (today errors are one-line
   `line:col: message`).

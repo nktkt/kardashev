@@ -83,11 +83,23 @@ std::vector<Token> lex(std::string_view source) {
         }
 
         // `// line comment` — drop through end of line (the \n itself is
-        // re-handled by the whitespace branch on the next iteration).
+        // re-handled by the whitespace branch on the next iteration). Phase 134:
+        // EXACTLY `///` (not `//` or `////+`) is a DOC comment — emit a
+        // DocComment token carrying the text (one leading space trimmed).
         if (c == '/' && i + 1 < source.size() && source[i + 1] == '/') {
+            const bool isDoc = i + 2 < source.size() && source[i + 2] == '/' &&
+                               (i + 3 >= source.size() || source[i + 3] != '/');
+            std::size_t docCol = col;
+            std::size_t textStart = i + 3; // first char past the three slashes
             while (i < source.size() && source[i] != '\n') {
                 ++i;
                 ++col;
+            }
+            if (isDoc) {
+                std::string text(source.substr(textStart, i - textStart));
+                if (!text.empty() && text[0] == ' ') text.erase(0, 1);
+                tokens.push_back(
+                    {TokenKind::DocComment, std::move(text), line, docCol});
             }
             continue;
         }

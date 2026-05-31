@@ -242,6 +242,48 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v24 Phase 130: rich diagnostics — snippet + caret + user-relative line numbers
+# (the prelude offset is recovered). Asserts snippet structure on parse/type/
+# borrow errors and that a valid program emits no diagnostics.
+sh_test(
+    name = "smoke_test_phase130",
+    srcs = ["smoke_test_phase130.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v24 Phase 131: parser panic-mode error recovery — one diagnostic per error.
+sh_test(
+    name = "smoke_test_phase131",
+    srcs = ["smoke_test_phase131.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v24 Phase 132: opt-in lint (-W) — unused vars + unreachable code, non-fatal,
+# no false positives (closure / fn-ptr / method / match uses recognized).
+sh_test(
+    name = "smoke_test_phase132",
+    srcs = ["smoke_test_phase132.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v24 Phase 133: error codes in diagnostics + `kardc --explain Exxxx`.
+sh_test(
+    name = "smoke_test_phase133",
+    srcs = ["smoke_test_phase133.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v24 Phase 134: /// doc comments — formatter round-trip + LSP hover surface.
+sh_test(
+    name = "smoke_test_phase134",
+    srcs = ["smoke_test_phase134.sh"],
+    data = [
+        "//compiler:kard-lsp",
+        "//compiler:kardc",
+        "//compiler:kardfmt",
+    ],
+)
+
 # v18 Phase 109: a unit-result async future (block_on / .await / spawn+join)
 # crashed the compiler (void load/return); now compiles + runs.
 sh_test(

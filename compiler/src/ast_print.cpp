@@ -259,7 +259,24 @@ private:
         out_ += ")]\n";
     }
 
+    // v24 Phase 134: emit a `///` doc comment (one line per `\n`) before a decl.
+    void printDoc(const std::string& doc, int depth) {
+        if (doc.empty()) return;
+        std::size_t start = 0;
+        for (;;) {
+            std::size_t nl = doc.find('\n', start);
+            indent(depth);
+            out_ += "/// ";
+            out_ += (nl == std::string::npos) ? doc.substr(start)
+                                              : doc.substr(start, nl - start);
+            out_ += "\n";
+            if (nl == std::string::npos) break;
+            start = nl + 1;
+        }
+    }
+
     void printStruct(const StructDecl& s) {
+        printDoc(s.doc, 0);
         printDerives(s.derives);
         if (s.isPub) out_ += "pub ";
         out_ += "struct " + s.name + genericParamsToString(s.genericParams);
@@ -277,6 +294,7 @@ private:
     }
 
     void printEnum(const EnumDecl& e) {
+        printDoc(e.doc, 0);
         printDerives(e.derives);
         if (e.isPub) out_ += "pub ";
         out_ += "enum " + e.name + genericParamsToString(e.genericParams);
@@ -360,6 +378,7 @@ private:
     }
 
     void printFn(const FnDecl& fn, int depth) {
+        printDoc(fn.doc, depth);
         indent(depth);
         if (fn.isPub) out_ += "pub ";
         if (fn.isConst) out_ += "const "; // Phase 25

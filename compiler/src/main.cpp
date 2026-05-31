@@ -29,6 +29,7 @@
 #include "kardashev/borrow_check.hpp"
 #include "kardashev/codegen.hpp"
 #include "kardashev/emit_c.hpp"
+#include "kardashev/lint.hpp"
 #include "kardashev/parser.hpp"
 #include "kardashev/typecheck.hpp"
 #include "kardashev/version.hpp"
@@ -1388,25 +1389,201 @@ bool resolveModules(const std::string& srcRaw,
     return true;
 }
 
-void reportParseErrors(const kardashev::ParseResult& r) {
-    for (const auto& e : r.errors) {
-        std::cerr << "parse error " << e.line << ":" << e.column << ": "
-                  << e.message << '\n';
+// v24 Phase 130: rich diagnostics — a rustc-style source snippet with a caret
+// under the offending column. The front-end parses applyPrelude(userSource), so
+// error line numbers are offset by the prelude's length; we recover that offset
+// to show the USER's own line number + file (not "453" for user line 1). The
+// header keeps the literal "<kind> error" + message, so message-grepping tests
+// (and the one "parse error" check) still match.
+namespace {
+std::size_t countLines(const std::string& s) {
+    std::size_t n = 1;
+    for (char c : s) if (c == '\n') ++n;
+    return n;
+}
+// Extract 1-based line `n` from `s` (without the trailing newline). Empty if
+// out of range.
+std::string nthLine(const std::string& s, std::size_t n) {
+    if (n == 0) return "";
+    std::size_t cur = 1, i = 0;
+    while (cur < n && i < s.size()) {
+        if (s[i] == '\n') ++cur;
+        ++i;
     }
+    if (cur != n) return "";
+    std::size_t end = i;
+    while (end < s.size() && s[end] != '\n') ++end;
+    return s.substr(i, end - i);
+}
+// Rewrite any prelude-prepended `<line>:<col>` embedded in a message (e.g.
+// "moved at 457:18") into the user's own coordinates, so a secondary position
+// inside a message matches the snippet header rather than showing the big
+// prelude-offset line. Only a `<digits>:<digit>` run whose line exceeds the
+// prelude length is touched — coincidental small `N:M` are left alone.
+std::string adjustMessagePositions(const std::string& msg,
+                                   std::size_t preludeLines) {
+    if (preludeLines == 0) return msg;
+    auto isDigit = [](char c) { return c >= '0' && c <= '9'; };
+    std::string out;
+    out.reserve(msg.size());
+    std::size_t i = 0;
+    while (i < msg.size()) {
+        if (isDigit(msg[i])) {
+            std::size_t j = i;
+            while (j < msg.size() && isDigit(msg[j])) ++j;
+            if (j < msg.size() && msg[j] == ':' && j + 1 < msg.size() &&
+                isDigit(msg[j + 1])) {
+                std::size_t lineNo = 0;
+                for (std::size_t k = i; k < j; ++k)
+                    lineNo = lineNo * 10 + (std::size_t)(msg[k] - '0');
+                std::size_t c = j + 1;
+                while (c < msg.size() && isDigit(msg[c])) ++c;
+                if (lineNo > preludeLines) {
+                    out += std::to_string(lineNo - preludeLines);
+                    out += msg.substr(j, c - j); // ":<col>"
+                    i = c;
+                    continue;
+                }
+            }
+            out += msg.substr(i, j - i);
+            i = j;
+            continue;
+        }
+        out += msg[i];
+        ++i;
+    }
+    return out;
 }
 
-void reportTypeErrors(const kardashev::TypeCheckResult& r) {
-    for (const auto& e : r.errors) {
-        std::cerr << "type error " << e.line << ":" << e.column << ": "
-                  << e.message << '\n';
+// v24 Phase 133: stable error codes + `kardc --explain Exxxx`. A curated table
+// maps the most common, distinctive diagnostics to a code with an extended
+// explanation. Classification is by message substring; an unmatched message
+// gets no code (a missing code beats a wrong one). The table grows over time.
+struct ErrorCode {
+    const char* code;
+    std::vector<const char*> match; // any of these substrings => this code
+    const char* title;
+    const char* explain;
+};
+const std::vector<ErrorCode>& errorCodes() {
+    static const std::vector<ErrorCode> table = {
+        {"E0001",
+         {"expected ", "unexpected "},
+         "syntax error",
+         "The parser reached a token it did not expect. Check for a missing\n"
+         "`;`, `}`, `)`, or `else`, or a keyword used as an identifier."},
+        {"E0308",
+         {"does not match", "same integer type", "expects bool", "arm body "
+          "type", " body type ", "operands", "mismatch"},
+         "mismatched types",
+         "An expression's type does not match the type required by its\n"
+         "context (a fn return type, an operator's operands, an `if`/`match`\n"
+         "arm, or a `let` annotation). kardashev does not implicitly convert\n"
+         "between types — cast explicitly with `as`, or fix the value."},
+        {"E0382",
+         {"moved value", "use of moved", "already moved"},
+         "use of a moved value",
+         "A non-`Copy` value was used after ownership moved out of it (into a\n"
+         "fn call, a `let`, or a struct/enum). Use the value before the move,\n"
+         "clone it (`.clone()`), or borrow it (`&x`) instead of moving."},
+        {"E0425",
+         {"unknown identifier", "undefined", "cannot find"},
+         "cannot find a name in scope",
+         "A name was referenced that is not a binding, function, type, or\n"
+         "const in scope. Check the spelling, the import (`mod`/`pub`), and\n"
+         "that the binding is declared before use in an enclosing scope."},
+        {"E0599",
+         {"no field", "no method", "field access on non", "non-struct"},
+         "no such field or method",
+         "The field or method does not exist on this type. Check the name, and\n"
+         "that the relevant `impl`/trait is in scope for a method call."},
+        {"E0571",
+         {"outside of a loop", "outside a loop"},
+         "`break`/`continue` outside a loop",
+         "`break` and `continue` are only valid inside a `while`/`loop`/`for`\n"
+         "body. Move the control-flow expression inside a loop."},
+        {"E0277",
+         {"does not implement", "trait bound", "is not satisfied", "no impl"},
+         "trait bound not satisfied",
+         "A generic was used at a type that does not implement a required\n"
+         "trait. Add the missing `impl Trait for Type`, or add/relax the bound."},
+        {"E0384",
+         {"cannot assign", "not mutable", "immutable", "non-mut"},
+         "assignment to an immutable binding",
+         "Assignment requires a `let mut` binding (or a `&mut` place).\n"
+         "Declare the binding `let mut x = …;` to make it reassignable."},
+    };
+    return table;
+}
+const ErrorCode* classifyError(const std::string& msg) {
+    for (const auto& ec : errorCodes())
+        for (const char* m : ec.match)
+            if (msg.find(m) != std::string::npos) return &ec;
+    return nullptr;
+}
+} // namespace
+
+void renderDiagnostic(std::ostream& os, const char* kind,
+                      const std::string& message, std::size_t line,
+                      std::size_t column, const std::string& userSource,
+                      const std::string& file) {
+    // Recover the prelude offset so the user sees their own line number (both
+    // in the header and in any position embedded in the message text).
+    const std::string full = applyPrelude(userSource);
+    std::size_t preludeLines = 0;
+    {
+        std::size_t fullL = countLines(full), userL = countLines(userSource);
+        if (fullL > userL) preludeLines = fullL - userL;
     }
+    // v24 Phase 133: append the error code (rustc-style `error[E0308]:`) when a
+    // curated code matches. Warnings are not coded.
+    std::string label = kind;
+    if (label.find("error") != std::string::npos) {
+        if (const ErrorCode* ec = classifyError(message))
+            label += std::string("[") + ec->code + "]";
+    }
+    os << label << ": " << adjustMessagePositions(message, preludeLines)
+       << '\n';
+    const bool inUser = line > preludeLines;
+    const std::size_t dispLine = inUser ? (line - preludeLines) : line;
+    const std::string& snippetSrc = inUser ? userSource : full;
+    const std::string where = inUser ? file : std::string("<prelude>");
+    os << " --> " << where << ':' << dispLine << ':' << column << '\n';
+    const std::string srcLine = nthLine(snippetSrc, dispLine);
+    if (srcLine.empty() && dispLine != 0) {
+        // Out of range (e.g. a merged-module line) — header + location only.
+        return;
+    }
+    const std::string gutter = std::to_string(dispLine);
+    const std::string pad(gutter.size(), ' ');
+    os << pad << " |\n";
+    os << gutter << " | " << srcLine << '\n';
+    os << pad << " | " << std::string(column > 0 ? column - 1 : 0, ' ')
+       << "^\n";
 }
 
-void reportBorrowErrors(const kardashev::BorrowCheckResult& r) {
-    for (const auto& e : r.errors) {
-        std::cerr << "borrow error " << e.line << ":" << e.column << ": "
-                  << e.message << '\n';
-    }
+void reportParseErrors(const kardashev::ParseResult& r,
+                       const std::string& src = "",
+                       const std::string& file = "<input>") {
+    for (const auto& e : r.errors)
+        renderDiagnostic(std::cerr, "parse error", e.message, e.line, e.column, src,
+                         file);
+}
+
+void reportTypeErrors(const kardashev::TypeCheckResult& r,
+                      const std::string& src = "",
+                      const std::string& file = "<input>") {
+    for (const auto& e : r.errors)
+        renderDiagnostic(std::cerr, "type error", e.message, e.line, e.column, src,
+                         file);
+}
+
+void reportBorrowErrors(const kardashev::BorrowCheckResult& r,
+                        const std::string& src = "",
+                        const std::string& file = "<input>") {
+    for (const auto& e : r.errors)
+        renderDiagnostic(std::cerr, "borrow error", e.message, e.line, e.column, src,
+                         file);
 }
 
 // Compile `src` through the full pipeline and JIT-call the named entry
@@ -1428,7 +1605,15 @@ std::optional<kardashev::ast::Program> buildProgram(
     std::unordered_set<std::string> visited;
     std::vector<std::string> errors;
     if (!resolveModules(src, srcDir, visited, merged, errors)) {
-        for (const auto& e : errors) std::cerr << e << '\n';
+        // v24 Phase 130: render the (common single-file) top-level parse errors
+        // with an offset-corrected source snippet. If the main file parses but a
+        // `mod` file failed, fall back to the collected strings.
+        auto pr = kardashev::parse(src);
+        if (!pr.ok()) {
+            reportParseErrors(pr, srcRaw, "<input>");
+        } else {
+            for (const auto& e : errors) std::cerr << e << '\n';
+        }
         return std::nullopt;
     }
     if (!errors.empty()) {
@@ -1436,6 +1621,27 @@ std::optional<kardashev::ast::Program> buildProgram(
         return std::nullopt;
     }
     return merged;
+}
+
+// v24 Phase 132: `-W` — run the lint pass and render its (non-fatal) warnings.
+// Lints the prelude-included program but drops anything in the prelude region,
+// so only the user's own code is flagged; lint positions are prelude-relative,
+// which renderDiagnostic offset-corrects to the user's line like any error.
+void emitWarnings(const std::string& srcRaw, const std::string& srcDir,
+                  const std::string& file) {
+    auto progOpt = buildProgram(srcRaw, srcDir);
+    if (!progOpt) return; // a build/parse error: the real compile reports it
+    std::size_t preludeLines = 0;
+    {
+        std::size_t fullL = countLines(applyPrelude(srcRaw)),
+                    userL = countLines(srcRaw);
+        if (fullL > userL) preludeLines = fullL - userL;
+    }
+    for (const auto& w : kardashev::lint(*progOpt)) {
+        if (w.line <= preludeLines) continue; // prelude — not the user's code
+        renderDiagnostic(std::cerr, "warning", w.message, w.line, w.column,
+                         srcRaw, file);
+    }
 }
 
 std::optional<std::int64_t> compileAndRun(const std::string& srcRaw,
@@ -1469,12 +1675,12 @@ std::optional<std::int64_t> compileAndRun(const std::string& srcRaw,
     }
     auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
-        reportTypeErrors(tcr);
+        reportTypeErrors(tcr, srcRaw, sourceFile);
         return std::nullopt;
     }
     auto bcr = kardashev::borrow_check(program, tcr);
     if (!bcr.ok()) {
-        reportBorrowErrors(bcr);
+        reportBorrowErrors(bcr, srcRaw, sourceFile);
         return std::nullopt;
     }
     auto cgr = kardashev::codegen(program, tcr, emitDebug, sourceFile,
@@ -1569,17 +1775,17 @@ int runREPL() {
             std::string trial = accumulated + line + "\n";
             auto pr = kardashev::parse(applyPrelude(trial));
             if (!pr.ok()) {
-                reportParseErrors(pr);
+                reportParseErrors(pr, trial, "<repl>");
                 continue;
             }
             auto tcr = kardashev::typecheck(pr.program);
             if (!tcr.ok()) {
-                reportTypeErrors(tcr);
+                reportTypeErrors(tcr, trial, "<repl>");
                 continue;
             }
             auto bcr = kardashev::borrow_check(pr.program, tcr);
             if (!bcr.ok()) {
-                reportBorrowErrors(bcr);
+                reportBorrowErrors(bcr, trial, "<repl>");
                 continue;
             }
             accumulated = std::move(trial);
@@ -1887,12 +2093,12 @@ bool compileToObject(const std::string& srcRaw, const std::string& srcDir,
     expandDerives(program); // Phase 42: synthesize #[derive(...)] impls
     auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
-        reportTypeErrors(tcr);
+        reportTypeErrors(tcr, srcRaw, sourceFile);
         return false;
     }
     auto bcr = kardashev::borrow_check(program, tcr);
     if (!bcr.ok()) {
-        reportBorrowErrors(bcr);
+        reportBorrowErrors(bcr, srcRaw, sourceFile);
         return false;
     }
     auto cgr = kardashev::codegen(program, tcr, emitDebug, sourceFile,
@@ -1920,12 +2126,12 @@ int emitLlvmIr(const std::string& srcRaw, const std::string& srcDir,
     expandDerives(program); // Phase 42: synthesize #[derive(...)] impls
     auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
-        reportTypeErrors(tcr);
+        reportTypeErrors(tcr, srcRaw, sourceFile);
         return 1;
     }
     auto bcr = kardashev::borrow_check(program, tcr);
     if (!bcr.ok()) {
-        reportBorrowErrors(bcr);
+        reportBorrowErrors(bcr, srcRaw, sourceFile);
         return 1;
     }
     auto cgr = kardashev::codegen(program, tcr, emitDebug, sourceFile,
@@ -1952,12 +2158,12 @@ int emitCSource(const std::string& srcRaw, const std::string& srcDir) {
     expandDerives(program);
     auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
-        reportTypeErrors(tcr);
+        reportTypeErrors(tcr, srcRaw);
         return 1;
     }
     auto bcr = kardashev::borrow_check(program, tcr);
     if (!bcr.ok()) {
-        reportBorrowErrors(bcr);
+        reportBorrowErrors(bcr, srcRaw);
         return 1;
     }
     // Emit only the USER's declarations: re-parse the raw source so the
@@ -2090,12 +2296,12 @@ int runTests(const std::string& srcRaw, const std::string& srcDir,
     expandDerives(program); // Phase 42: synthesize #[derive(...)] impls
     auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
-        reportTypeErrors(tcr);
+        reportTypeErrors(tcr, srcRaw, sourceFile);
         return 1;
     }
     auto bcr = kardashev::borrow_check(program, tcr);
     if (!bcr.ok()) {
-        reportBorrowErrors(bcr);
+        reportBorrowErrors(bcr, srcRaw, sourceFile);
         return 1;
     }
 
@@ -2188,6 +2394,9 @@ int main(int argc, char** argv) {
     bool emitIr = false;
     // v23 Phase 129: `--emit-c` prints portable C source (the second backend).
     bool emitC = false;
+    // v24 Phase 132: `-W` / `--warn` runs the (non-fatal) lint pass before the
+    // normal compile/run.
+    bool warnEnabled = false;
     // Phase 20a: `--test` discovers + JIT-runs `test_*() -> i64` fns.
     bool testMode = false;
     // Phase 20a: optimization level for the post-codegen LLVM pipeline.
@@ -2205,6 +2414,26 @@ int main(int argc, char** argv) {
             emitIr = true;
         } else if (a == "--emit-c") {
             emitC = true;
+        } else if (a == "--explain" && i + 1 < argc) {
+            // v24 Phase 133: `kardc --explain Exxxx` — print a code's extended
+            // explanation. A standalone command (no input file).
+            std::string want = argv[++i];
+            for (char& ch : want)
+                if (ch >= 'a' && ch <= 'z') ch = char(ch - 32);
+            for (const auto& ec : errorCodes()) {
+                if (want == ec.code) {
+                    std::cout << ec.code << ": " << ec.title << "\n\n"
+                              << ec.explain << '\n';
+                    return 0;
+                }
+            }
+            std::cerr << "kardc: unknown error code `" << argv[i]
+                      << "`. Known codes:";
+            for (const auto& ec : errorCodes()) std::cerr << ' ' << ec.code;
+            std::cerr << '\n';
+            return 2;
+        } else if (a == "-W" || a == "--warn") {
+            warnEnabled = true;
         } else if (a == "--test") {
             testMode = true;
         } else if (a == "-O0") {
@@ -2227,6 +2456,8 @@ int main(int argc, char** argv) {
                          "       kardc -g ...               # emit DWARF debug info\n"
                          "       kardc --emit-llvm <file.kd> # print LLVM IR to stdout\n"
                          "       kardc --emit-c <file.kd>   # print C source (i64/bool subset) to stdout\n"
+                         "       kardc -W <file.kd>         # lint: warn on unused vars + unreachable code\n"
+                         "       kardc --explain Exxxx      # explain a diagnostic error code\n"
                          "       kardc --no-cache ...       # bypass the AOT compile cache\n"
                          "       kardc --version            # print the toolchain version\n";
             return 0;
@@ -2240,6 +2471,12 @@ int main(int argc, char** argv) {
             }
             inputPath = std::move(a);
         }
+    }
+
+    // v24 Phase 132: `-W` lints the input (non-fatal) before the normal flow.
+    if (warnEnabled && !inputPath.empty()) {
+        if (auto src = readFile(inputPath))
+            emitWarnings(*src, dirOf(inputPath), inputPath);
     }
 
     if (testMode) {

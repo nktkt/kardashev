@@ -289,6 +289,7 @@ struct DefInfo {
     std::size_t column = 1; // 1-based
     std::size_t nameLen = 0;
     std::string hover;      // markdown body (without code fences)
+    std::string doc;        // v24 Phase 134: `///` doc, rendered below the fence
 };
 
 // One identifier occurrence in the source, with what it resolves to.
@@ -298,6 +299,7 @@ struct Occurrence {
     std::size_t endCol = 1;   // 1-based, exclusive
     std::string name;
     std::string hover;        // markdown body for this occurrence
+    std::string doc;          // v24 Phase 134: `///` doc, below the fence
     // Definition location (0 if unknown — e.g. a builtin / unresolved name).
     std::size_t defLine = 0;
     std::size_t defCol = 0;
@@ -516,6 +518,7 @@ private:
             std::size_t col = resolveNameColumn(fn.line, fn.column, fn.name);
             DefInfo d{fn.name, fn.line, col, fn.name.size(),
                       renderFnSignature(fn, tc_)};
+            d.doc = fn.doc; // v24 Phase 134
             out_.globals[fn.name] = d;
             out_.globalCompletions.push_back({fn.name, /*Function*/ 3, d.hover});
         }
@@ -624,6 +627,7 @@ private:
             occ.defCol = def->column;
             occ.defLen = def->nameLen > 0 ? def->nameLen : name.size();
             if (occ.hover.empty()) occ.hover = def->hover;
+            if (occ.doc.empty()) occ.doc = def->doc; // v24 Phase 134
         }
         out_.occurrences.push_back(std::move(occ));
     }
@@ -1029,6 +1033,7 @@ std::string buildHoverResult(const DocIndex& idx, std::size_t line,
     const Occurrence* o = occurrenceAt(idx, line, col);
     if (!o || o->hover.empty()) return "null";
     std::string md = "```kardashev\n" + o->hover + "\n```";
+    if (!o->doc.empty()) md += "\n\n" + o->doc; // v24 Phase 134: doc as prose
     std::ostringstream ss;
     ss << "{\"contents\":{\"kind\":\"markdown\",\"value\":\""
        << jsonEscape(md) << "\"},"
