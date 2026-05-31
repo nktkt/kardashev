@@ -277,6 +277,20 @@ struct TypeCheckResult {
         std::unordered_map<std::string,
                            std::unordered_map<std::string, TypePtr>>>
         implAssocTypes;
+    // v28 Phase 155 (GATs): a parameterized impl binding `type Out<T> = …;`
+    // stored RAW (the RHS has free params), keyed [typeName][traitName][assoc].
+    // Codegen substitutes the projection's args into `rhs` (with `Self` + the
+    // GAT's params bound) to materialize `Self::Out<i64>` for the instance.
+    struct GatBinding {
+        std::vector<std::string> paramNames;
+        ast::TypeRef rhs;
+        TypePtr selfTy;
+    };
+    std::unordered_map<
+        std::string,
+        std::unordered_map<std::string,
+                           std::unordered_map<std::string, GatBinding>>>
+        implGatBindings;
     // Global variant table: variant name -> (enumName, discriminant index).
     // Codegen reads this to map a constructor name to its enum and tag.
     // Phase 2.2 keeps variant names globally unique across all enums to

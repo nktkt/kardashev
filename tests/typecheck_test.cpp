@@ -56,6 +56,30 @@ void test_int_literal_return() {
 }
 
 // v27 Phase 147: the `char` type.
+void test_const_aggregate_ok() {
+    // v28 Phase 152: array / struct / tuple / enum const values + projection.
+    expectOk("const A: [i64; 3] = [1, 2, 3];\n"
+             "const S: i64 = A[0] + A[1] + A[2];\n"
+             "fn main() -> i64 { S }",
+             "const_array_proj_ok");
+    expectOk("struct P { x: i64, y: i64 }\n"
+             "const O: P = P { x: 1, y: 2 };\n"
+             "const X: i64 = O.x;\n"
+             "fn main() -> i64 { X }",
+             "const_struct_field_ok");
+    expectOk("const T: (i64, i64) = (4, 5);\n"
+             "fn main() -> i64 { T.0 + T.1 }",
+             "const_tuple_runtime_ok");
+}
+
+void test_const_aggregate_oob_errors() {
+    // An out-of-bounds const array index is a compile-time error.
+    expectErr("const A: [i64; 2] = [1, 2];\n"
+              "const X: i64 = A[9];\n"
+              "fn main() -> i64 { X }",
+              "const_array_oob_errors");
+}
+
 void test_char_literal_and_cast_ok() {
     expectOk("fn f() -> i64 { 'A' as i64 }", "char_literal_and_cast_ok");
     expectOk("fn f(c: char) -> char { c }", "char_param_ok");
@@ -3147,6 +3171,8 @@ int main() {
     test_closure_bound_fnmut_where_fn_errors();
     test_closure_bound_fn_widens_to_fnmut_ok();
     test_closure_records_kind_on_node();
+    test_const_aggregate_ok();
+    test_const_aggregate_oob_errors();
     test_char_literal_and_cast_ok();
     test_char_comparison_ok();
     test_char_arithmetic_errors();
@@ -3305,6 +3331,6 @@ int main() {
     test_const_type_mismatch_errors();
     test_const_array_len_bool_errors();
     test_const_array_len_calls_nonconst_fn_errors();
-    std::cout << "All typecheck tests passed (309 cases)\n";
+    std::cout << "All typecheck tests passed (311 cases)\n";
     return 0;
 }

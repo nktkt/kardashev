@@ -2633,6 +2633,42 @@ int emitLlvmIr(const std::string& srcRaw, const std::string& srcDir,
     return 0;
 }
 
+// v28 Phase 156: `--mono-report` — print the monomorphization footprint: every
+// generic instance the program forces codegen to emit (each exactly once —
+// codegen dedups identical instantiations). Makes code bloat from generics
+// visible. Front-end runs exactly as the normal compile.
+int monoReport(const std::string& srcRaw, const std::string& srcDir,
+               const std::string& sourceFile) {
+    auto progOpt = buildProgram(srcRaw, srcDir);
+    if (!progOpt) return 1;
+    auto& program = *progOpt;
+    expandDerives(program);
+    expandBlanketImpls(program);
+    fillTraitDefaults(program);
+    auto tcr = kardashev::typecheck(program);
+    if (!tcr.ok()) {
+        reportTypeErrors(tcr, srcRaw, sourceFile);
+        return 1;
+    }
+    auto bcr = kardashev::borrow_check(program, tcr);
+    if (!bcr.ok()) {
+        reportBorrowErrors(bcr, srcRaw, sourceFile);
+        return 1;
+    }
+    auto cgr = kardashev::codegen(program, tcr, /*emitDebug=*/false, sourceFile,
+                                  kardashev::OptLevel::O0);
+    if (!cgr.ok()) {
+        for (const auto& msg : cgr.errors)
+            std::cerr << "codegen error: " << msg << '\n';
+        return 1;
+    }
+    std::cout << "monomorphized instances: "
+              << cgr.monomorphizedInstances.size() << "\n";
+    for (const auto& name : cgr.monomorphizedInstances)
+        std::cout << "  " << name << "\n";
+    return 0;
+}
+
 // v23 Phase 129: `--emit-c` prints portable C source from the typechecked AST
 // (the second backend). The front-end — parse, derive expansion, typecheck,
 // borrow-check — runs exactly as for the LLVM path; only the lowering differs.
@@ -2883,6 +2919,7 @@ int main(int argc, char** argv) {
     // Phase 14a: `--emit-llvm` prints textual LLVM IR (with debug metadata
     // when `-g` is also given) instead of JITing or emitting an object.
     bool emitIr = false;
+    bool monoReportFlag = false; // v28 Phase 156: --mono-report
     // v23 Phase 129: `--emit-c` prints portable C source (the second backend).
     bool emitC = false;
     // v24 Phase 132: `-W` / `--warn` runs the (non-fatal) lint pass before the
@@ -2903,6 +2940,8 @@ int main(int argc, char** argv) {
             useCache = false;
         } else if (a == "--emit-llvm") {
             emitIr = true;
+        } else if (a == "--mono-report") {
+            monoReportFlag = true;
         } else if (a == "--emit-c") {
             emitC = true;
         } else if (a == "--explain" && i + 1 < argc) {
@@ -2995,6 +3034,18 @@ int main(int argc, char** argv) {
         }
         return emitLlvmIr(*src, dirOf(inputPath), emitDebug, inputPath,
                           optLevel);
+    }
+    if (monoReportFlag) {
+        if (inputPath.empty()) {
+            std::cerr << "kardc: --mono-report requires an input file\n";
+            return 2;
+        }
+        auto src = readFile(inputPath);
+        if (!src) {
+            std::cerr << "kardc: cannot open file: " << inputPath << '\n';
+            return 1;
+        }
+        return monoReport(*src, dirOf(inputPath), inputPath);
     }
     if (emitC) {
         if (inputPath.empty()) {

@@ -106,6 +106,13 @@ public:
         }
         for (const auto& s : program.structs) userSourceNames_.insert(s.name);
         for (const auto& e : program.enums) userSourceNames_.insert(e.name);
+        // v28 Phase 152: index each top-level `const`'s initializer by name. A
+        // runtime use of an AGGREGATE const (array/tuple/struct/enum — these are
+        // not scalar immediates in constExprValues) re-emits this initializer at
+        // the use site (Rust-style per-use inlining). Scalar consts keep the
+        // folded-immediate path (constExprValues) and are absent here is fine.
+        for (const auto& c : program.consts)
+            if (c.value) constInits_[c.name] = c.value.get();
         // Phase 24: record extern "C" declarations so emitCall can resolve
         // their C-ABI signature + per-arg coercions.
         for (const auto& ef : program.externFns) {
@@ -457,7 +464,13 @@ public:
                            : pb.buildPerModuleDefaultPipeline(lvl);
             mpm.run(*module_, mam);
         }
-        return {std::move(ctx_), std::move(module_), std::move(errors_)};
+        // v28 Phase 156: surface the monomorphized generic instances (each
+        // emitted once — codegen dedups) for `--mono-report`.
+        std::vector<std::string> mono(emittedInstances_.begin(),
+                                      emittedInstances_.end());
+        std::sort(mono.begin(), mono.end());
+        return {std::move(ctx_), std::move(module_), std::move(errors_),
+                std::move(mono)};
     }
 
 private:
@@ -632,6 +645,9 @@ private:
     std::unordered_map<const ast::FnDecl*, const ast::ImplDecl*> genericImplOf_;
     // v26 Phase 144: top-level type aliases (name -> aliased TypeRef).
     std::unordered_map<std::string, ast::TypeRef> typeAliases_;
+    // v28 Phase 152: top-level const name -> its initializer expr, for re-emitting
+    // an aggregate const at a runtime use site.
+    std::unordered_map<std::string, const ast::Expr*> constInits_;
 
     // Active during emission of a generic fn instance. Maps the source's
     // generic-param name (`T`) to the concrete TypePtr for this instance,
@@ -7000,6 +7016,34 @@ private:
                               "' base is not a concrete type");
             return makeInt();
         }
+        // v28 Phase 155 (GATs): a parameterized projection `Self::Out<i64>` —
+        // substitute the supplied args (resolved in the current instance) into
+        // the impl's raw `type Out<T> = …` binding by injecting Self + the GAT's
+        // params into the instance type map, then materialize the RHS.
+        if (!tr.assocTypeArgs.empty()) {
+            auto git = tc_.implGatBindings.find(typeName);
+            if (git != tc_.implGatBindings.end()) {
+                for (const auto& [traitName, table] : git->second) {
+                    auto bit = table.find(tr.assocName);
+                    if (bit == table.end()) continue;
+                    const auto& gb = bit->second;
+                    if (gb.paramNames.size() != tr.assocTypeArgs.size()) break;
+                    std::vector<TypePtr> argTys;
+                    for (const auto& a : tr.assocTypeArgs)
+                        argTys.push_back(astTypeRefToConcrete(a));
+                    auto savedMap = currentInstanceTypeMap_;
+                    currentInstanceTypeMap_["Self"] = gb.selfTy;
+                    for (std::size_t i = 0; i < gb.paramNames.size(); ++i)
+                        currentInstanceTypeMap_[gb.paramNames[i]] = argTys[i];
+                    TypePtr result = astTypeRefToConcrete(gb.rhs);
+                    currentInstanceTypeMap_ = savedMap;
+                    return resolveInInstance(result);
+                }
+            }
+            errors_.push_back("codegen: no generic associated type '" +
+                              tr.assocName + "' for type '" + typeName + "'");
+            return makeInt();
+        }
         auto tyIt = tc_.implAssocTypes.find(typeName);
         if (tyIt != tc_.implAssocTypes.end()) {
             for (const auto& [traitName, table] : tyIt->second) {
@@ -9806,14 +9850,33 @@ private:
                     return llvm::ConstantInt::get(
                         cty, static_cast<uint64_t>(cv.value), /*isSigned=*/true);
                 }
+                // v28 Phase 152: a runtime use of an AGGREGATE const
+                // (array/tuple/struct/enum) — not a scalar immediate, so re-emit
+                // its initializer here (each use is a fresh value, the Rust
+                // const-inlining semantics).
+                if (auto ciIt = constInits_.find(id->name);
+                    ciIt != constInits_.end())
+                    return emitExpr(*ciIt->second);
                 // Phase 59: a const-generic param used as a VALUE (`N` in the
                 // body of `dot<const N>`) lowers to this instance's concrete
                 // literal — zero runtime cost, distinct per monomorphization.
                 if (auto cpIt = currentConstParamSubst_.find(id->name);
                     cpIt != currentConstParamSubst_.end()) {
+                    // v28 Phase 153: emit at the param's declared width — i1 for
+                    // a `const _: bool`, i32 for `const _: char`, else i64.
+                    llvm::Type* lit = llvm::Type::getInt64Ty(*ctx_);
+                    if (TypePtr t = lookupExprType(*id)) {
+                        TypePtr r = resolveInInstance(t);
+                        if (r->kind == TypeKind::Bool)
+                            lit = llvm::Type::getInt1Ty(*ctx_);
+                        else if (r->kind == TypeKind::Char)
+                            lit = llvm::Type::getInt32Ty(*ctx_);
+                        else if (r->kind == TypeKind::Int)
+                            lit = llvm::Type::getIntNTy(*ctx_, r->intWidth);
+                    }
                     return llvm::ConstantInt::get(
-                        llvm::Type::getInt64Ty(*ctx_),
-                        static_cast<uint64_t>(cpIt->second), /*isSigned=*/true);
+                        lit, static_cast<uint64_t>(cpIt->second),
+                        /*isSigned=*/true);
                 }
             }
             // Phase 17a: a by-ref capture reads through the env pointer into

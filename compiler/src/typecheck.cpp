@@ -1071,30 +1071,46 @@ public:
         // For generic types the schema's per-decl generic env is active
         // while resolving the field / payload TypeRefs, so a `T` in
         // `struct Box<T> { value: T }` resolves to the schema Var.
-        for (const auto& sd : program.structs) {
-            auto it = structSchemas_.find(sd.name);
-            if (it == structSchemas_.end()) continue; // duplicate
-            if (!it->second.type->structFields.empty()) continue;
-            GenericEnv genEnv = buildGenericEnv(sd.genericParams,
-                                                  it->second.genericVars);
-            currentGenericEnv_ = &genEnv;
-            setConstParamsInScope(sd.genericParams); // Phase 57
-            std::vector<std::pair<std::string, TypePtr>> resolvedFields;
-            resolvedFields.reserve(sd.fields.size());
-            std::unordered_set<std::string> seen;
-            for (const auto& f : sd.fields) {
-                if (!seen.insert(f.name).second) {
-                    error("duplicate field '" + f.name + "' in struct '" +
-                              sd.name + "'",
-                          sd.line, sd.column);
+        // v28 Phase 154: struct field types and enum payloads can reference one
+        // another (`struct H { m: Maybe<i64> }` + `enum Maybe<T> { Yes(T), No }`).
+        // Whichever is resolved first sees the other only as a SHELL (no fields /
+        // no variants), and the resolved field/payload type embeds that empty
+        // shell — so e.g. a generic-enum struct field used to mismatch the value.
+        // Fix: resolve struct fields, then enum payloads, then RE-resolve struct
+        // fields (a second round) now that the enum schemas are complete. The
+        // `reResolve` flag bypasses the already-resolved guard. (enum->struct is
+        // covered by round 1's struct pass running before enums; struct->enum by
+        // the second struct round. One re-round suffices for the common single
+        // level of mutual reference.)
+        auto resolveAllStructFields = [&](bool reResolve) {
+            for (const auto& sd : program.structs) {
+                auto it = structSchemas_.find(sd.name);
+                if (it == structSchemas_.end()) continue; // duplicate
+                if (!reResolve && !it->second.type->structFields.empty())
                     continue;
+                GenericEnv genEnv = buildGenericEnv(sd.genericParams,
+                                                      it->second.genericVars);
+                currentGenericEnv_ = &genEnv;
+                setConstParamsInScope(sd.genericParams); // Phase 57
+                std::vector<std::pair<std::string, TypePtr>> resolvedFields;
+                resolvedFields.reserve(sd.fields.size());
+                std::unordered_set<std::string> seen;
+                for (const auto& f : sd.fields) {
+                    if (!seen.insert(f.name).second) {
+                        if (!reResolve)
+                            error("duplicate field '" + f.name +
+                                      "' in struct '" + sd.name + "'",
+                                  sd.line, sd.column);
+                        continue;
+                    }
+                    resolvedFields.emplace_back(f.name, resolveTypeRef(f.type));
                 }
-                resolvedFields.emplace_back(f.name, resolveTypeRef(f.type));
+                it->second.type->structFields = std::move(resolvedFields);
+                currentGenericEnv_ = nullptr;
+                currentConstParams_.clear();
             }
-            it->second.type->structFields = std::move(resolvedFields);
-            currentGenericEnv_ = nullptr;
-            currentConstParams_.clear();
-        }
+        };
+        resolveAllStructFields(/*reResolve=*/false);
 
         for (const auto& ed : program.enums) {
             auto it = enumSchemas_.find(ed.name);
@@ -1144,6 +1160,11 @@ public:
             currentGenericEnv_ = nullptr;
             currentConstParams_.clear(); // review fix: don't leak const enums
         }
+        // v28 Phase 154: second round — re-resolve struct fields now that every
+        // enum schema carries its full (substituted) variants, so a generic-enum
+        // struct field (`H { m: Maybe<i64> }`) materializes Yes(i64)/No and
+        // unifies with the constructed value.
+        resolveAllStructFields(/*reResolve=*/true);
 
         // Phase 13b / 17b: now that the prelude's generic `Option<T>` enum is
         // fully resolved, register `hashmap_get<V>(m: &HashMap<V>, k: i64)
@@ -1371,6 +1392,10 @@ public:
                     continue;
                 }
                 atypes.push_back(at.name);
+                // v28 Phase 155 (GATs): record the associated type's arity (the
+                // number of generic params it declares), so a projection
+                // `Self::Out<args>` can validate it supplies the right count.
+                traitGatArity_[td.name][at.name] = at.typeParams.size();
             }
             traitAssocTypes_[td.name] = std::move(atypes);
             std::unordered_set<std::string> seenMethod;
@@ -1581,7 +1606,23 @@ public:
                               at.line, at.column);
                         continue;
                     }
-                    resolvedAssoc[at.name] = resolveTypeRef(at.type);
+                    // v28 Phase 155 (GATs): a parameterized binding `type Out<T>
+                    // = Pair<T, T>;` can't be pre-resolved (the RHS has free
+                    // params); store it raw for per-projection substitution. A
+                    // plain (Phase 21b) binding pre-resolves as before. Counts as
+                    // "provided" either way (resolvedAssoc[name] = a placeholder).
+                    if (!at.typeParams.empty()) {
+                        GatBinding gb;
+                        gb.selfTy = forTy;
+                        for (const auto& tp : at.typeParams)
+                            gb.paramNames.push_back(tp.name);
+                        gb.rhs = at.type;
+                        implGatBindings_[typeName][impl.traitName][at.name] =
+                            std::move(gb);
+                        resolvedAssoc[at.name] = forTy; // sentinel: "provided"
+                    } else {
+                        resolvedAssoc[at.name] = resolveTypeRef(at.type);
+                    }
                 }
                 currentGenericEnv_ = savedEnv;
                 for (const auto& want : wantAssoc) {
@@ -2164,6 +2205,7 @@ public:
         result.dynVtablesNeeded = std::move(dynVtablesNeeded_);
         result.assocProjections = std::move(assocProjections_);
         result.implAssocTypes = std::move(implAssocTypes_);
+        result.implGatBindings = std::move(implGatBindings_); // v28 Phase 155
         return result;
     }
 
@@ -2182,6 +2224,16 @@ private:
     struct ConstValue {
         bool isBool = false;
         std::int64_t i = 0;
+        // v28 Phase 152: aggregate const values. `isAgg` marks an array / tuple
+        // / struct (`elems` in order; `fieldNames` parallel for a struct) or an
+        // enum (`enumTag` >= 0, `elems` = the variant's payload). A scalar use
+        // keeps isAgg=false. Aggregates exist so a `const` of these types can be
+        // built + PROJECTED (`A[i]`, `p.field`) at compile time; codegen emits a
+        // runtime use of the const by re-emitting its initializer.
+        bool isAgg = false;
+        int enumTag = -1;
+        std::vector<ConstValue> elems;
+        std::vector<std::string> fieldNames;
     };
     // Raised (and caught at const-eval entry points) when an initializer /
     // array length / const fn cannot be evaluated at compile time, or hits a
@@ -2248,6 +2300,22 @@ private:
         std::unordered_map<std::string,
                            std::unordered_map<std::string, TypePtr>>>
         implAssocTypes_;
+    // v28 Phase 155 (GATs): a trait's associated-type ARITY —
+    // traitGatArity_[trait][assocName] = number of generic params it declares
+    // (`type Out<T>;` -> 1). 0 (or absent) = a plain Phase-21b associated type.
+    std::unordered_map<std::string,
+                       std::unordered_map<std::string, std::size_t>>
+        traitGatArity_;
+    // v28 Phase 155 (GATs): a parameterized impl binding `type Out<T> = Pair<T,
+    // T>;` stored RAW (the RHS has free params), so a projection `Self::Out<i64>`
+    // can substitute the supplied args into it on demand. Uses the result-header
+    // GatBinding so it moves into the result for codegen verbatim.
+    using GatBinding = TypeCheckResult::GatBinding;
+    std::unordered_map<
+        std::string,
+        std::unordered_map<std::string,
+                           std::unordered_map<std::string, GatBinding>>>
+        implGatBindings_;
     // Phase 21b: during signature resolution of a generic fn / impl method, the
     // bound trait of each in-scope generic param's schema Var, keyed by var id.
     // Lets `resolveTypeRef` resolve a `C::Item` projection (C a Var) to the
@@ -2399,6 +2467,14 @@ private:
     // symbolic-length array (recorded, not const-evaluated). Set/cleared in
     // lockstep with currentGenericEnv_.
     std::unordered_set<std::string> currentConstParams_;
+    // v28 Phase 153: each in-scope const-generic param's declared type name
+    // (i64/bool/char), so a value-use of the param has the right type + width.
+    std::unordered_map<std::string, std::string> currentConstParamTypes_;
+    // v28 Phase 153/154: the expected type of the expression currently being
+    // checked, when known from an annotation/coercion target. A struct literal
+    // consults it to adopt const-generic args it can't infer from a field
+    // (`let s: Sel<true> = Sel { .. }`). null = no expectation.
+    TypePtr currentExpectedType_ = nullptr;
     // Phase 61: when checking a call argument that is a closure, the callee's
     // expected fn-typed parameter — so `checkClosure` can infer an unannotated
     // `|x|`'s param type before checking the body. Consumed (cleared) by
@@ -2406,19 +2482,30 @@ private:
     TypePtr expectedArgType_;
     void setConstParamsInScope(const std::vector<ast::TypeParam>& ps) {
         currentConstParams_.clear();
+        currentConstParamTypes_.clear();
         for (const auto& p : ps)
-            if (p.isConst) currentConstParams_.insert(p.name);
+            if (p.isConst) {
+                currentConstParams_.insert(p.name);
+                currentConstParamTypes_[p.name] = p.constTypeName;
+            }
     }
     // Phase 61: an impl method sees BOTH the impl's const params and its own
     // (`impl<.., const CAP> .. for RingBuffer<T, CAP>` + a `fn f<const M>`).
     void setConstParamsInScope(const std::vector<ast::TypeParam>& implPs,
                                const std::vector<ast::TypeParam>& fnPs) {
         currentConstParams_.clear();
+        currentConstParamTypes_.clear();
         for (const auto& p : implPs) {
-            if (p.isConst) currentConstParams_.insert(p.name);
+            if (p.isConst) {
+                currentConstParams_.insert(p.name);
+                currentConstParamTypes_[p.name] = p.constTypeName;
+            }
         }
         for (const auto& p : fnPs)
-            if (p.isConst) currentConstParams_.insert(p.name);
+            if (p.isConst) {
+                currentConstParams_.insert(p.name);
+                currentConstParamTypes_[p.name] = p.constTypeName;
+            }
     }
     // Phase 10a: names of generic params that are effect-row variables in
     // the signature currently being resolved. Active alongside
@@ -3144,7 +3231,13 @@ private:
                       f.second->line, f.second->column);
                 continue;
             }
-            if (!unify(valT, declIt->second)) {
+            // v28 Phase 154: route through coerceOrUnify (the coercion entry
+            // point) rather than a raw unify, so a struct-field value gets the
+            // same bidirectional inference / coercions a fn arg does — an
+            // unannotated `None` / empty container infers its type param from
+            // the field, an int literal narrows, a `Box<Concrete>` coerces to a
+            // `Box<dyn Trait>` field, a `&mut` reborrows to a `&` field.
+            if (!coerceOrUnify(*f.second, valT, declIt->second)) {
                 error("field '" + f.first + "' of struct '" + sl.structName +
                           "' has type " + typeToString(declIt->second) +
                           ", got " + typeToString(valT),
@@ -3228,6 +3321,18 @@ private:
         }
         TypePtr rb = resolve(base);
         if (rb->kind == TypeKind::Var) {
+            // v28 Phase 155: a GAT projection on a BOUNDED GENERIC param
+            // (`C::Out<i64>`) would need the args threaded through
+            // monomorphization — deferred. The concrete-`Self` GAT case (an impl
+            // method) is supported above.
+            if (!tr.assocTypeArgs.empty()) {
+                error("a generic associated-type projection on a bounded "
+                      "generic param ('" + tr.name + "::" + tr.assocName +
+                      "<…>') is not yet supported; use it on a concrete type "
+                      "(e.g. `Self::" + tr.assocName + "<…>` in an impl method)",
+                      tr.line, tr.column);
+                return makeInt();
+            }
             // `C::Item`: find C's bound trait, confirm it declares `Item`, and
             // record a projection placeholder for codegen.
             auto bit = currentVarBound_.find(rb->varId);
@@ -3268,6 +3373,44 @@ private:
         else {
             error("associated type projection on unsupported base type " +
                       typeToString(base),
+                  tr.line, tr.column);
+            return makeInt();
+        }
+        // v28 Phase 155 (GATs): a parameterized projection `Self::Out<i64>` on a
+        // concrete base — substitute the supplied args into the impl's raw
+        // `type Out<T> = ...` binding and resolve it.
+        if (!tr.assocTypeArgs.empty()) {
+            auto gtyIt = implGatBindings_.find(typeName);
+            if (gtyIt != implGatBindings_.end()) {
+                for (const auto& [traitName, table] : gtyIt->second) {
+                    auto bit = table.find(tr.assocName);
+                    if (bit == table.end()) continue;
+                    const GatBinding& gb = bit->second;
+                    if (gb.paramNames.size() != tr.assocTypeArgs.size()) {
+                        error("generic associated type '" + tr.assocName +
+                                  "' of '" + typeName + "' expects " +
+                                  std::to_string(gb.paramNames.size()) +
+                                  " type argument(s), got " +
+                                  std::to_string(tr.assocTypeArgs.size()),
+                              tr.line, tr.column);
+                        return makeInt();
+                    }
+                    // Resolve the supplied args in the CURRENT env, then bind
+                    // Self + the GAT's params and resolve the binding RHS.
+                    GenericEnv env;
+                    env["Self"] = gb.selfTy;
+                    for (std::size_t i = 0; i < gb.paramNames.size(); ++i)
+                        env[gb.paramNames[i]] =
+                            resolveTypeRef(tr.assocTypeArgs[i]);
+                    const GenericEnv* saved = currentGenericEnv_;
+                    currentGenericEnv_ = &env;
+                    TypePtr result = resolveTypeRef(gb.rhs);
+                    currentGenericEnv_ = saved;
+                    return result;
+                }
+            }
+            error("type '" + typeName + "' has no generic associated type '" +
+                      tr.assocName + "'",
                   tr.line, tr.column);
             return makeInt();
         }
@@ -4022,7 +4165,15 @@ private:
                 auto it = env->find(id->name);
                 if (it != env->end()) return it->second;
             }
-            // Not a local — must be another const.
+            // v28 Phase 152: a bare unit enum variant (`None`) in a const expr.
+            auto vl = lookupVariant(id->name);
+            if (vl.enumInstance) {
+                ConstValue agg;
+                agg.isAgg = true;
+                agg.enumTag = static_cast<int>(vl.variantIdx);
+                return agg;
+            }
+            // Not a local / variant — must be another const.
             return evalConstByName(id->name, e);
         }
         if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
@@ -4080,13 +4231,95 @@ private:
         if (auto* blk = dynamic_cast<const ast::BlockExpr*>(&e)) {
             return evalConstBlock(*blk, env, depth);
         }
+        // v28 Phase 152: aggregate const values — array / tuple / struct
+        // literals, enum constructors, and projection out of them.
+        if (auto* al = dynamic_cast<const ast::ArrayLitExpr*>(&e)) {
+            ConstValue agg;
+            agg.isAgg = true;
+            if (al->repeatCount) {
+                // `[value; N]` — N copies of the repeated value.
+                if (al->elements.empty())
+                    constFail("malformed array-repeat in const expr", e);
+                ConstValue v = evalConstExpr(*al->elements[0], env, depth);
+                std::int64_t n = 0;
+                if (!evalConstI64(*al->repeatCount, n) || n < 0)
+                    constFail("array-repeat length must be a non-negative const "
+                              "in a const expr",
+                              e);
+                agg.elems.assign(static_cast<std::size_t>(n), v);
+            } else {
+                for (const auto& el : al->elements)
+                    agg.elems.push_back(evalConstExpr(*el, env, depth));
+            }
+            return agg;
+        }
+        if (auto* tl = dynamic_cast<const ast::TupleLitExpr*>(&e)) {
+            ConstValue agg;
+            agg.isAgg = true;
+            for (const auto& el : tl->elements)
+                agg.elems.push_back(evalConstExpr(*el, env, depth));
+            return agg;
+        }
+        if (auto* sl = dynamic_cast<const ast::StructLitExpr*>(&e)) {
+            ConstValue agg;
+            agg.isAgg = true;
+            for (const auto& [fname, fexpr] : sl->fields) {
+                agg.fieldNames.push_back(fname);
+                agg.elems.push_back(evalConstExpr(*fexpr, env, depth));
+            }
+            return agg;
+        }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+            ConstValue obj = evalConstExpr(*ix->object, env, depth);
+            if (!obj.isAgg || obj.enumTag >= 0)
+                constFail("indexing requires an array/tuple const value", e);
+            ConstValue idx = evalConstExpr(*ix->index, env, depth);
+            if (idx.isBool || idx.isAgg)
+                constFail("array index must be an integer in a const expr", e);
+            if (idx.i < 0 ||
+                static_cast<std::size_t>(idx.i) >= obj.elems.size())
+                constFail("const array index " + std::to_string(idx.i) +
+                              " out of bounds (len " +
+                              std::to_string(obj.elems.size()) + ")",
+                          e);
+            return obj.elems[static_cast<std::size_t>(idx.i)];
+        }
+        if (auto* fe = dynamic_cast<const ast::FieldExpr*>(&e)) {
+            ConstValue obj = evalConstExpr(*fe->object, env, depth);
+            if (!obj.isAgg || obj.enumTag >= 0)
+                constFail("field access requires a struct const value", e);
+            for (std::size_t k = 0; k < obj.fieldNames.size(); ++k)
+                if (obj.fieldNames[k] == fe->fieldName) return obj.elems[k];
+            constFail("unknown field `" + fe->fieldName + "` in const struct value",
+                      e);
+        }
+        if (auto* tf = dynamic_cast<const ast::TupleFieldExpr*>(&e)) {
+            ConstValue obj = evalConstExpr(*tf->object, env, depth);
+            if (!obj.isAgg || obj.enumTag >= 0)
+                constFail("tuple-field access requires a tuple const value", e);
+            if (tf->index >= obj.elems.size())
+                constFail("const tuple index out of bounds", e);
+            return obj.elems[tf->index];
+        }
         if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+            // v28 Phase 152: an enum constructor with a payload in a const expr
+            // (e.g. `Some(5)`). A unit variant arrives as a bare IdentExpr and is
+            // handled by evalConstByName -> lookupVariant below.
+            auto vl = lookupVariant(call->callee);
+            if (vl.enumInstance) {
+                ConstValue agg;
+                agg.isAgg = true;
+                agg.enumTag = static_cast<int>(vl.variantIdx);
+                for (const auto& a : call->args)
+                    agg.elems.push_back(evalConstExpr(*a, env, depth));
+                return agg;
+            }
             return evalConstCall(*call, env, depth);
         }
         constFail("expression is not allowed in a const context (only int/"
                   "bool literals, arithmetic/comparison/unary operators, "
-                  "`if`/`else`, `let`, and calls to `const fn`s are "
-                  "const-evaluable)",
+                  "`if`/`else`, `let`, calls to `const fn`s, and "
+                  "array/tuple/struct/enum aggregates are const-evaluable)",
                   e);
     }
 
@@ -4314,10 +4547,21 @@ private:
     void checkConstItem(const ast::ConstDecl& cd) {
         TypePtr declared = resolveTypeRef(cd.type);
         TypePtr rDeclared = resolve(declared);
+        // v28 Phase 152: a const may be a scalar (i64/bool) OR an aggregate
+        // (array / tuple / struct / enum) whose leaves are const-evaluable. The
+        // evaluator enforces leaf-level evaluability; the type gate just admits
+        // the aggregate shapes here. (char / f64 scalar consts stay a documented
+        // follow-on — the integer evaluator + the const-use codegen width handle
+        // i64/bool today.)
         bool okType = rDeclared->kind == TypeKind::Int ||
-                      rDeclared->kind == TypeKind::Bool;
+                      rDeclared->kind == TypeKind::Bool ||
+                      rDeclared->kind == TypeKind::Array ||
+                      rDeclared->kind == TypeKind::Tuple ||
+                      rDeclared->kind == TypeKind::Struct ||
+                      rDeclared->kind == TypeKind::Enum;
         if (!okType) {
-            error("a `const` must have type i64 or bool in this version, got " +
+            error("a `const` must be a scalar (i64/bool) or an aggregate "
+                  "(array/tuple/struct/enum) of const-evaluable values, got " +
                       typeToString(declared),
                   cd.type.line, cd.type.column);
         }
@@ -4344,11 +4588,18 @@ private:
         try {
             constEvalSteps_ = 0;
             ConstValue v = evalConstByName(cd.name, *cd.value);
-            // v11 fix: wrap the final value to the DECLARED width too, so a
-            // bare-literal or otherwise-unwrapped initializer (`const C: i8 =
-            // 200i8`) is stored at the right width — codegen emits it narrow.
-            if (!v.isBool) v.i = wrapConstToType(v.i, *cd.value);
-            constExprValues_[cd.value.get()] = v;
+            // v28 Phase 152: an AGGREGATE const value (array/tuple/struct/enum)
+            // isn't a scalar immediate — codegen re-emits the initializer at a
+            // runtime use, so only a SCALAR result flows through constExprValues_
+            // (the codegen-facing folded-literal table). The aggregate stays in
+            // constValues_ for compile-time PROJECTION by other const exprs.
+            if (!v.isAgg) {
+                // v11 fix: wrap the final value to the DECLARED width too, so a
+                // bare-literal initializer (`const C: i8 = 200i8`) is stored at
+                // the right width — codegen emits it narrow.
+                if (!v.isBool) v.i = wrapConstToType(v.i, *cd.value);
+                constExprValues_[cd.value.get()] = v;
+            }
         } catch (const ConstEvalError& ce) {
             // Make sure a half-finished evaluation doesn't wedge the
             // in-progress set for later look-ups.
@@ -4422,7 +4673,10 @@ private:
                 try {
                     constEvalSteps_ = 0;
                     ConstValue v = evalConstByName(id->name, *id);
-                    constExprValues_[id] = v;
+                    // v28 Phase 152: only a SCALAR const use is a folded
+                    // immediate; an aggregate const use is re-emitted from its
+                    // initializer by codegen (so don't record a bogus scalar).
+                    if (!v.isAgg) constExprValues_[id] = v;
                 } catch (const ConstEvalError& ce) {
                     // The error is reported once at the const's own definition
                     // site (checkConstItem); avoid a duplicate here, but still
@@ -4435,6 +4689,12 @@ private:
             // value per instance (codegen emits a literal). A local of the same
             // name shadows it (handled by lookupLocal above).
             if (currentConstParams_.count(id->name)) {
+                // v28 Phase 153: the value's type is the param's declared type.
+                auto tit = currentConstParamTypes_.find(id->name);
+                if (tit != currentConstParamTypes_.end()) {
+                    if (tit->second == "bool") return makeBool();
+                    if (tit->second == "char") return makeChar();
+                }
                 return makeInt();
             }
             auto fnIt = fnSchemas_.find(id->name);
@@ -5445,6 +5705,26 @@ private:
                 auto vit = valTypes.find(fname);
                 if (vit != valTypes.end())
                     solveConstLengths(fty, vit->second, constSubst, constSym);
+            }
+            // v28 Phase 153/154: adopt const-generic args from the expected
+            // type (an annotation) for params not inferable from a field.
+            if (currentExpectedType_) {
+                TypePtr et = resolve(currentExpectedType_);
+                if (et->kind == TypeKind::Struct &&
+                    et->structName == sl.structName &&
+                    et->typeArgs.size() >= schema.constParamNames.size()) {
+                    for (std::size_t i = 0; i < schema.constParamNames.size();
+                         ++i) {
+                        const std::string& pn = schema.constParamNames[i];
+                        if (pn.empty() || constSubst.count(pn) ||
+                            constSym.count(pn))
+                            continue;
+                        TypePtr a = resolve(et->typeArgs[i]);
+                        if (a->kind == TypeKind::Int && a->isConstValue)
+                            constSubst[pn] =
+                                static_cast<std::size_t>(a->constValue);
+                    }
+                }
             }
             for (const auto& nm : schema.constParamNames) {
                 if (!nm.empty() && !constSubst.count(nm) && !constSym.count(nm)) {
@@ -8032,7 +8312,14 @@ private:
 
     void checkStmt(const ast::Stmt& s) {
         if (auto* let = dynamic_cast<const ast::LetStmt*>(&s)) {
+            // v28 Phase 153/154: a scalar annotation is an expected-type hint
+            // for the value (lets a struct literal adopt the annotation's
+            // const-generic args). Restored right after the value is checked.
+            TypePtr savedExpected = currentExpectedType_;
+            if (let->annotation && let->tupleNames.empty())
+                currentExpectedType_ = resolveTypeRef(*let->annotation);
             TypePtr valT = checkExpr(*let->value);
+            currentExpectedType_ = savedExpected;
             // Phase 22: tuple-destructuring `let (x, y) = t;`. The RHS must be
             // a tuple of matching arity; each non-`_` name binds to the
             // corresponding element type. `mut` applies to every bound name.

@@ -53,9 +53,10 @@ set +e; "$TMP/p57" >/dev/null; rc=$?; set -e
 [[ "$rc" -ne 7 ]] && { echo "FAIL [accept/aot]: exit $rc expected 7"; exit 1; }
 echo "PASS [decl-shell]: const-generic struct + tuple-let annotation, JIT 7, AOT exit $rc"
 
-# 2. negatives.
-printf 'struct Mat<const N: bool> { data: [i64; N] }\nfn main() -> i64 { 0 }\n' > "$TMP/nb.kd"
-rejects const-non-i64 "$TMP/nb.kd" "must be"
+# 2. negatives. (v28 Phase 153: a const param may now be i64/bool/char — but an
+# unsupported type like f64 is still rejected at the declaration.)
+printf 'struct Mat<const N: f64> { v: i64 }\nfn main() -> i64 { 0 }\n' > "$TMP/nb.kd"
+rejects const-bad-type "$TMP/nb.kd" "must be"
 printf 'fn main() -> i64 { let (a, b): (i64, i64) = (1, 2, 3); a + b }\n' > "$TMP/na.kd"
 rejects tuple-arity "$TMP/na.kd" "tuple"
 printf 'fn main() -> i64 ! { alloc } { let (a, b): (i64, String) = (1, 2); a }\n' > "$TMP/nt.kd"

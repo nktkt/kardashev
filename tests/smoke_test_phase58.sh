@@ -101,11 +101,14 @@ rejects type-in-const-slot "$TMP/typeslot.kd" "const"
 printf 'struct Wrap<T> { x: T }\nfn main() -> i64 { let a: Wrap<3> = Wrap { x: 1 }; 0 }\n' > "$TMP/constslot.kd"
 rejects const-in-type-slot "$TMP/constslot.kd" "expects a type"
 
-# A const param is inferred from the dimensions of the field that carries it;
-# a "phantom" const used in no array field is not inferable from a literal in
-# Phase 58 (a clear error, not a silent miscompile). The dimension carried by
-# a real field is the construction story the roadmap exercises (Mat/Matrix).
-printf 'struct Phantom<const N: i64> { x: i64 }\nfn main() -> i64 { let p: Phantom<4> = Phantom { x: 0 }; p.x }\n' > "$TMP/infer.kd"
+# A const param is inferred from the dimensions of the field that carries it.
+# A "phantom" const used in no array field can't be inferred from a bare literal
+# (a clear error, not a silent miscompile). v28 Phase 153/154: but it CAN be
+# supplied by the binding's type annotation now (expected-type propagation), so
+# only the un-annotated form errors.
+printf 'struct Phantom<const N: i64> { x: i64 }\nfn main() -> i64 { let p = Phantom { x: 0 }; p.x }\n' > "$TMP/infer.kd"
 rejects phantom-uninferable "$TMP/infer.kd" "cannot infer const parameter"
+printf 'struct Phantom2<const N: i64> { x: i64 }\nfn main() -> i64 { let p: Phantom2<4> = Phantom2 { x: 7 }; p.x }\n' > "$TMP/infer2.kd"
+"$KARDC" "$TMP/infer2.kd" >/dev/null 2>&1 && echo "PASS [phantom-from-annotation]: annotation supplies the const arg" || { echo "FAIL [phantom-from-annotation]: annotation should supply N"; exit 1; }
 
 echo "ALL PHASE 58 SMOKE TESTS PASSED"

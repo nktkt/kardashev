@@ -1040,6 +1040,20 @@ private:
             Token assocTok = expect(TokenKind::Identifier,
                                     "associated type name after `::`");
             tr.assocName = assocTok.lexeme;
+            // v28 Phase 155 (GATs): type arguments on the projection —
+            // `Self::Out<i64>`. Consumed here (into `assocTypeArgs`) so the
+            // general type-arg parser below doesn't also claim them.
+            if (accept(TokenKind::Lt)) {
+                if (!check(TokenKind::Gt)) {
+                    while (true) {
+                        tr.assocTypeArgs.push_back(parseTypeRef());
+                        if (!accept(TokenKind::Comma)) break;
+                        if (check(TokenKind::Gt)) break; // trailing comma
+                    }
+                }
+                expect(TokenKind::Gt, "> (after associated-type arguments)");
+            }
+            return tr;
         }
         // Optional type-args: `Name<T1, T2>`. Position is unambiguous because
         // `<` immediately after an Ident in a type-ref slot can only be the
@@ -1066,6 +1080,28 @@ private:
                                       n.lexeme);
                             carg.constArgValue = 0;
                         }
+                        tr.typeArgs.push_back(std::move(carg));
+                    } else if (check(TokenKind::KwTrue) ||
+                               check(TokenKind::KwFalse)) {
+                        // v28 Phase 153: a `bool` const-generic argument.
+                        Token b = consume();
+                        ast::TypeRef carg;
+                        carg.isConstArg = true;
+                        carg.constArgTypeName = "bool";
+                        carg.constArgValue = (b.kind == TokenKind::KwTrue) ? 1 : 0;
+                        carg.line = b.line;
+                        carg.column = b.column;
+                        tr.typeArgs.push_back(std::move(carg));
+                    } else if (check(TokenKind::CharLit)) {
+                        // v28 Phase 153: a `char` const-generic argument.
+                        Token ch = consume();
+                        ast::TypeRef carg;
+                        carg.isConstArg = true;
+                        carg.constArgTypeName = "char";
+                        carg.constArgValue =
+                            static_cast<long long>(std::stoul(ch.lexeme));
+                        carg.line = ch.line;
+                        carg.column = ch.column;
                         tr.typeArgs.push_back(std::move(carg));
                     } else {
                         tr.typeArgs.push_back(parseTypeRef());
@@ -1146,11 +1182,16 @@ private:
                            "e.g. `const N: i64`)");
                     Token tyTok =
                         expect(TokenKind::Identifier, "const-generic param type");
-                    if (tyTok.lexeme != "i64") {
+                    // v28 Phase 153: a const-generic param may be `i64`, `bool`,
+                    // or `char` (its value is still monomorphized by value).
+                    if (tyTok.lexeme != "i64" && tyTok.lexeme != "bool" &&
+                        tyTok.lexeme != "char") {
                         errorAt("const generic parameter `" + tp.name +
-                                    "` must be `i64`, got `" + tyTok.lexeme + "`",
+                                    "` must be `i64`, `bool`, or `char`, got `" +
+                                    tyTok.lexeme + "`",
                                 tyTok.line, tyTok.column);
                     }
+                    tp.constTypeName = tyTok.lexeme;
                 } else {
                     Token tpTok = expect(TokenKind::Identifier,
                                          "generic type parameter name");
@@ -1252,6 +1293,8 @@ private:
                 Token nameTok =
                     expect(TokenKind::Identifier, "associated type name");
                 at.name = nameTok.lexeme;
+                // v28 Phase 155 (GATs): optional generic params `type Out<T>;`.
+                at.typeParams = parseOptionalGenericParams();
                 expect(TokenKind::Semi, ";");
                 decl.assocTypes.push_back(std::move(at));
                 continue;
@@ -1469,6 +1512,9 @@ private:
                 Token nameTok =
                     expect(TokenKind::Identifier, "associated type name");
                 at.name = nameTok.lexeme;
+                // v28 Phase 155 (GATs): the binding's own params `type Out<T> =
+                // Pair<T, T>;` — those names are in scope while parsing the RHS.
+                at.typeParams = parseOptionalGenericParams();
                 expect(TokenKind::Eq, "=");
                 at.type = parseTypeRef();
                 expect(TokenKind::Semi, ";");

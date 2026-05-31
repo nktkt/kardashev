@@ -517,6 +517,11 @@ struct TypeRef {
     // projection Var that codegen materializes per monomorphic instance.
     // Empty for an ordinary (non-projection) type reference.
     std::string assocName;
+    // v28 Phase 155 (GATs): type arguments on the projected associated type —
+    // the `<i64>` in `Self::Out<i64>`. Only meaningful when `assocName` is set;
+    // empty for a non-generic associated type. The resolver substitutes these
+    // into the impl's `type Out<T> = ...` binding.
+    std::vector<TypeRef> assocTypeArgs;
     // Phase 11: `dyn Trait` — an unsized trait-object type. When `isDyn` is
     // true, `name` holds the trait name and `typeArgs` is empty. Combine with
     // `isRef` for `&dyn Trait`, or nest in `Box<...>` for `Box<dyn Trait>`.
@@ -561,6 +566,12 @@ struct TypeRef {
     // substitutes symbolic array lengths `[T; N]`.
     bool isConstArg = false;
     long long constArgValue = 0;
+    // v28 Phase 153: the const-arg's apparent type — `i64` (default, an integer
+    // literal), `bool` (`true`/`false`), or `char` (a char literal). Lets the
+    // typechecker check the arg matches the `const N: <type>` parameter and
+    // gives the const-value Type the right kind. The value is still a long long
+    // (bool 0/1, char codepoint) so monomorphization keys unchanged.
+    std::string constArgTypeName = "i64";
     // Function-type fields (valid only when isFn == true).
     bool isFn = false;
     std::vector<TypeRef> fnParams;
@@ -705,6 +716,12 @@ struct TypeParam {
     // A `[T; N]` length or a use-site `Foo<3>` arg binds it to a compile-time
     // integer; Phase 58 monomorphizes over that value.
     bool isConst = false;
+    // v28 Phase 153: the const param's declared type name — `i64` (default),
+    // `bool`, or `char`. The value is still carried as a `long long` (bool ->
+    // 0/1, char -> codepoint) so the value-based monomorphization keys
+    // unchanged; this drives the value-use TYPE (i64 / bool / char) + the
+    // codegen width (i64 / i1 / i32). Only meaningful when `isConst`.
+    std::string constTypeName = "i64";
     std::size_t line = 1;
     std::size_t column = 1;
 };
@@ -801,6 +818,9 @@ struct MethodSig {
 // (`type Item: Bound` / `type Item = Default`) this phase.
 struct AssocTypeDecl {
     std::string name;
+    // v28 Phase 155 (GATs): generic parameters on the associated type itself —
+    // the `T` in `type Out<T>;`. Empty for a plain (Phase 21b) associated type.
+    std::vector<TypeParam> typeParams;
     std::size_t line = 1;
     std::size_t column = 1;
 };
@@ -810,6 +830,10 @@ struct AssocTypeDecl {
 struct AssocTypeDef {
     std::string name;
     TypeRef type;
+    // v28 Phase 155 (GATs): the binding's own generic parameters — the `T` in
+    // `type Out<T> = Pair<T, T>;`. Those names are in scope in `type` (the RHS).
+    // A projection `Self::Out<i64>` substitutes them with the supplied args.
+    std::vector<TypeParam> typeParams;
     std::size_t line = 1;
     std::size_t column = 1;
 };

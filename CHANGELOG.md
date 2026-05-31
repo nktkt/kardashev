@@ -18,6 +18,40 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.28.0] — Roadmap v28 "const-eval & generics, finished" (Phases 152–156)
+
+Theme: finish the const-evaluator and the generics story — aggregate consts,
+non-i64 const-generics, deeper inference, GATs, and monomorphization control.
+
+### Added
+- **const-eval beyond i64/bool** (Phase 152) — array / tuple / struct / enum
+  `const` values, built and projected (`A[i]`, `p.field`, `t.0`) at compile time
+  with const bounds-checking, and usable as runtime values (the initializer is
+  re-emitted per use, Rust-style).
+- **const-generics beyond i64** (Phase 153) — a `const N` parameter may be
+  `i64`, `bool`, or `char`; a value-use has the param's type at the right width;
+  a binding's type annotation supplies the const arg (expected-type propagation).
+- **bidirectional inference** (Phase 154) — struct-literal field values get the
+  same coercions a fn argument does (an unannotated `None` infers from the field,
+  int literals narrow). Fixed a real mutual-resolution bug: a **generic enum as a
+  struct field** (`struct H { m: Option<i64> }` built with `Some`/`None`) used to
+  fail to type-check; now resolved via a second field-resolution round.
+- **generic associated types (GATs)** (Phase 155) — `type Out<T>;` in a trait,
+  `type Out<T> = Pair<T, T>;` in an impl, projected as `Self::Out<i64>` →
+  `Pair<i64, i64>` (the concrete-`Self` case), with arity checking.
+- **monomorphization control** (Phase 156) — generics are monomorphized on
+  demand and deduplicated (each instance emitted once); a concrete impl
+  **specializes** (beats) a bounded blanket impl; and `kardc --mono-report`
+  prints the monomorphization footprint (code-bloat visibility).
+
+### Deferred (documented follow-ons)
+- `char` / `f64` *scalar* consts (the integer evaluator + const-use codegen
+  width handle i64/bool today).
+- Turbofish (`f::<T>()`) and a GAT projection on a *bounded generic param*
+  (`C::Out<i64>`); enum const-generic params.
+
+718 unit cases (6 suites) + the full smoke sweep green, JIT and AOT.
+
 ## [0.27.0] — Roadmap v27 "strings, text & formatting" (Phases 147–151)
 
 Theme: make text a first-class, correct part of the language — a real `char`

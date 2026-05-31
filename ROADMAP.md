@@ -140,7 +140,8 @@ captures (a true runtime `FnOnce` needs a closure-env drop vtable).*
 - **150** **`Display` / `Debug`** formatting traits wired to format-args.
 - **151** string encode/parse helpers + a grapheme-awareness story.
 
-### v28 — const-eval & generics, finished
+### v28 — const-eval & generics, finished — *done (v0.28.0)*
+*Shipped: 152 const-eval for array/tuple/struct/enum aggregates (+ projection); 153 const-generics beyond i64 (bool/char) + expected-type propagation; 154 bidirectional inference (struct-field coercion + a fixed generic-enum-struct-field mutual-resolution bug); 155 GATs (`type Out<T>;` -> `Self::Out<i64>`, concrete-Self case); 156 monomorphization dedup + specialization (concrete beats blanket) + `--mono-report`. Documented follow-ons: char/f64 SCALAR consts, turbofish + bounded-generic-param GAT projection (`C::Out<i64>`), enum const-generic params.*
 *(Survey: const-eval is i64/bool only (`typecheck.cpp:4206`); const-generics
 i64-only; inference incomplete; no GATs.)*
 - **152** **const-eval beyond i64/bool** — struct / enum / array const values.

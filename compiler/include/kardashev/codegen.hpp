@@ -46,6 +46,11 @@ struct CodegenResult {
     std::unique_ptr<llvm::LLVMContext> context;
     std::unique_ptr<llvm::Module> module;
     std::vector<std::string> errors;
+    // v28 Phase 156: the mangled names of the GENERIC instances monomorphized
+    // for this program (each emitted exactly once — codegen dedups). `kardc
+    // --mono-report` prints these so the monomorphization footprint (a source of
+    // code bloat) is visible.
+    std::vector<std::string> monomorphizedInstances;
     bool ok() const { return errors.empty(); }
 };
 

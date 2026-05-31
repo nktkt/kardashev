@@ -342,6 +342,41 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v28 Phase 156: monomorphization dedup + specialization + --mono-report.
+sh_test(
+    name = "smoke_test_phase156",
+    srcs = ["smoke_test_phase156.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v28 Phase 155: generic associated types (GATs).
+sh_test(
+    name = "smoke_test_phase155",
+    srcs = ["smoke_test_phase155.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v28 Phase 154: bidirectional inference (struct-field coercion + enum/struct resolution).
+sh_test(
+    name = "smoke_test_phase154",
+    srcs = ["smoke_test_phase154.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v28 Phase 153: const-generics beyond i64 (bool/char const params).
+sh_test(
+    name = "smoke_test_phase153",
+    srcs = ["smoke_test_phase153.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v28 Phase 152: const-eval beyond i64/bool (array/tuple/struct/enum consts).
+sh_test(
+    name = "smoke_test_phase152",
+    srcs = ["smoke_test_phase152.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v27 Phase 151: char classification + string encode helpers.
 sh_test(
     name = "smoke_test_phase151",
