@@ -1173,12 +1173,14 @@ cc_test(
     # flaky: on macOS arm64 the in-process LLVM ORC JIT intermittently aborts at
     # teardown (~50% of runs) — confirmed NON-DETERMINISTIC by re-running the
     # identical commit (failed, then passed). It is ASan-clean and deterministic
-    # on Linux, where the full 154-case suite always passes, so a REAL codegen
-    # regression is still caught deterministically by the ubuntu job (this flag is
-    # a no-op there — a deterministic test never retries). Bazel retries up to 3×
-    # so the arm64 JIT non-determinism stops reddening macOS CI. Root cause (an
-    # arm64 ORC-JIT teardown abort) is a v14-hardening follow-up; tracked in the
-    # CI notes. This tolerates the flake WITHOUT masking Linux correctness.
+    # on Linux, where the full 161-case suite always passes, so a REAL codegen
+    # regression is still caught deterministically by the ubuntu job (these
+    # retries are a no-op there — a deterministic test never retries). `flaky`
+    # grants 3 attempts; v22 Phase 127 raises codegen_test to 5 via a scoped
+    # `--flaky_test_attempts` in .bazelrc (~12.5% -> ~3% residual on macOS).
+    # Root cause (an arm64 ORC-JIT teardown abort) needs macOS-arm64 hardware to
+    # diagnose and remains a follow-up. This tolerates the flake WITHOUT masking
+    # Linux correctness.
     flaky = True,
     deps = [
         "//compiler:codegen",
