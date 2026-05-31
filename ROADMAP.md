@@ -190,11 +190,12 @@ Turn anecdotes into numbers and fix the real footprint gaps:
   test is deterministic on Linux, so a genuine regression still fails all 5
   attempts and reddens CI.
 
-### v23 — a second backend (and the leftover platform reach)
+### v23 — a second backend — *the C backend lands (v0.23.0)*
 
 The v22 "second platform/backend" item is its own roadmap: a full second code
 generator is comparable in scope to the LLVM backend it parallels, so it is
-broken out here rather than rushed into a single phase.
+grown by subset rather than rushed. v0.23.0 ships the foundation (the i64/bool
+subset, differentially gated); the remaining bullets continue in later phases.
 
 - ✅ **Phase 129 (the C-source backend, done)** — `kardc --emit-c` walks the
   same typechecked AST that `codegen.cpp` lowers and emits portable C (compiled

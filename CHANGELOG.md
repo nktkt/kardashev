@@ -18,6 +18,43 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.23.0] — Roadmap v23 "a second backend" (Phase 129)
+
+Theme: break the LLVM/Linux monoculture. kardashev gains a **second code
+generator** — a C-source backend — chosen first because it is the most
+*verifiable* option here (a C toolchain is present), so it can be
+differentially gated against the LLVM backend. This release lands the
+foundational subset; the backend grows by subset (structs → enums + match →
+strings/Vec → Drop) in later phases, with WASM and a Windows target as the
+follow-on reach.
+
+### Added
+- **`kardc --emit-c` — a C-source backend** (Phase 129). Walks the same
+  typechecked AST that the LLVM backend lowers and emits portable C, compiled by
+  the system C compiler. The supported SUBSET: `i64`/`bool`, the full operator
+  set (arithmetic / comparison / `&&` `||` / bitwise / unary `- ! ~`), `let`
+  (incl. `mut` + assignment), `if`/`else` as a value, `while`, blocks, direct
+  calls + recursion + mutual recursion (forward prototypes), and top-level
+  `const`. Everything maps to `int64_t`, which is sound for the subset under
+  `cc -fwrapv` (two's-complement overflow, truncating `/`, dividend-signed `%`,
+  arithmetic `>>`, short-circuit `&&`/`||` — all matching kardashev's i64
+  semantics). Expression-oriented constructs (block / `if` / `while` as a value)
+  use GNU statement-expressions `({ ... })`. Anything outside the subset
+  (structs / enums / match / strings / `Vec` / closures / `Drop` / references /
+  generics / async / `mod` / ...) is **refused with a clear error** — the
+  backend never emits wrong C.
+- **Differential gating** (`tests/smoke_test_phase129.sh`) — for each of 12
+  subset programs (recursion, mutual recursion, `while` + nested `if`,
+  early-return, every operator, signed modulo, `const`, `bool`) the LLVM AOT
+  exit code equals the emitted-C (`cc -fwrapv`) exit code; an out-of-subset
+  struct program is cleanly refused. Skips cleanly when no C compiler is present
+  (the LLVM path is unaffected).
+
+The C backend is an `emit_c` library with **no LLVM dependency**; the front-end
+(parse → derive → typecheck → borrow-check) is shared with the LLVM path, and
+emission re-parses the raw user source so the auto-injected prelude doesn't trip
+the subset check. 704 unit cases (6 suites) + the full smoke sweep green.
+
 ## [0.22.0] — Roadmap v22 "ergonomics, docs, and platform hygiene" (Phases 124–127)
 
 Theme: two small but long-requested surface ergonomics, an honest docs pass, and
