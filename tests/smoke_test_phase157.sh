@@ -63,14 +63,15 @@ fn main() -> i64 { pick(Flag { on: true, hi: 9, lo: 1 }) + pick(Flag { on: false
 EOF
 diff_ok struct_bool "$TMP/b.kd"
 
-# 5) the out-of-subset boundary holds: an enum is still refused
+# 5) the out-of-subset boundary holds: a trait is still refused (v29 Phase 158
+#    brought ENUMS into the subset, so the negative is now a trait).
 cat > "$TMP/e.kd" <<'EOF'
-enum E { A, B }
+trait Show { fn show(&self) -> i64; }
 fn main() -> i64 { 0 }
 EOF
 out=$("$KARDC" --emit-c "$TMP/e.kd" 2>&1); rc=$?
-[[ "$rc" -ne 0 ]] || { echo "FAIL [enum_refused]: an enum program should be refused"; exit 1; }
-echo "$out" | grep -qi "outside the C-backend subset" || { echo "FAIL [enum_refused]: missing diagnostic"; exit 1; }
-echo "PASS [enum_refused]: an out-of-subset (enum) program is still refused"
+[[ "$rc" -ne 0 ]] || { echo "FAIL [trait_refused]: a trait program should be refused"; exit 1; }
+echo "$out" | grep -qi "outside the C-backend subset" || { echo "FAIL [trait_refused]: missing diagnostic"; exit 1; }
+echo "PASS [trait_refused]: an out-of-subset (trait) program is still refused"
 
 echo "PASS: Phase 157 — C backend structs (differentially gated vs LLVM)"

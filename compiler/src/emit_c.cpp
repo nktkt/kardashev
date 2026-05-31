@@ -24,6 +24,17 @@ struct CEmitter {
     std::unordered_map<std::string, const StructDecl*> structs_;
     std::unordered_map<std::string, const FnDecl*> fns_;
     std::unordered_map<std::string, std::string> varCType_;
+    // v29 Phase 158: enums lower to a tagged struct `struct E { int64_t tag;
+    // int64_t p0..p<maxArity-1>; }`. variantInfo_ maps a (globally-unique)
+    // variant name to its enum + tag index + the variant's payload TypeRefs.
+    struct VariantInfo {
+        std::string enumName;
+        int tag = 0;
+        const std::vector<TypeRef>* payloadTypes = nullptr;
+    };
+    std::unordered_map<std::string, VariantInfo> variantInfo_;
+    std::unordered_map<std::string, const EnumDecl*> enums_;
+    int matchCounter_ = 0; // fresh names for match temporaries
 
     void err(const std::string& m) { errors.push_back("emit-c: " + m); }
     bool ok() const { return errors.empty(); }
@@ -53,6 +64,7 @@ struct CEmitter {
     bool isStructName(const std::string& n) const {
         return structs_.count(n) > 0;
     }
+    bool isEnumName(const std::string& n) const { return enums_.count(n) > 0; }
 
     // v29 Phase 157: the C type of a kardashev TypeRef. Scalars -> int64_t, a
     // user struct -> `struct <Name>`. Anything else (refs, generics, enums,
@@ -67,16 +79,16 @@ struct CEmitter {
             return "";
         }
         if (isScalarName(t.name)) return "int64_t";
-        if (isStructName(t.name)) {
+        if (isStructName(t.name) || isEnumName(t.name)) {
             if (!t.typeArgs.empty()) {
-                err("generic struct `" + t.name +
+                err("generic type `" + t.name +
                     "<…>` is outside the C-backend subset");
                 return "";
             }
             return "struct " + t.name;
         }
         err("type `" + t.name + "` is outside the C-backend subset "
-            "(i64/bool/struct only)");
+            "(i64/bool/struct/enum only)");
         return "";
     }
 
@@ -112,9 +124,15 @@ struct CEmitter {
         if (auto* sl = dynamic_cast<const StructLitExpr*>(&e))
             return "struct " + sl->structName;
         if (auto* id = dynamic_cast<const IdentExpr*>(&e)) {
+            // v29 Phase 158: a bare unit-variant constructor (`None`) is a value
+            // of its enum type.
+            auto vi = variantInfo_.find(id->name);
+            if (vi != variantInfo_.end()) return "struct " + vi->second.enumName;
             auto it = varCType_.find(id->name);
             return it != varCType_.end() ? it->second : "int64_t";
         }
+        if (auto* mx = dynamic_cast<const MatchExpr*>(&e))
+            return mx->arms.empty() ? "int64_t" : ctypeOfExpr(*mx->arms[0].body);
         if (auto* fe = dynamic_cast<const FieldExpr*>(&e)) {
             std::string objTy = ctypeOfExpr(*fe->object);
             // objTy is "struct <Name>"; find the field's declared type.
@@ -128,6 +146,9 @@ struct CEmitter {
             return "int64_t";
         }
         if (auto* call = dynamic_cast<const CallExpr*>(&e)) {
+            // v29 Phase 158: a variant constructor with a payload (`Some(5)`).
+            auto vi = variantInfo_.find(call->callee);
+            if (vi != variantInfo_.end()) return "struct " + vi->second.enumName;
             auto fit = fns_.find(call->callee);
             if (fit != fns_.end()) return ctype(fit->second->returnType);
             return "int64_t"; // a builtin / scalar call
@@ -145,8 +166,14 @@ struct CEmitter {
             return "INT64_C(" + std::to_string(il->value) + ")";
         if (auto* bl = dynamic_cast<const BoolLitExpr*>(&e))
             return bl->value ? "INT64_C(1)" : "INT64_C(0)";
-        if (auto* id = dynamic_cast<const IdentExpr*>(&e))
+        if (auto* id = dynamic_cast<const IdentExpr*>(&e)) {
+            // v29 Phase 158: a bare unit-variant constructor (`None`).
+            auto vi = variantInfo_.find(id->name);
+            if (vi != variantInfo_.end())
+                return "((struct " + vi->second.enumName + "){ .tag = " +
+                       std::to_string(vi->second.tag) + " })";
             return vname(id->name);
+        }
         if (auto* un = dynamic_cast<const UnaryExpr*>(&e)) {
             const char* op = nullptr;
             switch (un->op) {
@@ -180,6 +207,17 @@ struct CEmitter {
         if (auto* fe = dynamic_cast<const FieldExpr*>(&e))
             return "(" + expr(*fe->object) + ")." + fe->fieldName;
         if (auto* call = dynamic_cast<const CallExpr*>(&e)) {
+            // v29 Phase 158: a variant constructor with a payload (`Some(5)`) —
+            // a compound literal `((struct E){ .tag = idx, .p0 = a, ... })`.
+            auto vi = variantInfo_.find(call->callee);
+            if (vi != variantInfo_.end()) {
+                std::string s = "((struct " + vi->second.enumName +
+                                "){ .tag = " + std::to_string(vi->second.tag);
+                for (std::size_t i = 0; i < call->args.size(); ++i)
+                    s += ", .p" + std::to_string(i) + " = " +
+                         expr(*call->args[i]);
+                return s + " })";
+            }
             std::string s = "kd_" + call->callee + "(";
             for (std::size_t i = 0; i < call->args.size(); ++i) {
                 if (i) s += ", ";
@@ -187,6 +225,10 @@ struct CEmitter {
             }
             return s + ")";
         }
+        // v29 Phase 158: a `match` -> an if/else chain on the tag (enum) or value
+        // (int), each arm binding its payloads, in a statement-expression.
+        if (auto* mx = dynamic_cast<const MatchExpr*>(&e))
+            return matchExpr(*mx);
         if (auto* iff = dynamic_cast<const IfExpr*>(&e)) {
             return "(" + expr(*iff->cond) + " ? " + expr(*iff->thenBranch) +
                    " : " + expr(*iff->elseBranch) + ")";
@@ -211,6 +253,79 @@ struct CEmitter {
             return "({ continue; INT64_C(0); })";
         err("unsupported expression in the C backend (outside the subset)");
         return "0";
+    }
+
+    // v29 Phase 158: lower a `match` to an if/else chain in a statement-
+    // expression. An ENUM scrutinee tests `.tag`; an INT scrutinee tests the
+    // value. A CtorPat binds its scalar payloads from `.p<i>`. Patterns outside
+    // the subset (nested ctor args, char/or/tuple/slice, guards) are refused.
+    std::string matchExpr(const MatchExpr& mx) {
+        std::string scrutCTy = ctypeOfExpr(*mx.scrutinee);
+        std::string resCTy =
+            mx.arms.empty() ? "int64_t" : ctypeOfExpr(*mx.arms[0].body);
+        int id = matchCounter_++;
+        const std::string m = "__m" + std::to_string(id);
+        const std::string r = "__r" + std::to_string(id);
+        std::string s = "({ " + scrutCTy + " " + m + " = (" +
+                        expr(*mx.scrutinee) + "); " + resCTy + " " + r + "; ";
+        bool first = true, hasCatchAll = false;
+        for (const auto& arm : mx.arms) {
+            std::string test, binds;
+            const Pattern& p = *arm.pattern;
+            if (auto* cp = dynamic_cast<const CtorPat*>(&p)) {
+                auto vi = variantInfo_.find(cp->ctorName);
+                if (vi == variantInfo_.end()) {
+                    err("unknown variant `" + cp->ctorName + "` in match");
+                    return "0";
+                }
+                test = m + ".tag == " + std::to_string(vi->second.tag);
+                for (std::size_t i = 0; i < cp->subpatterns.size(); ++i) {
+                    if (auto* vp = dynamic_cast<const VarPat*>(
+                            cp->subpatterns[i].get())) {
+                        std::string pty =
+                            (vi->second.payloadTypes &&
+                             i < vi->second.payloadTypes->size())
+                                ? ctype((*vi->second.payloadTypes)[i])
+                                : "int64_t";
+                        if (pty.empty()) return "0";
+                        binds += pty + " " + vname(vp->name) + " = " + m + ".p" +
+                                 std::to_string(i) + "; ";
+                    } else if (!dynamic_cast<const WildPat*>(
+                                   cp->subpatterns[i].get())) {
+                        err("a nested pattern in a match arm is outside the "
+                            "C-backend subset");
+                        return "0";
+                    }
+                }
+            } else if (auto* vp = dynamic_cast<const VarPat*>(&p)) {
+                auto vi = variantInfo_.find(vp->name);
+                if (vi != variantInfo_.end()) {
+                    test = m + ".tag == " + std::to_string(vi->second.tag);
+                } else {
+                    test = "1";
+                    hasCatchAll = true;
+                    binds = scrutCTy + " " + vname(vp->name) + " = " + m + "; ";
+                }
+            } else if (dynamic_cast<const WildPat*>(&p)) {
+                test = "1";
+                hasCatchAll = true;
+            } else if (auto* lp = dynamic_cast<const LitIntPat*>(&p)) {
+                test = "(" + m + " == INT64_C(" + std::to_string(lp->value) +
+                       "))";
+            } else {
+                err("a match pattern (char/or/tuple/slice/guard) is outside "
+                    "the C-backend subset");
+                return "0";
+            }
+            s += (first ? "if (" : "else if (") + test + ") { " + binds + r +
+                 " = " + expr(*arm.body) + "; } ";
+            first = false;
+        }
+        // The type checker guarantees exhaustiveness; a defensive zero default
+        // keeps the C compiler from warning about a possibly-unset result.
+        if (!hasCatchAll) s += "else { " + r + " = (" + resCTy + "){0}; } ";
+        s += r + "; })";
+        return s;
     }
 
     // A block used as a VALUE: `({ stmts...; tail; })`. A unit block (no tail)
@@ -335,23 +450,59 @@ struct CEmitter {
         if (!program.structs.empty()) out << "\n";
     }
 
+    // v29 Phase 158: emit a tagged-struct typedef per (non-generic, scalar-
+    // payload) enum: `struct E { int64_t tag; int64_t p0..p<maxArity-1>; }`.
+    void emitEnumDefs(const Program& program) {
+        for (const auto& en : program.enums) {
+            if (!en.genericParams.empty()) {
+                err("generic enum `" + en.name +
+                    "` is outside the C-backend subset");
+                return;
+            }
+            std::size_t maxArity = 0;
+            for (const auto& v : en.variants) {
+                if (v.payloadTypes.size() > maxArity)
+                    maxArity = v.payloadTypes.size();
+                for (const auto& pt : v.payloadTypes)
+                    if (ctype(pt) != "int64_t") {
+                        err("enum `" + en.name + "` variant `" + v.name +
+                            "` has a non-scalar payload — outside the "
+                            "C-backend subset (i64/bool payloads only)");
+                        return;
+                    }
+            }
+            out << "struct " << en.name << " {\n  int64_t tag;\n";
+            for (std::size_t i = 0; i < maxArity; ++i)
+                out << "  int64_t p" << i << ";\n";
+            out << "};\n";
+        }
+        if (!program.enums.empty()) out << "\n";
+    }
+
     void emitProgram(const Program& program) {
-        // v29 Phase 157: structs are now in the subset; enums/traits/impls/
+        // v29 Phase 157/158: structs + enums are in the subset; traits/impls/
         // extern/mod remain refused (later phases).
-        if (!program.enums.empty() || !program.traits.empty() ||
-            !program.impls.empty() || !program.externFns.empty() ||
-            !program.mods.empty()) {
-            err("the program uses enums/traits/impls/extern/mod — outside the "
-                "C-backend subset (i64/bool/struct functions + const)");
+        if (!program.traits.empty() || !program.impls.empty() ||
+            !program.externFns.empty() || !program.mods.empty()) {
+            err("the program uses traits/impls/extern/mod — outside the "
+                "C-backend subset (i64/bool/struct/enum functions + const)");
             return;
         }
         for (const auto& s : program.structs) structs_[s.name] = &s;
         for (const auto& fn : program.functions) fns_[fn.name] = &fn;
+        for (const auto& en : program.enums) {
+            enums_[en.name] = &en;
+            for (int i = 0; i < static_cast<int>(en.variants.size()); ++i)
+                variantInfo_[en.variants[i].name] = {
+                    en.name, i, &en.variants[i].payloadTypes};
+        }
 
-        out << "/* Generated by kardashev --emit-c (v29 Phase 157). */\n";
+        out << "/* Generated by kardashev --emit-c (v29 Phase 158). */\n";
         out << "#include <stdint.h>\n\n";
 
         emitStructDefs(program);
+        if (!ok()) return;
+        emitEnumDefs(program);
         if (!ok()) return;
 
         // Top-level consts (a const may reference an earlier one, so keep order).

@@ -81,13 +81,13 @@ echo "PASS [diff]: $pass programs — LLVM AOT exit == C-backend exit, all match
 # non-crashing error (the backend never emits wrong C). v29 Phase 157 brought
 # STRUCTS into the subset, so the negative now uses an ENUM (a later phase).
 cat > "$TMP/bad.kd" <<'EOF'
-enum Color { Red, Green }
+trait Show { fn show(&self) -> i64; }
 fn main() -> i64 { 0 }
 EOF
 set +e; out=$("$KARDC" --emit-c "$TMP/bad.kd" 2>&1); rc=$?; set -e
-[[ "$rc" -eq 0 ]] && { echo "FAIL [reject]: --emit-c should refuse an enum program"; exit 1; }
-[[ "$rc" -ge 128 ]] && { echo "FAIL [reject]: --emit-c crashed (signal $((rc-128))) on an enum program"; exit 1; }
+[[ "$rc" -eq 0 ]] && { echo "FAIL [reject]: --emit-c should refuse a trait program"; exit 1; }
+[[ "$rc" -ge 128 ]] && { echo "FAIL [reject]: --emit-c crashed (signal $((rc-128))) on a trait program"; exit 1; }
 grep -qi "outside the C-backend subset" <<< "$out" || { echo "FAIL [reject]: missing subset diagnostic; got: $out"; exit 1; }
-echo "PASS [reject]: an out-of-subset (enum) program is refused with a clean error"
+echo "PASS [reject]: an out-of-subset (trait) program is refused with a clean error"
 
 echo "PASS: Phase 129 — the --emit-c C backend matches LLVM across the i64/bool subset (differentially gated)"
