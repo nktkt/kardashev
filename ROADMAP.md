@@ -99,7 +99,7 @@ snippet+caret with user-relative lines, 131 parser panic-mode recovery, 132 the
 - **134** `///` **doc comments** captured in the AST and surfaced in LSP hover —
   groundwork for doc-generation (v36).
 
-### v25 — the trait system, finished
+### v25 — the trait system, finished — *done (v0.25.0)*
 *(Survey `lang-typesystem`: default methods, supertraits, blanket impls,
 coherence, associated consts — all "not implemented / monomorphic-only MVP".)*
 - **135** **default trait methods** (with impl override).

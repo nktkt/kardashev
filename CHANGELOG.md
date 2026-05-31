@@ -18,6 +18,40 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.25.0] — Roadmap v25 "the trait system, finished" (Phases 135–140)
+
+Theme: bring the trait system from MVP to a usable vocabulary — default methods,
+inheritance, blanket impls, coherence, associated consts, and the standard
+conversion traits. The enabling utility is a new AST deep-clone.
+
+### Added
+- **Default trait methods** (Phase 135) — a trait method may carry a `{ body }`;
+  impls inherit it unless they override. A `fillTraitDefaults` pass synthesizes
+  the method into each impl (deep-cloning the default via the new `ast_clone`),
+  so the type checker / codegen treat it like a hand-written method (a default
+  may call abstract or other default methods).
+- **Supertraits** (Phase 136) — `trait Ord: Eq + …`; a type impl'ing a trait
+  must also impl every supertrait (enforced at the impl site), and a subtrait's
+  default can call supertrait methods.
+- **Blanket impls** (Phase 137) — `impl<T: Bound> Trait for T`, expanded into
+  concrete `impl Trait for X` for every user type X satisfying the bound.
+- **Coherence / overlap checking** (Phase 138) — two impls of the same trait for
+  the same type (explicit, or two overlapping blankets) are rejected; a precise
+  per-instantiation key keeps `Pair<i64>` and `Pair<bool>` distinct.
+- **Associated consts** (Phase 139) — `const N: T;` in a trait and `const N: T =
+  expr;` in an impl, read as `Type::N()` (desugared to a no-self method).
+- **`From` / `Into` conversion traits** (Phase 140) — added to the prelude
+  (`Target::from(x)` / `x.into()`), generic over the source/target type.
+
+### Internal
+- **`ast_clone`** — a deep-clone of expression/statement/pattern subtrees (the
+  AST is move-only `unique_ptr`s), reused by the default-method and blanket-impl
+  expansion passes.
+
+No new operator sugar (`Deref`/`Index` auto-coercion is v34); `Self::N()` from
+within a method and the `From`↔`Into` auto-blanket are documented follow-ons.
+704 unit cases (6 suites) + the full smoke sweep green, JIT and AOT.
+
 ## [0.24.0] — Roadmap v24 "diagnostics & the developer surface" (Phases 130–134)
 
 Theme: developer experience — the highest-ROI gap on the road to production.
