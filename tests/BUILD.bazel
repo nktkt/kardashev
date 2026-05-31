@@ -342,6 +342,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v28 Phase 154: bidirectional inference (struct-field coercion + enum/struct resolution).
+sh_test(
+    name = "smoke_test_phase154",
+    srcs = ["smoke_test_phase154.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v28 Phase 153: const-generics beyond i64 (bool/char const params).
 sh_test(
     name = "smoke_test_phase153",

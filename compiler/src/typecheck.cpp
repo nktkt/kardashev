@@ -1071,30 +1071,46 @@ public:
         // For generic types the schema's per-decl generic env is active
         // while resolving the field / payload TypeRefs, so a `T` in
         // `struct Box<T> { value: T }` resolves to the schema Var.
-        for (const auto& sd : program.structs) {
-            auto it = structSchemas_.find(sd.name);
-            if (it == structSchemas_.end()) continue; // duplicate
-            if (!it->second.type->structFields.empty()) continue;
-            GenericEnv genEnv = buildGenericEnv(sd.genericParams,
-                                                  it->second.genericVars);
-            currentGenericEnv_ = &genEnv;
-            setConstParamsInScope(sd.genericParams); // Phase 57
-            std::vector<std::pair<std::string, TypePtr>> resolvedFields;
-            resolvedFields.reserve(sd.fields.size());
-            std::unordered_set<std::string> seen;
-            for (const auto& f : sd.fields) {
-                if (!seen.insert(f.name).second) {
-                    error("duplicate field '" + f.name + "' in struct '" +
-                              sd.name + "'",
-                          sd.line, sd.column);
+        // v28 Phase 154: struct field types and enum payloads can reference one
+        // another (`struct H { m: Maybe<i64> }` + `enum Maybe<T> { Yes(T), No }`).
+        // Whichever is resolved first sees the other only as a SHELL (no fields /
+        // no variants), and the resolved field/payload type embeds that empty
+        // shell — so e.g. a generic-enum struct field used to mismatch the value.
+        // Fix: resolve struct fields, then enum payloads, then RE-resolve struct
+        // fields (a second round) now that the enum schemas are complete. The
+        // `reResolve` flag bypasses the already-resolved guard. (enum->struct is
+        // covered by round 1's struct pass running before enums; struct->enum by
+        // the second struct round. One re-round suffices for the common single
+        // level of mutual reference.)
+        auto resolveAllStructFields = [&](bool reResolve) {
+            for (const auto& sd : program.structs) {
+                auto it = structSchemas_.find(sd.name);
+                if (it == structSchemas_.end()) continue; // duplicate
+                if (!reResolve && !it->second.type->structFields.empty())
                     continue;
+                GenericEnv genEnv = buildGenericEnv(sd.genericParams,
+                                                      it->second.genericVars);
+                currentGenericEnv_ = &genEnv;
+                setConstParamsInScope(sd.genericParams); // Phase 57
+                std::vector<std::pair<std::string, TypePtr>> resolvedFields;
+                resolvedFields.reserve(sd.fields.size());
+                std::unordered_set<std::string> seen;
+                for (const auto& f : sd.fields) {
+                    if (!seen.insert(f.name).second) {
+                        if (!reResolve)
+                            error("duplicate field '" + f.name +
+                                      "' in struct '" + sd.name + "'",
+                                  sd.line, sd.column);
+                        continue;
+                    }
+                    resolvedFields.emplace_back(f.name, resolveTypeRef(f.type));
                 }
-                resolvedFields.emplace_back(f.name, resolveTypeRef(f.type));
+                it->second.type->structFields = std::move(resolvedFields);
+                currentGenericEnv_ = nullptr;
+                currentConstParams_.clear();
             }
-            it->second.type->structFields = std::move(resolvedFields);
-            currentGenericEnv_ = nullptr;
-            currentConstParams_.clear();
-        }
+        };
+        resolveAllStructFields(/*reResolve=*/false);
 
         for (const auto& ed : program.enums) {
             auto it = enumSchemas_.find(ed.name);
@@ -1144,6 +1160,11 @@ public:
             currentGenericEnv_ = nullptr;
             currentConstParams_.clear(); // review fix: don't leak const enums
         }
+        // v28 Phase 154: second round — re-resolve struct fields now that every
+        // enum schema carries its full (substituted) variants, so a generic-enum
+        // struct field (`H { m: Maybe<i64> }`) materializes Yes(i64)/No and
+        // unifies with the constructed value.
+        resolveAllStructFields(/*reResolve=*/true);
 
         // Phase 13b / 17b: now that the prelude's generic `Option<T>` enum is
         // fully resolved, register `hashmap_get<V>(m: &HashMap<V>, k: i64)
@@ -3173,7 +3194,13 @@ private:
                       f.second->line, f.second->column);
                 continue;
             }
-            if (!unify(valT, declIt->second)) {
+            // v28 Phase 154: route through coerceOrUnify (the coercion entry
+            // point) rather than a raw unify, so a struct-field value gets the
+            // same bidirectional inference / coercions a fn arg does — an
+            // unannotated `None` / empty container infers its type param from
+            // the field, an int literal narrows, a `Box<Concrete>` coerces to a
+            // `Box<dyn Trait>` field, a `&mut` reborrows to a `&` field.
+            if (!coerceOrUnify(*f.second, valT, declIt->second)) {
                 error("field '" + f.first + "' of struct '" + sl.structName +
                           "' has type " + typeToString(declIt->second) +
                           ", got " + typeToString(valT),
