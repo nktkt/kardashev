@@ -1674,6 +1674,65 @@ void test_fnmut_records_byref_on_node() {
     assert(sawRByValue);
 }
 
+void test_closure_bound_fn_ok() {
+    // Phase 145: a read-only (Fn) closure satisfies an `Fn(..)` bound.
+    expectOk("fn apply(f: Fn(i64) -> i64, x: i64) -> i64 { f(x) }\n"
+             "fn main() -> i64 { let n = 10; apply(|y| y + n, 32) }",
+             "closure_bound_fn_ok");
+}
+
+void test_closure_bound_fnmut_where_fn_errors() {
+    // Phase 145: an FnMut closure (mutates a capture) is rejected where an
+    // `Fn(..)` bound is required.
+    expectErr("fn apply(f: Fn(i64) -> i64, x: i64) -> i64 { f(x) }\n"
+              "fn main() -> i64 { let mut c = 0; "
+              "apply(|y| { c = c + 1; y + c }, 41) }",
+              "closure_bound_fnmut_where_fn_errors");
+}
+
+void test_closure_bound_fn_widens_to_fnmut_ok() {
+    // Phase 145: Fn < FnMut, so a plain Fn closure satisfies an `FnMut(..)`
+    // bound (and an FnMut closure satisfies its own `FnMut(..)` bound).
+    expectOk("fn run(f: FnMut(i64) -> i64) -> i64 { f(20) }\n"
+             "fn main() -> i64 { let k = 22; run(|x| x + k) }",
+             "closure_bound_fn_widens_to_fnmut_ok");
+    expectOk("fn run3(f: FnMut(i64) -> i64) -> i64 { f(1); f(1); f(1) }\n"
+             "fn main() -> i64 { let mut t = 0; "
+             "run3(|x| { t = t + x; t }) }",
+             "closure_bound_fnmut_ok");
+}
+
+void test_closure_records_kind_on_node() {
+    // Phase 145: the typechecker classifies each closure on its node — a
+    // read-only closure is Fn, a mutating one is FnMut.
+    auto pr = parse("fn main() -> i64 { let r = 7; let mut n = 0; "
+                    "let a = |x| x + r; let b = || { n = n + 1; }; "
+                    "a(1) + n }");
+    assert(pr.ok());
+    auto res = typecheck(pr.program);
+    if (!res.ok()) {
+        std::cerr << "[closure_records_kind_on_node] tc failed\n";
+        dump(res);
+        std::abort();
+    }
+    const auto& mainFn = pr.program.functions.back();
+    const kardashev::ast::ClosureExpr* aCl = nullptr;
+    const kardashev::ast::ClosureExpr* bCl = nullptr;
+    for (const auto& stmt : mainFn.body->stmts) {
+        if (auto* let =
+                dynamic_cast<const kardashev::ast::LetStmt*>(stmt.get())) {
+            if (auto* cl = dynamic_cast<const kardashev::ast::ClosureExpr*>(
+                    let->value.get())) {
+                if (let->name == "a") aCl = cl;
+                if (let->name == "b") bCl = cl;
+            }
+        }
+    }
+    assert(aCl != nullptr && bCl != nullptr);
+    assert(aCl->kind == kardashev::ast::ClosureKind::Fn);
+    assert(bCl->kind == kardashev::ast::ClosureKind::FnMut);
+}
+
 void test_fnmut_non_mut_capture_errors() {
     // Mutating a non-`mut` captured binding is rejected.
     expectErrContains(
@@ -3053,6 +3112,10 @@ int main() {
     test_call_value_arg_type_mismatch_errors();
     test_fnmut_by_ref_capture_ok();
     test_fnmut_records_byref_on_node();
+    test_closure_bound_fn_ok();
+    test_closure_bound_fnmut_where_fn_errors();
+    test_closure_bound_fn_widens_to_fnmut_ok();
+    test_closure_records_kind_on_node();
     test_fnmut_non_mut_capture_errors();
     test_fnmut_return_byref_closure_errors();
     test_return_byvalue_closure_ok();

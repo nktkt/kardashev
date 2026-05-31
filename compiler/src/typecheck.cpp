@@ -3634,6 +3634,10 @@ private:
             }
             TypePtr fnTy = makeFunction(std::move(argTys), retTy,
                                         std::move(labels), rowVar);
+            // Phase 145: carry a `Fn(..)`/`FnMut(..)`/`FnOnce(..)` bound onto
+            // the Function type so coerceOrUnify can check a passed closure's
+            // kind satisfies it (a bare `fn(..)` leaves closureBound at -1).
+            fnTy->closureBound = tr.closureBound;
             if (tr.isRef) return makeRef(fnTy, tr.refIsMut);
             return fnTy;
         }
@@ -4658,10 +4662,49 @@ private:
         return true;
     }
 
+    // Phase 145: human names for the closure-kind ranks.
+    static const char* closureKindName(int rank) {
+        switch (rank) {
+            case 0: return "Fn";
+            case 1: return "FnMut";
+            default: return "FnOnce";
+        }
+    }
+
     bool coerceOrUnify(const ast::Expr& srcExpr, const TypePtr& actual,
                        const TypePtr& expected) {
         TypePtr e = resolve(expected);
         TypePtr a = resolve(actual);
+        // Phase 145: when the expected slot is a `Fn(..)`/`FnMut(..)`/
+        // `FnOnce(..)` bound (closureBound >= 0), check the supplied callable's
+        // kind satisfies it. A closure EXPRESSION carries its classified kind
+        // on the node; any other callable (a top-level fn name, a fn-typed
+        // variable) is treated as `Fn` — the most permissive, satisfying every
+        // bound — since a plain fn pointer captures nothing. (Enforcement is
+        // exact for a closure passed directly; a closure routed through an
+        // intermediate `let` binding loses its kind and reads as `Fn`.)
+        if (e->kind == TypeKind::Function && e->closureBound >= 0) {
+            int actualRank = 0;
+            if (auto* cl = dynamic_cast<const ast::ClosureExpr*>(&srcExpr))
+                actualRank = static_cast<int>(cl->kind);
+            if (actualRank > e->closureBound) {
+                error(std::string("this closure is `") +
+                          closureKindName(actualRank) +
+                          "` (it " +
+                          (actualRank == 2
+                               ? "moves a captured value out"
+                               : "mutates a captured binding") +
+                          "), but a `" + closureKindName(e->closureBound) +
+                          "` is required here; an `" +
+                          closureKindName(e->closureBound) +
+                          "` callable may not " +
+                          (e->closureBound == 0
+                               ? "mutate or consume its captures"
+                               : "consume its captures"),
+                      srcExpr.line, srcExpr.column);
+                // fall through to unify so the signature is still checked
+            }
+        }
         // v11: an integer literal narrows to the expected concrete int width
         // (`let x: i32 = 5`, `f(5)` with an i32 param). Only when `actual` is
         // a plain i64 (the literal's default) — never override a real type.
@@ -6238,6 +6281,12 @@ private:
         cl.captures.reserve(order.size());
         std::vector<std::pair<std::string, TypePtr>> captureTypes;
         std::vector<bool> captureMut; // parallel to captureTypes
+        // Phase 145: classify the closure as Fn/FnMut/FnOnce. Start at Fn (0);
+        // a by-ref (mutated) capture lifts it to FnMut (1); a consumed/moved-out
+        // non-Copy capture (a captured `Sender`, which must be moved into the
+        // spawned worker) lifts it to FnOnce (2). The kind is the max over all
+        // captures.
+        int kindRank = 0;
         for (const auto& name : order) {
             TypePtr t = lookupLocal(name);
             if (!t) continue; // defensive — collectFreeVars only adds locals
@@ -6329,6 +6378,14 @@ private:
                           "captures are not yet supported",
                       cl.line, cl.column);
             }
+            // Phase 145: fold this capture into the closure-kind rank. A
+            // mutated capture ⇒ FnMut; a captured `Sender` (moved out into the
+            // worker, hence consumed after one call) ⇒ FnOnce.
+            if (rt->kind == TypeKind::Struct && rt->structName == "Sender")
+                kindRank = std::max(kindRank, 2);
+            else if (mutated)
+                kindRank = std::max(kindRank, 1);
+
             ast::ClosureCapture cap;
             cap.name = name;
             cap.type = t;
@@ -6337,6 +6394,7 @@ private:
             captureTypes.emplace_back(name, t);
             captureMut.push_back(enclosingMut);
         }
+        cl.kind = static_cast<ast::ClosureKind>(kindRank);
 
         // 2) Resolve param types: annotated -> that type; else a fresh Var
         // that unification with the use-context (e.g. a higher-order fn's

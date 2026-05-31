@@ -321,6 +321,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v26 Phase 145: Fn/FnMut/FnOnce closure-trait hierarchy + capture classification.
+sh_test(
+    name = "smoke_test_phase145",
+    srcs = ["smoke_test_phase145.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v26 Phase 144: type aliases (type Name = Target).
 sh_test(
     name = "smoke_test_phase144",

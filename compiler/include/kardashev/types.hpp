@@ -108,6 +108,13 @@ struct Type {
     // codegen's LLVM lowering (the calling convention is unchanged).
     std::vector<std::string> effectLabels;
     TypePtr effectRowVar; // null = closed row (no polymorphic tail)
+    // Phase 145: a closure-trait bound carried by a `Fn(..)`/`FnMut(..)`/
+    // `FnOnce(..)` parameter type — the required maximum closure kind rank
+    // (0 = Fn, 1 = FnMut, 2 = FnOnce). -1 = no bound (a bare `fn(..)` value
+    // type, which accepts a closure of any kind). Purely a compile-time check
+    // (coerceOrUnify); never reaches codegen — the fat-pointer ABI is shared
+    // with plain fn values, so a bound type lowers identically.
+    int closureBound = -1;
 
     // Var:
     int varId = -1;

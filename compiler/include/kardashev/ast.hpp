@@ -553,6 +553,14 @@ struct TypeRef {
     std::vector<TypeRef> fnParams;
     std::shared_ptr<TypeRef> fnRet; // shared_ptr so TypeRef stays copyable
     std::vector<std::string> fnEffects; // effect-row labels (concrete + vars)
+    // Phase 145: a closure-trait bound spelled in type position —
+    // `Fn(A) -> R` / `FnMut(A) -> R` / `FnOnce(A) -> R`. Parsed exactly like a
+    // bare `fn(A) -> R` (same fat-pointer ABI at codegen) but tagged with the
+    // required kind rank: -1 = none (a plain `fn(..)` slot accepts any kind),
+    // 0 = Fn, 1 = FnMut, 2 = FnOnce. A passed closure must classify at or below
+    // this rank (an `Fn` closure satisfies all bounds; an `FnMut` only
+    // `FnMut`/`FnOnce`). Carried onto the Function Type as `closureBound`.
+    int closureBound = -1;
     std::size_t line = 1;
     std::size_t column = 1;
 };
@@ -616,6 +624,15 @@ struct ClosureCapture {
     bool byRef = false; // Phase 17a: captured by reference (FnMut)
 };
 
+// Phase 145: the Fn/FnMut/FnOnce closure-trait hierarchy. Every closure is
+// classified by how it uses its captures: `Fn` only reads them (callable
+// any number of times, immutably), `FnMut` mutates a by-ref capture (callable
+// repeatedly, but exclusively), `FnOnce` consumes/moves a capture out of the
+// env (callable once — e.g. a captured `Sender` moved into a spawned worker).
+// The ranks are ordered Fn < FnMut < FnOnce: an `Fn` closure satisfies every
+// bound, an `FnMut` satisfies `FnMut`/`FnOnce`, an `FnOnce` only `FnOnce`.
+enum class ClosureKind { Fn = 0, FnMut = 1, FnOnce = 2 };
+
 struct ClosureExpr : Expr {
     std::vector<ClosureParam> params;
     ExprPtr body;
@@ -624,6 +641,11 @@ struct ClosureExpr : Expr {
     // env struct and load captures; `mutable` so the checker can populate
     // it while walking an otherwise-const AST.
     mutable std::vector<ClosureCapture> captures;
+    // Phase 145: the closure's classified kind (Fn/FnMut/FnOnce), computed by
+    // the typechecker from its captures. `mutable` for the same const-walk
+    // reason as `captures`. Read at coercion sites to check it satisfies a
+    // required `Fn(..)` / `FnMut(..)` / `FnOnce(..)` parameter bound.
+    mutable ClosureKind kind = ClosureKind::Fn;
 };
 
 // Phase 4: a function's declared effect row. `labels` carries the

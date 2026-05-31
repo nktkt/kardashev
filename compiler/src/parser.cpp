@@ -729,6 +729,50 @@ private:
             tr.fnEffects = std::move(row.labels);
             return tr;
         }
+        // Phase 145: a closure-trait bound in type position — `Fn(A) -> R`,
+        // `FnMut(A) -> R`, `FnOnce(A) -> R`. Parsed exactly like the bare
+        // `fn(..)` form above (same fields, same fat-pointer ABI) but tagged
+        // with the required kind rank in `closureBound`. Only fires when the
+        // identifier is immediately followed by `(` so a plain type named `Fn`
+        // (unlikely, but harmless) still parses as a nominal type.
+        if (check(TokenKind::Identifier) &&
+            (peek().lexeme == "Fn" || peek().lexeme == "FnMut" ||
+             peek().lexeme == "FnOnce") &&
+            peek(1).kind == TokenKind::LParen) {
+            Token kindTok = consume();
+            ast::TypeRef tr;
+            tr.isFn = true;
+            tr.closureBound = kindTok.lexeme == "Fn"     ? 0
+                              : kindTok.lexeme == "FnMut" ? 1
+                                                          : 2;
+            tr.isRef = isRef;
+            tr.refIsMut = refIsMut;
+            tr.line = isRef ? ampTok.line : kindTok.line;
+            tr.column = isRef ? ampTok.column : kindTok.column;
+            expect(TokenKind::LParen, "(");
+            if (!check(TokenKind::RParen)) {
+                while (true) {
+                    tr.fnParams.push_back(parseTypeRef());
+                    if (!accept(TokenKind::Comma)) break;
+                    if (check(TokenKind::RParen)) break; // trailing comma
+                }
+            }
+            expect(TokenKind::RParen, ")");
+            // The return type is optional: `Fn(A)` (no `-> R`) means `-> ()`,
+            // matching how a unit-returning callable reads.
+            if (accept(TokenKind::Arrow)) {
+                tr.fnRet = std::make_shared<ast::TypeRef>(parseTypeRef());
+            } else {
+                ast::TypeRef unitRet;
+                unitRet.name = "unit";
+                unitRet.line = kindTok.line;
+                unitRet.column = kindTok.column;
+                tr.fnRet = std::make_shared<ast::TypeRef>(std::move(unitRet));
+            }
+            ast::EffectRow row = parseOptionalEffectRow();
+            tr.fnEffects = std::move(row.labels);
+            return tr;
+        }
         // Phase 11: `dyn Trait` — an unsized trait object. `dyn` stays an
         // Identifier at the lexer level (like `mut`/`async`), so match by
         // lexeme. The trait name follows; combine with the `&` prefix above
