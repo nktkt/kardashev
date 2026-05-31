@@ -18,6 +18,34 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.19.0] — Roadmap v19 "hardening III" (Phases 112–114)
+
+Theme: push differential fuzzing into the memory-safety and integer-arithmetic
+codegen paths (the bug classes that mattered most), and clean up diagnostics.
+
+### Added
+- **A memory-safety fuzzer** (Phase 112) — random but borrow-valid struct
+  programs: a struct with K fields, each owning a heap `String` and printing a
+  unique id on `Drop`; a random subset of distinct fields is moved into a `Vec`,
+  the rest drop at scope exit. Two oracles: heap-clean under `MALLOC_CHECK_=3`
+  (a double-free aborts) and every id dropped EXACTLY once. A 1 M-iteration loop
+  variant gates on RSS-flatness. 75 programs across 3 seeds are all sound —
+  evidence the v17/v18 per-field move/drop machinery holds across varied inputs.
+- **A division / modulo / bitwise fuzzer** (Phase 113) — the integer paths the
+  arithmetic fuzzer skipped, and a classic miscompile source. Generates random
+  `+ - * / % & | ^ << >>` programs with the kardashev source and a C-semantics
+  Python reference in lockstep (truncating `sdiv`, dividend-signed `srem`,
+  arithmetic `>>`). 200 programs across 4 seeds agree (JIT == AOT == reference) —
+  the lowering follows C/Rust semantics, not Python's floor-mod.
+
+### Fixed
+- **Clean codegen diagnostics** (Phase 114) — when codegen reports a real error
+  it kept emitting placeholder IR, and the module verifier then piled cascading
+  "module verification failed" lines on top of the real diagnostic. Codegen now
+  returns the real errors directly and skips the verifier when any error was
+  already reported; the verifier still runs on the error-free path (catching
+  codegen bugs that emit invalid IR without reporting an error).
+
 ## [0.18.0] — Roadmap v18 "hardening II" (Phases 108–111)
 
 Theme: close the concrete gaps that dogfooding the self-hosted compiler (v15–v17)

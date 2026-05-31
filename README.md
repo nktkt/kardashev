@@ -52,7 +52,7 @@ Effect sets are unioned across the call graph and checked at definition sites; n
 
 ## Status
 
-All eighteen roadmaps (Phases 0–111, **v1–v18**) have shipped and are merged to
+All nineteen roadmaps (Phases 0–114, **v1–v19**) have shipped and are merged to
 `main` — 6 unit suites plus the full smoke-test aggregate pass **JIT and AOT**
 on a cleared clean build. v15–v17 ("self-hosting") build a complete compiler
 *in* kardashev — the north-star arc toward a bootstrap: v15 the front-end
@@ -65,7 +65,9 @@ host-compiler bugs (a field-move double-free, a unit-tail-`match` miscompile, a
 field-assignment leak). v18 ("hardening II") closed the remaining gaps the
 adversarial review exposed (a field re-initialization over-rejection, a
 unit-async compiler crash) and added a **differential fuzzer** (random programs,
-JIT == AOT == reference) over the arithmetic + control-flow codegen paths. v14 ("hardening") made the toolchain trustworthy
+JIT == AOT == reference) over the arithmetic + control-flow codegen paths; v19
+("hardening III") extended the fuzzing into the memory-safety and integer
+(division/modulo/bitwise) paths and cleaned up codegen diagnostics. v14 ("hardening") made the toolchain trustworthy
 across platforms: **macOS CI went green for the first time** (portable leak
 gates), the smoke harness is SIGPIPE-robust, the channel capture-and-keep footgun
 is now a precise compile error, and a JIT-vs-AOT differential sweep over the 9
@@ -416,11 +418,11 @@ generic keys; 29 plugged the Drop leaks 27–28's new droppable values made load
 hole; 31 integrated 27–30 into the self-written capstones; 32 documented the result last.
 Each shipped green before the next, exactly as v1–v4 did.
 
-## Roadmap v19 — in progress
+## Roadmap v19 — shipped
 
-> **Status: in progress** on `feat/roadmap-v19`. "Hardening III" — push the
-> differential fuzzing into the memory-safety paths (the bug class that mattered
-> most), and keep closing gaps.
+> **Status: shipped** (`0.19.0`). "Hardening III" — push the differential fuzzing
+> into the memory-safety and integer (division/modulo/bitwise) codegen paths (the
+> bug classes that mattered most), and clean up codegen diagnostics.
 >
 > - **Phase 112 — a memory-safety fuzzer (done).** Targets the exact bug class
 >   v17/v18 fixed (field-move double-free, leak, per-field drop tracking).
