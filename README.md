@@ -90,7 +90,7 @@ Build with Bazel (`bazel build //... && bazel test //...`) on ubuntu or macOS, o
 
 ## Status
 
-Twenty-one roadmaps (**v1–v21**, Phases 0–123) have shipped and are merged to `main`, each green on a cleared clean build — 6 unit suites plus the full smoke / fuzz aggregate, **JIT and AOT**, on ubuntu + macOS CI. Current release: **[v0.21.0](https://github.com/kardashevlang/kardashev/releases/latest)**.
+Twenty-two roadmaps (**v1–v22**, Phases 0–127) have shipped and are merged to `main`, each green on a cleared clean build — 6 unit suites plus the full smoke / fuzz aggregate, **JIT and AOT**, on ubuntu + macOS CI. Current release: **[v0.22.0](https://github.com/kardashevlang/kardashev/releases/latest)**.
 
 The north-star arc is **self-hosting**: v15–v17 build a complete compiler *in* kardashev — lexer → parser → type checker → code generator + VM, with `examples/selfhost/compile.kd` type-checking a whole function and then compiling + running its body. Dogfooding it found and fixed three real host-compiler bugs. v18–v19 added a differential fuzzer (random programs, `JIT == AOT == reference`) across the arithmetic, control-flow, memory-safety, and integer codegen paths.
 
@@ -121,8 +121,9 @@ The north-star arc is **self-hosting**: v15–v17 build a complete compiler *in*
 | v19 | "hardening III" — memory-safety + integer fuzzers, cleaner diagnostics |
 | v20 | "toward a real bootstrap" — the self-hosted compiler emits **real LLVM IR** (clang → native, differential-gated vs the host), plus **structs** and **enums + match** |
 | v21 | "prove it, and close the gaps" — a **benchmark suite** (kardashev is C-competitive), the `spawn`/`join` **frame-leak fix**, `HashMap`/`HashSet` **`remove`** (backward-shift deletion), and a generic **`Mutex<T>`** cell |
+| v22 | "ergonomics, docs, and platform hygiene" — **`\|\|`** short-circuit logical-or, **`&<temporary>`** (ref-to-rvalue materializes a dropped slot), a docs reconciliation pass, and a tighter macOS flaky-retry scope |
 
-**v21 — prove it, and close the gaps (shipped):** no new syntax — v21 makes the existing language honest. A committed **benchmark suite** (`bench/`, `BENCHMARKS.md`) shows kardashev is **C-competitive** (`fib`/`collatz` ≈ 1.0×, a tight loop ≈ 2.2× C); the async `spawn`/`join` **frame leak** is fixed (RSS-flat); `HashMap`/`HashSet` gained **`remove`** (tombstone-free backward-shift deletion); and `Mutex` is now generic over its **cell type** (guard a struct/`String`/`Vec`, across threads). **Next (v22+) — and an honest take on where this stands vs production languages:** see **[ROADMAP.md](ROADMAP.md)**.
+**v22 — ergonomics, docs, and platform hygiene (shipped):** two long-requested surface ergonomics plus housekeeping. **`||`** short-circuit logical-or lands (disambiguated positionally from the zero-param closure `|| body`, binding looser than `&&`); **`&<temporary>`** makes `&A(10)` / `&5` / `&Foo { .. }` work by materializing the rvalue into a statement-scoped, dropped slot (no more `let`-first workaround; drop-once verified leak-free). The language-reference docs are reconciled with reality (`%`, `&&`/`||`, `&`-of-temporary, enum-typed struct fields were all wrongly listed as unsupported), and the macOS `codegen_test` flaky-retry is raised + regex-scoped. The **second-backend** exploration is broken out to **v23** (a differentially-gated C backend first). **Next (v23+) — and an honest take on where this stands vs production languages:** see **[ROADMAP.md](ROADMAP.md)**.
 
 ## Why "kardashev"?
 

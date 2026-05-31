@@ -18,6 +18,57 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.22.0] — Roadmap v22 "ergonomics, docs, and platform hygiene" (Phases 124–127)
+
+Theme: two small but long-requested surface ergonomics, an honest docs pass, and
+a CI-stability tweak. The second-backend exploration is broken out to **v23** —
+a full second code generator is its own roadmap, planned (a differentially-gated
+C backend first) rather than rushed.
+
+### Added
+- **`||` short-circuit logical-or** (Phase 124) — resolves the long-standing
+  collision with the zero-parameter closure `|| body`. Disambiguation is
+  positional: `||` is logical-or in infix position (after an operand) and a
+  closure at the head of an expression, so the two never alias. `||` binds looser
+  than `&&` (`a || b && c` is `a || (b && c)`); the lowering mirrors `&&`'s
+  short-circuit (a branch + phi, flipped — lhs true skips the rhs). Pinned by
+  `tests/smoke_test_phase124.sh` plus parser-precedence and codegen
+  short-circuit unit cases.
+- **`&<temporary>`** (Phase 125) — taking a reference to an rvalue (`&A(10)`,
+  `&5`, `&Foo { .. }`, `&(a + b)`, a nullary variant `&Nil`) now works: the value
+  is materialized into a fresh entry-block slot (one slot reused across loop
+  iterations, like a `let`), registered as a droppable temporary dropped at scope
+  exit, and its address is the borrow. Previously this was a hard codegen error;
+  the documented `let`-first workaround is no longer needed. A droppable
+  temporary (`&Text(int_to_string(i))`, an enum owning a heap String) in a 500k
+  loop drops exactly once — RSS flat, `MALLOC_CHECK_=3` clean. Pinned by
+  `tests/smoke_test_phase125.sh`.
+
+### Changed
+- **Language-reference + stdlib docs reconciled with reality** (Phase 126) — `%`,
+  `&&`/`||`, `&` of a literal/temporary, and enum-typed struct fields were all
+  listed as deliberate limitations but compile today (Phases 33 / 36 / 124 / 125).
+  The honesty note, the lexical-structure operator table, the enum-field section,
+  the surface-limitations list, and the stale "Roadmap v5" version headers are
+  brought in line with the implementation and the test suite. doclint stays green.
+- **macOS `codegen_test` flaky-retry residual cut** (Phase 127) — the macOS-arm64
+  ORC-JIT teardown abort (~50%/run, confirmed non-deterministic; root cause needs
+  macOS-arm64 hardware) goes from 3 to 5 `--flaky_test_attempts`, scoped by regex
+  to that one target so a real regression elsewhere is never masked (~12.5% → ~3%
+  residual). The test is deterministic on Linux, so a genuine regression still
+  fails all attempts.
+
+### Fixed
+- **`&` of a unit/void temporary no longer crashes** — `&()`, `&{ }`, and
+  `&<unit-returning call>` reach the new materialization path; a void value has
+  no storage, so they now report a clean codegen error instead of building an
+  invalid `alloca void` (which aborted). Guarded in `emitRefToTemporary`.
+
+No new language surface beyond `||` and `&<temporary>`; one deliberate change —
+`&A(10)`-style ref-to-temporary now compiles where it previously errored, so the
+`smoke_test_diag` known-bad program is repointed to `&()`. 704 unit cases (6
+suites) + the full smoke sweep green on Linux, JIT and AOT.
+
 ## [0.21.0] — Roadmap v21 "prove it, and close the gaps" (Phases 120–123)
 
 Theme: turn anecdotes into numbers, fix the real footprint leak, and close the
