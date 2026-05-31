@@ -204,6 +204,15 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v21 Phase 123: generic Mutex<T> cell (was Mutex<i64>). bool/struct/i64 cells,
+# heap-clean Mutex<String> (get-clones/set-drops, RSS-flat), and a struct cell
+# shared across two threads landing on the exact total (mutual exclusion).
+sh_test(
+    name = "smoke_test_mutex_generic",
+    srcs = ["smoke_test_mutex_generic.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v18 Phase 109: a unit-result async future (block_on / .await / spawn+join)
 # crashed the compiler (void load/return); now compiles + runs.
 sh_test(

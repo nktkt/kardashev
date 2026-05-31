@@ -877,16 +877,23 @@ public:
             sch.declaredEffects.add("io");
             fnSchemas_["thread_join"] = std::move(sch);
         }
-        // Phase 19 built-in: `Mutex<i64>` represented as an i64 HANDLE (a
-        // pointer to a heap `{ pthread_mutex_t, i64 value }`). The handle is
+        // Phase 19 / 123 built-in: `Mutex<T>` represented as an i64 HANDLE (a
+        // pointer to a heap `{ pthread_mutex_t, T value }`). The handle is
         // i64 — therefore Copy — so it can be captured BY VALUE into each
         // thread's closure, giving every thread the same underlying lock +
-        // cell (the cross-thread sharing mechanism).
+        // cell (the cross-thread sharing mechanism). v21 Phase 123 lifts the
+        // guarded cell from i64-only to an arbitrary `T`: mutex_new/get/set are
+        // now generic over the cell type (mirroring the handle-based `join<T>` /
+        // `spawn<T>` idiom — T flows via the call's type args; the i64 handle is
+        // type-erased exactly like a thread/async handle). mutex_lock/unlock
+        // stay T-agnostic (they only touch the pthread_mutex_t at offset 0).
         //
-        //   mutex_new(v: i64) -> i64 ! { alloc }   (heap-allocates the block)
+        //   mutex_new<T>(v: T) -> i64 ! { alloc }   (heap-allocates the block)
         {
             FnSchema sch;
-            sch.signature = makeFunction({makeInt()}, makeInt());
+            TypePtr mv = makeFreshVar();
+            sch.signature = makeFunction({mv}, makeInt());
+            sch.genericVars.push_back(mv);
             sch.declaredEffects.add("alloc");
             fnSchemas_["mutex_new"] = std::move(sch);
         }
@@ -906,19 +913,25 @@ public:
             sch.declaredEffects.add("io");
             fnSchemas_["mutex_unlock"] = std::move(sch);
         }
-        //   mutex_get(h: i64) -> i64           (read the guarded cell)
-        //   mutex_set(h: i64, v: i64) -> i64   (write the guarded cell)
+        //   mutex_get<T>(h: i64) -> T           (read the guarded cell)
+        //   mutex_set<T>(h: i64, v: T) -> i64   (write the guarded cell, ret 0)
         // The caller is expected to hold the lock. `io`-effecting for the
         // write (a shared-memory mutation other threads observe); the read is
-        // left pure so reading under a lock needs no extra annotation.
+        // left pure so reading under a lock needs no extra annotation. `get`'s
+        // T appears only in return position (pinned by the call context, like
+        // `join<T>`); an unconstrained `mutex_get` defaults T to i64 in codegen.
         {
             FnSchema sch;
-            sch.signature = makeFunction({makeInt()}, makeInt());
+            TypePtr mv = makeFreshVar();
+            sch.signature = makeFunction({makeInt()}, mv);
+            sch.genericVars.push_back(mv);
             fnSchemas_["mutex_get"] = std::move(sch);
         }
         {
             FnSchema sch;
-            sch.signature = makeFunction({makeInt(), makeInt()}, makeInt());
+            TypePtr mv = makeFreshVar();
+            sch.signature = makeFunction({makeInt(), mv}, makeInt());
+            sch.genericVars.push_back(mv);
             sch.declaredEffects.add("io");
             fnSchemas_["mutex_set"] = std::move(sch);
         }

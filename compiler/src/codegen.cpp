@@ -3473,30 +3473,10 @@ private:
             declaredFns_["thread_join"] = fn;
         }
 
-        // i64 mutex_new(i64 v)
-        {
-            auto* fnTy =
-                llvm::FunctionType::get(i64Ty, {i64Ty}, /*isVarArg=*/false);
-            auto* fn = llvm::Function::Create(
-                fnTy, llvm::Function::ExternalLinkage, "mutex_new",
-                module_.get());
-            fn->getArg(0)->setName("v");
-            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
-            llvm::IRBuilder<> b(entry);
-            uint64_t sz =
-                module_->getDataLayout().getTypeAllocSize(mutexBlkTy_);
-            auto* blk = b.CreateCall(
-                mallocFn_, {llvm::ConstantInt::get(i64Ty, sz)}, "mutex_blk");
-            auto* mtxPtr =
-                b.CreateStructGEP(mutexBlkTy_, blk, 0, "mtx_ptr");
-            b.CreateCall(pthreadMutexInitFn_,
-                         {mtxPtr, llvm::ConstantPointerNull::get(i8PtrTy)});
-            b.CreateStore(
-                fn->getArg(0),
-                b.CreateStructGEP(mutexBlkTy_, blk, 1, "value_slot"));
-            b.CreateRet(b.CreatePtrToInt(blk, i64Ty, "handle"));
-            declaredFns_["mutex_new"] = fn;
-        }
+        // mutex_new/get/set are GENERIC over the cell type T (Phase 123) — they
+        // are emitted per-T by getOrEmitMutexOp (a per-T block `{[64 x i8], T}`),
+        // not here. Only the T-agnostic lock/unlock (which touch the
+        // pthread_mutex_t at field 0) are emitted in this fixed runtime.
 
         // i64 mutex_lock(i64 h) / i64 mutex_unlock(i64 h) — lock/unlock and
         // return 0 (an i64 so it composes in expression position).
@@ -3516,44 +3496,107 @@ private:
         };
         emitMutexLockOp("mutex_lock", pthreadMutexLockFn_);
         emitMutexLockOp("mutex_unlock", pthreadMutexUnlockFn_);
+        (void)voidTy;
+    }
 
-        // i64 mutex_get(i64 h): read the guarded cell.
+    // Phase 123 (v21): per-T Mutex cell ops. The guarded cell is now an
+    // arbitrary T (was i64-only), so mutex_new/get/set are specialized per cell
+    // type over a block `{ [64 x i8] pthread_mutex_t, T value }`. The i64 handle
+    // (PtrToInt of the block) is unchanged — Copy + shareable across threads,
+    // and type-erased exactly like a `join`/`spawn` handle. lock/unlock are
+    // T-agnostic (field 0) and stay in declareThreadRuntime. Mirrors
+    // getOrEmitHashMapOp / getOrEmitChannelOp (emit all three on first use of a
+    // given T, return the requested one).
+    llvm::StructType* mutexBlkTyFor(const TypePtr& T) {
+        auto& ctx = *ctx_;
+        std::string mangle = mangleType(T);
+        auto it = mutexBlkTys_.find(mangle);
+        if (it != mutexBlkTys_.end()) return it->second;
+        auto* mtxStorageTy =
+            llvm::ArrayType::get(llvm::Type::getInt8Ty(ctx), 64);
+        auto* valTy = mapKardashevType(T);
+        auto* blkTy = llvm::StructType::create(
+            ctx, {mtxStorageTy, valTy}, "kd.mutex_blk." + mangle);
+        mutexBlkTys_[mangle] = blkTy;
+        return blkTy;
+    }
+    std::unordered_map<std::string, llvm::StructType*> mutexBlkTys_;
+
+    llvm::Function* getOrEmitMutexOp(const std::string& op, const TypePtr& T) {
+        ensureThreadRuntime();
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        std::string mangle = mangleType(T);
+        std::string want = op + "__mx_" + mangle;
+        if (auto it = declaredFns_.find(want); it != declaredFns_.end())
+            return it->second;
+        auto* blkTy = mutexBlkTyFor(T);
+        auto* valTy = mapKardashevType(T);
+
+        // mutex_new__mx_<T>(T v) -> i64 : malloc the block, init the pthread
+        // mutex (field 0), store v (field 1), return (i64)block.
         {
             auto* fnTy =
-                llvm::FunctionType::get(i64Ty, {i64Ty}, /*isVarArg=*/false);
+                llvm::FunctionType::get(i64Ty, {valTy}, /*isVarArg=*/false);
             auto* fn = llvm::Function::Create(
-                fnTy, llvm::Function::ExternalLinkage, "mutex_get",
-                module_.get());
+                fnTy, llvm::Function::ExternalLinkage,
+                "mutex_new__mx_" + mangle, module_.get());
+            fn->getArg(0)->setName("v");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            uint64_t sz = module_->getDataLayout().getTypeAllocSize(blkTy);
+            auto* blk = b.CreateCall(
+                mallocFn_, {llvm::ConstantInt::get(i64Ty, sz)}, "mutex_blk");
+            b.CreateCall(
+                pthreadMutexInitFn_,
+                {b.CreateStructGEP(blkTy, blk, 0, "mtx_ptr"),
+                 llvm::ConstantPointerNull::get(i8PtrTy)});
+            b.CreateStore(fn->getArg(0),
+                          b.CreateStructGEP(blkTy, blk, 1, "value_slot"));
+            b.CreateRet(b.CreatePtrToInt(blk, i64Ty, "handle"));
+            declaredFns_["mutex_new__mx_" + mangle] = fn;
+        }
+        // mutex_get__mx_<T>(i64 h) -> T : read the guarded cell BY VALUE. The
+        // cell stays in the block, so a non-Copy T must be returned as an
+        // independent CLONE (a bitwise load would alias the block's heap and
+        // double-free under the holder's drop) — for a Copy T the clone folds
+        // to a plain copy.
+        {
+            auto* fnTy =
+                llvm::FunctionType::get(valTy, {i64Ty}, /*isVarArg=*/false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage,
+                "mutex_get__mx_" + mangle, module_.get());
             fn->getArg(0)->setName("h");
             auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
             llvm::IRBuilder<> b(entry);
             auto* blk = b.CreateIntToPtr(fn->getArg(0), i8PtrTy, "blk");
-            auto* v = b.CreateLoad(
-                i64Ty, b.CreateStructGEP(mutexBlkTy_, blk, 1, "value_ptr"),
-                "value");
-            b.CreateRet(v);
-            declaredFns_["mutex_get"] = fn;
+            auto* valP = b.CreateStructGEP(blkTy, blk, 1, "value_ptr");
+            b.CreateRet(b.CreateCall(getOrEmitCloneFn(T), {valP}, "value"));
+            declaredFns_["mutex_get__mx_" + mangle] = fn;
         }
-
-        // i64 mutex_set(i64 h, i64 v): write the guarded cell, return v.
+        // mutex_set__mx_<T>(i64 h, T v) -> i64 : drop the OLD cell value (it is
+        // being overwritten — else a non-Copy T leaks each set), store v, ret 0.
         {
             auto* fnTy = llvm::FunctionType::get(
-                i64Ty, {i64Ty, i64Ty}, /*isVarArg=*/false);
+                i64Ty, {i64Ty, valTy}, /*isVarArg=*/false);
             auto* fn = llvm::Function::Create(
-                fnTy, llvm::Function::ExternalLinkage, "mutex_set",
-                module_.get());
+                fnTy, llvm::Function::ExternalLinkage,
+                "mutex_set__mx_" + mangle, module_.get());
             fn->getArg(0)->setName("h");
             fn->getArg(1)->setName("v");
             auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
             llvm::IRBuilder<> b(entry);
             auto* blk = b.CreateIntToPtr(fn->getArg(0), i8PtrTy, "blk");
-            b.CreateStore(
-                fn->getArg(1),
-                b.CreateStructGEP(mutexBlkTy_, blk, 1, "value_ptr"));
-            (void)voidTy;
-            b.CreateRet(fn->getArg(1));
-            declaredFns_["mutex_set"] = fn;
+            auto* valP = b.CreateStructGEP(blkTy, blk, 1, "value_ptr");
+            b.CreateCall(getOrEmitDropThunk(T), {valP});
+            b.CreateStore(fn->getArg(1), valP);
+            b.CreateRet(llvm::ConstantInt::get(i64Ty, 0));
+            declaredFns_["mutex_set__mx_" + mangle] = fn;
         }
+        auto it = declaredFns_.find(want);
+        return it != declaredFns_.end() ? it->second : nullptr;
     }
 
     // --- Phase 76 (v13): typed MPSC channels (pthread mutex + condition var) ---
@@ -10865,6 +10908,26 @@ private:
                 return builder_->CreateCall(
                 fn, args,
                 fn->getReturnType()->isVoidTy() ? "" : "call_" + call.callee);
+            }
+            // Phase 123: `Mutex<T>` cell ops — generic over the guarded type T.
+            // `mutex_get<T>`'s T is return-only, so an unconstrained call leaves
+            // it an unsolved Var; default to i64 (like join) so it codegens.
+            if ((call.callee == "mutex_new" || call.callee == "mutex_get" ||
+                 call.callee == "mutex_set") &&
+                !concreteTypeArgs.empty()) {
+                TypePtr mt = resolve(concreteTypeArgs[0]);
+                if (mt->kind == TypeKind::Var) mt = makeInt();
+                llvm::Function* fn = getOrEmitMutexOp(call.callee, mt);
+                if (!fn) {
+                    errors_.push_back(
+                        "codegen: cannot specialize " + call.callee);
+                    return llvm::ConstantInt::get(
+                        llvm::Type::getInt64Ty(*ctx_), 0);
+                }
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(fn, args, "call_" + call.callee);
             }
             const std::string mangled =
                 mangleInstance(call.callee, concreteTypeArgs);
