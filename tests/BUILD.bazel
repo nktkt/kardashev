@@ -251,6 +251,14 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v24 Phase 132: opt-in lint (-W) — unused vars + unreachable code, non-fatal,
+# no false positives (closure / fn-ptr / method / match uses recognized).
+sh_test(
+    name = "smoke_test_phase132",
+    srcs = ["smoke_test_phase132.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v18 Phase 109: a unit-result async future (block_on / .await / spawn+join)
 # crashed the compiler (void load/return); now compiles + runs.
 sh_test(

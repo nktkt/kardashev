@@ -124,6 +124,18 @@ cc_library(
     ],
 )
 
+# v24 Phase 132: the lint pass (-W). No LLVM dependency.
+cc_library(
+    name = "lint",
+    srcs = ["src/lint.cpp"],
+    hdrs = ["include/kardashev/lint.hpp"],
+    strip_include_prefix = "include",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":ast",
+    ],
+)
+
 cc_binary(
     name = "kardc",
     srcs = ["src/main.cpp"],
@@ -132,6 +144,7 @@ cc_binary(
         ":borrow_check",
         ":codegen",
         ":emit_c",
+        ":lint",
         ":parser",
         ":typecheck",
         ":version",

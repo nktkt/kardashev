@@ -29,6 +29,7 @@
 #include "kardashev/borrow_check.hpp"
 #include "kardashev/codegen.hpp"
 #include "kardashev/emit_c.hpp"
+#include "kardashev/lint.hpp"
 #include "kardashev/parser.hpp"
 #include "kardashev/typecheck.hpp"
 #include "kardashev/version.hpp"
@@ -1467,7 +1468,7 @@ void renderDiagnostic(std::ostream& os, const char* kind,
         std::size_t fullL = countLines(full), userL = countLines(userSource);
         if (fullL > userL) preludeLines = fullL - userL;
     }
-    os << kind << " error: " << adjustMessagePositions(message, preludeLines)
+    os << kind << ": " << adjustMessagePositions(message, preludeLines)
        << '\n';
     const bool inUser = line > preludeLines;
     const std::size_t dispLine = inUser ? (line - preludeLines) : line;
@@ -1491,7 +1492,7 @@ void reportParseErrors(const kardashev::ParseResult& r,
                        const std::string& src = "",
                        const std::string& file = "<input>") {
     for (const auto& e : r.errors)
-        renderDiagnostic(std::cerr, "parse", e.message, e.line, e.column, src,
+        renderDiagnostic(std::cerr, "parse error", e.message, e.line, e.column, src,
                          file);
 }
 
@@ -1499,7 +1500,7 @@ void reportTypeErrors(const kardashev::TypeCheckResult& r,
                       const std::string& src = "",
                       const std::string& file = "<input>") {
     for (const auto& e : r.errors)
-        renderDiagnostic(std::cerr, "type", e.message, e.line, e.column, src,
+        renderDiagnostic(std::cerr, "type error", e.message, e.line, e.column, src,
                          file);
 }
 
@@ -1507,7 +1508,7 @@ void reportBorrowErrors(const kardashev::BorrowCheckResult& r,
                         const std::string& src = "",
                         const std::string& file = "<input>") {
     for (const auto& e : r.errors)
-        renderDiagnostic(std::cerr, "borrow", e.message, e.line, e.column, src,
+        renderDiagnostic(std::cerr, "borrow error", e.message, e.line, e.column, src,
                          file);
 }
 
@@ -1546,6 +1547,27 @@ std::optional<kardashev::ast::Program> buildProgram(
         return std::nullopt;
     }
     return merged;
+}
+
+// v24 Phase 132: `-W` — run the lint pass and render its (non-fatal) warnings.
+// Lints the prelude-included program but drops anything in the prelude region,
+// so only the user's own code is flagged; lint positions are prelude-relative,
+// which renderDiagnostic offset-corrects to the user's line like any error.
+void emitWarnings(const std::string& srcRaw, const std::string& srcDir,
+                  const std::string& file) {
+    auto progOpt = buildProgram(srcRaw, srcDir);
+    if (!progOpt) return; // a build/parse error: the real compile reports it
+    std::size_t preludeLines = 0;
+    {
+        std::size_t fullL = countLines(applyPrelude(srcRaw)),
+                    userL = countLines(srcRaw);
+        if (fullL > userL) preludeLines = fullL - userL;
+    }
+    for (const auto& w : kardashev::lint(*progOpt)) {
+        if (w.line <= preludeLines) continue; // prelude — not the user's code
+        renderDiagnostic(std::cerr, "warning", w.message, w.line, w.column,
+                         srcRaw, file);
+    }
 }
 
 std::optional<std::int64_t> compileAndRun(const std::string& srcRaw,
@@ -2298,6 +2320,9 @@ int main(int argc, char** argv) {
     bool emitIr = false;
     // v23 Phase 129: `--emit-c` prints portable C source (the second backend).
     bool emitC = false;
+    // v24 Phase 132: `-W` / `--warn` runs the (non-fatal) lint pass before the
+    // normal compile/run.
+    bool warnEnabled = false;
     // Phase 20a: `--test` discovers + JIT-runs `test_*() -> i64` fns.
     bool testMode = false;
     // Phase 20a: optimization level for the post-codegen LLVM pipeline.
@@ -2315,6 +2340,8 @@ int main(int argc, char** argv) {
             emitIr = true;
         } else if (a == "--emit-c") {
             emitC = true;
+        } else if (a == "-W" || a == "--warn") {
+            warnEnabled = true;
         } else if (a == "--test") {
             testMode = true;
         } else if (a == "-O0") {
@@ -2337,6 +2364,7 @@ int main(int argc, char** argv) {
                          "       kardc -g ...               # emit DWARF debug info\n"
                          "       kardc --emit-llvm <file.kd> # print LLVM IR to stdout\n"
                          "       kardc --emit-c <file.kd>   # print C source (i64/bool subset) to stdout\n"
+                         "       kardc -W <file.kd>         # lint: warn on unused vars + unreachable code\n"
                          "       kardc --no-cache ...       # bypass the AOT compile cache\n"
                          "       kardc --version            # print the toolchain version\n";
             return 0;
@@ -2350,6 +2378,12 @@ int main(int argc, char** argv) {
             }
             inputPath = std::move(a);
         }
+    }
+
+    // v24 Phase 132: `-W` lints the input (non-fatal) before the normal flow.
+    if (warnEnabled && !inputPath.empty()) {
+        if (auto src = readFile(inputPath))
+            emitWarnings(*src, dirOf(inputPath), inputPath);
     }
 
     if (testMode) {
