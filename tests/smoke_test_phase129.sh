@@ -77,16 +77,17 @@ differential "mutual-rec" 'fn even(n: i64) -> bool { if n == 0 { true } else { o
 differential "nested-if"  'fn cl(x: i64) -> i64 { if x < 0 { 0 } else { if x > 100 { 100 } else { x } } } fn main() -> i64 { cl(150) - cl(0 - 5) + cl(42) }'
 echo "PASS [diff]: $pass programs — LLVM AOT exit == C-backend exit, all matched"
 
-# Out-of-subset: a struct program must be REFUSED with a clean, non-crashing
-# error (the backend never emits wrong C).
+# Out-of-subset: an out-of-subset program must be REFUSED with a clean,
+# non-crashing error (the backend never emits wrong C). v29 Phase 157 brought
+# STRUCTS into the subset, so the negative now uses an ENUM (a later phase).
 cat > "$TMP/bad.kd" <<'EOF'
-struct P { x: i64 }
-fn main() -> i64 { let p = P { x: 5 }; p.x }
+enum Color { Red, Green }
+fn main() -> i64 { 0 }
 EOF
 set +e; out=$("$KARDC" --emit-c "$TMP/bad.kd" 2>&1); rc=$?; set -e
-[[ "$rc" -eq 0 ]] && { echo "FAIL [reject]: --emit-c should refuse a struct program"; exit 1; }
-[[ "$rc" -ge 128 ]] && { echo "FAIL [reject]: --emit-c crashed (signal $((rc-128))) on a struct program"; exit 1; }
+[[ "$rc" -eq 0 ]] && { echo "FAIL [reject]: --emit-c should refuse an enum program"; exit 1; }
+[[ "$rc" -ge 128 ]] && { echo "FAIL [reject]: --emit-c crashed (signal $((rc-128))) on an enum program"; exit 1; }
 grep -qi "outside the C-backend subset" <<< "$out" || { echo "FAIL [reject]: missing subset diagnostic; got: $out"; exit 1; }
-echo "PASS [reject]: an out-of-subset (struct) program is refused with a clean error"
+echo "PASS [reject]: an out-of-subset (enum) program is refused with a clean error"
 
 echo "PASS: Phase 129 — the --emit-c C backend matches LLVM across the i64/bool subset (differentially gated)"
