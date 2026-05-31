@@ -69,6 +69,39 @@ struct CEmitter {
         return structs_.count(n) > 0;
     }
     bool isEnumName(const std::string& n) const { return enums_.count(n) > 0; }
+    // v30 Phase 162: the set of String builtins this program calls (so the C
+    // runtime emits only what's used). A call to one of these (or a String type
+    // / string literal) opts the program into the String runtime.
+    bool usesString_ = false;
+    bool programCallsStringBuiltin_ = false; // set by the pre-scan
+    // v30 Phase 162: escape a kardashev string's bytes into a C string literal.
+    static std::string cStringLit(const std::string& s) {
+        std::string out = "\"";
+        for (unsigned char c : s) {
+            switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\t': out += "\\t"; break;
+            case '\r': out += "\\r"; break;
+            default:
+                if (c >= 0x20 && c < 0x7F) out += static_cast<char>(c);
+                else {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\x%02x", c);
+                    out += buf;
+                }
+            }
+        }
+        return out + "\"";
+    }
+    static bool isStringBuiltin(const std::string& n) {
+        static const std::set<std::string> b = {
+            "string_new", "str_len", "str_char_at", "str_push_byte",
+            "string_push_str", "print_str", "print_string", "print_no_nl",
+            "println", "int_to_string", "str_eq", "str_substring", "print"};
+        return b.count(n) > 0;
+    }
 
     // v29 Phase 157: the C type of a kardashev TypeRef. Scalars -> int64_t, a
     // user struct -> `struct <Name>`. Anything else (refs, generics, enums,
@@ -98,6 +131,8 @@ struct CEmitter {
         // which the caller (an ExprStmt) discards. Keeps the uniform
         // `return <block value>;` lowering for a void-like function.
         if (t.name == "unit") return "int64_t";
+        // v30 Phase 162: String -> the C runtime's `struct kdstr`.
+        if (t.name == "String") { usesString_ = true; return "struct kdstr"; }
         if (isScalarName(t.name)) return "int64_t";
         if (isStructName(t.name) || isEnumName(t.name)) {
             if (!t.typeArgs.empty()) {
@@ -141,6 +176,11 @@ struct CEmitter {
     // `let` with no annotation, a compound literal, etc.). The AST is already
     // typechecked, so this structural derivation is sound for the subset.
     std::string ctypeOfExpr(const Expr& e) {
+        // v30 Phase 162: a string literal + the String-returning builtins.
+        if (dynamic_cast<const StringLitExpr*>(&e)) {
+            usesString_ = true;
+            return "struct kdstr";
+        }
         if (auto* sl = dynamic_cast<const StructLitExpr*>(&e))
             return "struct " + sl->structName;
         if (auto* id = dynamic_cast<const IdentExpr*>(&e)) {
@@ -185,7 +225,14 @@ struct CEmitter {
             if (vi != variantInfo_.end()) return "struct " + vi->second.enumName;
             auto fit = fns_.find(call->callee);
             if (fit != fns_.end()) return ctype(fit->second->returnType);
-            return "int64_t"; // a builtin / scalar call
+            // v30 Phase 162: String-returning builtins.
+            if (call->callee == "string_new" ||
+                call->callee == "int_to_string" ||
+                call->callee == "str_substring") {
+                usesString_ = true;
+                return "struct kdstr";
+            }
+            return "int64_t"; // a scalar builtin call
         }
         if (auto* iff = dynamic_cast<const IfExpr*>(&e))
             return ctypeOfExpr(*iff->thenBranch);
@@ -200,6 +247,15 @@ struct CEmitter {
             return "INT64_C(" + std::to_string(il->value) + ")";
         if (auto* bl = dynamic_cast<const BoolLitExpr*>(&e))
             return bl->value ? "INT64_C(1)" : "INT64_C(0)";
+        // v30 Phase 162: a string literal -> a borrowed kdstr { data, len,
+        // cap=0 } over a C string literal (cap==0 = read-only, never freed,
+        // copy-on-write on mutation — same convention as the LLVM backend).
+        if (auto* sl = dynamic_cast<const StringLitExpr*>(&e)) {
+            usesString_ = true;
+            return "((struct kdstr){ .data = (char*)" + cStringLit(sl->value) +
+                   ", .len = INT64_C(" + std::to_string(sl->value.size()) +
+                   "), .cap = INT64_C(0) })";
+        }
         if (auto* id = dynamic_cast<const IdentExpr*>(&e)) {
             // v29 Phase 158: a bare unit-variant constructor (`None`).
             auto vi = variantInfo_.find(id->name);
@@ -264,6 +320,9 @@ struct CEmitter {
                          expr(*call->args[i]);
                 return s + " })";
             }
+            // v30 Phase 162: a String builtin opts the program into the C
+            // String runtime (emitted up front as `kd_<name>` definitions).
+            if (isStringBuiltin(call->callee)) usesString_ = true;
             std::string s = "kd_" + call->callee + "(";
             for (std::size_t i = 0; i < call->args.size(); ++i) {
                 if (i) s += ", ";
@@ -575,6 +634,150 @@ struct CEmitter {
         if (!program.enums.empty()) out << "\n";
     }
 
+    // v30 Phase 162: does any signature mention String? (A pre-scan so the C
+    // String runtime is emitted before the fns that use it. A String-builtin
+    // call inside a body also opts in, but a program that calls a string builtin
+    // necessarily has a String value somewhere a signature/let exposes; to be
+    // safe we also scan const/fn return+param types here.)
+    // v30 Phase 162: recursively scan an expression for a String-builtin call or
+    // a string literal (so the runtime is emitted up front, before the bodies).
+    bool exprUsesString(const Expr* e) {
+        if (!e) return false;
+        if (dynamic_cast<const StringLitExpr*>(e)) return true;
+        if (auto* c = dynamic_cast<const CallExpr*>(e)) {
+            if (isStringBuiltin(c->callee)) return true;
+            for (auto& a : c->args) if (exprUsesString(a.get())) return true;
+            return false;
+        }
+        if (auto* b = dynamic_cast<const BinaryExpr*>(e))
+            return exprUsesString(b->lhs.get()) || exprUsesString(b->rhs.get());
+        if (auto* u = dynamic_cast<const UnaryExpr*>(e))
+            return exprUsesString(u->operand.get());
+        if (auto* r = dynamic_cast<const RefExpr*>(e))
+            return exprUsesString(r->operand.get());
+        if (auto* f = dynamic_cast<const FieldExpr*>(e))
+            return exprUsesString(f->object.get());
+        if (auto* iff = dynamic_cast<const IfExpr*>(e))
+            return exprUsesString(iff->cond.get()) ||
+                   exprUsesString(iff->thenBranch.get()) ||
+                   exprUsesString(iff->elseBranch.get());
+        if (auto* w = dynamic_cast<const WhileExpr*>(e))
+            return exprUsesString(w->cond.get()) ||
+                   exprUsesString(w->body.get());
+        if (auto* lp = dynamic_cast<const LoopExpr*>(e))
+            return exprUsesString(lp->body.get());
+        if (auto* fo = dynamic_cast<const ForExpr*>(e))
+            return exprUsesString(fo->iter.get()) ||
+                   exprUsesString(fo->body.get());
+        if (auto* mx = dynamic_cast<const MatchExpr*>(e)) {
+            if (exprUsesString(mx->scrutinee.get())) return true;
+            for (auto& arm : mx->arms)
+                if (exprUsesString(arm.body.get())) return true;
+            return false;
+        }
+        if (auto* sl = dynamic_cast<const StructLitExpr*>(e)) {
+            for (auto& f : sl->fields)
+                if (exprUsesString(f.second.get())) return true;
+            return false;
+        }
+        if (auto* blk = dynamic_cast<const BlockExpr*>(e)) {
+            for (auto& st : blk->stmts) {
+                if (auto* l = dynamic_cast<const LetStmt*>(st.get()))
+                    if (exprUsesString(l->value.get())) return true;
+                if (auto* es = dynamic_cast<const ExprStmt*>(st.get()))
+                    if (exprUsesString(es->expr.get())) return true;
+                if (auto* as = dynamic_cast<const AssignStmt*>(st.get()))
+                    if (exprUsesString(as->value.get()) ||
+                        exprUsesString(as->target.get())) return true;
+                if (auto* rs = dynamic_cast<const ReturnStmt*>(st.get()))
+                    if (exprUsesString(rs->value.get())) return true;
+            }
+            return exprUsesString(blk->tail.get());
+        }
+        return false;
+    }
+
+    bool programUsesString(const Program& program) {
+        auto mentions = [](const TypeRef& t) {
+            return t.name == "String";
+        };
+        for (const auto& c : program.consts)
+            if (mentions(c.type)) return true;
+        for (const auto& s : program.structs)
+            for (const auto& f : s.fields)
+                if (mentions(f.type)) return true;
+        for (const auto& fn : program.functions) {
+            if (mentions(fn.returnType)) return true;
+            for (const auto& p : fn.params)
+                if (mentions(p.type)) return true;
+        }
+        // Fall back to a textual probe of the whole program's call names: a
+        // program may only touch String via builtins (e.g. print_str(&"x")).
+        return programCallsStringBuiltin_;
+    }
+
+    // v30 Phase 162: a faithful C re-implementation of the String runtime the
+    // LLVM backend builds as IR. `struct kdstr { char* data; int64_t len;
+    // int64_t cap; }`; cap==0 marks a borrowed/read-only literal (never freed),
+    // so a mutation copies-on-write to a heap buffer first. Reads work uniformly
+    // on borrowed + heap strings. Semantics mirror codegen.cpp's builtins
+    // exactly (so the differential gate holds): str_char_at clamps OOB to -1,
+    // str_substring clamps, str_eq is byte-exact, push grows by doubling,
+    // int_to_string is decimal, the print fns use the same printf formats.
+    void emitStringRuntime() {
+        out << "#include <stdlib.h>\n#include <string.h>\n#include <stdio.h>\n";
+        out << "struct kdstr { char* data; int64_t len; int64_t cap; };\n";
+        out <<
+"static void kd__str_reserve(struct kdstr* s, int64_t need) {\n"
+"  if (s->cap == 0) { /* borrowed: copy-on-write */\n"
+"    int64_t nc = need > 8 ? need : 8; char* nb = (char*)malloc((size_t)nc);\n"
+"    if (s->len > 0 && s->data) memcpy(nb, s->data, (size_t)s->len);\n"
+"    s->data = nb; s->cap = nc; return; }\n"
+"  if (s->cap >= need) return;\n"
+"  int64_t nc = s->cap * 2; if (nc < need) nc = need;\n"
+"  s->data = (char*)realloc(s->data, (size_t)nc); s->cap = nc;\n"
+"}\n"
+"static struct kdstr kd_string_new(void) {\n"
+"  struct kdstr s; s.data = 0; s.len = 0; s.cap = 0; return s; /* lazy alloc */\n"
+"}\n"
+"static int64_t kd_str_len(struct kdstr* s) { return s->len; }\n"
+"static int64_t kd_str_char_at(struct kdstr* s, int64_t i) {\n"
+"  if (i < 0 || i >= s->len) return -1;\n"
+"  return (int64_t)(unsigned char)s->data[i];\n"
+"}\n"
+"static int64_t kd_str_push_byte(struct kdstr* s, int64_t b) {\n"
+"  kd__str_reserve(s, s->len + 1); s->data[s->len] = (char)(unsigned char)b;\n"
+"  s->len += 1; return 0;\n"
+"}\n"
+"static int64_t kd_string_push_str(struct kdstr* s, struct kdstr o) {\n"
+"  if (o.len > 0) { kd__str_reserve(s, s->len + o.len);\n"
+"    memcpy(s->data + s->len, o.data, (size_t)o.len); s->len += o.len; }\n"
+"  if (o.cap != 0) free(o.data); /* `other` is moved-in: free a heap-owned arg */\n"
+"  return 0;\n"
+"}\n"
+"static int64_t kd_str_eq(struct kdstr* a, struct kdstr* b) {\n"
+"  if (a->len != b->len) return 0;\n"
+"  return memcmp(a->data, b->data, (size_t)a->len) == 0 ? 1 : 0;\n"
+"}\n"
+"static struct kdstr kd_str_substring(struct kdstr* s, int64_t start, int64_t len) {\n"
+"  if (start < 0) start = 0; if (start > s->len) start = s->len;\n"
+"  if (len < 0) len = 0; if (start + len > s->len) len = s->len - start;\n"
+"  struct kdstr r; r.cap = len > 0 ? len : 1; r.data = (char*)malloc((size_t)r.cap);\n"
+"  if (len > 0) memcpy(r.data, s->data + start, (size_t)len); r.len = len; return r;\n"
+"}\n"
+"static struct kdstr kd_int_to_string(int64_t v) {\n"
+"  char buf[24]; int n = snprintf(buf, sizeof(buf), \"%lld\", (long long)v);\n"
+"  struct kdstr r; r.cap = n > 0 ? n : 1; r.data = (char*)malloc((size_t)r.cap);\n"
+"  if (n > 0) memcpy(r.data, buf, (size_t)n); r.len = n > 0 ? n : 0; return r;\n"
+"}\n"
+"static int64_t kd_print_str(struct kdstr* s) { printf(\"%.*s\\n\", (int)s->len, s->data); return 0; }\n"
+"static int64_t kd_print_string(struct kdstr* s) { return kd_print_str(s); }\n"
+"static int64_t kd_println(struct kdstr* s) { return kd_print_str(s); }\n"
+"static int64_t kd_print_no_nl(struct kdstr* s) { printf(\"%.*s\", (int)s->len, s->data); return 0; }\n"
+"static int64_t kd_print(int64_t v) { printf(\"%lld\\n\", (long long)v); return 0; }\n";
+        out << "\n";
+    }
+
     void emitProgram(const Program& program) {
         // v29 Phase 157/158: structs + enums are in the subset; traits/impls/
         // extern/mod remain refused (later phases).
@@ -593,13 +796,23 @@ struct CEmitter {
                     en.name, i, &en.variants[i].payloadTypes};
         }
 
-        out << "/* Generated by kardashev --emit-c (v29 Phase 158). */\n";
-        out << "#include <stdint.h>\n\n";
+        out << "/* Generated by kardashev --emit-c (v30 Phase 162). */\n";
+        out << "#include <stdint.h>\n";
 
         emitStructDefs(program);
         if (!ok()) return;
         emitEnumDefs(program);
         if (!ok()) return;
+        // v30 Phase 162: the String runtime (emitted only if the program uses
+        // String). Pre-scan every fn body for a string literal / builtin call so
+        // the runtime is emitted before the fns that reference it.
+        for (const auto& fn : program.functions)
+            if (fn.body && exprUsesString(fn.body.get()))
+                programCallsStringBuiltin_ = true;
+        for (const auto& c : program.consts)
+            if (exprUsesString(c.value.get()))
+                programCallsStringBuiltin_ = true;
+        if (programUsesString(program)) emitStringRuntime();
 
         // Top-level consts (a const may reference an earlier one, so keep order).
         for (const auto& c : program.consts) {
