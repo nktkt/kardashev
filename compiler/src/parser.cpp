@@ -954,6 +954,14 @@ private:
         // Phase 21a: trait type params `trait Name<T0, T1> { ... }`. Mirrors
         // struct/enum/fn generics (the `<` after a trait name is unambiguous).
         decl.genericParams = parseOptionalGenericParams();
+        // v25 Phase 136: optional supertrait bounds `trait Ord: Eq + Hash { … }`.
+        if (accept(TokenKind::Colon)) {
+            while (true) {
+                Token superTok = expect(TokenKind::Identifier, "a supertrait name");
+                decl.supertraits.push_back(superTok.lexeme);
+                if (!accept(TokenKind::Plus)) break;
+            }
+        }
         expect(TokenKind::LBrace, "{");
         while (!check(TokenKind::RBrace) && !check(TokenKind::EndOfInput)) {
             if (errors_.size() > 20) break;
@@ -972,10 +980,50 @@ private:
                 decl.assocTypes.push_back(std::move(at));
                 continue;
             }
+            // v25 Phase 139: a trait associated const `const N: T;` desugars to
+            // a no-self method signature `fn N() -> T;`.
+            if (check(TokenKind::KwConst) && peek(1).kind != TokenKind::KwFn) {
+                decl.methods.push_back(parseTraitAssocConst());
+                continue;
+            }
             decl.methods.push_back(parseMethodSig());
         }
         expect(TokenKind::RBrace, "}");
         return decl;
+    }
+
+    // v25 Phase 139: `const N: T;` in a trait -> a no-self method sig.
+    ast::MethodSig parseTraitAssocConst() {
+        Token c = expect(TokenKind::KwConst, "const");
+        Token name = expect(TokenKind::Identifier, "associated const name");
+        expect(TokenKind::Colon, ":");
+        ast::MethodSig sig;
+        sig.name = name.lexeme;
+        sig.returnType = parseTypeRef();
+        sig.line = c.line;
+        sig.column = c.column;
+        expect(TokenKind::Semi, ";");
+        return sig;
+    }
+
+    // v25 Phase 139: `const N: T = expr;` in an impl -> `fn N() -> T { expr }`.
+    ast::FnDecl parseImplAssocConst() {
+        Token c = expect(TokenKind::KwConst, "const");
+        Token name = expect(TokenKind::Identifier, "associated const name");
+        expect(TokenKind::Colon, ":");
+        ast::FnDecl fn;
+        fn.name = name.lexeme;
+        fn.returnType = parseTypeRef();
+        fn.line = c.line;
+        fn.column = c.column;
+        expect(TokenKind::Eq, "=");
+        auto body = std::make_unique<ast::BlockExpr>();
+        body->line = c.line;
+        body->column = c.column;
+        body->tail = parseExpr();
+        expect(TokenKind::Semi, ";");
+        fn.body = std::move(body);
+        return fn;
     }
 
     ast::MethodSig parseMethodSig() {
@@ -995,7 +1043,13 @@ private:
         expect(TokenKind::RParen, ")");
         sig.returnType = parseOptionalReturnType();
         sig.effects = parseOptionalEffectRow();
-        expect(TokenKind::Semi, ";");
+        // v25 Phase 135: a trait method may carry a DEFAULT body `{ … }` instead
+        // of `;`; impls that don't override it inherit the default.
+        if (check(TokenKind::LBrace)) {
+            sig.body = parseBlockExpr();
+        } else {
+            expect(TokenKind::Semi, ";");
+        }
         return sig;
     }
 
@@ -1143,6 +1197,13 @@ private:
                 at.type = parseTypeRef();
                 expect(TokenKind::Semi, ";");
                 decl.assocTypes.push_back(std::move(at));
+                continue;
+            }
+            // v25 Phase 139: an associated const `const N: T = expr;` desugars
+            // to a no-self method `fn N() -> T { expr }`, read as `Type::N()`.
+            // (`const fn` is a function — disambiguate on the token after.)
+            if (check(TokenKind::KwConst) && peek(1).kind != TokenKind::KwFn) {
+                decl.methods.push_back(parseImplAssocConst());
                 continue;
             }
             decl.methods.push_back(parseImplFnDecl());

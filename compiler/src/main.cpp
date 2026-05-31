@@ -27,6 +27,7 @@
 // works cleanly (smoke_test exercises this).
 
 #include "kardashev/borrow_check.hpp"
+#include "kardashev/ast_clone.hpp"
 #include "kardashev/codegen.hpp"
 #include "kardashev/emit_c.hpp"
 #include "kardashev/lint.hpp"
@@ -381,6 +382,17 @@ std::string applyPrelude(const std::string& userSrc) {
             "impl Default for f64 { fn default() -> f64 ! { alloc } { 0.0 } }\n"
             "impl Default for String { fn default() -> String ! { alloc } { \"\" } }\n"
             "impl<T> Default for Vec<T> { fn default() -> Vec<T> ! { alloc } { vec_new() } }\n";
+    }
+    // v25 Phase 140: the conversion vocabulary. `From<T>` builds a Self from a
+    // T (static — read `Target::from(x)`); `Into<U>` consumes self into a U
+    // (`x.into()`). Generic over the source/target type, like Iterator<T>. A
+    // type opts in by impl'ing either directly; the From <-> Into auto-blanket
+    // (Into from From) is a follow-on (needs a reverse-bound where-clause).
+    if (userSrc.find("trait From") == std::string::npos) {
+        prelude += "trait From<T> { fn from(x: T) -> Self; }\n";
+    }
+    if (userSrc.find("trait Into") == std::string::npos) {
+        prelude += "trait Into<U> { fn into(self) -> U; }\n";
     }
     // Phase 43: runtime string escape decode/encode for JSON-style strings,
     // written in kardashev over str_push_byte / str_char_at. `\\uXXXX` decodes
@@ -1306,6 +1318,99 @@ void expandDerives(kardashev::ast::Program& prog) {
         prog.impls.push_back(std::move(impl));
 }
 
+// v25 Phase 135: fill trait DEFAULT method bodies into impls that don't override
+// them. For each trait impl, any trait method that has a default body and is not
+// provided by the impl gets a synthesized impl method whose body is a deep-clone
+// of the default — so the rest of the pipeline (typecheck binds Self to the impl
+// type, codegen monomorphizes) treats it exactly like a hand-written method.
+void fillTraitDefaults(kardashev::ast::Program& prog) {
+    std::unordered_map<std::string, const kardashev::ast::TraitDecl*> traits;
+    for (const auto& t : prog.traits) traits[t.name] = &t;
+    for (auto& impl : prog.impls) {
+        if (impl.traitName.empty()) continue; // inherent impl: no defaults
+        auto it = traits.find(impl.traitName);
+        if (it == traits.end()) continue;
+        std::set<std::string> provided;
+        for (const auto& m : impl.methods) provided.insert(m.name);
+        for (const auto& sig : it->second->methods) {
+            if (!sig.body) continue;                 // abstract — impl provides
+            if (provided.count(sig.name)) continue;  // overridden
+            kardashev::ast::FnDecl fn;
+            fn.name = sig.name;
+            fn.params = sig.params; // incl. `self: Self` — bound to forType
+            fn.returnType = sig.returnType;
+            fn.effects = sig.effects;
+            fn.line = sig.line;
+            fn.column = sig.column;
+            fn.body = kardashev::ast::cloneBlock(*sig.body);
+            impl.methods.push_back(std::move(fn));
+        }
+    }
+}
+
+// v25 Phase 137: blanket impls. `impl<T: B> Tr for T` gives Tr to every type
+// that impls B. Rather than teach method resolution + monomorphization to fall
+// back through a bound, expand each blanket into CONCRETE `impl Tr for X` for
+// every user type X that satisfies the bound (deep-cloning the method bodies,
+// with Self -> X handled by the concrete impl). The original blanket is removed,
+// so the rest of the pipeline only sees ordinary concrete impls. Scope: the
+// bound is the param's primary trait bound; a body that names the type param T
+// in type position isn't substituted (the common blanket — calling the bound's
+// methods on self — works). Over-generates for unused types (harmless).
+void expandBlanketImpls(kardashev::ast::Program& prog) {
+    std::set<std::string> impld; // "X/Trait" pairs that already exist
+    for (const auto& im : prog.impls)
+        if (!im.traitName.empty())
+            impld.insert(im.forType.name + "/" + im.traitName);
+    std::vector<std::string> types;
+    for (const auto& s : prog.structs) types.push_back(s.name);
+    for (const auto& e : prog.enums) types.push_back(e.name);
+
+    std::vector<kardashev::ast::ImplDecl> kept, blankets;
+    for (auto& im : prog.impls) {
+        bool isBlanket = false;
+        if (!im.traitName.empty() && !im.genericParams.empty() &&
+            im.forType.typeArgs.empty()) {
+            for (const auto& gp : im.genericParams)
+                if (gp.name == im.forType.name) { isBlanket = true; break; }
+        }
+        (isBlanket ? blankets : kept).push_back(std::move(im));
+    }
+    for (const auto& bl : blankets) {
+        std::string bound;
+        for (const auto& gp : bl.genericParams)
+            if (gp.name == bl.forType.name) { bound = gp.bound; break; }
+        for (const auto& X : types) {
+            if (X == bl.forType.name) continue;
+            if (!bound.empty() && !impld.count(X + "/" + bound)) continue;
+            if (impld.count(X + "/" + bl.traitName)) continue;
+            kardashev::ast::ImplDecl ni;
+            ni.traitName = bl.traitName;
+            ni.traitTypeArgs = bl.traitTypeArgs;
+            ni.forType.name = X;
+            ni.line = bl.line;
+            ni.column = bl.column;
+            for (const auto& m : bl.methods) {
+                kardashev::ast::FnDecl fn;
+                fn.name = m.name;
+                fn.params = m.params;
+                fn.returnType = m.returnType;
+                fn.effects = m.effects;
+                fn.line = m.line;
+                fn.column = m.column;
+                if (m.body) fn.body = kardashev::ast::cloneBlock(*m.body);
+                ni.methods.push_back(std::move(fn));
+            }
+            // NB: do NOT mark this synthesized pair as "seen" — `impld` holds
+            // only the ORIGINAL (explicit) impls, so an explicit impl still wins
+            // (X stays skipped), but two overlapping blankets both synthesize
+            // `impl Tr for X`, which the Phase 138 coherence check then rejects.
+            kept.push_back(std::move(ni));
+        }
+    }
+    prog.impls = std::move(kept);
+}
+
 // Phase 7.1: resolve `mod foo;` directives by reading sibling `.kd`
 // files and merging their declarations into the caller's program. The
 // merge is FLAT — module contents become part of the top-level program
@@ -1656,6 +1761,8 @@ std::optional<std::int64_t> compileAndRun(const std::string& srcRaw,
     if (!progOpt) return std::nullopt;
     auto& program = *progOpt;
     expandDerives(program); // Phase 42: synthesize #[derive(...)] impls
+    expandBlanketImpls(program); // v25 Phase 137
+    fillTraitDefaults(program); // v25 Phase 135
     // PR#26 (ABI safety): the JIT calls `entry` through an i64()-typed
     // function pointer, so reject any entry whose signature doesn't match —
     // a non-empty parameter list or a non-integer return would corrupt the
@@ -2091,6 +2198,8 @@ bool compileToObject(const std::string& srcRaw, const std::string& srcDir,
     if (!progOpt) return false;
     auto& program = *progOpt;
     expandDerives(program); // Phase 42: synthesize #[derive(...)] impls
+    expandBlanketImpls(program); // v25 Phase 137
+    fillTraitDefaults(program); // v25 Phase 135
     auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
         reportTypeErrors(tcr, srcRaw, sourceFile);
@@ -2124,6 +2233,8 @@ int emitLlvmIr(const std::string& srcRaw, const std::string& srcDir,
     if (!progOpt) return 1;
     auto& program = *progOpt;
     expandDerives(program); // Phase 42: synthesize #[derive(...)] impls
+    expandBlanketImpls(program); // v25 Phase 137
+    fillTraitDefaults(program); // v25 Phase 135
     auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
         reportTypeErrors(tcr, srcRaw, sourceFile);
@@ -2156,6 +2267,8 @@ int emitCSource(const std::string& srcRaw, const std::string& srcDir) {
     if (!progOpt) return 1;
     auto& program = *progOpt;
     expandDerives(program);
+    expandBlanketImpls(program); // v25 Phase 137
+    fillTraitDefaults(program); // v25 Phase 135
     auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
         reportTypeErrors(tcr, srcRaw);
@@ -2294,6 +2407,8 @@ int runTests(const std::string& srcRaw, const std::string& srcDir,
     if (!progOpt) return 1;
     auto& program = *progOpt;
     expandDerives(program); // Phase 42: synthesize #[derive(...)] impls
+    expandBlanketImpls(program); // v25 Phase 137
+    fillTraitDefaults(program); // v25 Phase 135
     auto tcr = kardashev::typecheck(program);
     if (!tcr.ok()) {
         reportTypeErrors(tcr, srcRaw, sourceFile);

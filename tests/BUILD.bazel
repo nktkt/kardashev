@@ -258,6 +258,48 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v25 Phase 135: default trait methods (inherit / override / chain).
+sh_test(
+    name = "smoke_test_phase135",
+    srcs = ["smoke_test_phase135.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v25 Phase 136: supertraits — coverage enforced; subtrait defaults reach them.
+sh_test(
+    name = "smoke_test_phase136",
+    srcs = ["smoke_test_phase136.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v25 Phase 137: blanket impls (impl<T: Bound> Trait for T).
+sh_test(
+    name = "smoke_test_phase137",
+    srcs = ["smoke_test_phase137.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v25 Phase 138: coherence / overlap checking (conflicting impls rejected).
+sh_test(
+    name = "smoke_test_phase138",
+    srcs = ["smoke_test_phase138.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v25 Phase 139: associated consts (const N: T in trait/impl, read Type::N()).
+sh_test(
+    name = "smoke_test_phase139",
+    srcs = ["smoke_test_phase139.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v25 Phase 140: standard conversion vocabulary (From<T> / Into<U>).
+sh_test(
+    name = "smoke_test_phase140",
+    srcs = ["smoke_test_phase140.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v24 Phase 132: opt-in lint (-W) — unused vars + unreachable code, non-fatal,
 # no false positives (closure / fn-ptr / method / match uses recognized).
 sh_test(

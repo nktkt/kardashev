@@ -136,12 +136,25 @@ cc_library(
     ],
 )
 
+# v25 Phase 135: AST deep-clone (synthesize default-method impls). No LLVM dep.
+cc_library(
+    name = "ast_clone",
+    srcs = ["src/ast_clone.cpp"],
+    hdrs = ["include/kardashev/ast_clone.hpp"],
+    strip_include_prefix = "include",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":ast",
+    ],
+)
+
 cc_binary(
     name = "kardc",
     srcs = ["src/main.cpp"],
     visibility = ["//visibility:public"],
     deps = [
         ":borrow_check",
+        ":ast_clone",
         ":codegen",
         ":emit_c",
         ":lint",
