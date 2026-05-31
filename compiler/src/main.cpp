@@ -383,6 +383,17 @@ std::string applyPrelude(const std::string& userSrc) {
             "impl Default for String { fn default() -> String ! { alloc } { \"\" } }\n"
             "impl<T> Default for Vec<T> { fn default() -> Vec<T> ! { alloc } { vec_new() } }\n";
     }
+    // v25 Phase 140: the conversion vocabulary. `From<T>` builds a Self from a
+    // T (static — read `Target::from(x)`); `Into<U>` consumes self into a U
+    // (`x.into()`). Generic over the source/target type, like Iterator<T>. A
+    // type opts in by impl'ing either directly; the From <-> Into auto-blanket
+    // (Into from From) is a follow-on (needs a reverse-bound where-clause).
+    if (userSrc.find("trait From") == std::string::npos) {
+        prelude += "trait From<T> { fn from(x: T) -> Self; }\n";
+    }
+    if (userSrc.find("trait Into") == std::string::npos) {
+        prelude += "trait Into<U> { fn into(self) -> U; }\n";
+    }
     // Phase 43: runtime string escape decode/encode for JSON-style strings,
     // written in kardashev over str_push_byte / str_char_at. `\\uXXXX` decodes
     // the Latin-1 subset (cp < 256); higher code points become '?' (documented).

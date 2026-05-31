@@ -293,6 +293,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v25 Phase 140: standard conversion vocabulary (From<T> / Into<U>).
+sh_test(
+    name = "smoke_test_phase140",
+    srcs = ["smoke_test_phase140.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v24 Phase 132: opt-in lint (-W) — unused vars + unreachable code, non-fatal,
 # no false positives (closure / fn-ptr / method / match uses recognized).
 sh_test(
