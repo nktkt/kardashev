@@ -52,7 +52,7 @@ Effect sets are unioned across the call graph and checked at definition sites; n
 
 ## Status
 
-All eighteen roadmaps (Phases 0–111, **v1–v18**) have shipped and are merged to
+All nineteen roadmaps (Phases 0–114, **v1–v19**) have shipped and are merged to
 `main` — 6 unit suites plus the full smoke-test aggregate pass **JIT and AOT**
 on a cleared clean build. v15–v17 ("self-hosting") build a complete compiler
 *in* kardashev — the north-star arc toward a bootstrap: v15 the front-end
@@ -65,7 +65,9 @@ host-compiler bugs (a field-move double-free, a unit-tail-`match` miscompile, a
 field-assignment leak). v18 ("hardening II") closed the remaining gaps the
 adversarial review exposed (a field re-initialization over-rejection, a
 unit-async compiler crash) and added a **differential fuzzer** (random programs,
-JIT == AOT == reference) over the arithmetic + control-flow codegen paths. v14 ("hardening") made the toolchain trustworthy
+JIT == AOT == reference) over the arithmetic + control-flow codegen paths; v19
+("hardening III") extended the fuzzing into the memory-safety and integer
+(division/modulo/bitwise) paths and cleaned up codegen diagnostics. v14 ("hardening") made the toolchain trustworthy
 across platforms: **macOS CI went green for the first time** (portable leak
 gates), the smoke harness is SIGPIPE-robust, the channel capture-and-keep footgun
 is now a precise compile error, and a JIT-vs-AOT differential sweep over the 9
@@ -415,6 +417,46 @@ generic keys; 29 plugged the Drop leaks 27–28's new droppable values made load
 30's `Result<String, IoError>` drops cleanly on the error path *because* 29 closed that
 hole; 31 integrated 27–30 into the self-written capstones; 32 documented the result last.
 Each shipped green before the next, exactly as v1–v4 did.
+
+## Roadmap v19 — shipped
+
+> **Status: shipped** (`0.19.0`). "Hardening III" — push the differential fuzzing
+> into the memory-safety and integer (division/modulo/bitwise) codegen paths (the
+> bug classes that mattered most), and clean up codegen diagnostics.
+>
+> - **Phase 112 — a memory-safety fuzzer (done).** Targets the exact bug class
+>   v17/v18 fixed (field-move double-free, leak, per-field drop tracking).
+>   `tests/smoke_test_fuzz_memsafety.sh` generates random but borrow-VALID struct
+>   programs — a struct with K fields, each an `N` that owns a heap `String` and
+>   prints a unique id on `Drop` — and moves a random subset of distinct fields
+>   into a `Vec`, letting the rest drop at scope exit. Two oracles, no reference
+>   needed: (1) heap-clean under `MALLOC_CHECK_=3` (a double-free of a moved
+>   field's buffer aborts), and (2) every id is dropped EXACTLY once (a
+>   double-drop or leaked drop shows as a wrong count). A 1 M-iteration loop
+>   variant gates on RSS-flatness (a per-iteration leak balloons it). 75 programs
+>   across 3 seeds are all sound — strong evidence the per-field move/drop
+>   machinery holds across varied programs.
+>
+> - **Phase 113 — fuzzing the division / modulo / bitwise codegen (done).** The
+>   paths the arithmetic fuzzer skipped, and a classic miscompile source: signed
+>   division *truncates* toward zero (not floors) and `%` takes the sign of the
+>   *dividend* (C / Rust / LLVM semantics, not Python's floor-mod).
+>   `tests/smoke_test_fuzz_div.sh` generates random `+ - * / % & | ^ << >>`
+>   programs (non-zero literal divisors/shift amounts; negative dividends), with
+>   the kardashev source and a C-semantics Python reference emitted in lockstep.
+>   200 programs across 4 seeds agree (JIT == AOT == reference) — confirming the
+>   `sdiv`/`srem`/bitwise/arithmetic-shift lowering is correct. (Writing it
+>   confirmed the compiler follows C/Rust `%` semantics, not Python's.)
+>
+> - **Phase 114 — clean codegen diagnostics (done).** When codegen reports a real
+>   error, each error path returns a placeholder and keeps emitting, so the IR
+>   ends up type-mismatched — and the module verifier then piled cascading
+>   "module verification failed" lines on top of the real diagnostic, burying it.
+>   Codegen now returns the real errors directly and skips the verifier when any
+>   error was already reported; the verifier still runs on the error-free path
+>   (its valuable role — catching a codegen bug that emits invalid IR *without*
+>   reporting an error, like the unit-async `load void` before Phase 109). Pinned
+>   by `tests/smoke_test_diag.sh`.
 
 ## Roadmap v18 — shipped
 

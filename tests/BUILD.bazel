@@ -212,6 +212,30 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v19 Phase 112: a MEMORY-SAFETY fuzzer — random struct/Drop/partial-move
+# programs, each heap-clean under MALLOC_CHECK_=3 with every field dropped once.
+sh_test(
+    name = "smoke_test_fuzz_memsafety",
+    srcs = ["smoke_test_fuzz_memsafety.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v19 Phase 113: a differential fuzzer for the DIVISION / MODULO / BITWISE codegen
+# (C-semantics: truncating sdiv, dividend-signed srem, arithmetic >>).
+sh_test(
+    name = "smoke_test_fuzz_div",
+    srcs = ["smoke_test_fuzz_div.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v19 Phase 114: a codegen error reports the REAL diagnostic, not cascading
+# "module verification failed" noise from the placeholder IR.
+sh_test(
+    name = "smoke_test_diag",
+    srcs = ["smoke_test_diag.sh"],
+    data = ["//compiler:kardc"],
+)
+
 sh_test(
     name = "smoke_test_threads",
     srcs = ["smoke_test_threads.sh"],

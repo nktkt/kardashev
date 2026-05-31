@@ -400,6 +400,18 @@ public:
                 if (tm) module_->setDataLayout(tm->createDataLayout());
             }
         }
+        // v19 Phase 114: if codegen already reported errors, the IR is expected
+        // to be ill-formed — each error path returns a placeholder value and
+        // keeps emitting, so downstream uses produce type-mismatched IR. Running
+        // the verifier here would pile cascading "module verification failed"
+        // diagnostics on top of the REAL error, burying it. Return the real
+        // errors directly; the caller never JITs/AOTs a module that has errors.
+        // (When errors_ is EMPTY the verifier still runs below — that is its
+        // valuable role: catching a codegen bug that emitted invalid IR WITHOUT
+        // reporting an error, e.g. the unit-async `load void` before Phase 109.)
+        if (!errors_.empty()) {
+            return {std::move(ctx_), std::move(module_), std::move(errors_)};
+        }
         std::string verifyErrs;
         llvm::raw_string_ostream os(verifyErrs);
         if (llvm::verifyModule(*module_, &os)) {
