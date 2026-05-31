@@ -18,6 +18,39 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.29.0] — Roadmap v29 "the C backend, finished I (aggregates + control)" (Phases 157–161)
+
+Theme: grow the `--emit-c` C-source backend (v23) from the i64/bool scalar
+subset to aggregates + the full control surface, each phase differentially
+gated against the LLVM backend (the LLVM-AOT exit code must equal the
+emitted-C-compiled-by-the-system-cc exit code).
+
+### Added (C backend, `kardc --emit-c`)
+- **Structs** (Phase 157) — typedefs (inner-before-outer order), struct literals
+  as C designated-initializer compound literals, field access/assignment, and
+  struct-typed lets/params/returns. The backend is now type-aware (a value is
+  `int64_t` or `struct <Name>`), not "everything is int64_t".
+- **Enums + `match`** (Phase 158) — an enum lowers to a tagged struct
+  `struct E { int64_t tag; int64_t p0..; }`; a variant constructor is a compound
+  literal; `match` lowers (without the LLVM decision tree) to an if/else chain on
+  the tag (enum) or value (int), binding scalar payloads from `.p<i>`.
+- **References / borrows** (Phase 159) — `&T`/`&mut T` → C pointers; `&x`,
+  `&<temporary>` (a pointer to a C99 block-scoped compound literal), `*r`, and
+  `r.field` auto-dereferencing to `(*r).field`; plus unit-returning fns.
+- **`for` / `loop`-with-value + multi-file modules** (Phase 160) —
+  `for x in a..b` → a C `for`; `loop { … break v; }` → a `while (1)` yielding the
+  break value; and `mod foo;` programs are merged (resolveModules on the raw
+  source, sans prelude) so the C backend sees every module's fns.
+- **A randomized C-vs-LLVM differential oracle** (Phase 161) — generates many
+  random programs over the subset (arithmetic, comparisons, `&&`/`||`, nested
+  if/else, helper fns, while loops) and asserts LLVM-AOT exit == `--emit-c` exit.
+
+Out-of-subset code (traits/impls/strings/Vec/Drop/closures/generics/async) is
+still refused with a clear error — the backend never emits wrong C. A
+match-through-reference that binds a payload is a documented follow-on.
+
+718 unit cases (6 suites) + the full smoke sweep green, JIT and AOT.
+
 ## [0.28.0] — Roadmap v28 "const-eval & generics, finished" (Phases 152–156)
 
 Theme: finish the const-evaluator and the generics story — aggregate consts,
