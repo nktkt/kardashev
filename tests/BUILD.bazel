@@ -195,6 +195,15 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v21 Phase 122: HashMap/HashSet remove via backward-shift deletion (tombstone-
+# free). Probe-chain preservation (head/middle/tail/wrap), a 50-key oracle, and
+# heap-clean String-map remove + 200k churn under MALLOC_CHECK_=3 (RSS-flat).
+sh_test(
+    name = "smoke_test_hashremove",
+    srcs = ["smoke_test_hashremove.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v18 Phase 109: a unit-result async future (block_on / .await / spawn+join)
 # crashed the compiler (void load/return); now compiles + runs.
 sh_test(

@@ -2781,6 +2781,186 @@ private:
             }
         }
 
+        // Phase 122 (v21): hashmap_remove<K,V>(m: &mut HashMap, k: K)
+        // -> Option<V>. Open-addressing deletion via BACKWARD-SHIFT (Knuth
+        // Algorithm R): instead of leaving a tombstone, the rest of the probe
+        // chain is shifted back into the hole so the table stays TOMBSTONE-FREE.
+        // That keeps get/insert/grow completely untouched — their "stop at the
+        // first empty slot" invariant still holds because every live key remains
+        // reachable from its home slot by a contiguous run of occupied slots.
+        // On a hit: MOVE the value out (returned as Some — ownership transfers,
+        // so NO clone, unlike get), DROP the stored key + the consumed lookup
+        // key, decrement len, back-shift the chain, and empty the trailing slot.
+        // On a miss: drop the lookup key and return None.
+        {
+            TypePtr optTy = optionType(V);
+            if (optTy) {
+                mapKardashevType(optTy);
+                const std::string optMangled =
+                    mangleStructInstance(optTy->enumName, optTy->typeArgs);
+                auto* optLlvm = enumTypes_[optMangled];
+                unsigned someIdx = variantIndexInEnum(optTy, "Some");
+                unsigned noneIdx = variantIndexInEnum(optTy, "None");
+                unsigned someSlot = enumPayloadIndices_[optMangled][someIdx][0];
+                auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+                auto* fnTy =
+                    llvm::FunctionType::get(optLlvm, {i8PtrTy, keyTy}, false);
+                auto* fn = llvm::Function::Create(
+                    fnTy, llvm::Function::ExternalLinkage,
+                    "hashmap_remove__" + vMangle, module_.get());
+                fn->getArg(0)->setName("m");
+                fn->getArg(1)->setName("k");
+                auto* mPtr = fn->getArg(0);
+                auto* k = fn->getArg(1);
+                auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+                auto* seedBB = llvm::BasicBlock::Create(ctx, "seed", fn);
+                auto* findBB = llvm::BasicBlock::Create(ctx, "find", fn);
+                auto* checkBB = llvm::BasicBlock::Create(ctx, "check", fn);
+                auto* stepBB = llvm::BasicBlock::Create(ctx, "step", fn);
+                auto* noneBB = llvm::BasicBlock::Create(ctx, "none", fn);
+                auto* foundBB = llvm::BasicBlock::Create(ctx, "found", fn);
+                auto* shiftHdr =
+                    llvm::BasicBlock::Create(ctx, "shift.hdr", fn);
+                auto* shiftBody =
+                    llvm::BasicBlock::Create(ctx, "shift.body", fn);
+                auto* doMoveBB =
+                    llvm::BasicBlock::Create(ctx, "shift.move", fn);
+                auto* shiftDone =
+                    llvm::BasicBlock::Create(ctx, "shift.done", fn);
+
+                auto buildNone = [&](llvm::IRBuilder<>& bb) {
+                    llvm::Value* agg = llvm::UndefValue::get(optLlvm);
+                    return bb.CreateInsertValue(
+                        agg, llvm::ConstantInt::get(i32Ty, noneIdx), {0},
+                        "none");
+                };
+
+                llvm::IRBuilder<> b(entry);
+                auto* idxSlot = b.CreateAlloca(i64Ty, nullptr, "idx");
+                auto* holeSlot = b.CreateAlloca(i64Ty, nullptr, "hole");
+                auto* jSlot = b.CreateAlloca(i64Ty, nullptr, "j");
+                llvm::Value* kSlot = nullptr;
+                if (!keyIsInt) {
+                    kSlot = b.CreateAlloca(keyTy, nullptr, "kslot");
+                    b.CreateStore(k, kSlot);
+                }
+                auto* bucketsP = b.CreateStructGEP(hmTy, mPtr, 0, "bucketsP");
+                auto* lenP = b.CreateStructGEP(hmTy, mPtr, 1, "lenP");
+                auto* capP = b.CreateStructGEP(hmTy, mPtr, 2, "capP");
+                auto* cap = b.CreateLoad(i64Ty, capP, "cap");
+                auto* buckets = b.CreateLoad(i8PtrTy, bucketsP, "buckets");
+                b.CreateCondBr(b.CreateICmpEQ(cap, zero, "capZero"), noneBB,
+                               seedBB);
+
+                b.SetInsertPoint(seedBB);
+                b.CreateStore(emitStart(b, k, kSlot, cap), idxSlot);
+                b.CreateBr(findBB);
+
+                // find: probe to the key (an empty slot first => miss).
+                b.SetInsertPoint(findBB);
+                auto* i = b.CreateLoad(i64Ty, idxSlot, "i");
+                auto* eptr = b.CreateGEP(entryTy, buckets, i, "eptr");
+                auto* state = b.CreateLoad(
+                    i64Ty, b.CreateStructGEP(entryTy, eptr, 0, "stateP"),
+                    "state");
+                b.CreateCondBr(b.CreateICmpEQ(state, zero, "isEmpty"), noneBB,
+                               checkBB);
+
+                b.SetInsertPoint(checkBB);
+                auto* keyP = b.CreateStructGEP(entryTy, eptr, 1, "keyP");
+                b.CreateCondBr(emitEq(b, k, kSlot, keyP), foundBB, stepBB);
+
+                b.SetInsertPoint(stepBB);
+                b.CreateStore(
+                    b.CreateURem(b.CreateAdd(i, one, "inc"), cap, "wrap"),
+                    idxSlot);
+                b.CreateBr(findBB);
+
+                b.SetInsertPoint(noneBB);
+                dropConsumedKey(b, kSlot);
+                b.CreateRet(buildNone(b));
+
+                // found at slot i: move the value out, drop the stored key +
+                // the lookup key, len--, then back-shift starting from the hole.
+                b.SetInsertPoint(foundBB);
+                auto* valP = b.CreateStructGEP(entryTy, eptr, 2, "valP");
+                auto* val = b.CreateLoad(valTy, valP, "val"); // MOVE out
+                b.CreateCall(getOrEmitDropThunk(K), {keyP});  // drop stored key
+                dropConsumedKey(b, kSlot);                    // drop lookup key
+                auto* len0 = b.CreateLoad(i64Ty, lenP, "len");
+                b.CreateStore(b.CreateSub(len0, one, "len.dec"), lenP);
+                b.CreateStore(i, holeSlot);
+                b.CreateStore(i, jSlot);
+                b.CreateBr(shiftHdr);
+
+                // shift.hdr: advance j; stop at the first empty slot.
+                b.SetInsertPoint(shiftHdr);
+                auto* jPrev = b.CreateLoad(i64Ty, jSlot, "j.prev");
+                auto* j =
+                    b.CreateURem(b.CreateAdd(jPrev, one, "j.inc"), cap, "j.wrap");
+                b.CreateStore(j, jSlot);
+                auto* ej = b.CreateGEP(entryTy, buckets, j, "ej");
+                auto* sj = b.CreateLoad(
+                    i64Ty, b.CreateStructGEP(entryTy, ej, 0, "ejStateP"),
+                    "sj");
+                b.CreateCondBr(b.CreateICmpEQ(sj, zero, "ejEmpty"), shiftDone,
+                               shiftBody);
+
+                // shift.body: move ej into the hole iff its home is NOT
+                // cyclically in (hole, j] — i.e. iff relocating it to the hole
+                // keeps it reachable from its home. (Knuth Algorithm R.)
+                b.SetInsertPoint(shiftBody);
+                auto* hole = b.CreateLoad(i64Ty, holeSlot, "hole");
+                auto* ejKeyP = b.CreateStructGEP(entryTy, ej, 1, "ejKeyP");
+                llvm::Value* ejKeyVal =
+                    keyIsInt ? b.CreateLoad(i64Ty, ejKeyP, "ejk") : nullptr;
+                auto* home = emitStart(b, ejKeyVal, ejKeyP, cap);
+                auto* holeLEj = b.CreateICmpULE(hole, j, "holeLEj");
+                auto* holeLTh = b.CreateICmpULT(hole, home, "holeLTh");
+                auto* hLEj = b.CreateICmpULE(home, j, "hLEj");
+                // skip(=keep) if home in (hole,j]:
+                //   hole<=j : (hole<home && home<=j);  hole>j : (hole<home || home<=j)
+                auto* keep = b.CreateSelect(
+                    holeLEj, b.CreateAnd(holeLTh, hLEj),
+                    b.CreateOr(holeLTh, hLEj), "keep");
+                b.CreateCondBr(keep, shiftHdr, doMoveBB);
+
+                // shift.move: copy ej -> hole (whole entry by value), then the
+                // vacated slot j becomes the new hole.
+                b.SetInsertPoint(doMoveBB);
+                auto* hole2 = b.CreateLoad(i64Ty, holeSlot, "hole2");
+                auto* eh = b.CreateGEP(entryTy, buckets, hole2, "eh");
+                b.CreateStore(one, b.CreateStructGEP(entryTy, eh, 0, "ehState"));
+                b.CreateStore(
+                    b.CreateLoad(keyTy,
+                                 b.CreateStructGEP(entryTy, ej, 1, "ejKeyP2"),
+                                 "ejKey"),
+                    b.CreateStructGEP(entryTy, eh, 1, "ehKey"));
+                b.CreateStore(
+                    b.CreateLoad(valTy,
+                                 b.CreateStructGEP(entryTy, ej, 2, "ejValP"),
+                                 "ejVal"),
+                    b.CreateStructGEP(entryTy, eh, 2, "ehVal"));
+                b.CreateStore(j, holeSlot);
+                b.CreateBr(shiftHdr);
+
+                // shift.done: empty the trailing hole, return Some(val).
+                b.SetInsertPoint(shiftDone);
+                auto* holeF = b.CreateLoad(i64Ty, holeSlot, "holeF");
+                auto* ehF = b.CreateGEP(entryTy, buckets, holeF, "ehF");
+                b.CreateStore(zero,
+                              b.CreateStructGEP(entryTy, ehF, 0, "ehFState"));
+                llvm::Value* someAgg = llvm::UndefValue::get(optLlvm);
+                someAgg = b.CreateInsertValue(
+                    someAgg, llvm::ConstantInt::get(i32Ty, someIdx), {0},
+                    "some");
+                someAgg =
+                    b.CreateInsertValue(someAgg, val, {someSlot}, "someV");
+                b.CreateRet(someAgg);
+                declaredFns_["hashmap_remove__" + vMangle] = fn;
+            }
+        }
+
         // hashmap_len__<V>(m: &HashMap) -> i64 (value-agnostic, but emitted
         // per-V so the interception routes uniformly).
         {
@@ -2875,7 +3055,10 @@ private:
         llvm::Function* mapGet = getOrEmitHashMapOp("hashmap_get", T, i64T);
         llvm::Function* mapLen = getOrEmitHashMapOp("hashmap_len", T, i64T);
         llvm::Function* mapKeys = getOrEmitHashMapOp("hashmap_keys", T, i64T);
-        if (!mapNew || !mapInsert || !mapGet || !mapLen || !mapKeys)
+        llvm::Function* mapRemove =
+            getOrEmitHashMapOp("hashmap_remove", T, i64T);
+        if (!mapNew || !mapInsert || !mapGet || !mapLen || !mapKeys ||
+            !mapRemove)
             return nullptr;
 
         // hashset_new() -> HashSet
@@ -2939,6 +3122,29 @@ private:
             b.CreateRet(b.CreateICmpEQ(
                 disc, llvm::ConstantInt::get(i32Ty, someIdx), "found"));
             declaredFns_["hashset_contains__set_" + suffix] = fn;
+        }
+        // Phase 122 (v21): hashset_remove(s, k) -> bool : remove(k) and report
+        // whether it was present (the underlying map returned Some). The dummy
+        // i64 value is discarded; the element key is dropped by hashmap_remove.
+        {
+            TypePtr optTy = optionType(i64T);
+            unsigned someIdx = variantIndexInEnum(optTy, "Some");
+            auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+            auto* fnTy =
+                llvm::FunctionType::get(i1Ty, {i8PtrTy, elemTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage,
+                "hashset_remove__set_" + suffix, module_.get());
+            fn->getArg(0)->setName("s");
+            fn->getArg(1)->setName("k");
+            auto* e = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(e);
+            auto* opt =
+                b.CreateCall(mapRemove, {fn->getArg(0), fn->getArg(1)}, "opt");
+            auto* disc = b.CreateExtractValue(opt, {0}, "disc");
+            b.CreateRet(b.CreateICmpEQ(
+                disc, llvm::ConstantInt::get(i32Ty, someIdx), "removed"));
+            declaredFns_["hashset_remove__set_" + suffix] = fn;
         }
         // v12 Phase 71: hashset_items(s) -> Vec<T> — enumerate the set's
         // elements (the underlying map's keys). Closes the "no way to iterate a
@@ -10618,6 +10824,7 @@ private:
                  call.callee == "hashmap_insert" ||
                  call.callee == "hashmap_get" ||
                  call.callee == "hashmap_get_ref" ||
+                 call.callee == "hashmap_remove" ||
                  call.callee == "hashmap_keys" ||
                  call.callee == "hashmap_len") &&
                 concreteTypeArgs.size() >= 2) {
@@ -10640,6 +10847,7 @@ private:
             if ((call.callee == "hashset_new" ||
                  call.callee == "hashset_insert" ||
                  call.callee == "hashset_contains" ||
+                 call.callee == "hashset_remove" ||
                  call.callee == "hashset_len" ||
                  call.callee == "hashset_items") &&
                 !concreteTypeArgs.empty()) {

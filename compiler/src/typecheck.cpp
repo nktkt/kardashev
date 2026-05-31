@@ -686,6 +686,16 @@ public:
             sch.genericVars.push_back(hsVar);
             fnSchemas_["hashset_contains"] = std::move(sch);
         }
+        // Phase 122 (v21): hashset_remove<T>(s: &mut HashSet<T>, k: T) -> bool
+        // — true if the element was present (and is now removed), false if it
+        // was absent. `&mut` (it mutates the table).
+        {
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeRef(hashSetInst, /*isMut=*/true), hsVar}, makeBool());
+            sch.genericVars.push_back(hsVar);
+            fnSchemas_["hashset_remove"] = std::move(sch);
+        }
         // hashset_len<T>(s: &HashSet<T>) -> i64
         {
             FnSchema sch;
@@ -1122,6 +1132,29 @@ public:
             sch.genericVars.push_back(hmKeyVar);
             sch.genericVars.push_back(hmValVar);
             fnSchemas_["hashmap_get"] = std::move(sch);
+
+            // Phase 122 (v21): hashmap_remove<K,V>(m: &mut HashMap<K,V>, k: K)
+            // -> Option<V> — Some(v) if the key was present (removed, value
+            // moved out), None otherwise. `&mut` (it mutates the table) and a
+            // fresh Option<V> instance over the SAME V Var (pinned at the call
+            // site, like hashmap_get).
+            {
+                TypePtr optV2;
+                if (!optSchema.genericVars.empty()) {
+                    std::unordered_map<int, TypePtr> subst;
+                    subst[optSchema.genericVars[0]->varId] = hmValVar;
+                    optV2 = instantiate(optSchema.type, subst);
+                    optV2->typeArgs = {hmValVar};
+                } else {
+                    optV2 = optSchema.type;
+                }
+                FnSchema rmsch;
+                rmsch.signature = makeFunction(
+                    {makeRef(hashMapInst, /*isMut=*/true), hmKeyVar}, optV2);
+                rmsch.genericVars.push_back(hmKeyVar);
+                rmsch.genericVars.push_back(hmValVar);
+                fnSchemas_["hashmap_remove"] = std::move(rmsch);
+            }
 
             // Phase 34: hashmap_get_ref<K,V>(m: &HashMap<K,V>, k: K)
             // -> Option<&V> — a borrow into the value slot (read-without-move).
