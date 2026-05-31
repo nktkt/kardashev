@@ -450,6 +450,14 @@ Each shipped green before the next, exactly as v1–v4 did.
 >   expression as wrapped 64-bit arithmetic. Seeded for reproducibility. 300
 >   programs across 5 seeds agree exactly (no miscompile found — confidence in the
 >   arithmetic/codegen lowering).
+>
+> - **Phase 111 — fuzzing the control-flow path (done).** Extends the fuzzer with
+>   `let` bindings, comparisons (`< == >`), and `if/else`:
+>   `tests/smoke_test_fuzz_control.sh` generates programs that bind two `i64`
+>   locals and return an `if (<cmp>) { <expr> } else { <expr> }` over them, with
+>   a Python reference mirroring branch selection. 200 programs across 4 seeds
+>   agree (JIT == AOT == reference) — confidence in comparison lowering, branch
+>   selection, and local-variable codegen.
 
 ## Roadmap v17 — shipped
 

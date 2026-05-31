@@ -204,6 +204,14 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v18 Phase 111: a differential fuzzer over the CONTROL-FLOW path — random
+# let/comparison/if-else programs, JIT == AOT == python reference.
+sh_test(
+    name = "smoke_test_fuzz_control",
+    srcs = ["smoke_test_fuzz_control.sh"],
+    data = ["//compiler:kardc"],
+)
+
 sh_test(
     name = "smoke_test_threads",
     srcs = ["smoke_test_threads.sh"],
