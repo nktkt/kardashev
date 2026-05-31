@@ -72,6 +72,32 @@ void test_binary_precedence() {
     assert(rr && rr->value == 3);
 }
 
+void test_logical_or_precedence() {
+    // Phase 124: `||` binds looser than `&&`, so `a || b && c` is
+    // `Or(a, And(b, c))` and `a && b || c` is `Or(And(a, b), c)`.
+    {
+        auto r = parseWrapped("a || b && c");
+        const auto* root = dynamic_cast<const ast::BinaryExpr*>(tailExprOf(r));
+        assert(root && root->op == ast::BinOp::Or);
+        assert(dynamic_cast<const ast::IdentExpr*>(root->lhs.get()));
+        const auto* rhs = dynamic_cast<const ast::BinaryExpr*>(root->rhs.get());
+        assert(rhs && rhs->op == ast::BinOp::And);
+    }
+    {
+        auto r = parseWrapped("a && b || c");
+        const auto* root = dynamic_cast<const ast::BinaryExpr*>(tailExprOf(r));
+        assert(root && root->op == ast::BinOp::Or);
+        const auto* lhs = dynamic_cast<const ast::BinaryExpr*>(root->lhs.get());
+        assert(lhs && lhs->op == ast::BinOp::And);
+    }
+    {
+        // A leading `||` in PRIMARY position is still a zero-param closure,
+        // not a malformed logical-or — disambiguation is positional.
+        auto r = parseWrapped("|| 42");
+        assert(dynamic_cast<const ast::ClosureExpr*>(tailExprOf(r)));
+    }
+}
+
 void test_left_associativity() {
     // `1 - 2 - 3` should parse as Sub(Sub(1, 2), 3).
     auto r = parseWrapped("1 - 2 - 3");
@@ -1915,6 +1941,7 @@ int main() {
     test_int_literal();
     test_identifier();
     test_binary_precedence();
+    test_logical_or_precedence();
     test_left_associativity();
     test_parenthesized();
     test_function_call();
@@ -2064,6 +2091,6 @@ int main() {
     test_tuple_let_annotation();
     test_nested_tuple_field_access(); // v10 regression
     test_array_repeat(); // Phase 62
-    std::cout << "All parser tests passed (136 cases)\n";
+    std::cout << "All parser tests passed (137 cases)\n";
     return 0;
 }

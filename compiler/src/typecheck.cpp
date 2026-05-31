@@ -4021,6 +4021,8 @@ private:
             return {true, (l.i != r.i) ? 1 : 0};
         case Op::And: // Phase 33: bool && bool (both operands treated as 0/1)
             return {true, (l.i != 0 && r.i != 0) ? 1 : 0};
+        case Op::Or: // Phase 124: bool || bool (both operands treated as 0/1)
+            return {true, (l.i != 0 || r.i != 0) ? 1 : 0};
         case Op::Lt:
         case Op::Le:
         case Op::Gt:
@@ -5367,16 +5369,18 @@ private:
     TypePtr checkBinary(const ast::BinaryExpr& bin) {
         TypePtr lhs = checkExpr(*bin.lhs);
         TypePtr rhs = checkExpr(*bin.rhs);
-        // Phase 33: `&&` is the only boolean binary op — both operands and the
-        // result are bool (short-circuit; codegen only evaluates rhs if lhs).
-        if (bin.op == ast::BinOp::And) {
+        // Phase 33/124: `&&` and `||` are the boolean binary ops — both
+        // operands and the result are bool (short-circuit; codegen only
+        // evaluates rhs when lhs doesn't already settle the result).
+        if (bin.op == ast::BinOp::And || bin.op == ast::BinOp::Or) {
+            const char* sp = (bin.op == ast::BinOp::And) ? "&&" : "||";
             if (!unify(lhs, makeBool())) {
-                error("logical `&&` expects bool on lhs, got " +
+                error(std::string("logical `") + sp + "` expects bool on lhs, got " +
                           typeToString(lhs),
                       bin.lhs->line, bin.lhs->column);
             }
             if (!unify(rhs, makeBool())) {
-                error("logical `&&` expects bool on rhs, got " +
+                error(std::string("logical `") + sp + "` expects bool on rhs, got " +
                           typeToString(rhs),
                       bin.rhs->line, bin.rhs->column);
             }

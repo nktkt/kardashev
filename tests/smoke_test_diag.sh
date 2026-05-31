@@ -2,9 +2,14 @@
 # v19 Phase 114: when codegen reports a real error, the diagnostics must show only
 # that error — NOT cascading "module verification failed" noise from the
 # placeholder IR each error path keeps emitting. Asserts a known-bad program
-# (`&<temporary>`, an unsupported borrow place) reports the real error and does
-# NOT print a verifier cascade; and that a VALID program still compiles + runs
-# (the verifier still guards the error-free path).
+# reports the real error and does NOT print a verifier cascade; and that a VALID
+# program still compiles + runs (the verifier still guards the error-free path).
+#
+# v22 Phase 125 note: the old trigger here was `&A(10)` (ref to an enum literal),
+# which now COMPILES — `&<temporary>` materializes a dropped slot. The borrow
+# that remains unmaterializable is `&()` / `&<unit-returning call>`: a unit value
+# has no storage to point at, so it is still a clean codegen error (and used to
+# crash before the void guard in emitRefToTemporary).
 set -uo pipefail
 KARDC=""
 for candidate in \
@@ -18,9 +23,7 @@ echo "Using kardc at: $KARDC"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 
 cat > "$TMP/bad.kd" <<'EOF'
-enum E { A(i64) }
-fn val(e: &E) -> i64 { match e { A(v) => *v } }
-fn main() -> i64 { val(&A(10)) }
+fn main() -> i64 { let r = &(); 0 }
 EOF
 set +e; out=$("$KARDC" "$TMP/bad.kd" 2>&1); rc=$?; set -e
 [[ "$rc" -ne 0 ]] || { echo "FAIL [diag]: bad program compiled (rc 0)"; exit 1; }

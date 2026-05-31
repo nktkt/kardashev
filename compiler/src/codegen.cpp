@@ -10018,6 +10018,34 @@ private:
     // We restrict the operand to a bare Ident — borrowing temporaries
     // would require a stack-spill, which lands in Phase 2.4c alongside
     // `&mut` extensions.
+    // Phase 125: `&<temporary>` — materialize an rvalue operand of `&` into a
+    // fresh slot and return its address (the borrow). The operand is an enum
+    // literal (`&Val(42)`, `&Nil`), a constructor / call result, a struct
+    // literal, an `&5`, or an arithmetic expression — anything that has no
+    // pre-existing storage. The slot is hoisted to the entry block (one slot
+    // reused across loop iterations, exactly like a `let`), and a DROPPABLE
+    // temporary is registered for scope-exit drop — a safe over-approximation
+    // of Rust's end-of-statement temporary lifetime, since `&tmp` never escapes
+    // the slot here (proven leak-/double-free-clean by smoke_test_phase125).
+    // Previously this errored (and an earlier build passed a wrong scalar).
+    llvm::Value* emitRefToTemporary(const ast::Expr& operand) {
+        llvm::Value* v = emitExpr(operand);
+        // A unit/void temporary has no value or storage to borrow — `&{ }`,
+        // `&()`, or `&<unit-returning call>`. emitExpr returns null for a unit
+        // block and a void-typed value for a unit call; an `alloca void` would
+        // be invalid IR (and crashed before this guard). Reject it cleanly.
+        if (!v || v->getType()->isVoidTy()) {
+            errors_.push_back(
+                "codegen: `&` operand must be a binding, a field/index/"
+                "tuple-field place, or a materializable value");
+            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
+        }
+        auto* slot = entryAlloca(v->getType(), "ref.tmp");
+        builder_->CreateStore(v, slot);
+        registerDroppableLocal("ref.tmp", slot, lookupExprType(operand));
+        return slot;
+    }
+
     llvm::Value* emitRef(const ast::RefExpr& re) {
         auto* id = dynamic_cast<const ast::IdentExpr*>(re.operand.get());
         if (!id) {
@@ -10028,10 +10056,7 @@ private:
             // `match &h.t { ... }`.
             if (llvm::Value* addr = emitPlaceAddr(*re.operand))
                 return addr;
-            errors_.push_back(
-                "codegen: `&` operand must be a binding or a field/index/"
-                "tuple-field place");
-            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
+            return emitRefToTemporary(*re.operand);
         }
         // Phase 17a: `&x` / `&mut x` of a by-ref capture is the env pointer —
         // it already addresses the enclosing variable's storage.
@@ -10039,9 +10064,11 @@ private:
             return rit->second.first;
         auto it = locals_.find(id->name);
         if (it == locals_.end()) {
-            errors_.push_back("codegen: `&` operand unknown binding " +
-                              id->name);
-            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
+            // Phase 125: the ident is not a binding — it's a nullary enum
+            // variant (`&Nil`) or another value-producing name. Materialize it
+            // like any other `&<temporary>`. A genuinely undefined name was
+            // already rejected by the type checker, so emitExpr is safe here.
+            return emitRefToTemporary(*re.operand);
         }
         // The alloca's value is already a pointer to the binding's stack
         // slot — exactly what `&T` should be at the LLVM level.
@@ -10367,6 +10394,28 @@ private:
             phi->addIncoming(R, rhsEnd);
             return phi;
         }
+        // Phase 124: `a || b` == `lhs ? true : rhs` — the mirror of `&&`, with
+        // the conditional branch and the short-circuit phi constant flipped:
+        // when lhs is true we skip rhs and yield true.
+        if (bin.op == ast::BinOp::Or) {
+            auto& ctx = *ctx_;
+            auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+            llvm::Value* L = emitExpr(*bin.lhs);
+            auto* entryBB = builder_->GetInsertBlock();
+            auto* fn = entryBB->getParent();
+            auto* rhsBB = llvm::BasicBlock::Create(ctx, "or.rhs", fn);
+            auto* contBB = llvm::BasicBlock::Create(ctx, "or.cont", fn);
+            builder_->CreateCondBr(L, contBB, rhsBB); // lhs true -> short-circuit
+            builder_->SetInsertPoint(rhsBB);
+            llvm::Value* R = emitExpr(*bin.rhs);
+            auto* rhsEnd = builder_->GetInsertBlock(); // rhs may have added blocks
+            builder_->CreateBr(contBB);
+            builder_->SetInsertPoint(contBB);
+            auto* phi = builder_->CreatePHI(i1Ty, 2, "or");
+            phi->addIncoming(llvm::ConstantInt::getTrue(ctx), entryBB);
+            phi->addIncoming(R, rhsEnd);
+            return phi;
+        }
         llvm::Value* L = emitExpr(*bin.lhs);
         llvm::Value* R = emitExpr(*bin.rhs);
         // Phase 39/67: float operands (f32 OR f64) use floating-point ops
@@ -10386,6 +10435,7 @@ private:
             case ast::BinOp::NotEq: return builder_->CreateFCmpUNE(L, R, "fne");
             case ast::BinOp::Mod:
             case ast::BinOp::And:
+            case ast::BinOp::Or:
             case ast::BinOp::BitAnd:
             case ast::BinOp::BitOr:
             case ast::BinOp::BitXor:
@@ -10429,7 +10479,8 @@ private:
             // Arithmetic (sign-extending) for signed, logical for unsigned.
             return uns ? builder_->CreateLShr(L, R, "lshr")
                        : builder_->CreateAShr(L, R, "ashr");
-        case ast::BinOp::And: return nullptr; // handled above
+        case ast::BinOp::And:
+        case ast::BinOp::Or: return nullptr; // handled above
         }
         return nullptr;
     }

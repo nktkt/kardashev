@@ -213,6 +213,25 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v22 Phase 124: `||` short-circuit logical-or. Truth table, short-circuit (a
+# trapping `10/0` in a dead rhs is skipped), precedence below `&&` (both
+# directions), and the zero-param closure `|| body` left intact. JIT + AOT.
+sh_test(
+    name = "smoke_test_phase124",
+    srcs = ["smoke_test_phase124.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v22 Phase 125: `&<temporary>` materializes a dropped statement-scoped slot
+# (the &A(10) ref-to-enum-literal fix). &enum/&int/&struct-literal borrow; a
+# droppable temporary drops exactly once (RSS-flat, MALLOC_CHECK clean over
+# 500k); `&()` (a unit value) stays a clean codegen error. JIT + AOT.
+sh_test(
+    name = "smoke_test_phase125",
+    srcs = ["smoke_test_phase125.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v18 Phase 109: a unit-result async future (block_on / .await / spawn+join)
 # crashed the compiler (void load/return); now compiles + runs.
 sh_test(
@@ -1154,12 +1173,14 @@ cc_test(
     # flaky: on macOS arm64 the in-process LLVM ORC JIT intermittently aborts at
     # teardown (~50% of runs) — confirmed NON-DETERMINISTIC by re-running the
     # identical commit (failed, then passed). It is ASan-clean and deterministic
-    # on Linux, where the full 154-case suite always passes, so a REAL codegen
-    # regression is still caught deterministically by the ubuntu job (this flag is
-    # a no-op there — a deterministic test never retries). Bazel retries up to 3×
-    # so the arm64 JIT non-determinism stops reddening macOS CI. Root cause (an
-    # arm64 ORC-JIT teardown abort) is a v14-hardening follow-up; tracked in the
-    # CI notes. This tolerates the flake WITHOUT masking Linux correctness.
+    # on Linux, where the full 161-case suite always passes, so a REAL codegen
+    # regression is still caught deterministically by the ubuntu job (these
+    # retries are a no-op there — a deterministic test never retries). `flaky`
+    # grants 3 attempts; v22 Phase 127 raises codegen_test to 5 via a scoped
+    # `--flaky_test_attempts` in .bazelrc (~12.5% -> ~3% residual on macOS).
+    # Root cause (an arm64 ORC-JIT teardown abort) needs macOS-arm64 hardware to
+    # diagnose and remains a follow-up. This tolerates the flake WITHOUT masking
+    # Linux correctness.
     flaky = True,
     deps = [
         "//compiler:codegen",

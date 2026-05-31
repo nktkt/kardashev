@@ -106,7 +106,7 @@ step past "toy":
 built from, adversarially reviewed (119). Full kardashev-compiles-kardashev
 remains several roadmaps out, but this is well past "toy".
 
-### v21 — prove it, and close the leaks — *in progress*
+### v21 — prove it, and close the leaks — *done (v0.21.0)*
 
 Turn anecdotes into numbers and fix the real footprint gaps:
 
@@ -155,18 +155,63 @@ Turn anecdotes into numbers and fix the real footprint gaps:
   honestly; the other handle-based surfaces, OS-thread return value and the
   const-eval scalar set, remain `i64`/`bool`-MVP and are documented as such.)*
 
-### v22 — ergonomics, docs, and platform
+### v22 — ergonomics, docs, and platform hygiene — *done (v0.22.0)*
 
-- **`||` logical-or** (resolve the closure-syntax collision); **`&<temporary>`**
-  (materialize an rvalue into a statement-scoped, dropped slot) and the related
-  `&A(10)` ref-to-enum-literal miscompile.
-- **Reconcile the docs with reality** — the language reference still claims `%`,
-  `&&`, and enum-typed struct fields are unsupported when they work; bring the
-  reference in line with the implementation and the test suite.
-- The macOS `codegen_test` arm64 JIT-teardown **flake**: root-cause it (needs a
-  macOS-arm64 environment) or raise `--flaky_test_attempts` to cut the residual.
-- Explore a **second platform or backend** (Windows, or a WASM/C portability
-  backend) to break the LLVM/Linux-leaning monoculture.
+- ✅ **Phase 124 (`||` logical-or, done)** — short-circuit logical-or, resolving
+  the collision with the zero-param closure `|| body`. Disambiguation is
+  positional: `||` is the `PipePipe` token — logical-or in INFIX position (after
+  an operand) and a closure in PRIMARY position — so the precedence loop and
+  `parsePrimary` never alias. `||` binds looser than `&&` (the precedence ladder
+  shifts up one tier); lowering mirrors `&&`'s short-circuit branch+phi, flipped
+  (lhs true skips rhs and yields true). Pinned by `tests/smoke_test_phase124.sh`
+  (truth table, dead-rhs `10/0` skipped, precedence both directions, closure
+  intact) + parser (precedence) and codegen (short-circuit) unit cases.
+- ✅ **Phase 125 (`&<temporary>`, done)** — `&<rvalue>` (`&A(10)`, `&5`, a struct
+  literal, an arithmetic temp, a nullary variant `&Nil`) had no storage to point
+  at and errored; now it materializes the value into an entry-block slot (one
+  slot reused across loop iterations, like a `let`), registers a droppable
+  temporary for scope-exit drop, and borrows the slot. Drop safety is the
+  load-bearing part: a `&Text(int_to_string(i))` (an enum owning a heap String)
+  in a 500k loop drops exactly once — RSS flat at ~2 MB, `MALLOC_CHECK_=3` clean.
+  `&()` (a unit value has no storage) stays a clean codegen error, and the void
+  guard fixes a crash a unit-returning call hit on the new path. Pinned by
+  `tests/smoke_test_phase125.sh`; `smoke_test_diag` repoints to `&()`.
+- ✅ **Phase 126 (docs reconciliation, done)** — the language reference and stdlib
+  docs listed `%`, `&&`/`||`, `&` of a literal/temporary, and enum-typed struct
+  fields as deliberate limitations; all four compile (Phases 33 / 36 / 124 / 125).
+  The honesty note, the lexical-structure table, the enum-field section, the
+  surface-limitations list, and the stale "Roadmap v5" version headers are
+  brought in line with the implementation and the test suite. doclint stays green.
+- ✅ **Phase 127 (macOS flake residual, done)** — the macOS-arm64 `codegen_test`
+  ORC-JIT teardown abort (~50%/run, confirmed non-deterministic; root cause needs
+  macOS-arm64 hardware this environment lacks) is raised from 3 to 5
+  `--flaky_test_attempts`, scoped by regex to that one target so a real
+  regression anywhere else is never retried/masked (~12.5% → ~3% residual). The
+  test is deterministic on Linux, so a genuine regression still fails all 5
+  attempts and reddens CI.
+
+### v23 — a second backend (and the leftover platform reach)
+
+The v22 "second platform/backend" item is its own roadmap: a full second code
+generator is comparable in scope to the LLVM backend it parallels, so it is
+broken out here rather than rushed into a single phase.
+
+- **A C-source backend (`--emit-c`), recommended first.** Walk the same
+  typechecked AST that `codegen.cpp` lowers and emit portable C, compiled by the
+  system C compiler. It is the most *verifiable* option in this environment (a C
+  toolchain is present), so it can be **differentially gated** against the LLVM
+  backend exactly as the self-hosted compiler already is — the existing
+  arithmetic / control-flow fuzzers (Phases 110–111) become the oracle
+  (`emit-c` output == LLVM AOT output == reference). Scope it as a SUBSET first —
+  i64/bool, arithmetic / comparison / bitwise, `&&`/`||`, `if` / `while`,
+  functions + recursion — then grow it (structs → enums + match → strings / Vec →
+  Drop) phase by phase, each differentially green, before claiming portability.
+  This breaks the LLVM/Linux monoculture for a real subset without shipping a stub.
+- **WASM** and a **Windows target** are the follow-on reach once the C backend
+  proves the AST→target seam. WASM needs a committed runtime in CI (wasmtime or
+  node) so it can be differentially tested the same way; the Windows port is
+  mostly toolchain/ABI work (PE objects, the `clang-cl`/MSVC driver, path
+  handling) layered on the existing LLVM backend rather than a new code generator.
 
 ## Deferred (honest — documented, not stubbed)
 

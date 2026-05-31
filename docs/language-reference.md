@@ -1,15 +1,19 @@
 # kardashev Language Reference
 
-The surface language as it compiles **today** — through Roadmap v5 (Phases
-0–32). [`../README.md`](../README.md) is the authoritative record of what
-shipped; this document is the practical reference for writing programs. Every
-snippet here compiles under `kardc` as written. Features still on the runway
-are not described here.
+The surface language as it compiles **today**. [`../README.md`](../README.md)
+and [`../ROADMAP.md`](../ROADMAP.md) are the authoritative record of everything
+that has shipped; this document is the practical reference for the core
+constructs and operators. Every snippet here compiles under `kardc` as written.
+Features still on the runway are not described here.
 
 A note on honesty: kardashev has a handful of deliberate surface limitations
-(no `&&`/`||`, no `&` of a literal, no enum-typed struct fields, no `%`). These
-are real, they are called out below, and the examples obey them — they are not
-hidden.
+(an `if` used as a value needs an `else`; a `&mut` parameter is not
+auto-reborrowed through recursive calls; strings carry no NUL terminator).
+These are real, they are called out below, and the examples obey them — they
+are not hidden. Earlier drafts of this reference also listed `&&`/`||`, `%`,
+`&` of a temporary, and enum-typed struct fields as missing; all four now work
+(Phases 33, 36, 124, 125) and the *Surface limitations* section records the
+correction.
 
 ## Lexical structure
 
@@ -19,15 +23,16 @@ hidden.
 | Integer literal    | `[0-9]+`                                                    |
 | Boolean literal    | `true` / `false`                                            |
 | String literal     | `"..."` with `\n \t \r \\ \"` escapes                       |
-| Operators          | `+ - * / < <= > >= == != = -> => ? !`                       |
+| Operators          | `+ - * / % < <= > >= == != = -> => ? ! && \|\| & \| ^ << >>` |
 | Punctuation        | `( ) { } [ ] , ; : :: . _ & .. ..=`                         |
 | Keywords           | `fn let if else return struct enum match trait impl for`    |
 |                    | `mod pub const extern while loop break continue true false`  |
 
-**No `%` (modulo) operator exists** — it is not in the lexer. There is **no
-`&&` or `||` boolean operator** (`||` is lexed only as the head of a
-zero-parameter closure `|| expr`). Combine boolean tests with nested `if`s
-instead — see *Surface limitations*.
+`%` (modulo), `&&` and `||` (short-circuit boolean operators), and the integer
+bitwise operators (`& | ^ << >>`) are all supported. `||` is disambiguated
+positionally: after an operand it is logical-or, while at the head of an
+expression `|| expr` it is still a zero-parameter closure. `&&` binds tighter
+than `||`, and both bind looser than the comparisons.
 
 `async`, `await`, `mut`, `dyn`, `where`, and `self` are recognized
 positionally rather than as reserved words, so they can also appear as plain
@@ -161,15 +166,16 @@ fn main() -> i64 {
 Enums are generic (`enum Option<T> { Some(T), None }`) and so are structs
 (`struct Pair<A, B> { first: A, second: B }`).
 
-**Limitation — no enum-typed struct field.** A struct field whose type is a
-user enum is not codegen-supported. The idiom (used by the calc and kdlex
-capstones) is to store an `i64` *code* in the field and lift it to the enum at
-the boundary via a small function:
+A struct field may itself be enum-typed (`struct Holder { t: Tree, tag: i64 }`
+where `Tree` is an enum). Read such a field by reference and match on it —
+`match &h.t { ... }` (see `smoke_test_phase36`). The older `i64`-*code* idiom
+(store a code in the field, lift it to the enum at the boundary via a small
+function) still appears in the calc and kdlex capstones and remains valid:
 
 ```rust
 const K_NUM: i64 = 0;
 const K_PLUS: i64 = 1;
-struct Tok { kind: i64, val: i64 }                  // i64 code, NOT a TokKind field
+struct Tok { kind: i64, val: i64 }                  // i64 code; a TokKind field also works
 
 enum TokKind { Num, Plus, Other }
 fn kind_of(k: i64) -> TokKind {
@@ -486,22 +492,17 @@ These are real properties of the language today. Every snippet above obeys them.
 
 1. **`if` requires an `else`.** A bare `if c { ... }` is a parse error; use
    `if c { ... } else { ... }` or `if c { ... } else {}`.
-2. **No `&&` / `||`.** Combine boolean tests with nested `if`s:
-   ```rust
-   fn is_digit(ch: i64) -> bool {        // "ch >= 48 AND ch <= 57"
-       if ch >= 48 { if ch <= 57 { true } else { false } } else { false }
-   }
-   ```
-3. **No `&` of a literal/temporary.** `&"x"` and `&Foo { .. }` are rejected;
-   bind to a `let` first, then `&that`.
-4. **No enum-typed struct field.** Store an `i64` code and lift it to the enum
-   via a function (the calc/kdlex idiom).
-5. **A `&mut` parameter is passed by move, not auto-reborrowed** through
+2. **A `&mut` parameter is passed by move, not auto-reborrowed** through
    recursive calls — thread state through return tuples instead. `&mut local`
    at a single call site is fine.
-6. **No `%` modulo operator** — it is not in the lexer.
-7. **Strings have no NUL terminator** (`{ ptr, len, cap }`); `vec_get` returns a
+3. **Strings have no NUL terminator** (`{ ptr, len, cap }`); `vec_get` returns a
    shallow copy.
+
+Four items that earlier editions listed here have since shipped and are **no
+longer limitations**: `&&` / `||` short-circuit boolean operators (`&&` Phase
+33, `||` Phase 124 — `&&` binds tighter), `%` modulo (Phase 33), `&` of a
+literal or temporary (Phase 125 — `&5` and `&Foo { .. }` materialize a
+statement-scoped, dropped slot), and enum-typed struct fields (Phase 36).
 
 ## Modules
 

@@ -456,31 +456,33 @@ private:
     //   comparisons = 1, additive = 2, multiplicative = 3.
     static int binOpPrec(BinOp op) {
         switch (op) {
-        case BinOp::And:   // Phase 33: `&&` binds loosest
+        case BinOp::Or:    // Phase 124: `||` binds loosest
             return 1;
+        case BinOp::And:   // Phase 33: `&&` (below `||`)
+            return 2;
         case BinOp::Lt:
         case BinOp::Le:
         case BinOp::Gt:
         case BinOp::Ge:
         case BinOp::Eq:
         case BinOp::NotEq:
-            return 2;
-        case BinOp::BitOr:  // Phase 66: bitwise tiers, between comparison & add
             return 3;
-        case BinOp::BitXor:
+        case BinOp::BitOr:  // Phase 66: bitwise tiers, between comparison & add
             return 4;
-        case BinOp::BitAnd:
+        case BinOp::BitXor:
             return 5;
+        case BinOp::BitAnd:
+            return 6;
         case BinOp::Shl:
         case BinOp::Shr:
-            return 6;
+            return 7;
         case BinOp::Add:
         case BinOp::Sub:
-            return 7;
+            return 8;
         case BinOp::Mul:
         case BinOp::Div:
         case BinOp::Mod:
-            return 8;
+            return 9;
         }
         return 1;
     }
@@ -499,6 +501,7 @@ private:
         case BinOp::Eq: return "==";
         case BinOp::NotEq: return "!=";
         case BinOp::And: return "&&";
+        case BinOp::Or: return "||";
         case BinOp::BitAnd: return "&"; // Phase 66
         case BinOp::BitOr: return "|";
         case BinOp::BitXor: return "^";

@@ -67,6 +67,7 @@ enum class BinOp {
     Lt, Le, Gt, Ge,
     Eq, NotEq,
     And,          // Phase 33: `&&` short-circuit logical-and (bool -> bool)
+    Or,           // Phase 124: `||` short-circuit logical-or (bool -> bool)
     // Phase 66: integer bitwise operators (int -> int, any width/signedness).
     // `Shr` is arithmetic (sign-extending) for a signed operand and logical
     // (zero-filling) for an unsigned one — codegen picks ashr/lshr by type.

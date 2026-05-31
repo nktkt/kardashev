@@ -1,8 +1,7 @@
 # Standard Library
 
-What ships with `kardc` through Roadmap v5 (Phases 0–32). Everything
-here is built into the compiler — no external crate / module is
-imported. The prelude declarations (`Option`, `Result`, the
+What ships with `kardc` today. Everything here is built into the
+compiler — no external crate / module is imported. The prelude declarations (`Option`, `Result`, the
 `Iterator` / `Hash` / `Eq` traits, the combinators, the file-I/O
 wrappers) are prepended to your source automatically; the builtin
 functions (`print`, `vec_*`, `hashmap_*`, `str_*`, …) are recognized
@@ -10,11 +9,11 @@ by the typechecker and lowered by codegen on demand. A program that
 defines its own `Option` / `Iterator` / etc. suppresses the matching
 prelude entry, so there's never a duplicate-declaration error.
 
-> Two reminders that govern every snippet below. `if` is an
+> One reminder that governs every snippet below. `if` is an
 > **expression and requires an `else`** (`if c { … } else { … }`, never
-> a bare `if c { … }`). There is **no `&&` / `||`** — nest `if`s to
-> combine boolean tests. You cannot take `&` of a literal or temporary;
-> bind it to a `let` first (`let p = "x"; print_str(&p);`).
+> a bare `if c { … }`). The short-circuit `&&` / `||` operators are
+> available, and `&` of a literal or temporary works (`&5`, `&Foo { .. }`)
+> — it materializes a statement-scoped, dropped slot.
 
 ## Prelude (auto-included)
 

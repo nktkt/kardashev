@@ -1310,36 +1310,41 @@ private:
 
     // --- Expressions ---
 
-    // Precedence tiers (tighter = larger). Phase 66 inserts the bitwise tiers
-    // BETWEEN comparison and additive, matching Rust: `&&` < comparison <
-    // `|` < `^` < `&` < shift < `+ -` < `* / %`. Shift (`<< >>`) is a two-token
-    // operator handled by adjacency in parseExprPrec (kShiftPrec).
-    static constexpr int kShiftPrec = 6;
+    // Precedence tiers (tighter = larger). Phase 124 adds `||` as the loosest
+    // tier (below `&&`), matching Rust: `||` < `&&` < comparison < `|` < `^` <
+    // `&` < shift < `+ -` < `* / %`. Shift (`<< >>`) is a two-token operator
+    // handled by adjacency in parseExprPrec (kShiftPrec). `||` is the PipePipe
+    // token: in INFIX position (after an operand) it is logical-or, while in
+    // PRIMARY position it is still a zero-param closure — parsePrimary matches
+    // it there before this loop ever consults binPrec.
+    static constexpr int kShiftPrec = 7;
     static int binPrec(TokenKind k) {
         switch (k) {
-        case TokenKind::AmpAmp: // `&&` binds loosest (below comparisons)
+        case TokenKind::PipePipe: // Phase 124: `||` binds loosest (below `&&`)
             return 1;
+        case TokenKind::AmpAmp: // `&&` (below comparisons, above `||`)
+            return 2;
         case TokenKind::EqEq:
         case TokenKind::NotEq:
         case TokenKind::Lt:
         case TokenKind::Le:
         case TokenKind::Gt:
         case TokenKind::Ge:
-            return 2;
-        case TokenKind::Pipe: // Phase 66: infix bitwise-or
             return 3;
-        case TokenKind::Caret: // Phase 66: bitwise-xor
+        case TokenKind::Pipe: // Phase 66: infix bitwise-or
             return 4;
-        case TokenKind::Ampersand: // Phase 66: infix bitwise-and
+        case TokenKind::Caret: // Phase 66: bitwise-xor
             return 5;
-        // kShiftPrec == 6 (handled by adjacency, not a single token)
+        case TokenKind::Ampersand: // Phase 66: infix bitwise-and
+            return 6;
+        // kShiftPrec == 7 (handled by adjacency, not a single token)
         case TokenKind::Plus:
         case TokenKind::Minus:
-            return 7;
+            return 8;
         case TokenKind::Star:
         case TokenKind::Slash:
         case TokenKind::Percent: // `%` at the multiplicative tier
-            return 8;
+            return 9;
         default:
             return 0; // not a binop
         }
@@ -1353,6 +1358,7 @@ private:
         case TokenKind::Slash: return ast::BinOp::Div;
         case TokenKind::Percent: return ast::BinOp::Mod;
         case TokenKind::AmpAmp: return ast::BinOp::And;
+        case TokenKind::PipePipe: return ast::BinOp::Or;    // Phase 124
         case TokenKind::Lt: return ast::BinOp::Lt;
         case TokenKind::Le: return ast::BinOp::Le;
         case TokenKind::Gt: return ast::BinOp::Gt;
