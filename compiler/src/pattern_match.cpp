@@ -76,6 +76,11 @@ PatViewPtr view(
     if (auto lp = dynamic_cast<const ast::LitIntPat*>(&p)) {
         return mkLit(lp->value);
     }
+    // v27 Phase 147: a char-literal pattern is a literal head keyed on its
+    // codepoint (same decision-tree machinery as an int literal).
+    if (auto cp = dynamic_cast<const ast::LitCharPat*>(&p)) {
+        return mkLit(static_cast<std::int64_t>(cp->codepoint));
+    }
     if (auto vp = dynamic_cast<const ast::VarPat*>(&p)) {
         auto it = variantIndex.find(vp->name);
         if (it != variantIndex.end()) {
@@ -733,7 +738,11 @@ std::unique_ptr<DecisionTree> dtCompile(
         return tree;
     }
 
-    if (colType && colType->kind == TypeKind::Int) {
+    // v27 Phase 147: a `char` column is literal-discriminated exactly like an
+    // `int` column — the Lit machinery is value-based (codepoints stored as
+    // int64), so the same Switch-with-default lowering applies.
+    if (colType && (colType->kind == TypeKind::Int ||
+                    colType->kind == TypeKind::Char)) {
         auto tree = std::make_unique<DecisionTree>();
         tree->kind = DecisionTree::Switch;
         tree->occurrence = occurrences[col];

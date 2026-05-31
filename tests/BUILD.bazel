@@ -335,6 +335,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v27 Phase 147: the `char` type (Unicode scalar) + UTF-8 char<->string bridges.
+sh_test(
+    name = "smoke_test_phase147",
+    srcs = ["smoke_test_phase147.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v26 Phase 144: type aliases (type Name = Target).
 sh_test(
     name = "smoke_test_phase144",

@@ -600,6 +600,26 @@ private:
             out_ += "\"" + escapeString(sl->value) + "\"";
             return;
         }
+        // v27 Phase 147: char literal. Printable ASCII prints directly; common
+        // control chars use a named escape; anything else round-trips as
+        // `'\u{HEX}'` (always re-lexable to the same scalar).
+        if (auto* cl = dynamic_cast<const CharLitExpr*>(&e)) {
+            std::uint32_t cp = cl->codepoint;
+            out_ += '\'';
+            if (cp == '\n') out_ += "\\n";
+            else if (cp == '\t') out_ += "\\t";
+            else if (cp == '\r') out_ += "\\r";
+            else if (cp == '\\') out_ += "\\\\";
+            else if (cp == '\'') out_ += "\\'";
+            else if (cp >= 0x20 && cp < 0x7F) out_ += static_cast<char>(cp);
+            else {
+                char buf[16];
+                std::snprintf(buf, sizeof(buf), "\\u{%X}", cp);
+                out_ += buf;
+            }
+            out_ += '\'';
+            return;
+        }
         if (auto* id = dynamic_cast<const IdentExpr*>(&e)) {
             out_ += id->name;
             return;
@@ -860,6 +880,25 @@ private:
     void printPattern(const Pattern& p) {
         if (auto* lit = dynamic_cast<const LitIntPat*>(&p)) {
             out_ += std::to_string(lit->value);
+            return;
+        }
+        // v27 Phase 147: a char-literal pattern reuses the char-literal expr
+        // printer (printable ASCII / named escape / `'\u{HEX}'`).
+        if (auto* cp = dynamic_cast<const LitCharPat*>(&p)) {
+            std::uint32_t c = cp->codepoint;
+            out_ += '\'';
+            if (c == '\n') out_ += "\\n";
+            else if (c == '\t') out_ += "\\t";
+            else if (c == '\r') out_ += "\\r";
+            else if (c == '\\') out_ += "\\\\";
+            else if (c == '\'') out_ += "\\'";
+            else if (c >= 0x20 && c < 0x7F) out_ += static_cast<char>(c);
+            else {
+                char buf[16];
+                std::snprintf(buf, sizeof(buf), "\\u{%X}", c);
+                out_ += buf;
+            }
+            out_ += '\'';
             return;
         }
         if (dynamic_cast<const WildPat*>(&p)) {

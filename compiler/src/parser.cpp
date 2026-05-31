@@ -2013,6 +2013,18 @@ private:
             return e;
         }
 
+        // v27 Phase 147: char literal `'c'`. The lexer already decoded the
+        // scalar to a codepoint stored as a decimal string in the lexeme.
+        if (t.kind == TokenKind::CharLit) {
+            Token tok = consume();
+            auto e = std::make_unique<ast::CharLitExpr>();
+            e->line = tok.line;
+            e->column = tok.column;
+            e->codepoint =
+                static_cast<std::uint32_t>(std::stoul(tok.lexeme));
+            return e;
+        }
+
         // Phase 15: boolean literals `true` / `false`.
         if (t.kind == TokenKind::KwTrue || t.kind == TokenKind::KwFalse) {
             Token tok = consume();
@@ -2608,6 +2620,15 @@ private:
             p->line = tok.line;
             p->column = tok.column;
             p->value = parseIntLitLexeme(tok, nullptr, nullptr);
+            return p;
+        }
+        // v27 Phase 147: a char-literal pattern `'a'`.
+        if (t.kind == TokenKind::CharLit) {
+            Token tok = consume();
+            auto p = std::make_unique<ast::LitCharPat>();
+            p->line = tok.line;
+            p->column = tok.column;
+            p->codepoint = static_cast<std::uint32_t>(std::stoul(tok.lexeme));
             return p;
         }
         if (t.kind == TokenKind::Underscore) {

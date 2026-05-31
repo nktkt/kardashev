@@ -126,6 +126,10 @@ ExprPtr cloneExpr(const Expr& e) {
         auto n = std::make_unique<StringLitExpr>();
         n->value = s->value;
         out = std::move(n);
+    } else if (auto* c = dynamic_cast<const CharLitExpr*>(&e)) {
+        auto n = std::make_unique<CharLitExpr>();
+        n->codepoint = c->codepoint;
+        out = std::move(n);
     } else if (auto* id = dynamic_cast<const IdentExpr*>(&e)) {
         auto n = std::make_unique<IdentExpr>();
         n->name = id->name;

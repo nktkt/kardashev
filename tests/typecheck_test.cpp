@@ -55,6 +55,37 @@ void test_int_literal_return() {
     expectOk("fn f() -> i64 { 42 }", "int_literal_return");
 }
 
+// v27 Phase 147: the `char` type.
+void test_char_literal_and_cast_ok() {
+    expectOk("fn f() -> i64 { 'A' as i64 }", "char_literal_and_cast_ok");
+    expectOk("fn f(c: char) -> char { c }", "char_param_ok");
+    expectOk("fn f() -> char { let n = 65; n as char }", "int_to_char_ok");
+}
+
+void test_char_comparison_ok() {
+    expectOk("fn f(a: char, b: char) -> bool { a < b }", "char_lt_ok");
+    expectOk("fn f(a: char) -> bool { a == 'x' }", "char_eq_ok");
+}
+
+void test_char_arithmetic_errors() {
+    expectErr("fn f() -> i64 { let x = 'a' + 'b'; 0 }",
+              "char_arithmetic_errors");
+}
+
+void test_char_int_mismatch_errors() {
+    // A char does not unify with an integer — comparison needs an `as` cast.
+    expectErr("fn f() -> bool { 'a' == 97 }", "char_int_mismatch_errors");
+    expectErr("fn f(c: char) -> i64 { c }", "char_is_not_i64");
+}
+
+void test_char_pattern_ok() {
+    expectOk("fn f(c: char) -> i64 { match c { 'a' => 1, _ => 0 } }",
+             "char_pattern_ok");
+    // A char pattern against an i64 scrutinee is a type error.
+    expectErr("fn f(n: i64) -> i64 { match n { 'a' => 1, _ => 0 } }",
+              "char_pattern_on_int_errors");
+}
+
 void test_param_ref() {
     expectOk("fn f(x: i64) -> i64 { x }", "param_ref");
 }
@@ -3116,6 +3147,11 @@ int main() {
     test_closure_bound_fnmut_where_fn_errors();
     test_closure_bound_fn_widens_to_fnmut_ok();
     test_closure_records_kind_on_node();
+    test_char_literal_and_cast_ok();
+    test_char_comparison_ok();
+    test_char_arithmetic_errors();
+    test_char_int_mismatch_errors();
+    test_char_pattern_ok();
     test_fnmut_non_mut_capture_errors();
     test_fnmut_return_byref_closure_errors();
     test_return_byvalue_closure_ok();
@@ -3269,6 +3305,6 @@ int main() {
     test_const_type_mismatch_errors();
     test_const_array_len_bool_errors();
     test_const_array_len_calls_nonconst_fn_errors();
-    std::cout << "All typecheck tests passed (304 cases)\n";
+    std::cout << "All typecheck tests passed (309 cases)\n";
     return 0;
 }

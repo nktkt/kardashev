@@ -6855,6 +6855,8 @@ private:
                 return r->floatWidth == 32 ? llvm::Type::getFloatTy(*ctx_)
                                            : llvm::Type::getDoubleTy(*ctx_);
             case TypeKind::Bool: return llvm::Type::getInt1Ty(*ctx_);
+            case TypeKind::Char: // v27 Phase 147: a Unicode scalar -> i32
+                return llvm::Type::getInt32Ty(*ctx_);
             case TypeKind::Unit: return llvm::Type::getVoidTy(*ctx_);
             case TypeKind::Ref: {
                 // Phase 11: `&dyn Trait` is a fat pointer, not a thin one.
@@ -7143,6 +7145,7 @@ private:
         if (tr.name == "f64") return makeFloat(); // Phase 39/44
         if (tr.name == "f32") return makeFloatW(32); // Phase 67
         if (tr.name == "bool") return makeBool();
+        if (tr.name == "char") return makeChar(); // v27 Phase 147
         // Phase 16: a fn with no `-> T` annotation returns unit (parser
         // synthesizes a "unit" TypeRef). Mirrors typecheck's resolveTypeRef.
         if (tr.name == "unit") return makeUnit();
@@ -9758,6 +9761,11 @@ private:
             return llvm::ConstantInt::get(llvm::Type::getInt1Ty(*ctx_),
                                           bl->value ? 1 : 0);
         }
+        // v27 Phase 147: char literal -> i32 constant (the Unicode codepoint).
+        if (auto* cl = dynamic_cast<const ast::CharLitExpr*>(&e)) {
+            return llvm::ConstantInt::get(llvm::Type::getInt32Ty(*ctx_),
+                                          cl->codepoint);
+        }
         // Phase 15: prefix unary operators.
         if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
             return emitUnary(*un);
@@ -11319,9 +11327,14 @@ private:
                                 llvm::Type::getInt32Ty(*ctx_), c.ctorTag),
                             "tagmatch");
                     } else {
+                        // v27 Phase 147: build the literal at the SCRUTINEE's
+                        // own integer width so a `char` (i32) literal pattern
+                        // compares as i32, not i64 (a type-mismatched icmp).
+                        llvm::Type* litTy = subVal->getType()->isIntegerTy()
+                                                ? subVal->getType()
+                                                : llvm::Type::getInt64Ty(*ctx_);
                         llvm::Value* litV = llvm::ConstantInt::get(
-                            llvm::Type::getInt64Ty(*ctx_),
-                            static_cast<uint64_t>(c.litValue),
+                            litTy, static_cast<uint64_t>(c.litValue),
                             /*isSigned=*/true);
                         eq = builder_->CreateICmpEQ(subVal, litV, "litmatch");
                     }

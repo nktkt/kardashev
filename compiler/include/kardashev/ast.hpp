@@ -126,6 +126,13 @@ struct LitIntPat : Pattern {
     std::int64_t value = 0;
 };
 
+// v27 Phase 147: a char-literal pattern `'a' => ...`. Refutable; the scrutinee
+// must be `char`. Lowered through the same literal-discriminated decision tree
+// as LitIntPat (keyed on the codepoint), comparing at the char's i32 width.
+struct LitCharPat : Pattern {
+    std::uint32_t codepoint = 0;
+};
+
 struct WildPat : Pattern {};
 
 struct VarPat : Pattern {
@@ -197,6 +204,12 @@ struct BoolLitExpr : Expr {
 // global byte buffer wrapped in the built-in `String` struct.
 struct StringLitExpr : Expr {
     std::string value;
+};
+
+// v27 Phase 147: `'c'` char literal — one Unicode scalar value. Typechecks to
+// the `char` type; codegen lowers to an i32 constant holding the codepoint.
+struct CharLitExpr : Expr {
+    std::uint32_t codepoint = 0;
 };
 
 struct IdentExpr : Expr {

@@ -851,6 +851,58 @@ std::string applyPrelude(const std::string& userSrc) {
             "    out\n"
             "}\n";
     }
+    // v27 Phase 147: char <-> string bridges, written in kardashev over the
+    // `str_push_byte` builtin and the new `char as i64` / `i64 as char` casts.
+    // `str_push_char` UTF-8-ENCODES the scalar (1–4 bytes, the real codec);
+    // `char_to_string` builds a one-char String; `char_from_u32` is the
+    // VALIDATING constructor (out-of-range / surrogate -> U+FFFD replacement);
+    // `print_char` writes a char with no trailing newline.
+    if (userSrc.find("fn str_push_char") == std::string::npos) {
+        prelude +=
+            "fn str_push_char(s: &mut String, c: char) -> i64 ! { alloc } {\n"
+            "    let cp = c as i64;\n"
+            "    if cp < 128 {\n"
+            "        str_push_byte(s, cp)\n"
+            "    } else if cp < 2048 {\n"
+            "        str_push_byte(s, 192 | (cp >> 6));\n"
+            "        str_push_byte(s, 128 | (cp & 63))\n"
+            "    } else if cp < 65536 {\n"
+            "        str_push_byte(s, 224 | (cp >> 12));\n"
+            "        str_push_byte(s, 128 | ((cp >> 6) & 63));\n"
+            "        str_push_byte(s, 128 | (cp & 63))\n"
+            "    } else {\n"
+            "        str_push_byte(s, 240 | (cp >> 18));\n"
+            "        str_push_byte(s, 128 | ((cp >> 12) & 63));\n"
+            "        str_push_byte(s, 128 | ((cp >> 6) & 63));\n"
+            "        str_push_byte(s, 128 | (cp & 63))\n"
+            "    }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn char_to_string") == std::string::npos) {
+        prelude +=
+            "fn char_to_string(c: char) -> String ! { alloc } {\n"
+            "    let mut s = string_new();\n"
+            "    str_push_char(&mut s, c);\n"
+            "    s\n"
+            "}\n";
+    }
+    if (userSrc.find("fn char_from_u32") == std::string::npos) {
+        prelude +=
+            "fn char_from_u32(n: i64) -> char {\n"
+            "    if n < 0 { '\\u{FFFD}' }\n"
+            "    else if n > 1114111 { '\\u{FFFD}' }\n"
+            "    else if n >= 55296 {\n"
+            "        if n <= 57343 { '\\u{FFFD}' } else { n as char }\n"
+            "    } else { n as char }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn print_char") == std::string::npos) {
+        prelude +=
+            "fn print_char(c: char) -> i64 ! { io, alloc } {\n"
+            "    let s = char_to_string(c);\n"
+            "    print_no_nl(&s)\n"
+            "}\n";
+    }
     if (userSrc.find("fn option_unwrap_or") == std::string::npos) {
         prelude +=
             "fn option_unwrap_or(o: Option<i64>, default: i64) -> i64 {\n"

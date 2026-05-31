@@ -56,6 +56,12 @@ TypePtr makeBool() {
     return t;
 }
 
+TypePtr makeChar() {
+    auto t = std::make_shared<Type>();
+    t->kind = TypeKind::Char;
+    return t;
+}
+
 TypePtr makeUnit() {
     auto t = std::make_shared<Type>();
     t->kind = TypeKind::Unit;
@@ -908,6 +914,7 @@ std::string typeToString(const TypePtr& t) {
         return intTypeName(r->intWidth, r->intSigned); // v11: i8..u64
     case TypeKind::Float: return floatTypeName(r->floatWidth); // Phase 67
     case TypeKind::Bool: return "bool";
+    case TypeKind::Char: return "char"; // v27 Phase 147
     case TypeKind::Unit: return "()";
     case TypeKind::Var:
         // v11: an unconstrained integer-literal var defaults to i64.

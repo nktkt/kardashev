@@ -72,6 +72,7 @@ bool isCopyType(const TypePtr& t) {
     case TypeKind::Int:
     case TypeKind::Float: // Phase 39: f64 is a Copy scalar
     case TypeKind::Bool:
+    case TypeKind::Char:  // v27 Phase 147: a char is a Copy i32 scalar
     case TypeKind::Unit:
         return true;
     case TypeKind::Ref:

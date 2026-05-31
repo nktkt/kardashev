@@ -133,6 +133,83 @@ std::vector<Token> lex(std::string_view source) {
             continue;
         }
 
+        // v27 Phase 147: char literal `'c'` — exactly one Unicode scalar.
+        // Supports the escapes `\n \t \r \\ \' \0` and `\u{XXXX}` (1–6 hex).
+        // A bare char may be multi-byte UTF-8 in the source; we decode it to a
+        // codepoint. The token's lexeme carries the codepoint as a decimal
+        // string (the parser turns it into a CharLitExpr). (`'` is unused
+        // elsewhere — kardashev has no lifetime syntax — so this is
+        // unambiguous.)
+        if (c == '\'') {
+            ++i;
+            ++col;
+            unsigned long cp = 0;
+            bool haveCp = false;
+            if (i < source.size() && source[i] == '\\' && i + 1 < source.size()) {
+                char e = source[i + 1];
+                i += 2;
+                col += 2;
+                haveCp = true;
+                switch (e) {
+                    case 'n': cp = '\n'; break;
+                    case 't': cp = '\t'; break;
+                    case 'r': cp = '\r'; break;
+                    case '\\': cp = '\\'; break;
+                    case '\'': cp = '\''; break;
+                    case '0': cp = 0; break;
+                    case 'u': {
+                        // `\u{XXXX}` — skip `{`, read hex, skip `}`.
+                        if (i < source.size() && source[i] == '{') {
+                            ++i; ++col;
+                            cp = 0;
+                            while (i < source.size() && source[i] != '}') {
+                                char h = source[i];
+                                int d = (h >= '0' && h <= '9') ? h - '0'
+                                        : (h >= 'a' && h <= 'f') ? h - 'a' + 10
+                                        : (h >= 'A' && h <= 'F') ? h - 'A' + 10
+                                                                 : -1;
+                                if (d < 0) break;
+                                cp = cp * 16 + static_cast<unsigned long>(d);
+                                ++i; ++col;
+                            }
+                            if (i < source.size() && source[i] == '}') { ++i; ++col; }
+                        }
+                        break;
+                    }
+                    default: cp = static_cast<unsigned char>(e); break;
+                }
+            } else if (i < source.size() && source[i] != '\'') {
+                // A raw character — decode a UTF-8 sequence to its codepoint.
+                unsigned char b0 = static_cast<unsigned char>(source[i]);
+                int extra = (b0 < 0x80)   ? 0
+                            : (b0 >> 5) == 0x6 ? 1
+                            : (b0 >> 4) == 0xE ? 2
+                            : (b0 >> 3) == 0x1E ? 3
+                                                : 0;
+                if (extra == 0) {
+                    cp = b0;
+                } else {
+                    cp = b0 & (0x7Fu >> (extra + 1));
+                    for (int k = 0; k < extra && i + 1 < source.size(); ++k) {
+                        ++i;
+                        cp = (cp << 6) |
+                             (static_cast<unsigned char>(source[i]) & 0x3Fu);
+                    }
+                }
+                ++i;
+                col += 1 + extra;
+                haveCp = true;
+            }
+            if (i < source.size() && source[i] == '\'') { ++i; ++col; }
+            if (!haveCp) {
+                // empty `''` — recover as NUL so the parser still produces a node
+                cp = 0;
+            }
+            tokens.push_back({TokenKind::CharLit, std::to_string(cp), line,
+                              startCol});
+            continue;
+        }
+
         // Integer or float literal (Phase 39). Scan the integer part, then
         // promote to a float iff a `.` is FOLLOWED BY A DIGIT (so `1.5` is a
         // float, but `1..5` stays the int `1` + the `..` range op) or an
@@ -367,6 +444,7 @@ std::string_view tokenKindName(TokenKind kind) {
     case TokenKind::Integer: return "Integer";
     case TokenKind::Float: return "Float";
     case TokenKind::StringLit: return "StringLit";
+    case TokenKind::CharLit: return "CharLit";
     case TokenKind::Identifier: return "Identifier";
     case TokenKind::KwFn: return "KwFn";
     case TokenKind::KwLet: return "KwLet";

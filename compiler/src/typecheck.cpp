@@ -3700,6 +3700,11 @@ private:
                 error("bool takes no type arguments", tr.line, tr.column);
             return makeBool();
         }
+        if (tr.name == "char") { // v27 Phase 147
+            if (!tr.typeArgs.empty())
+                error("char takes no type arguments", tr.line, tr.column);
+            return makeChar();
+        }
         std::vector<TypePtr> argTypes;
         argTypes.reserve(tr.typeArgs.size());
         for (const auto& a : tr.typeArgs) argTypes.push_back(resolveTypeRef(a));
@@ -4399,6 +4404,9 @@ private:
             auto it = structSchemas_.find("String");
             return it != structSchemas_.end() ? it->second.type
                                               : makeStruct("String", {});
+        }
+        if (dynamic_cast<const ast::CharLitExpr*>(&e)) {
+            return makeChar(); // v27 Phase 147
         }
         if (auto* id = dynamic_cast<const ast::IdentExpr*>(&e)) {
             if (auto t = lookupLocal(id->name)) return t;
@@ -5538,6 +5546,25 @@ private:
                                (bin.op == ast::BinOp::Shr);
         const char* what =
             isComparison ? "comparison" : isBitwise ? "bitwise" : "arithmetic";
+        // v27 Phase 147: `char` supports equality + ordering (by codepoint),
+        // returning bool — but NO arithmetic / bitwise (like Rust). Both sides
+        // must be `char`.
+        if (resolve(lhs)->kind == TypeKind::Char ||
+            resolve(rhs)->kind == TypeKind::Char) {
+            if (!isComparison) {
+                error(std::string(what) +
+                          " operators are not defined for `char` (cast to an "
+                          "integer with `as` first)",
+                      bin.line, bin.column);
+                return makeChar();
+            }
+            if (!unify(lhs, rhs) || resolve(lhs)->kind != TypeKind::Char) {
+                error("`char` comparison requires both operands to be `char`, "
+                      "got " + typeToString(lhs) + " and " + typeToString(rhs),
+                      bin.line, bin.column);
+            }
+            return makeBool();
+        }
         // Phase 39/67: float arithmetic / comparison. If a side is a float,
         // both sides must be the SAME float width (f32 or f64) — there is NO
         // implicit i64<->float or f32<->f64 coercion (use `as`). `%` and the
@@ -6302,6 +6329,7 @@ private:
             // by-value captures outright in this MVP.
             bool copyable = rt->kind == TypeKind::Int ||
                             rt->kind == TypeKind::Bool ||
+                            rt->kind == TypeKind::Char || // v27 Phase 147
                             rt->kind == TypeKind::Unit;
             // Phase 123: a `Mutex<T>` is a true Copy i64 handle (the lock+cell
             // block is process-lifetime, never freed), so capturing it by value
@@ -7101,6 +7129,23 @@ private:
             return (t->kind == TypeKind::Int && !t->isConstValue) ||
                    t->kind == TypeKind::Float;
         };
+        // v27 Phase 147: `char as <int>` reads the scalar's codepoint, and
+        // `<int> as char` builds a char from a codepoint (the integer is
+        // assumed in range — `char_from_u32` is the validating constructor).
+        // No `char as f64` / `f64 as char`. char-to-char is identity.
+        if (src->kind == TypeKind::Char || dst->kind == TypeKind::Char) {
+            bool ok = (src->kind == TypeKind::Char && dst->kind == TypeKind::Char) ||
+                      (src->kind == TypeKind::Char &&
+                       dst->kind == TypeKind::Int && !dst->isConstValue) ||
+                      (dst->kind == TypeKind::Char &&
+                       src->kind == TypeKind::Int && !src->isConstValue);
+            if (!ok) {
+                error("`as` cast for `char` is only to/from an integer type, "
+                      "got " + typeToString(src) + " as " + typeToString(dst),
+                      ce.line, ce.column);
+            }
+            return dst;
+        }
         if (!isNumeric(src) || !isNumeric(dst)) {
             error("`as` cast is only allowed between numeric types (integers "
                   "and f64), got " +
@@ -7472,6 +7517,7 @@ private:
         case TypeKind::Int:
         case TypeKind::Float: // Phase 39: f64 is Copy
         case TypeKind::Bool:
+        case TypeKind::Char:  // v27 Phase 147: char is a Copy scalar
         case TypeKind::Unit:
             return true;
         case TypeKind::Array:
@@ -7858,6 +7904,15 @@ private:
         if (dynamic_cast<const ast::LitIntPat*>(&pat)) {
             if (!unify(expected, makeInt())) {
                 error("integer pattern requires i64, scrutinee is " +
+                          typeToString(expected),
+                      pat.line, pat.column);
+            }
+            return;
+        }
+        // v27 Phase 147: a char-literal pattern requires a `char` scrutinee.
+        if (dynamic_cast<const ast::LitCharPat*>(&pat)) {
+            if (!unify(expected, makeChar())) {
+                error("char pattern requires a `char` scrutinee, got " +
                           typeToString(expected),
                       pat.line, pat.column);
             }

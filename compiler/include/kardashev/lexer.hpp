@@ -24,6 +24,8 @@ enum class TokenKind {
     Integer,
     Float, // Phase 39: f64 literal — DIGIT+ ('.' DIGIT+)? ([eE][+-]?DIGIT+)?
     StringLit, // Phase 5.y: "..." string literal
+    CharLit,   // v27 Phase 147: '...' char literal — one Unicode scalar; the
+               // token's lexeme holds the scalar's codepoint as a decimal string
     Identifier,
 
     // Keywords

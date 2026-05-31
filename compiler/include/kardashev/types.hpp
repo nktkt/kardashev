@@ -30,6 +30,11 @@ enum class TypeKind {
     Int,
     Float, // Phase 39: f64, lowering to LLVM `double`
     Bool,
+    // v27 Phase 147: `char` — a Unicode scalar value (0..=0x10FFFF, no
+    // surrogates). A DISTINCT type from the integer tower (no arithmetic; only
+    // equality/ordering and an explicit `as` cast bridge it to/from integers).
+    // Lowers to an LLVM i32 holding the codepoint.
+    Char,
     Unit,
     Function,
     Var,
@@ -195,6 +200,7 @@ TypePtr makeFloat();
 TypePtr makeFloatW(int width);
 std::string floatTypeName(int width);
 TypePtr makeBool();
+TypePtr makeChar(); // v27 Phase 147: the `char` type (Unicode scalar)
 TypePtr makeUnit();
 // Build a function type. The 2-arg form yields a pure (empty) effect row;
 // the 4-arg form attaches an explicit row (concrete labels + optional row
