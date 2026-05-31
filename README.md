@@ -52,7 +52,7 @@ Effect sets are unioned across the call graph and checked at definition sites; n
 
 ## Status
 
-All seventeen roadmaps (Phases 0–107, **v1–v17**) have shipped and are merged to
+All eighteen roadmaps (Phases 0–111, **v1–v18**) have shipped and are merged to
 `main` — 6 unit suites plus the full smoke-test aggregate pass **JIT and AOT**
 on a cleared clean build. v15–v17 ("self-hosting") build a complete compiler
 *in* kardashev — the north-star arc toward a bootstrap: v15 the front-end
@@ -62,7 +62,10 @@ code generator** — capstone `examples/selfhost/compile.kd` type-checks a whole
 function and compiles + runs its body (lex → parse → type-check → codegen → VM,
 every stage in kardashev). Dogfooding self-hosting found and fixed three real
 host-compiler bugs (a field-move double-free, a unit-tail-`match` miscompile, a
-field-assignment leak). v14 ("hardening") made the toolchain trustworthy
+field-assignment leak). v18 ("hardening II") closed the remaining gaps the
+adversarial review exposed (a field re-initialization over-rejection, a
+unit-async compiler crash) and added a **differential fuzzer** (random programs,
+JIT == AOT == reference) over the arithmetic + control-flow codegen paths. v14 ("hardening") made the toolchain trustworthy
 across platforms: **macOS CI went green for the first time** (portable leak
 gates), the smoke harness is SIGPIPE-robust, the channel capture-and-keep footgun
 is now a precise compile error, and a JIT-vs-AOT differential sweep over the 9
@@ -413,11 +416,12 @@ generic keys; 29 plugged the Drop leaks 27–28's new droppable values made load
 hole; 31 integrated 27–30 into the self-written capstones; 32 documented the result last.
 Each shipped green before the next, exactly as v1–v4 did.
 
-## Roadmap v18 — in progress
+## Roadmap v18 — shipped
 
-> **Status: in progress** on `feat/roadmap-v18`. "Hardening II" — close the
-> concrete gaps that dogfooding the self-hosted compiler (v15–v17) exposed, and
-> deepen the test surface. Each phase a real, tested fix.
+> **Status: shipped** (`0.18.0`). "Hardening II" — close the concrete gaps that
+> dogfooding the self-hosted compiler (v15–v17) and its adversarial review
+> exposed, and deepen the test surface with differential fuzzing. Each phase a
+> real, tested fix.
 >
 > - **Phase 108 — re-initializing a moved-out field is legal (done).** v17's
 >   field-level move tracking (Phase 106) conservatively rejected `s.a = new`

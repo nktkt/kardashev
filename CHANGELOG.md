@@ -18,6 +18,35 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.18.0] — Roadmap v18 "hardening II" (Phases 108–111)
+
+Theme: close the concrete gaps that dogfooding the self-hosted compiler (v15–v17)
+and its adversarial review exposed, and deepen the test surface with differential
+fuzzing.
+
+### Fixed
+- **Re-initializing a moved-out struct field is legal** (Phase 108) — v17's
+  field-level move tracking conservatively rejected `s.a = new` after `s.a` was
+  moved out. The borrow checker now clears that field from the root's moved set
+  on a `root.field = v` assignment (after the RHS is consumed, so `s.a = f(s.a)`
+  still flags the RHS), so the field and struct are usable again. Using a moved
+  field *without* re-initializing it is still rejected.
+- **A unit-returning async fn no longer crashes the compiler** (Phase 109) — an
+  `async fn f(..) ! { .. } { stmt; }` (no `-> T`) SIGTRAP'd the compiler when its
+  future was consumed: `block_on` / `.await` / `spawn`+`join` read the `Poll<T>`
+  value slot as `T`, and for the unit result `T` maps to LLVM `void`, so a `load
+  void` (and a named `void` call) emitted invalid IR. A void result now yields
+  the unit placeholder without a load, and the `block_on` call is left unnamed.
+  (Found by the v17 adversarial review.)
+
+### Added
+- **A differential fuzzer for the codegen path** (Phases 110–111) — generates
+  random, always-valid programs and checks three oracles agree: the JIT-printed
+  value, the AOT exit code, and a Python reference. Phase 110 covers arithmetic
+  (`+ - * ( )` over `i64`); Phase 111 adds `let` bindings, comparisons, and
+  `if/else` branch selection. Seeded for reproducibility; 500 programs across the
+  two harnesses agree exactly — no miscompile found.
+
 ## [0.17.0] — Roadmap v17 "self-hosting, continued — a compiler in kardashev" (Phases 98–107)
 
 Theme: complete the self-hosted compiler — type checker **and** code generator,
