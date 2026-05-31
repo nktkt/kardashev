@@ -903,6 +903,96 @@ std::string applyPrelude(const std::string& userSrc) {
             "    print_no_nl(&s)\n"
             "}\n";
     }
+    // v27 Phase 148: UTF-8 correctness — decode/iterate a String's bytes as
+    // Unicode chars. `str_char_width_at` is the byte width (1-4) of the char
+    // whose lead byte is at byte index i; `str_decode_char_at` DECODES that
+    // char; `str_char_count` counts chars (vs `str_len`'s BYTES); `string_chars`
+    // collects all chars into a `Vec<char>`; `str_is_valid_utf8` structurally
+    // validates the byte sequence. All written over the byte builtin
+    // `str_char_at` + `char_from_u32`. (Byte indexing stays `str_char_at` /
+    // `str_len`; these add the char-aware layer.)
+    if (userSrc.find("fn str_char_width_at") == std::string::npos) {
+        prelude +=
+            "fn str_char_width_at(s: &String, i: i64) -> i64 {\n"
+            "    let b = str_char_at(s, i);\n"
+            "    if b < 128 { 1 } else if b < 192 { 1 }\n"
+            "    else if b < 224 { 2 } else if b < 240 { 3 } else { 4 }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_decode_char_at") == std::string::npos) {
+        prelude +=
+            "fn str_decode_char_at(s: &String, i: i64) -> char {\n"
+            "    let b0 = str_char_at(s, i);\n"
+            "    if b0 < 128 { char_from_u32(b0) }\n"
+            "    else if b0 < 224 {\n"
+            "        let b1 = str_char_at(s, i + 1);\n"
+            "        char_from_u32(((b0 & 31) << 6) | (b1 & 63))\n"
+            "    } else if b0 < 240 {\n"
+            "        let b1 = str_char_at(s, i + 1);\n"
+            "        let b2 = str_char_at(s, i + 2);\n"
+            "        char_from_u32(((b0 & 15) << 12) | ((b1 & 63) << 6) | (b2 & 63))\n"
+            "    } else {\n"
+            "        let b1 = str_char_at(s, i + 1);\n"
+            "        let b2 = str_char_at(s, i + 2);\n"
+            "        let b3 = str_char_at(s, i + 3);\n"
+            "        char_from_u32(((b0 & 7) << 18) | ((b1 & 63) << 12) | ((b2 & 63) << 6) | (b3 & 63))\n"
+            "    }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_char_count") == std::string::npos) {
+        prelude +=
+            "fn str_char_count(s: &String) -> i64 {\n"
+            "    let n = str_len(s);\n"
+            "    let mut i = 0;\n"
+            "    let mut count = 0;\n"
+            "    while i < n {\n"
+            "        i = i + str_char_width_at(s, i);\n"
+            "        count = count + 1;\n"
+            "    }\n"
+            "    count\n"
+            "}\n";
+    }
+    if (userSrc.find("fn string_chars") == std::string::npos) {
+        prelude +=
+            "fn string_chars(s: &String) -> Vec<char> ! { alloc } {\n"
+            "    let n = str_len(s);\n"
+            "    let mut out = vec_new();\n"
+            "    let mut i = 0;\n"
+            "    while i < n {\n"
+            "        let w = str_char_width_at(s, i);\n"
+            "        vec_push(&mut out, str_decode_char_at(s, i));\n"
+            "        i = i + w;\n"
+            "    }\n"
+            "    out\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_is_valid_utf8") == std::string::npos) {
+        prelude +=
+            "fn str_is_valid_utf8(s: &String) -> bool {\n"
+            "    let n = str_len(s);\n"
+            "    let mut i = 0;\n"
+            "    let mut ok = true;\n"
+            "    while i < n {\n"
+            "        let b0 = str_char_at(s, i);\n"
+            "        let w = if b0 < 128 { 1 } else if b0 < 192 { 0 }\n"
+            "                else if b0 < 224 { 2 } else if b0 < 240 { 3 }\n"
+            "                else if b0 < 248 { 4 } else { 0 };\n"
+            "        if w == 0 { ok = false; i = n; }\n"
+            "        else if i + w > n { ok = false; i = n; }\n"
+            "        else {\n"
+            "            let mut k = 1;\n"
+            "            while k < w {\n"
+            "                let bc = str_char_at(s, i + k);\n"
+            "                if bc < 128 { ok = false; }\n"
+            "                else if bc >= 192 { ok = false; } else {}\n"
+            "                k = k + 1;\n"
+            "            }\n"
+            "            i = i + w;\n"
+            "        }\n"
+            "    }\n"
+            "    ok\n"
+            "}\n";
+    }
     if (userSrc.find("fn option_unwrap_or") == std::string::npos) {
         prelude +=
             "fn option_unwrap_or(o: Option<i64>, default: i64) -> i64 {\n"

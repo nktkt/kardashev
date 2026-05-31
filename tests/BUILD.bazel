@@ -342,6 +342,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v27 Phase 148: UTF-8 correctness — char iteration / indexing / validation.
+sh_test(
+    name = "smoke_test_phase148",
+    srcs = ["smoke_test_phase148.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v26 Phase 144: type aliases (type Name = Target).
 sh_test(
     name = "smoke_test_phase144",
