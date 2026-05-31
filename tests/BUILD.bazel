@@ -342,6 +342,41 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v29 Phase 161: randomized C-vs-LLVM differential oracle.
+sh_test(
+    name = "smoke_test_phase161",
+    srcs = ["smoke_test_phase161.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v29 Phase 160: C backend for/loop-with-value + modules (gated vs LLVM).
+sh_test(
+    name = "smoke_test_phase160",
+    srcs = ["smoke_test_phase160.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v29 Phase 159: C backend references/borrows + &<temporary> (gated vs LLVM).
+sh_test(
+    name = "smoke_test_phase159",
+    srcs = ["smoke_test_phase159.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v29 Phase 158: C backend enums + match (differentially gated vs LLVM).
+sh_test(
+    name = "smoke_test_phase158",
+    srcs = ["smoke_test_phase158.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v29 Phase 157: C backend structs (differentially gated vs LLVM).
+sh_test(
+    name = "smoke_test_phase157",
+    srcs = ["smoke_test_phase157.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v28 Phase 156: monomorphization dedup + specialization + --mono-report.
 sh_test(
     name = "smoke_test_phase156",

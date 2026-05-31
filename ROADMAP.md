@@ -151,7 +151,8 @@ i64-only; inference incomplete; no GATs.)*
 - **155** **generic associated types** (GATs).
 - **156** **monomorphization control** / specialization + code-bloat mitigation.
 
-### v29 — the C backend, finished I (aggregates + control)
+### v29 — the C backend, finished I (aggregates + control) — *done (v0.29.0)*
+*Shipped: the `--emit-c` C backend grew from i64/bool to 157 structs, 158 enums + match (tagged unions + an if/else decision tree), 159 references/borrows + `&<temporary>` (auto-deref) + unit-returning fns, 160 for-over-range + loop-with-value + multi-file modules, 161 a randomized C-vs-LLVM differential oracle. Every phase differentially gated (LLVM-AOT exit == emitted-C exit). Out-of-subset (traits/impls/strings/Vec/Drop/closures/generics/async) still REFUSED, never miscompiled. Documented follow-on: match-through-ref payload binding.*
 Continue v23 (`--emit-c`), each phase differentially gated vs LLVM.
 *(Survey `backends-performance`: the explicit subset list in `emit_c.hpp`.)*
 - **157** C backend: **structs** (layout + field access).
