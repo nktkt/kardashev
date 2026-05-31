@@ -120,6 +120,8 @@ The north-star arc is **self-hosting**: v15–v17 build a complete compiler *in*
 | v18 | "hardening II" — review-followup fixes + a differential fuzzer |
 | v19 | "hardening III" — memory-safety + integer fuzzers, cleaner diagnostics |
 
+**Next (v20+) — and an honest take on where this stands vs production languages:** see **[ROADMAP.md](ROADMAP.md)**.
+
 ## Why "kardashev"?
 
 The [Kardashev scale](https://en.wikipedia.org/wiki/Kardashev_scale) ranks civilizations by how much energy they can harness. A systems language, in its own small way, is about controlling resources at scale — a fitting name for one that aims to be precise about effects, ownership, and computation.
