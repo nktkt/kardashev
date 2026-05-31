@@ -1035,6 +1035,94 @@ std::string applyPrelude(const std::string& userSrc) {
             "    ok\n"
             "}\n";
     }
+    // v27 Phase 151: char classification + string encode helpers. The char
+    // predicates / case mappings are ASCII-correct (full Unicode case folding +
+    // the property tables are a documented future item, gated on shipping the
+    // Unicode character database). str_join / str_replace / str_lines round out
+    // the text-building vocabulary over the existing byte ops.
+    if (userSrc.find("fn char_is_digit") == std::string::npos) {
+        prelude +=
+            "fn char_is_digit(c: char) -> bool { let n = c as i64; n >= 48 && n <= 57 }\n";
+    }
+    if (userSrc.find("fn char_is_alpha") == std::string::npos) {
+        prelude +=
+            "fn char_is_alpha(c: char) -> bool {\n"
+            "    let n = c as i64;\n"
+            "    (n >= 65 && n <= 90) || (n >= 97 && n <= 122)\n"
+            "}\n";
+    }
+    if (userSrc.find("fn char_is_alnum") == std::string::npos) {
+        prelude +=
+            "fn char_is_alnum(c: char) -> bool { char_is_alpha(c) || char_is_digit(c) }\n";
+    }
+    if (userSrc.find("fn char_is_whitespace") == std::string::npos) {
+        prelude +=
+            "fn char_is_whitespace(c: char) -> bool {\n"
+            "    let n = c as i64;\n"
+            "    n == 32 || n == 9 || n == 10 || n == 13\n"
+            "}\n";
+    }
+    if (userSrc.find("fn char_to_upper") == std::string::npos) {
+        prelude +=
+            "fn char_to_upper(c: char) -> char {\n"
+            "    let n = c as i64;\n"
+            "    if n >= 97 { if n <= 122 { char_from_u32(n - 32) } else { c } } else { c }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn char_to_lower") == std::string::npos) {
+        prelude +=
+            "fn char_to_lower(c: char) -> char {\n"
+            "    let n = c as i64;\n"
+            "    if n >= 65 { if n <= 90 { char_from_u32(n + 32) } else { c } } else { c }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_join") == std::string::npos) {
+        prelude +=
+            "fn str_join(parts: &Vec<String>, sep: &String) -> String ! { alloc } {\n"
+            "    let mut out = string_new();\n"
+            "    let n = vec_len(parts);\n"
+            "    let mut i = 0;\n"
+            "    while i < n {\n"
+            "        if i > 0 { string_push_str(&mut out, clone(sep)); } else {}\n"
+            "        string_push_str(&mut out, vec_get(parts, i));\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    out\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_replace") == std::string::npos) {
+        prelude +=
+            "fn str_replace(s: &String, from: &String, to: &String) -> String ! { alloc } {\n"
+            "    let mut out = string_new();\n"
+            "    let sl = str_len(s);\n"
+            "    let fl = str_len(from);\n"
+            "    let mut i = 0;\n"
+            "    while i < sl {\n"
+            "        let mut matched = fl > 0;\n"
+            "        if i + fl > sl { matched = false; } else {\n"
+            "            let mut k = 0;\n"
+            "            while k < fl {\n"
+            "                if matched {\n"
+            "                    if str_char_at(s, i + k) != str_char_at(from, k) { matched = false; } else {}\n"
+            "                } else {}\n"
+            "                k = k + 1;\n"
+            "            }\n"
+            "        }\n"
+            "        if matched {\n"
+            "            string_push_str(&mut out, clone(to));\n"
+            "            i = i + fl;\n"
+            "        } else {\n"
+            "            str_push_byte(&mut out, str_char_at(s, i));\n"
+            "            i = i + 1;\n"
+            "        }\n"
+            "    }\n"
+            "    out\n"
+            "}\n";
+    }
+    if (userSrc.find("fn str_lines") == std::string::npos) {
+        prelude +=
+            "fn str_lines(s: &String) -> Vec<String> ! { alloc } { str_split(s, 10) }\n";
+    }
     if (userSrc.find("fn option_unwrap_or") == std::string::npos) {
         prelude +=
             "fn option_unwrap_or(o: Option<i64>, default: i64) -> i64 {\n"

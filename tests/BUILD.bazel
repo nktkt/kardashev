@@ -342,6 +342,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v27 Phase 151: char classification + string encode helpers.
+sh_test(
+    name = "smoke_test_phase151",
+    srcs = ["smoke_test_phase151.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v27 Phase 150: the Debug trait + {:?} format spec + #[derive(Debug)].
 sh_test(
     name = "smoke_test_phase150",

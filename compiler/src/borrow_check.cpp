@@ -230,6 +230,7 @@ private:
         }
         if (tr.name == "i64") return makeInt();
         if (tr.name == "bool") return makeBool();
+        if (tr.name == "char") return makeChar(); // v27 Phase 147: Copy scalar
         auto t = std::make_shared<Type>();
         t->kind = TypeKind::Struct;
         t->structName = tr.name;
