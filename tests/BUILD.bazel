@@ -342,6 +342,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v30 Phase 164: C backend Drop/RAII (differential + ASan leak oracle).
+sh_test(
+    name = "smoke_test_phase164",
+    srcs = ["smoke_test_phase164.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v30 Phase 163: C backend scalar-element Vec (differentially gated).
 sh_test(
     name = "smoke_test_phase163",

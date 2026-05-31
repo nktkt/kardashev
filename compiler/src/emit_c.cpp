@@ -560,6 +560,134 @@ struct CEmitter {
         return s;
     }
 
+    // v30 Phase 164 (Drop / RAII): count occurrences of the identifier `name`
+    // that are NOT a borrow (`&name` / `&mut name`). A borrow keeps ownership in
+    // this scope; a BARE occurrence (returned as a value, moved into a call,
+    // reassigned, used as a field/index base that could move it out) means the
+    // binding may escape, so it is NOT safe to drop at scope exit. Conservative:
+    // any bare use ⇒ don't drop (a leak is sound; a wrong drop double-frees).
+    int bareUses(const Expr* e, const std::string& name) {
+        if (!e) return 0;
+        if (auto* re = dynamic_cast<const RefExpr*>(e)) {
+            // `&name` / `&mut name` is a borrow, not a bare use. A `&(other
+            // expr)` still recurses to find bare uses inside it.
+            if (dynamic_cast<const IdentExpr*>(re->operand.get())) return 0;
+            return bareUses(re->operand.get(), name);
+        }
+        if (auto* id = dynamic_cast<const IdentExpr*>(e))
+            return id->name == name ? 1 : 0;
+        int n = 0;
+        if (auto* u = dynamic_cast<const UnaryExpr*>(e)) n += bareUses(u->operand.get(), name);
+        else if (auto* b = dynamic_cast<const BinaryExpr*>(e)) { n += bareUses(b->lhs.get(), name); n += bareUses(b->rhs.get(), name); }
+        else if (auto* f = dynamic_cast<const FieldExpr*>(e)) n += bareUses(f->object.get(), name);
+        else if (auto* iff = dynamic_cast<const IfExpr*>(e)) { n += bareUses(iff->cond.get(), name); n += bareUses(iff->thenBranch.get(), name); n += bareUses(iff->elseBranch.get(), name); }
+        else if (auto* w = dynamic_cast<const WhileExpr*>(e)) { n += bareUses(w->cond.get(), name); n += bareUses(w->body.get(), name); }
+        else if (auto* lp = dynamic_cast<const LoopExpr*>(e)) n += bareUses(lp->body.get(), name);
+        else if (auto* fo = dynamic_cast<const ForExpr*>(e)) { n += bareUses(fo->iter.get(), name); n += bareUses(fo->body.get(), name); }
+        else if (auto* c = dynamic_cast<const CallExpr*>(e)) { for (auto& a : c->args) n += bareUses(a.get(), name); }
+        else if (auto* mx = dynamic_cast<const MatchExpr*>(e)) { n += bareUses(mx->scrutinee.get(), name); for (auto& arm : mx->arms) n += bareUses(arm.body.get(), name); }
+        else if (auto* sl = dynamic_cast<const StructLitExpr*>(e)) { for (auto& fld : sl->fields) n += bareUses(fld.second.get(), name); }
+        else if (auto* br = dynamic_cast<const BreakExpr*>(e)) n += bareUses(br->value.get(), name);
+        else if (auto* blk = dynamic_cast<const BlockExpr*>(e)) {
+            for (auto& st : blk->stmts) {
+                if (auto* l = dynamic_cast<const LetStmt*>(st.get())) n += bareUses(l->value.get(), name);
+                else if (auto* es = dynamic_cast<const ExprStmt*>(st.get())) n += bareUses(es->expr.get(), name);
+                else if (auto* as = dynamic_cast<const AssignStmt*>(st.get())) { n += bareUses(as->target.get(), name); n += bareUses(as->value.get(), name); }
+                else if (auto* rs = dynamic_cast<const ReturnStmt*>(st.get())) n += bareUses(rs->value.get(), name);
+            }
+            n += bareUses(blk->tail.get(), name);
+        }
+        return n;
+    }
+
+    // v30 Phase 164: does any statement (at any depth) early-`return`? If so we
+    // disable scope-exit drops for the whole fn (a drop placed only at the tail
+    // would be skipped on the early-return path — a leak; never a double-free).
+    bool hasEarlyReturn(const Expr* e) {
+        if (!e) return false;
+        if (auto* iff = dynamic_cast<const IfExpr*>(e))
+            return hasEarlyReturn(iff->cond.get()) || hasEarlyReturn(iff->thenBranch.get()) || hasEarlyReturn(iff->elseBranch.get());
+        if (auto* w = dynamic_cast<const WhileExpr*>(e)) return hasEarlyReturn(w->cond.get()) || hasEarlyReturn(w->body.get());
+        if (auto* lp = dynamic_cast<const LoopExpr*>(e)) return hasEarlyReturn(lp->body.get());
+        if (auto* fo = dynamic_cast<const ForExpr*>(e)) return hasEarlyReturn(fo->iter.get()) || hasEarlyReturn(fo->body.get());
+        if (auto* mx = dynamic_cast<const MatchExpr*>(e)) { if (hasEarlyReturn(mx->scrutinee.get())) return true; for (auto& arm : mx->arms) if (hasEarlyReturn(arm.body.get())) return true; return false; }
+        if (auto* blk = dynamic_cast<const BlockExpr*>(e)) {
+            for (auto& st : blk->stmts) {
+                if (dynamic_cast<const ReturnStmt*>(st.get())) return true;
+                if (auto* es = dynamic_cast<const ExprStmt*>(st.get())) if (hasEarlyReturn(es->expr.get())) return true;
+                if (auto* l = dynamic_cast<const LetStmt*>(st.get())) if (hasEarlyReturn(l->value.get())) return true;
+            }
+            return hasEarlyReturn(blk->tail.get());
+        }
+        return false;
+    }
+
+    // v30 Phase 164: emit a FUNCTION body that drops its non-escaping heap-owning
+    // top-level locals (String -> kd__str_drop, Vec -> kd__vec_drop) at exit.
+    // The tail is captured to `__ret` FIRST (so a tail that borrows a local is
+    // computed before the drop), then drops run, then `__ret` is yielded. Only
+    // top-level lets are considered, only when the binding has zero BARE uses
+    // (all uses are borrows) and the body has no early `return` — otherwise the
+    // local is left alone (a sound leak). retCTy types the captured result.
+    std::string fnBodyWithDrops(const FnDecl& fn, const std::string& retCTy) {
+        const BlockExpr& b = *fn.body;
+        // total bare (non-borrow) uses of `name` across the whole body.
+        auto totalBare = [&](const std::string& name, const Stmt* skip) -> int {
+            int bare = 0;
+            for (const auto& st2 : b.stmts) {
+                if (st2.get() == skip) continue; // skip a let's own decl
+                if (auto* l2 = dynamic_cast<const LetStmt*>(st2.get())) bare += bareUses(l2->value.get(), name);
+                else if (auto* es = dynamic_cast<const ExprStmt*>(st2.get())) bare += bareUses(es->expr.get(), name);
+                else if (auto* as = dynamic_cast<const AssignStmt*>(st2.get())) { bare += bareUses(as->target.get(), name); bare += bareUses(as->value.get(), name); }
+                else if (auto* rs = dynamic_cast<const ReturnStmt*>(st2.get())) bare += bareUses(rs->value.get(), name);
+            }
+            bare += bareUses(b.tail.get(), name);
+            return bare;
+        };
+        const char* helperFor = nullptr; // (set per check below)
+        auto heapHelper = [](const std::string& cty) -> const char* {
+            if (cty == "struct kdstr") return "kd__str_drop";
+            if (cty == "struct kdvec") return "kd__vec_drop";
+            return nullptr;
+        };
+        (void)helperFor;
+        // Collect droppable bindings: a by-value heap PARAM (the callee owns the
+        // moved-in value), then top-level heap LOCALS — both only when every use
+        // is a borrow and the fn has no early return. Params drop AFTER locals
+        // (reverse declaration order overall is fine — independent buffers).
+        std::vector<std::pair<std::string, std::string>> drops; // (cname, helper)
+        bool earlyRet = hasEarlyReturn(&b);
+        if (!earlyRet) {
+            for (const auto& st : b.stmts) {
+                auto* let = dynamic_cast<const LetStmt*>(st.get());
+                if (!let || !let->tupleNames.empty()) continue;
+                std::string cty = let->annotation ? ctype(*let->annotation)
+                                                  : ctypeOfExpr(*let->value);
+                const char* helper = heapHelper(cty);
+                if (helper && totalBare(let->name, st.get()) == 0)
+                    drops.emplace_back(vname(let->name), helper);
+            }
+            // v30 Phase 164 (fix): a by-value heap PARAM is owned by this fn (the
+            // caller moved it in), so drop it at exit unless it escapes (bare use
+            // / moved on). A `&T` / `&mut T` param is a borrow (its C type ends
+            // in `*`) — never dropped.
+            for (const auto& p : fn.params) {
+                std::string pty = ctype(p.type);
+                const char* helper = heapHelper(pty);
+                if (helper && totalBare(p.name, nullptr) == 0)
+                    drops.emplace_back(vname(p.name), helper);
+            }
+        }
+        if (drops.empty()) return blockValue(b); // nothing to drop: as before
+        std::string s = "({ ";
+        for (const auto& st : b.stmts) s += stmt(*st) + " ";
+        s += retCTy + " __ret = (" +
+             (b.tail ? expr(*b.tail) : std::string("INT64_C(0)")) + "); ";
+        for (const auto& [cn, helper] : drops) s += helper + ("(&" + cn + "); ");
+        s += "__ret; })";
+        return s;
+    }
+
     // A block used for EFFECT (a while body): `{ stmts...; tail-for-effect; }`.
     std::string blockStmts(const BlockExpr& b) {
         std::string s = "{ ";
@@ -867,7 +995,10 @@ struct CEmitter {
 "static int64_t kd_print_string(struct kdstr* s) { return kd_print_str(s); }\n"
 "static int64_t kd_println(struct kdstr* s) { return kd_print_str(s); }\n"
 "static int64_t kd_print_no_nl(struct kdstr* s) { printf(\"%.*s\", (int)s->len, s->data); return 0; }\n"
-"static int64_t kd_print(int64_t v) { printf(\"%lld\\n\", (long long)v); return 0; }\n";
+"static int64_t kd_print(int64_t v) { printf(\"%lld\\n\", (long long)v); return 0; }\n"
+// v30 Phase 164: drop a String — free only a heap-owned buffer (cap != 0); a
+// borrowed literal (cap == 0) points at a C string literal and must NOT be freed.
+"static void kd__str_drop(struct kdstr* s) { if (s->cap != 0 && s->data) free(s->data); }\n";
         out << "\n";
     }
 
@@ -915,7 +1046,10 @@ struct CEmitter {
 "static int64_t kd_vec_swap(struct kdvec* v, int64_t i, int64_t j) {\n"
 "  if (i<0||j<0||i>=v->len||j>=v->len||!v->data||i==j) return 0;\n"
 "  int64_t t=v->data[i]; v->data[i]=v->data[j]; v->data[j]=t; return 0;\n"
-"}\n";
+"}\n"
+// v30 Phase 164: drop a Vec — free its (scalar-element) heap buffer. data is
+// null for an empty Vec; free(NULL) is a no-op, so this is unconditional.
+"static void kd__vec_drop(struct kdvec* v) { free(v->data); }\n";
         out << "\n";
     }
 
@@ -990,7 +1124,12 @@ struct CEmitter {
                 varCType_[p.name] = ctype(p.type);
             std::string sig = signature(fn);
             if (sig.empty()) return;
-            out << sig << " {\n  return " << blockValue(*fn.body) << ";\n}\n\n";
+            // v30 Phase 164: drop non-escaping heap-owning top-level locals at
+            // function exit (RAII). retCTy types the captured tail value.
+            std::string retCTy = ctype(fn.returnType);
+            if (retCTy.empty()) return;
+            out << sig << " {\n  return " << fnBodyWithDrops(fn, retCTy)
+                << ";\n}\n\n";
             if (!ok()) return;
         }
 
