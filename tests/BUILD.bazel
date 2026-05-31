@@ -232,6 +232,16 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v23 Phase 129: the `--emit-c` C backend, differentially gated against LLVM.
+# For each i64/bool-subset program the LLVM AOT exit code must equal the
+# emitted-C-compiled-by-the-system-cc exit code; an out-of-subset (struct)
+# program is refused with a clean error. Skips cleanly if no C compiler.
+sh_test(
+    name = "smoke_test_phase129",
+    srcs = ["smoke_test_phase129.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v18 Phase 109: a unit-result async future (block_on / .await / spawn+join)
 # crashed the compiler (void load/return); now compiles + runs.
 sh_test(

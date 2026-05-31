@@ -111,6 +111,19 @@ cc_library(
     ],
 )
 
+# v23 Phase 129: the C-source backend (`--emit-c`). Walks the typechecked AST
+# and emits portable C for the i64/bool subset; no LLVM dependency.
+cc_library(
+    name = "emit_c",
+    srcs = ["src/emit_c.cpp"],
+    hdrs = ["include/kardashev/emit_c.hpp"],
+    strip_include_prefix = "include",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":ast",
+    ],
+)
+
 cc_binary(
     name = "kardc",
     srcs = ["src/main.cpp"],
@@ -118,6 +131,7 @@ cc_binary(
     deps = [
         ":borrow_check",
         ":codegen",
+        ":emit_c",
         ":parser",
         ":typecheck",
         ":version",

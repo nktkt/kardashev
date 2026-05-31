@@ -28,6 +28,7 @@
 
 #include "kardashev/borrow_check.hpp"
 #include "kardashev/codegen.hpp"
+#include "kardashev/emit_c.hpp"
 #include "kardashev/parser.hpp"
 #include "kardashev/typecheck.hpp"
 #include "kardashev/version.hpp"
@@ -1939,6 +1940,44 @@ int emitLlvmIr(const std::string& srcRaw, const std::string& srcDir,
     return 0;
 }
 
+// v23 Phase 129: `--emit-c` prints portable C source from the typechecked AST
+// (the second backend). The front-end — parse, derive expansion, typecheck,
+// borrow-check — runs exactly as for the LLVM path; only the lowering differs.
+// The C backend handles the i64/bool subset and refuses (with a clear error)
+// anything outside it, so it never emits wrong C. Returns a process exit code.
+int emitCSource(const std::string& srcRaw, const std::string& srcDir) {
+    auto progOpt = buildProgram(srcRaw, srcDir);
+    if (!progOpt) return 1;
+    auto& program = *progOpt;
+    expandDerives(program);
+    auto tcr = kardashev::typecheck(program);
+    if (!tcr.ok()) {
+        reportTypeErrors(tcr);
+        return 1;
+    }
+    auto bcr = kardashev::borrow_check(program, tcr);
+    if (!bcr.ok()) {
+        reportBorrowErrors(bcr);
+        return 1;
+    }
+    // Emit only the USER's declarations: re-parse the raw source so the
+    // auto-injected prelude (Option/Result/traits/combinators) doesn't trip the
+    // subset check. Out-of-subset USER code still errors in emit_c. The program
+    // already type/borrow-checked above, so this re-parse cannot fail.
+    auto pr = kardashev::parse(srcRaw);
+    if (!pr.ok()) {
+        std::cerr << "kardc: internal: re-parse for --emit-c failed\n";
+        return 1;
+    }
+    auto cr = kardashev::emit_c(pr.program);
+    if (!cr.ok()) {
+        for (const auto& msg : cr.errors) std::cerr << msg << '\n';
+        return 1;
+    }
+    std::cout << cr.code;
+    return 0;
+}
+
 // Compile + link `src` into a native executable at `outExePath`. When
 // `useCache` is set we content-address the emitted object: a cache hit skips
 // the whole compile and links the cached object; a miss compiles, deposits
@@ -2147,6 +2186,8 @@ int main(int argc, char** argv) {
     // Phase 14a: `--emit-llvm` prints textual LLVM IR (with debug metadata
     // when `-g` is also given) instead of JITing or emitting an object.
     bool emitIr = false;
+    // v23 Phase 129: `--emit-c` prints portable C source (the second backend).
+    bool emitC = false;
     // Phase 20a: `--test` discovers + JIT-runs `test_*() -> i64` fns.
     bool testMode = false;
     // Phase 20a: optimization level for the post-codegen LLVM pipeline.
@@ -2162,6 +2203,8 @@ int main(int argc, char** argv) {
             useCache = false;
         } else if (a == "--emit-llvm") {
             emitIr = true;
+        } else if (a == "--emit-c") {
+            emitC = true;
         } else if (a == "--test") {
             testMode = true;
         } else if (a == "-O0") {
@@ -2183,6 +2226,7 @@ int main(int argc, char** argv) {
                          "       kardc -O0|-O1|-O2|-O3 ...   # optimization level (default -O2)\n"
                          "       kardc -g ...               # emit DWARF debug info\n"
                          "       kardc --emit-llvm <file.kd> # print LLVM IR to stdout\n"
+                         "       kardc --emit-c <file.kd>   # print C source (i64/bool subset) to stdout\n"
                          "       kardc --no-cache ...       # bypass the AOT compile cache\n"
                          "       kardc --version            # print the toolchain version\n";
             return 0;
@@ -2223,6 +2267,18 @@ int main(int argc, char** argv) {
         }
         return emitLlvmIr(*src, dirOf(inputPath), emitDebug, inputPath,
                           optLevel);
+    }
+    if (emitC) {
+        if (inputPath.empty()) {
+            std::cerr << "kardc: --emit-c requires an input file\n";
+            return 2;
+        }
+        auto src = readFile(inputPath);
+        if (!src) {
+            std::cerr << "kardc: cannot open file: " << inputPath << '\n';
+            return 1;
+        }
+        return emitCSource(*src, dirOf(inputPath));
     }
     if (!outPath.empty()) {
         if (inputPath.empty()) {
