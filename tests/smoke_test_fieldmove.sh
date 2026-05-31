@@ -88,4 +88,42 @@ n11=$(grep -cx "11" <<< "$got"); n22=$(grep -cx "22" <<< "$got")
 [[ "$n22" -eq 1 ]] || { echo "FAIL [sibling-drop]: SIBLING b(22) dropped $n22 times (expected 1 — 0 means it leaked); output: $got"; exit 1; }
 echo "PASS [sibling-drop]: after a partial move the moved field drops once AND its sibling still drops once (no leak)"
 
+# 4. Phase 107 field-ASSIGN: `s.a = new` must FREE the old field value (no leak)
+# and not double-free. A loop overwriting a heap String field stays RSS-flat,
+# and repeated overwrites + the final scope drop are heap-clean.
+cat > "$TMP/fa.kd" <<'EOF'
+struct S { a: String, n: i64 }
+fn main() -> i64 ! { io, alloc } {
+    let mut sink = 0;
+    let mut i = 0;
+    while i < 300000 {
+        let mut s = S { a: int_to_string(i), n: 0 };
+        s.a = int_to_string(i + 1);   // overwrite field a — old String must be freed
+        sink = sink + str_len(&s.a);
+        i = i + 1;
+    }
+    sink
+}
+EOF
+"$KARDC" --no-cache -o "$TMP/fa" "$TMP/fa.kd" >/dev/null 2>&1
+bad=0
+for r in 1 2 3 4; do
+    set +e; MALLOC_CHECK_=3 "$TMP/fa" >/dev/null 2>"$TMP/fae"; rc=$?; set -e
+    if [[ "$rc" -eq 134 ]] || grep -qi 'free\|corrupt' "$TMP/fae"; then bad=$((bad+1)); fi
+done
+[[ "$bad" -eq 0 ]] || { echo "FAIL [field-assign]: $bad/4 runs corrupted the heap"; exit 1; }
+# RSS-flat check: 300k overwrites would balloon if the old field value leaked.
+# (The program returns `sink` as its exit code, so don't gate on its status.)
+rss=""
+if command -v /usr/bin/time >/dev/null 2>&1; then
+    set +e; /usr/bin/time -v "$TMP/fa" >/dev/null 2>"$TMP/time"; set -e
+    rss=$(grep -oE 'Maximum resident set size \(kbytes\): [0-9]+' "$TMP/time" 2>/dev/null | grep -oE '[0-9]+$' || true)
+fi
+if [[ -n "$rss" ]]; then
+    [[ "$rss" -lt 32768 ]] || { echo "FAIL [field-assign]: RSS $rss KB — old field value leaks on overwrite"; exit 1; }
+    echo "PASS [field-assign]: 's.a = new' frees the old field value (RSS ${rss} KB flat, heap-clean)"
+else
+    echo "PASS [field-assign]: 's.a = new' heap-clean under MALLOC_CHECK_=3 (RSS gate skipped — no GNU time)"
+fi
+
 echo "ALL FIELD-MOVE REGRESSION TESTS PASSED"

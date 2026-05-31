@@ -9089,7 +9089,55 @@ private:
                 return;
             }
         }
+        // v17 Phase 107: `root.field = v` overwrites a struct FIELD. If `root` is
+        // a per-field-tracked drop local and the field is droppable, the OLD
+        // field value would otherwise LEAK. Drop it — guarded by the field's drop
+        // flag, so a previously moved-out field (flag cleared) is NOT double-freed
+        // — then store and re-arm the flag (the field owns a value again).
+        if (auto* fe = dynamic_cast<const ast::FieldExpr*>(as.target.get())) {
+            if (auto* rid =
+                    dynamic_cast<const ast::IdentExpr*>(fe->object.get())) {
+                DropLocal* d = findDropLocal(rid->name);
+                if (d && !d->fieldFlags.empty() && d->type) {
+                    for (unsigned i = 0; i < d->type->structFields.size(); ++i) {
+                        if (d->type->structFields[i].first != fe->fieldName)
+                            continue;
+                        const TypePtr& fty = d->type->structFields[i].second;
+                        if (!isDroppable(fty)) break;
+                        for (const auto& [fidx, fflag] : d->fieldFlags) {
+                            if (fidx != i) continue;
+                            emitGuardedDropAtPlace(slot, fty, fflag);
+                            builder_->CreateStore(v, slot);
+                            builder_->CreateStore(
+                                llvm::ConstantInt::getTrue(*ctx_), fflag);
+                            return;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
         builder_->CreateStore(v, slot);
+    }
+
+    // v17 Phase 107: drop the value at an arbitrary place `place` of type `ty`,
+    // guarded by drop flag `flag` (drop only if live). Used to free a struct
+    // field's old value on `root.field = v` overwrite without double-freeing a
+    // field that was moved out (its flag is cleared).
+    void emitGuardedDropAtPlace(llvm::Value* place, const TypePtr& ty,
+                                llvm::AllocaInst* flag) {
+        if (currentBlockTerminated()) return;
+        auto& ctx = *ctx_;
+        auto* live = builder_->CreateLoad(llvm::Type::getInt1Ty(ctx), flag,
+                                          "asn.fld.live");
+        auto* dropBB = llvm::BasicBlock::Create(ctx, "asn.drop", currentFn_);
+        auto* afterBB =
+            llvm::BasicBlock::Create(ctx, "asn.drop.after", currentFn_);
+        builder_->CreateCondBr(live, dropBB, afterBB);
+        builder_->SetInsertPoint(dropBB);
+        emitDropGlue(place, ty);
+        if (!currentBlockTerminated()) builder_->CreateBr(afterBB);
+        builder_->SetInsertPoint(afterBB);
     }
 
     // Find the tracked owning local named `name` in any live scope (innermost

@@ -535,6 +535,18 @@ Each shipped green before the next, exactly as v1–v4 did.
 >   dogfooding self-hosting** — completing the field-move soundness story (Phase
 >   99 stopped the single-move double-free, 100 made siblings leak-free, 106
 >   rejects the double/partial-then-whole move at compile time).
+>
+> - **Phase 107 — field-assignment no longer leaks the overwritten value (done).**
+>   The same review found a leak: `s.a = new` overwrote a droppable struct field
+>   without freeing the old value (`emitAssign` only dropped-before-overwrite for
+>   a bare-binding target, not a field target) — a loop reassigning a heap String
+>   field ballooned RSS to ~64 MB over 2 M iterations. Fixed in codegen: for a
+>   `root.field = v` assignment where `root` is a per-field-tracked local, the old
+>   field value is dropped — **guarded by the field's drop flag**, so a
+>   previously moved-out field is not double-freed — then the new value is stored
+>   and the flag re-armed. RSS now flat at ~2 MB; heap-clean under
+>   `MALLOC_CHECK_=3`. Pinned by `tests/smoke_test_fieldmove.sh` (field-assign
+>   case). Both bugs the adversarial review surfaced are now fixed.
 
 ## Roadmap v16 — shipped
 
