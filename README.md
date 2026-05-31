@@ -90,7 +90,7 @@ Build with Bazel (`bazel build //... && bazel test //...`) on ubuntu or macOS, o
 
 ## Status
 
-Nineteen roadmaps (**v1–v19**, Phases 0–114) have shipped and are merged to `main`, each green on a cleared clean build — 6 unit suites plus the full smoke / fuzz aggregate, **JIT and AOT**, on ubuntu + macOS CI. Current release: **[v0.19.0](https://github.com/kardashevlang/kardashev/releases/latest)**.
+Twenty roadmaps (**v1–v20**, Phases 0–119) have shipped and are merged to `main`, each green on a cleared clean build — 6 unit suites plus the full smoke / fuzz aggregate, **JIT and AOT**, on ubuntu + macOS CI. Current release: **[v0.20.0](https://github.com/kardashevlang/kardashev/releases/latest)**.
 
 The north-star arc is **self-hosting**: v15–v17 build a complete compiler *in* kardashev — lexer → parser → type checker → code generator + VM, with `examples/selfhost/compile.kd` type-checking a whole function and then compiling + running its body. Dogfooding it found and fixed three real host-compiler bugs. v18–v19 added a differential fuzzer (random programs, `JIT == AOT == reference`) across the arithmetic, control-flow, memory-safety, and integer codegen paths.
 
@@ -119,8 +119,9 @@ The north-star arc is **self-hosting**: v15–v17 build a complete compiler *in*
 | v17 | "a compiler in kardashev" — a self-hosted type checker + code generator; capstone `compile.kd` |
 | v18 | "hardening II" — review-followup fixes + a differential fuzzer |
 | v19 | "hardening III" — memory-safety + integer fuzzers, cleaner diagnostics |
+| v20 | "toward a real bootstrap" — the self-hosted compiler emits **real LLVM IR** (clang → native, differential-gated vs the host), plus **structs** and **enums + match** |
 
-**v20 — toward a real bootstrap (in progress):** the self-hosted compiler now emits **real LLVM IR** (`clang`-compiled to a native binary, differential-gated against the host) instead of interpreting a stack VM — the first step past "toy". **Next (v20+) — and an honest take on where this stands vs production languages:** see **[ROADMAP.md](ROADMAP.md)**.
+**v20 — toward a real bootstrap (shipped):** the self-hosted compiler now emits **real LLVM IR** — `clang`-compiled to a native binary and differential-gated against the host — for an i64/bool language **with structs and enums + match**, well past the old stack-VM "toy". It is still a *subset* of kardashev, so not yet a true bootstrap. **Next (v21+) — and an honest take on where this stands vs production languages:** see **[ROADMAP.md](ROADMAP.md)**.
 
 ## Why "kardashev"?
 

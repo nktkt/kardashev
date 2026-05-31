@@ -18,6 +18,45 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.20.0] — Roadmap v20 "toward a real bootstrap" (Phases 115–119)
+
+Theme: move the self-hosted compiler past the toy. Through v19 "self-hosting"
+meant a mini compiler that lowered a 2-type expression language to an in-process
+stack VM (it emitted no real code). v20 makes it emit **real native code**,
+proves that code **matches the host compiler**, and extends it to the aggregate
+shapes kardashev itself is built from — **structs and enums**.
+
+### Added
+- **Real LLVM IR codegen** (Phase 115, `examples/selfhost/llvmgen.kd`) — the
+  self-hosted compiler now lowers each `Expr` to SSA-form **textual LLVM IR**
+  (`add`/`mul`/`icmp`+`zext`/branch-free `select`) and prints a complete module,
+  so `clang out.ll -o prog && ./prog` runs **natively** — a real compilable
+  artifact, not an interpreter. Differential-gated against the host.
+- **A differential fuzzer over the self-hosted codegen** (Phase 116) — for many
+  random valid functions with random args, the self-hosted-emitted IR (clang →
+  native) must equal the host compiler's result. The self-hosted backend matches
+  the host across random programs.
+- **Structs** (Phase 117, `structgen.kd`) — `struct NAME { f: i64, ... }`, struct
+  literals, and field access, lowered to first-class LLVM aggregates
+  (`insertvalue`/`extractvalue`); every value carries its type. Differential-gated.
+- **Enums + `match`** (Phase 118, `enumgen.kd`) — `enum NAME { V(i64), ... }`,
+  variant construction, and `match`, with an enum as a tagged pair `{ i64, i64 }`,
+  construction → `insertvalue`, and `match` → `extractvalue` + a branch-free
+  **select-chain** on the tag (sound because the language is pure). Differential-
+  gated across all branches/variants.
+
+### Fixed
+- **Adversarial review** (Phase 119) of the three self-hosted compilers (~80
+  programs vs the host, IR validity, test honesty) found and fixed: a `match`
+  whose arms return enum values lowering its select-chain as `i64` instead of the
+  aggregate type (clang-rejected; host accepted); and a latent aggregate-return
+  `main` mismatch. Both pinned by regression cases. IR validity and test honesty
+  came back clean.
+
+> The "self-hosting" is now well past "toy" — but it is still a **subset** (i64/
+> bool + structs + enums, not all of kardashev), so this is **not** yet a true
+> bootstrap. See [ROADMAP.md](ROADMAP.md).
+
 ## [0.19.0] — Roadmap v19 "hardening III" (Phases 112–114)
 
 Theme: push differential fuzzing into the memory-safety and integer-arithmetic
