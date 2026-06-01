@@ -114,6 +114,15 @@ std::string applyPrelude(const std::string& userSrc) {
             " self.start = self.start + 1; Some(v) }\n"
             "        }\n"
             "    }\n"
+            "}\n"
+            // v35 Phase 188: drain ANY `Iterator<T>` into an owned Vec — the
+            // lazy-to-eager bridge. Injected with the trait (and suppressed
+            // together with it) so a user who redefines `Iterator` is unaffected.
+            "fn iter_collect<T, I: Iterator<T>>(it: &mut I) -> Vec<T> ! { alloc } {\n"
+            "    let mut out = vec_new();\n"
+            "    let mut go = true;\n"
+            "    while go { match it.next() { Some(x) => { vec_push(&mut out, x); }, None => { go = false; } } }\n"
+            "    out\n"
             "}\n";
     }
     // Phase 28: the `Hash` and `Eq` traits with built-in impls for i64 and
@@ -833,6 +842,210 @@ std::string applyPrelude(const std::string& userSrc) {
             "    acc\n"
             "}\n";
     }
+    // v35 Phase 188: iterator-adaptor / reducer completeness. EAGER Vec-based
+    // adaptors (each returns a fresh owned Vec, cloning the elements it keeps)
+    // and reducers, plus a lazy `iter_collect` that drains ANY `Iterator<T>`
+    // into a Vec. (Honest: these are eager over a materialized Vec, not Rust's
+    // lazy adaptor structs — `iter_collect` is the bridge from the lazy
+    // `Iterator` trait; a fully lazy adaptor tower is future work.) Closure-
+    // taking reducers are effect-polymorphic in the predicate's row `e`.
+    if (userSrc.find("fn vec_take") == std::string::npos) {
+        prelude +=
+            "fn vec_take<T: Clone>(v: &Vec<T>, n: i64) -> Vec<T> ! { alloc } {\n"
+            "    let mut out = vec_new();\n"
+            "    let mut i = 0;\n"
+            "    while i < n { if i < vec_len(v) { vec_push(&mut out, vec_get_ref(v, i).clone()); } else {} i = i + 1; }\n"
+            "    out\n"
+            "}\n"
+            "fn vec_skip<T: Clone>(v: &Vec<T>, n: i64) -> Vec<T> ! { alloc } {\n"
+            "    let mut out = vec_new();\n"
+            "    let mut i = n;\n"
+            "    while i < vec_len(v) { vec_push(&mut out, vec_get_ref(v, i).clone()); i = i + 1; }\n"
+            "    out\n"
+            "}\n"
+            "fn vec_chain<T: Clone>(a: &Vec<T>, b: &Vec<T>) -> Vec<T> ! { alloc } {\n"
+            "    let mut out = vec_new();\n"
+            "    let mut i = 0;\n"
+            "    while i < vec_len(a) { vec_push(&mut out, vec_get_ref(a, i).clone()); i = i + 1; }\n"
+            "    let mut j = 0;\n"
+            "    while j < vec_len(b) { vec_push(&mut out, vec_get_ref(b, j).clone()); j = j + 1; }\n"
+            "    out\n"
+            "}\n"
+            "fn vec_zip<A: Clone, B: Clone>(a: &Vec<A>, b: &Vec<B>) -> Vec<(A, B)> ! { alloc } {\n"
+            "    let mut out = vec_new();\n"
+            "    let mut i = 0;\n"
+            "    while i < vec_len(a) {\n"
+            "        if i < vec_len(b) { vec_push(&mut out, (vec_get_ref(a, i).clone(), vec_get_ref(b, i).clone())); } else {}\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    out\n"
+            "}\n"
+            "fn vec_enumerate<T: Clone>(v: &Vec<T>) -> Vec<(i64, T)> ! { alloc } {\n"
+            "    let mut out = vec_new();\n"
+            "    let mut i = 0;\n"
+            "    while i < vec_len(v) { vec_push(&mut out, (i, vec_get_ref(v, i).clone())); i = i + 1; }\n"
+            "    out\n"
+            "}\n"
+            "fn vec_sum(v: &Vec<i64>) -> i64 ! { alloc } {\n"
+            "    let mut s = 0;\n"
+            "    let mut i = 0;\n"
+            "    while i < vec_len(v) { s = s + vec_get(v, i); i = i + 1; }\n"
+            "    s\n"
+            "}\n"
+            "fn vec_any<T, e>(v: &Vec<T>, pred: fn(&T) -> bool ! {e}) -> bool ! { alloc, e } {\n"
+            "    let mut i = 0;\n"
+            "    let mut found = false;\n"
+            "    while i < vec_len(v) { if pred(vec_get_ref(v, i)) { found = true; } else {} i = i + 1; }\n"
+            "    found\n"
+            "}\n"
+            "fn vec_all<T, e>(v: &Vec<T>, pred: fn(&T) -> bool ! {e}) -> bool ! { alloc, e } {\n"
+            "    let mut i = 0;\n"
+            "    let mut ok = true;\n"
+            "    while i < vec_len(v) { if pred(vec_get_ref(v, i)) {} else { ok = false; } i = i + 1; }\n"
+            "    ok\n"
+            "}\n"
+            "fn vec_find<T: Clone, e>(v: &Vec<T>, pred: fn(&T) -> bool ! {e}) -> Option<T> ! { alloc, e } {\n"
+            "    let mut i = 0;\n"
+            "    let mut idx = 0 - 1;\n"
+            "    while i < vec_len(v) {\n"
+            "        if idx < 0 { if pred(vec_get_ref(v, i)) { idx = i; } else {} } else {}\n"
+            "        i = i + 1;\n"
+            "    }\n"
+            "    if idx < 0 { None } else { Some(vec_get_ref(v, idx).clone()) }\n"
+            "}\n"
+            "fn vec_min<T: Ord + Clone>(v: &Vec<T>) -> Option<T> ! { alloc } {\n"
+            "    if vec_len(v) == 0 { None } else {\n"
+            "        let mut best = 0;\n"
+            "        let mut i = 1;\n"
+            "        while i < vec_len(v) { if vec_get_ref(v, i).cmp(vec_get_ref(v, best)) < 0 { best = i; } else {} i = i + 1; }\n"
+            "        Some(vec_get_ref(v, best).clone())\n"
+            "    }\n"
+            "}\n"
+            "fn vec_max<T: Ord + Clone>(v: &Vec<T>) -> Option<T> ! { alloc } {\n"
+            "    if vec_len(v) == 0 { None } else {\n"
+            "        let mut best = 0;\n"
+            "        let mut i = 1;\n"
+            "        while i < vec_len(v) { if vec_get_ref(v, i).cmp(vec_get_ref(v, best)) > 0 { best = i; } else {} i = i + 1; }\n"
+            "        Some(vec_get_ref(v, best).clone())\n"
+            "    }\n"
+            "}\n";
+    }
+    // v35 Phase 187: VecDeque<T> — a double-ended queue, O(1) AMORTIZED at both
+    // ends, written in kardashev over two `Vec` stacks (`f` = front, `b` =
+    // back). The deque order front->back is `f` read top->bottom followed by
+    // `b` read bottom->top. A pop from an empty side first flips the other side
+    // into it (each element is moved at most twice → amortized O(1)). Pops
+    // return `Option<T>` (`None` when empty); `! { alloc }` because the Vec ops
+    // allocate.
+    if (userSrc.find("struct VecDeque") == std::string::npos) {
+        prelude +=
+            "struct VecDeque<T> { f: Vec<T>, b: Vec<T> }\n"
+            "fn vecdeque_new<T>() -> VecDeque<T> ! { alloc } { VecDeque { f: vec_new(), b: vec_new() } }\n"
+            "fn vecdeque_len<T>(d: &VecDeque<T>) -> i64 ! { alloc } { vec_len(&d.f) + vec_len(&d.b) }\n"
+            "fn vecdeque_is_empty<T>(d: &VecDeque<T>) -> bool ! { alloc } { vecdeque_len(d) == 0 }\n"
+            "fn vecdeque_push_front<T>(d: &mut VecDeque<T>, x: T) ! { alloc } { vec_push(&mut d.f, x); }\n"
+            "fn vecdeque_push_back<T>(d: &mut VecDeque<T>, x: T) ! { alloc } { vec_push(&mut d.b, x); }\n"
+            "fn vecdeque_pop_front<T>(d: &mut VecDeque<T>) -> Option<T> ! { alloc } {\n"
+            "    if vec_len(&d.f) == 0 {\n"
+            "        while vec_len(&d.b) > 0 { let x = vec_pop(&mut d.b); vec_push(&mut d.f, x); }\n"
+            "    } else {}\n"
+            "    if vec_len(&d.f) == 0 { None } else { Some(vec_pop(&mut d.f)) }\n"
+            "}\n"
+            "fn vecdeque_pop_back<T>(d: &mut VecDeque<T>) -> Option<T> ! { alloc } {\n"
+            "    if vec_len(&d.b) == 0 {\n"
+            "        while vec_len(&d.f) > 0 { let x = vec_pop(&mut d.f); vec_push(&mut d.b, x); }\n"
+            "    } else {}\n"
+            "    if vec_len(&d.b) == 0 { None } else { Some(vec_pop(&mut d.b)) }\n"
+            "}\n";
+    }
+    // v35 Phase 187: BTreeMap<K: Ord, V> — an ORDERED map kept as two parallel
+    // `Vec`s (keys + values) held in sorted-by-key order, over the existing
+    // `Ord` trait (`cmp -> i64`, negative / zero / positive). Lookups are
+    // binary search (O(log n)); insert/remove shift the tails (O(n));
+    // iteration via `btreemap_key_at` is in ascending key order — the property
+    // that distinguishes it from the (unordered) HashMap. `btreemap_lb` returns
+    // the lower-bound index (the first key not less than `key`).
+    if (userSrc.find("struct BTreeMap") == std::string::npos) {
+        prelude +=
+            "struct BTreeMap<K, V> { keys: Vec<K>, vals: Vec<V> }\n"
+            "fn btreemap_new<K, V>() -> BTreeMap<K, V> ! { alloc } { BTreeMap { keys: vec_new(), vals: vec_new() } }\n"
+            "fn btreemap_len<K, V>(m: &BTreeMap<K, V>) -> i64 ! { alloc } { vec_len(&m.keys) }\n"
+            "fn btreemap_is_empty<K, V>(m: &BTreeMap<K, V>) -> bool ! { alloc } { vec_len(&m.keys) == 0 }\n"
+            "fn btreemap_lb<K: Ord, V>(m: &BTreeMap<K, V>, key: &K) -> i64 ! { alloc } {\n"
+            "    let mut lo = 0;\n"
+            "    let mut hi = vec_len(&m.keys);\n"
+            "    while lo < hi {\n"
+            "        let mid = (lo + hi) / 2;\n"
+            "        if vec_get_ref(&m.keys, mid).cmp(key) < 0 { lo = mid + 1; } else { hi = mid; }\n"
+            "    }\n"
+            "    lo\n"
+            "}\n"
+            "fn btreemap_contains<K: Ord, V>(m: &BTreeMap<K, V>, key: &K) -> bool ! { alloc } {\n"
+            "    let i = btreemap_lb(m, key);\n"
+            "    if i < vec_len(&m.keys) { vec_get_ref(&m.keys, i).cmp(key) == 0 } else { false }\n"
+            "}\n"
+            "fn btreemap_get<K: Ord, V: Clone>(m: &BTreeMap<K, V>, key: &K) -> Option<V> ! { alloc } {\n"
+            "    let i = btreemap_lb(m, key);\n"
+            "    if i < vec_len(&m.keys) {\n"
+            "        if vec_get_ref(&m.keys, i).cmp(key) == 0 { Some(vec_get_ref(&m.vals, i).clone()) } else { None }\n"
+            "    } else { None }\n"
+            "}\n"
+            "fn btreemap_insert<K: Ord, V>(m: &mut BTreeMap<K, V>, key: K, val: V) ! { alloc } {\n"
+            "    let i = btreemap_lb(m, &key);\n"
+            "    let present = if i < vec_len(&m.keys) { vec_get_ref(&m.keys, i).cmp(&key) == 0 } else { false };\n"
+            "    if present {\n"
+            "        vec_remove(&mut m.vals, i);\n"
+            "        vec_insert(&mut m.vals, i, val);\n"
+            "    } else {\n"
+            "        vec_insert(&mut m.keys, i, key);\n"
+            "        vec_insert(&mut m.vals, i, val);\n"
+            "    }\n"
+            "}\n"
+            "fn btreemap_remove<K: Ord, V>(m: &mut BTreeMap<K, V>, key: &K) -> bool ! { alloc } {\n"
+            "    let i = btreemap_lb(m, key);\n"
+            "    if i < vec_len(&m.keys) {\n"
+            "        if vec_get_ref(&m.keys, i).cmp(key) == 0 {\n"
+            "            vec_remove(&mut m.keys, i); vec_remove(&mut m.vals, i); true\n"
+            "        } else { false }\n"
+            "    } else { false }\n"
+            "}\n"
+            "fn btreemap_key_at<K: Clone, V>(m: &BTreeMap<K, V>, i: i64) -> K ! { alloc } { vec_get_ref(&m.keys, i).clone() }\n";
+    }
+    // v35 Phase 187: BTreeSet<T: Ord> — an ORDERED set, a sorted `Vec<T>` with
+    // binary-search membership and dedup-on-insert. `btreeset_at` gives
+    // ascending-order iteration. Same Ord-based shape as BTreeMap.
+    if (userSrc.find("struct BTreeSet") == std::string::npos) {
+        prelude +=
+            "struct BTreeSet<T> { items: Vec<T> }\n"
+            "fn btreeset_new<T>() -> BTreeSet<T> ! { alloc } { BTreeSet { items: vec_new() } }\n"
+            "fn btreeset_len<T>(s: &BTreeSet<T>) -> i64 ! { alloc } { vec_len(&s.items) }\n"
+            "fn btreeset_is_empty<T>(s: &BTreeSet<T>) -> bool ! { alloc } { vec_len(&s.items) == 0 }\n"
+            "fn btreeset_lb<T: Ord>(s: &BTreeSet<T>, x: &T) -> i64 ! { alloc } {\n"
+            "    let mut lo = 0;\n"
+            "    let mut hi = vec_len(&s.items);\n"
+            "    while lo < hi {\n"
+            "        let mid = (lo + hi) / 2;\n"
+            "        if vec_get_ref(&s.items, mid).cmp(x) < 0 { lo = mid + 1; } else { hi = mid; }\n"
+            "    }\n"
+            "    lo\n"
+            "}\n"
+            "fn btreeset_contains<T: Ord>(s: &BTreeSet<T>, x: &T) -> bool ! { alloc } {\n"
+            "    let i = btreeset_lb(s, x);\n"
+            "    if i < vec_len(&s.items) { vec_get_ref(&s.items, i).cmp(x) == 0 } else { false }\n"
+            "}\n"
+            "fn btreeset_insert<T: Ord>(s: &mut BTreeSet<T>, x: T) -> bool ! { alloc } {\n"
+            "    let i = btreeset_lb(s, &x);\n"
+            "    let present = if i < vec_len(&s.items) { vec_get_ref(&s.items, i).cmp(&x) == 0 } else { false };\n"
+            "    if present { false } else { vec_insert(&mut s.items, i, x); true }\n"
+            "}\n"
+            "fn btreeset_remove<T: Ord>(s: &mut BTreeSet<T>, x: &T) -> bool ! { alloc } {\n"
+            "    let i = btreeset_lb(s, x);\n"
+            "    if i < vec_len(&s.items) {\n"
+            "        if vec_get_ref(&s.items, i).cmp(x) == 0 { vec_remove(&mut s.items, i); true } else { false }\n"
+            "    } else { false }\n"
+            "}\n"
+            "fn btreeset_at<T: Clone>(s: &BTreeSet<T>, i: i64) -> T ! { alloc } { vec_get_ref(&s.items, i).clone() }\n";
+    }
     // Phase 55 (v9): enumerate a HashMap's entries as a Vec of (key, value)
     // tuples (each deep-cloned, so the Vec owns them), so a map can be ranked /
     // printed without manual key lookups. Bucket-order; the caller sorts (e.g.
@@ -1297,6 +1510,81 @@ std::string applyPrelude(const std::string& userSrc) {
         prelude +=
             "fn result_is_ok(r: Result<i64, i64>) -> bool {\n"
             "    match r { Ok(x) => true, Err(e) => false }\n"
+            "}\n";
+    }
+    // v35 Phase 190: the error-handling ecosystem. The `Error` trait (a
+    // describable error) + GENERIC Result inspectors/converters (the existing
+    // result_* helpers above are i64-only; these work for any T/E). `?`-with-
+    // `From` conversion is handled in the type checker + codegen (checkTry /
+    // emitTry), so a `?` on a `Result<_, E1>` inside a fn returning
+    // `Result<_, E2>` converts via `E2::from(e1)` when an `impl From<E1> for
+    // E2` exists.
+    if (userSrc.find("trait Error") == std::string::npos) {
+        prelude += "trait Error { fn message(&self) -> String ! { alloc }; }\n";
+    }
+    // NOTE: these use the canonical generic letters T / U / V (the Err type is
+    // U, not E) — using `E`/`F` would make `E`/`F` NEW reserved names that
+    // shadow any user type named `E`/`F` (`enum E { … }`), which several
+    // existing programs define. T/U/V are already reserved by vec_map /
+    // HashMap, so this adds no new collisions.
+    if (userSrc.find("fn result_is_err") == std::string::npos) {
+        prelude +=
+            "fn result_is_err<T, U>(r: &Result<T, U>) -> bool {\n"
+            "    match r { Ok(x) => false, Err(e) => true }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn result_ok") == std::string::npos) {
+        prelude +=
+            "fn result_ok<T, U>(r: Result<T, U>) -> Option<T> {\n"
+            "    match r { Ok(x) => Some(x), Err(e) => None }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn result_err") == std::string::npos) {
+        prelude +=
+            "fn result_err<T, U>(r: Result<T, U>) -> Option<U> {\n"
+            "    match r { Ok(x) => None, Err(e) => Some(e) }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn result_map_err") == std::string::npos) {
+        prelude +=
+            "fn result_map_err<T, U, V, e>(r: Result<T, U>, f: fn(U) -> V ! {e})"
+            " -> Result<T, V> ! {e} {\n"
+            "    match r { Ok(x) => Ok(x), Err(er) => Err(f(er)) }\n"
+            "}\n";
+    }
+    // v35 Phase 191: a seeded pseudo-random generator — a 64-bit linear
+    // congruential generator (the SplitMix/PCG-style constants). DETERMINISTIC:
+    // the same seed yields the same sequence (so it is unit-testable, unlike a
+    // wall-clock or OS-entropy source). Uses only `*` / `+` (which wrap in
+    // 2's-complement under the default `-fwrapv` policy) and `%`. `rng_below`
+    // gives a value in [0, n); `rng_range` in [lo, hi); `rng_bool` a coin flip.
+    if (userSrc.find("struct Rng") == std::string::npos) {
+        prelude +=
+            "struct Rng { state: i64 }\n"
+            "fn rng_new(seed: i64) -> Rng { Rng { state: seed } }\n"
+            "fn rng_next(r: &mut Rng) -> i64 {\n"
+            "    r.state = r.state * 6364136223846793005 + 1442695040888963407;\n"
+            "    r.state\n"
+            "}\n"
+            "fn rng_below(r: &mut Rng, n: i64) -> i64 {\n"
+            "    if n <= 0 { 0 } else {\n"
+            "        let v = rng_next(r);\n"
+            "        let m = v % n;\n"
+            "        if m < 0 { m + n } else { m }\n"
+            "    }\n"
+            "}\n"
+            "fn rng_range(r: &mut Rng, lo: i64, hi: i64) -> i64 {\n"
+            "    if hi <= lo { lo } else { lo + rng_below(r, hi - lo) }\n"
+            "}\n"
+            "fn rng_bool(r: &mut Rng) -> bool { rng_below(r, 2) == 1 }\n"
+            // Fisher-Yates in-place shuffle over a Vec<T>, driven by the Rng.
+            "fn vec_shuffle<T>(v: &mut Vec<T>, r: &mut Rng) ! { alloc } {\n"
+            "    let mut i = vec_len(v);\n"
+            "    while i > 1 {\n"
+            "        i = i - 1;\n"
+            "        let j = rng_below(r, i + 1);\n"
+            "        vec_swap(v, i, j);\n"
+            "    }\n"
             "}\n";
     }
     return prelude + userSrc;

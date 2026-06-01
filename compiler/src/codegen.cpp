@@ -13546,8 +13546,23 @@ private:
                 llvm::ConstantInt::get(
                     llvm::Type::getInt32Ty(*ctx_), retErrIdx),
                 {0}, "errtag");
+            // v35 Phase 190: `?`-with-`From`. If the operand's Err type differs
+            // from the fn's Err type, convert via `E2::from(e1)` before wrapping.
+            llvm::Value* errPayload = errVal;
+            if (auto cit = tc_.tryFromConv.find(&te);
+                cit != tc_.tryFromConv.end()) {
+                auto fit = declaredFns_.find(cit->second);
+                if (fit != declaredFns_.end()) {
+                    errPayload = builder_->CreateCall(fit->second, {errVal},
+                                                      "fromconv");
+                } else {
+                    errors_.push_back(
+                        "codegen: `?` From-conversion fn not emitted: " +
+                        cit->second);
+                }
+            }
             propAgg = builder_->CreateInsertValue(
-                propAgg, errVal,
+                propAgg, errPayload,
                 {enumPayloadIndices_[retMangled][retErrIdx][0]},
                 "errpld");
             // Phase 16: the `?` early-return path must drop the function's

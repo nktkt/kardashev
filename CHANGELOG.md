@@ -18,6 +18,52 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.35.0] — Roadmap v35 "stdlib depth: collections, iterators, errors & random" (Phases 187-191)
+
+Theme: broaden the standard library — ordered collections, a fuller iterator
+surface, an error-handling ecosystem, and a seeded PRNG. Almost all of it is
+written in kardashev itself (in the prelude, over the `Vec` primitive and the
+existing traits), demonstrating the language is now expressive enough to grow
+its own stdlib. Every phase is differentially gated (JIT vs AOT).
+
+### Added
+- **Ordered collections + a deque** (Phase 187) — `VecDeque<T>` (a two-stack
+  double-ended queue, O(1) amortized at both ends; pops return `Option<T>`),
+  `BTreeMap<K: Ord, V>` (an ordered map kept as parallel sorted Vecs, binary
+  search, ascending-key iteration — the property HashMap lacks; works for i64
+  and String keys), and `BTreeSet<T: Ord>` (ordered set, dedup on insert). All
+  over the `Vec` primitive and the existing `Ord` trait — no new builtins.
+- **Iterator-adaptor / reducer completeness** (Phase 188) — `vec_take` /
+  `vec_skip` / `vec_chain` / `vec_zip` (-> `Vec<(A,B)>`) / `vec_enumerate`, the
+  reducers `vec_sum` / `vec_any` / `vec_all` / `vec_find` / `vec_min` /
+  `vec_max`, and `iter_collect<T, I: Iterator<T>>` which drains ANY value
+  implementing the `Iterator` trait (e.g. a Range) into a Vec — the lazy→eager
+  bridge.
+- **Error-handling ecosystem** (Phase 190) — an `Error` trait
+  (`fn message(&self) -> String`); generic `result_is_err` / `result_ok`
+  (`-> Option<T>`) / `result_err` (`-> Option<E>`) / `result_map_err`; and
+  **`?`-with-`From`**: a `?` on a `Result<_, E1>` inside a fn returning
+  `Result<_, E2>` now converts the error via `E2::from(e1)` when an
+  `impl From<E1> for E2` exists, instead of being a hard type error
+  (a same-type `?` is unchanged; a mismatch with no `From` impl is a clear
+  diagnostic).
+- **Seeded PRNG** (Phase 191) — `Rng`, a deterministic 64-bit LCG
+  (`rng_new` / `rng_next` / `rng_below` / `rng_range` / `rng_bool`) plus a
+  Fisher-Yates `vec_shuffle<T>`. Seeded ⇒ reproducible ⇒ unit-testable, and
+  identical under JIT and AOT.
+
+### Deferred / honest limitations
+- **Phase 189 (buffered I/O, stdin streams, file seek, full process/env)** is
+  NOT in this release: it is runtime/FFI-heavy and largely non-deterministic to
+  test in CI. Tracked in ROADMAP.md.
+- These collections are eager and Vec-backed: `BTreeMap`/`BTreeSet` are sorted
+  vectors (O(log n) lookup, O(n) insert), not balanced trees; the iterator
+  adaptors are eager (materialized Vecs), not Rust's lazy adaptor structs
+  (`iter_collect` is the lazy→eager bridge). Reference-returning helpers
+  (`get` / `key_at`) return owned values via a `Clone` bound (no lifetime
+  system). `?`-with-`From` supports one `From` impl per error type. Wall-clock
+  time and (de)serialization (serde-like) remain future work.
+
 ## [0.34.0] — Roadmap v34 "metaprogramming: macros, derive & comptime" (Phases 182-186)
 
 Theme: give the language the tools to abstract over syntax and shift work to

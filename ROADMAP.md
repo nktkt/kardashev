@@ -10,7 +10,7 @@ full numeric tower, async, and threads. It is well above the median hobby/studen
 compiler in breadth and test discipline. It is **not** a production language: it
 is pre-ecosystem, pre-performance-proven, and MVP-shaped in places.
 
-**Shipped: v1–v34** (Phases 0–186, through `v0.34.0`). The per-version themes are
+**Shipped: v1–v35** (Phases 0–191, through `v0.35.0`; Phase 189 deferred). The per-version themes are
 in the [README roadmap table](README.md#roadmap); every phase's detail is in
 [CHANGELOG.md](CHANGELOG.md). v15–v19 built a self-hosted *mini* compiler and a
 differential-fuzzing test surface; v20 took it to real LLVM IR; v21 added a
@@ -266,16 +266,23 @@ effect system "tracking only — no handlers/subtyping".)*
   before type-checking; folded into the AOT cache key. (`kard.toml [features]`
   auto-feed deferred — a thin follow-on; macro **hygiene** not implemented.)
 
-### v35 — stdlib depth & runtime
+### v35 — stdlib depth & runtime — SHIPPED (`v0.35.0`), except 189
 *(Survey `stdlib-runtime`: BTree/VecDeque, iterator adaptors, buffered I/O,
-error trait, time/random, serde.)*
-- **187** ordered collections (**`BTreeMap`/`BTreeSet`**) + **`VecDeque`**.
-- **188** **iterator-adaptor** completeness (lazy, double-ended, zip/chain/
-  enumerate/collect).
-- **189** **buffered I/O**, stdin streams, file seek, full process/env API.
-- **190** an **error-trait** ecosystem (`Error` trait, source chains, `?`-with-
-  `From` conversion).
-- **191** **time/duration**, random, OS APIs; (de)**serialization** (serde-like).
+error trait, time/random, serde.)* Almost all written in kardashev itself
+(prelude, over the `Vec` primitive + existing traits).
+- **187** ✅ ordered collections (**`BTreeMap`/`BTreeSet`**, sorted parallel
+  Vecs + binary search, i64/String keys) + **`VecDeque`** (two-stack, O(1)
+  amortized).
+- **188** ✅ **iterator-adaptor** completeness — take/skip/chain/zip/enumerate +
+  sum/any/all/find/min/max + `iter_collect` (drains any `Iterator`). EAGER (the
+  lazy adaptor-struct tower is future work).
+- **189** ⛔ DEFERRED — **buffered I/O**, stdin streams, file seek, full
+  process/env. Runtime/FFI-heavy + largely non-deterministic to test in CI.
+- **190** ✅ an **error-trait** ecosystem (`Error` trait + generic Result
+  combinators + **`?`-with-`From`** conversion; one `From` impl per error type;
+  source chains future).
+- **191** ✅ **random** — a seeded deterministic LCG `Rng` + `vec_shuffle`.
+  **time/duration** + (de)**serialization** (serde-like) remain future work.
 
 ### v36 — tooling & compiler performance
 *(Survey `tooling-ecosystem` + `backends-performance`.)*
