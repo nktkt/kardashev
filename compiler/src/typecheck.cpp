@@ -4082,9 +4082,10 @@ private:
         auto representable = [&](const TypePtr& ty) -> bool {
             TypePtr rr = resolve(ty);
             switch (rr->kind) {
-            case TypeKind::Int:
+            case TypeKind::Int:   // any width i8..i64 / u8..u64 (C char..long)
+            case TypeKind::Float: // v33 Phase 178: f64 -> C double, f32 -> float
             case TypeKind::Bool:
-            case TypeKind::Ref: // any &T / &mut T / &[T] -> C pointer
+            case TypeKind::Ref: // any &T / &mut T / &[T] / *const T / *mut T -> C pointer
                 return true;
             case TypeKind::Unit:
                 return isReturn; // void return is fine; a void *param* isn't
@@ -4100,7 +4101,8 @@ private:
         if (!representable(r)) {
             error("type `" + typeToString(r) + "` is not supported in an "
                   "`extern \"C\"` signature for '" + fnName +
-                  "' (allowed: i64, i32, bool, &T / &mut T / &[T] (C pointer), "
+                  "' (allowed: i8..i64 / u8..u64, f32 / f64, bool, "
+                  "&T / &mut T / &[T] / *const T / *mut T (C pointer), "
                   "String / &String (passes the data pointer)" +
                   std::string(isReturn ? ", or unit (void return)" : "") + ")",
                   tr.line, tr.column);
