@@ -10,7 +10,7 @@ full numeric tower, async, and threads. It is well above the median hobby/studen
 compiler in breadth and test discipline. It is **not** a production language: it
 is pre-ecosystem, pre-performance-proven, and MVP-shaped in places.
 
-**Shipped: v1–v35** (Phases 0–191, through `v0.35.0`; Phase 189 deferred). The per-version themes are
+**Shipped: v1–v36** (Phases 0–196, through `v0.36.0`; Phases 189/193/195 deferred). The full numbered roadmap (v1–v36) is now released; what remains are the four XL **Mega-arcs** below. The per-version themes are
 in the [README roadmap table](README.md#roadmap); every phase's detail is in
 [CHANGELOG.md](CHANGELOG.md). v15–v19 built a self-hosted *mini* compiler and a
 differential-fuzzing test surface; v20 took it to real LLVM IR; v21 added a
@@ -284,19 +284,22 @@ error trait, time/random, serde.)* Almost all written in kardashev itself
 - **191** ✅ **random** — a seeded deterministic LCG `Rng` + `vec_shuffle`.
   **time/duration** + (de)**serialization** (serde-like) remain future work.
 
-### v36 — tooling & compiler performance
+### v36 — tooling & compiler performance — SHIPPED (`v0.36.0`), except 193/195
 *(Survey `tooling-ecosystem` + `backends-performance`.)*
-- **192** **LSP completeness** — live diagnostics, semantic tokens, code actions,
-  inlay hints, cross-file rename, workspace symbols; editor plugins; watch mode.
-- **193** **debugger** story — validated gdb/lldb + pretty-printers + backtraces
-  with line info; split-DWARF.
-- **194** **doc-gen** (`///` → an API-docs site + doctests) + a **test framework**
-  (property-based + isolation) + REPL/CI-release polish.
-- **195** **incremental compilation** — query caching (unify / trait-resolve /
-  per-module) + compile-time-perf work.
-- **196** **codegen optimization** — close the committed ~2.2× tight-loop gap
-  (register allocation, inlining cost model, bounds-check elision, LICM,
-  datalayout) + LTO; expand the benchmark suite with regression detection.
+- **192** ✅ (partial) **LSP** — `textDocument/documentSymbol` (file outline,
+  user symbols only). Semantic tokens / code actions / inlay hints / watch mode
+  remain.
+- **193** ⛔ DEFERRED — **debugger** story (validated gdb/lldb + pretty-printers
+  + backtraces). Needs a gdb/lldb environment to validate — not deterministically
+  testable in this sandbox.
+- **194** ✅ (partial) **doc-gen** — `kardc --doc` emits Markdown API docs from
+  `///` comments. A hosted docs site + executable doctests remain.
+- **195** ⛔ DEFERRED — **incremental compilation** (query caching). A large
+  query-engine rearchitecture; the content-addressed AOT cache already covers
+  whole-program reuse.
+- **196** ✅ (partial) **codegen optimization** — bounds-check ELISION for
+  statically-in-bounds constant indices. The rest of the ~2.2× gap (regalloc,
+  inlining cost model, LICM, LTO) + a benchmark-regression harness remain.
 
 ## Mega-arcs (each is XL — a dedicated multi-roadmap track)
 

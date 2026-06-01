@@ -3080,6 +3080,127 @@ int monoReport(const std::string& srcRaw, const std::string& srcDir,
     return 0;
 }
 
+// v36 Phase 194: render a TypeRef to a readable signature string for docs.
+std::string docRenderTypeRef(const kardashev::ast::TypeRef& t) {
+    if (t.isFn) {
+        std::string s = "fn(";
+        for (std::size_t i = 0; i < t.fnParams.size(); ++i) {
+            if (i) s += ", ";
+            s += docRenderTypeRef(t.fnParams[i]);
+        }
+        s += ")";
+        if (t.fnRet) s += " -> " + docRenderTypeRef(*t.fnRet);
+        return s;
+    }
+    std::string s;
+    if (t.isRef) s += t.refIsMut ? "&mut " : "&";
+    if (t.isRawPtr) s += t.rawPtrMut ? "*mut " : "*const ";
+    if (t.isDyn) s += "dyn ";
+    s += t.name;
+    if (!t.typeArgs.empty()) {
+        s += "<";
+        for (std::size_t i = 0; i < t.typeArgs.size(); ++i) {
+            if (i) s += ", ";
+            s += docRenderTypeRef(t.typeArgs[i]);
+        }
+        s += ">";
+    }
+    return s;
+}
+
+// v36 Phase 194: `--doc` — generate Markdown API documentation from a source
+// file's top-level `fn` / `struct` / `enum` declarations and their `///` doc
+// comments (captured in Phase 134). The RAW user source is parsed (no prelude),
+// so only the user's own items are documented. A `///`-documented item is a
+// "doctest" target too; here we emit the rendered docs to stdout (a docs-site
+// generator / static host is future work, but the structured output is the
+// hard part). Returns a process exit code.
+std::string docGenericParams(
+    const std::vector<kardashev::ast::TypeParam>& gps) {
+    if (gps.empty()) return "";
+    std::string s = "<";
+    for (std::size_t i = 0; i < gps.size(); ++i) {
+        if (i) s += ", ";
+        s += gps[i].name;
+    }
+    s += ">";
+    return s;
+}
+int emitDocs(const std::string& srcRaw) {
+    auto pr = kardashev::parse(srcRaw);
+    if (!pr.ok()) {
+        for (const auto& e : pr.errors)
+            std::cerr << "parse error " << e.line << ":" << e.column << ": "
+                      << e.message << '\n';
+        return 1;
+    }
+    const auto& prog = pr.program;
+    std::cout << "# API Documentation\n";
+    if (!prog.functions.empty()) {
+        std::cout << "\n## Functions\n";
+        for (const auto& fn : prog.functions) {
+            std::cout << "\n### `";
+            if (fn.isPub) std::cout << "pub ";
+            if (fn.isConst) std::cout << "const ";
+            if (fn.isAsync) std::cout << "async ";
+            std::cout << "fn " << fn.name << docGenericParams(fn.genericParams)
+                      << "(";
+            for (std::size_t i = 0; i < fn.params.size(); ++i) {
+                if (i) std::cout << ", ";
+                std::cout << fn.params[i].name << ": "
+                          << docRenderTypeRef(fn.params[i].type);
+            }
+            std::cout << ")";
+            if (!fn.returnType.name.empty() && fn.returnType.name != "()")
+                std::cout << " -> " << docRenderTypeRef(fn.returnType);
+            std::cout << "`\n";
+            if (!fn.doc.empty()) std::cout << "\n" << fn.doc << "\n";
+        }
+    }
+    if (!prog.structs.empty()) {
+        std::cout << "\n## Structs\n";
+        for (const auto& s : prog.structs) {
+            std::cout << "\n### `";
+            if (s.isPub) std::cout << "pub ";
+            std::cout << "struct " << s.name << docGenericParams(s.genericParams)
+                      << "`\n";
+            if (!s.doc.empty()) std::cout << "\n" << s.doc << "\n";
+            if (!s.fields.empty()) {
+                std::cout << "\n";
+                for (const auto& f : s.fields)
+                    std::cout << "- `" << f.name << ": "
+                              << docRenderTypeRef(f.type) << "`\n";
+            }
+        }
+    }
+    if (!prog.enums.empty()) {
+        std::cout << "\n## Enums\n";
+        for (const auto& en : prog.enums) {
+            std::cout << "\n### `";
+            if (en.isPub) std::cout << "pub ";
+            std::cout << "enum " << en.name
+                      << docGenericParams(en.genericParams) << "`\n";
+            if (!en.doc.empty()) std::cout << "\n" << en.doc << "\n";
+            if (!en.variants.empty()) {
+                std::cout << "\n";
+                for (const auto& v : en.variants) {
+                    std::cout << "- `" << v.name;
+                    if (!v.payloadTypes.empty()) {
+                        std::cout << "(";
+                        for (std::size_t i = 0; i < v.payloadTypes.size(); ++i) {
+                            if (i) std::cout << ", ";
+                            std::cout << docRenderTypeRef(v.payloadTypes[i]);
+                        }
+                        std::cout << ")";
+                    }
+                    std::cout << "`\n";
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 // v23 Phase 129: `--emit-c` prints portable C source from the typechecked AST
 // (the second backend). The front-end — parse, derive expansion, typecheck,
 // borrow-check — runs exactly as for the LLVM path; only the lowering differs.
@@ -3338,6 +3459,7 @@ int main(int argc, char** argv) {
     bool monoReportFlag = false; // v28 Phase 156: --mono-report
     // v23 Phase 129: `--emit-c` prints portable C source (the second backend).
     bool emitC = false;
+    bool emitDoc = false; // v36 Phase 194: `--doc` Markdown API docs
     // v24 Phase 132: `-W` / `--warn` runs the (non-fatal) lint pass before the
     // normal compile/run.
     bool warnEnabled = false;
@@ -3360,6 +3482,8 @@ int main(int argc, char** argv) {
             monoReportFlag = true;
         } else if (a == "--emit-c") {
             emitC = true;
+        } else if (a == "--doc") {
+            emitDoc = true;
         } else if (a == "--cfg" && i + 1 < argc) {
             // v34 Phase 186: enable a conditional-compilation flag. Either a
             // bare name (`--cfg linux` matches `#[cfg(linux)]`) or a key=value
@@ -3407,6 +3531,7 @@ int main(int argc, char** argv) {
                          "       kardc -g ...               # emit DWARF debug info\n"
                          "       kardc --emit-llvm <file.kd> # print LLVM IR to stdout\n"
                          "       kardc --emit-c <file.kd>   # print C source (i64/bool subset) to stdout\n"
+                         "       kardc --doc <file.kd>      # print Markdown API docs from /// comments\n"
                          "       kardc --cfg NAME ...       # enable a #[cfg(NAME)] flag (also --cfg key=val)\n"
                          "       kardc -W <file.kd>         # lint: warn on unused vars + unreachable code\n"
                          "       kardc --explain Exxxx      # explain a diagnostic error code\n"
@@ -3480,6 +3605,18 @@ int main(int argc, char** argv) {
             return 1;
         }
         return emitCSource(*src, dirOf(inputPath));
+    }
+    if (emitDoc) {
+        if (inputPath.empty()) {
+            std::cerr << "kardc: --doc requires an input file\n";
+            return 2;
+        }
+        auto src = readFile(inputPath);
+        if (!src) {
+            std::cerr << "kardc: cannot open file: " << inputPath << '\n';
+            return 1;
+        }
+        return emitDocs(*src);
     }
     if (!outPath.empty()) {
         if (inputPath.empty()) {

@@ -1059,6 +1059,36 @@ std::string buildDefinitionResult(const DocIndex& idx, const std::string& uri,
     return ss.str();
 }
 
+// v36 Phase 192: `textDocument/documentSymbol` — the file outline. Returns a
+// flat SymbolInformation[] of the USER's top-level fn / struct / enum decls
+// (the program is parsed RAW, without the prelude, so editor outlines /
+// breadcrumbs / the symbol-search list show only the user's own items).
+// LSP SymbolKind: Function = 12, Struct = 23, Enum = 10.
+std::string buildDocumentSymbolResult(const kardashev::ast::Program& prog,
+                                      const std::string& uri) {
+    std::ostringstream ss;
+    ss << "[";
+    bool first = true;
+    auto emit = [&](const std::string& name, int kind, std::size_t line,
+                    std::size_t col) {
+        if (line == 0 || name.empty()) return;
+        std::size_t l0 = line - 1;
+        std::size_t c0 = col > 0 ? col - 1 : 0;
+        if (!first) ss << ",";
+        first = false;
+        ss << "{\"name\":\"" << jsonEscape(name) << "\",\"kind\":" << kind
+           << ",\"location\":{\"uri\":\"" << jsonEscape(uri)
+           << "\",\"range\":{\"start\":{\"line\":" << l0 << ",\"character\":"
+           << c0 << "},\"end\":{\"line\":" << l0 << ",\"character\":"
+           << (c0 + name.size()) << "}}}}";
+    };
+    for (const auto& fn : prog.functions) emit(fn.name, 12, fn.line, fn.column);
+    for (const auto& s : prog.structs) emit(s.name, 23, s.line, s.column);
+    for (const auto& e : prog.enums) emit(e.name, 10, e.line, e.column);
+    ss << "]";
+    return ss.str();
+}
+
 std::string buildCompletionResult(const DocIndex& idx,
                                   const ast::Program& prog, std::size_t line) {
     std::ostringstream ss;
@@ -1120,6 +1150,7 @@ int main() {
                 "\"definitionProvider\":true,"
                 "\"referencesProvider\":true,"
                 "\"renameProvider\":true,"
+                "\"documentSymbolProvider\":true,"
                 "\"completionProvider\":{\"triggerCharacters\":[\".\"]},"
                 "\"diagnosticProvider\":{\"interFileDependencies\":false,"
                                         "\"workspaceDiagnostics\":false}"
@@ -1195,6 +1226,16 @@ int main() {
                                                        newName));
                 }
             }
+        } else if (method == "textDocument/documentSymbol") {
+            // v36 Phase 192: file outline. Only `uri` is needed (no position).
+            std::string uri = findStringField(msg, "uri");
+            auto dit = docs.find(uri);
+            if (dit == docs.end()) {
+                sendResponse(id, "null");
+                continue;
+            }
+            auto pr = kardashev::parse(dit->second);
+            sendResponse(id, buildDocumentSymbolResult(pr.program, uri));
         } else if (method == "shutdown") {
             shutdownRequested = true;
             sendResponse(id, "null");

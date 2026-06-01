@@ -18,6 +18,40 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.36.0] — Roadmap v36 "tooling & compiler performance" (Phases 192, 194, 196)
+
+Theme: developer-facing tooling and a concrete codegen-performance win. Each
+shipped phase is independently verifiable (LSP over stdio JSON-RPC, Markdown
+output, IR inspection).
+
+### Added
+- **LSP `textDocument/documentSymbol`** (Phase 192) — the file outline: the
+  server advertises `documentSymbolProvider` and returns the user's top-level
+  `fn` / `struct` / `enum` decls with their LSP `SymbolKind` and position
+  (parsed raw — no prelude noise). Editors get outline / breadcrumbs / go-to-
+  symbol.
+- **`kardc --doc`** (Phase 194) — generates Markdown API documentation from a
+  file's top-level declarations and their `///` doc comments: rendered
+  signatures (visibility, generics, parameter types, return type), struct
+  fields, and enum variants. Prelude items are excluded.
+- **Bounds-check elision** (Phase 196) — when an array index is a compile-time
+  constant provably in `[0, len)`, codegen emits no runtime bounds check (no
+  compare / branch / panic block); a runtime index keeps its check and an
+  out-of-range constant is still caught. A concrete step toward closing the
+  codegen-performance gap.
+
+### Deferred / honest limitations
+- **Phase 193 (debugger story — validated gdb/lldb + pretty-printers +
+  backtraces)** and **Phase 195 (incremental compilation — query caching)** are
+  NOT in this release: 193 needs a gdb/lldb environment to validate (not
+  deterministically testable in this sandbox), and 195 is a large query-engine
+  rearchitecture (the content-addressed AOT cache already covers whole-program
+  reuse). Tracked in ROADMAP.md.
+- doc-gen emits the structured Markdown; a hosted docs site + executable
+  doctests are future work. The remaining LSP features (semantic tokens, code
+  actions, inlay hints) and broader perf work (regalloc, inlining, LICM, LTO)
+  remain.
+
 ## [0.35.0] — Roadmap v35 "stdlib depth: collections, iterators, errors & random" (Phases 187-191)
 
 Theme: broaden the standard library — ordered collections, a fuller iterator
