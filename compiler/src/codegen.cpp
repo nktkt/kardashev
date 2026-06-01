@@ -12684,6 +12684,26 @@ private:
             call.callee == "wrapping_mul") {
             return emitCheckedArith(call);
         }
+        // v39 raw-pointer arithmetic / write. `ptr_offset` is a GEP by element
+        // over the pointee LLVM type (advances by n elements); `ptr_write`
+        // stores into the pointee. Both operate on opaque raw pointers; the
+        // element type comes from the typechecked raw-pointer type.
+        if (call.callee == "ptr_offset" && call.args.size() == 2) {
+            llvm::Value* p = emitExpr(*call.args[0]);
+            llvm::Value* n = emitExpr(*call.args[1]);
+            TypePtr pt = lookupExprType(*call.args[0]);
+            if (pt) pt = resolveInInstance(pt);
+            llvm::Type* elemLlvm = llvm::Type::getInt8Ty(*ctx_);
+            if (pt && pt->kind == TypeKind::Ref)
+                elemLlvm = mapKardashevType(resolveInInstance(pt->refInner));
+            return builder_->CreateGEP(elemLlvm, p, {n}, "ptr_offset");
+        }
+        if (call.callee == "ptr_write" && call.args.size() == 2) {
+            llvm::Value* p = emitExpr(*call.args[0]);
+            llvm::Value* v = emitConsume(*call.args[1]);
+            builder_->CreateStore(v, p);
+            return nullptr; // unit
+        }
         // Phase 48: a qualified static call `Type::method(args)` resolved by the
         // typechecker to a concrete impl method (an associated / no-self trait
         // method like `P::default()`). Emit a direct call to the mangled impl

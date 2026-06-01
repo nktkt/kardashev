@@ -18,6 +18,30 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.39.0] — Roadmap v39 "FFI maturity, no_std & async parity I" (partial)
+
+The systems-language unblocker version. Most of its phases are large or
+environment-bound (several were deferred in v31/v33); this ships the tractable,
+locally-verifiable FFI slice.
+
+### Added
+- **Raw-pointer arithmetic + write** (retires part of the Phase 177 deferral) —
+  `ptr_offset(p: *const/*mut T, n: i64)` advances a raw pointer by n ELEMENTS
+  (GEP by pointee type), and `ptr_write(p: *mut T, v: T)` stores through a
+  `*mut` (raw write, since `*p = v` deref-assign is unsupported language-wide).
+  Both are unchecked and require `unsafe`; with the existing `*p` raw deref,
+  raw pointers now support read + write + arithmetic. A C-style "sum an array
+  via a moving pointer" loop works.
+
+### Deferred / honest limitations
+- The rest of v39 remains (tracked in ROADMAP-1.0-AND-BEYOND.md, v39):
+  `repr(C)` struct-by-value + C callbacks across `extern "C"`, a `kard bindgen`
+  header importer, `no_std`/freestanding + pluggable `GlobalAlloc`, generic
+  `thread_join<T>`, the kqueue/poll cross-platform reactor, blocking multi-wait
+  select + async Mutex/RwLock, recursive Future-drop, and HRTB
+  (`for<'a>`)/let-generalization. Several need core-runtime rewrites or a
+  macOS/embedded environment to verify.
+
 ## [0.38.0] — Roadmap v38 "The type system, completed I (lifetime spine)" (partial)
 
 The load-bearing type-system version. Its headline pieces are genuinely
