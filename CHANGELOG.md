@@ -18,6 +18,28 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.38.0] — Roadmap v38 "The type system, completed I (lifetime spine)" (partial)
+
+The load-bearing type-system version. Its headline pieces are genuinely
+multi-month type theory; this release ships the tractable, verifiable core and
+honestly defers the rest.
+
+### Added
+- **Object-safety (dyn-safety) completeness** — `dyn Trait` now enforces the
+  full classic rules: in addition to rejecting static (no-`self`) methods
+  (Phase 11), a method that RETURNS `Self` by value or takes a `Self`-by-value
+  (non-receiver) PARAMETER makes the trait non-object-safe, with a diagnostic
+  naming the offending method/parameter. Object-safe traits dispatch correctly
+  through `&dyn`; `&Self` / `Self::Assoc` returns and params stay fine.
+
+### Deferred / honest limitations
+- The rest of v38 is NOT in this release — it is multi-month type-theory work:
+  **named lifetimes + region inference (NLL)** (an XL borrow-checker
+  rearchitecture; kardashev keeps its sound NLL-lite position-counting check
+  meanwhile), **full GATs** (bounded-Self / generic-param projection),
+  **variance inference**, and **where-clauses on associated-type projections**
+  + **supertrait `dyn` upcast**. Tracked in ROADMAP-1.0-AND-BEYOND.md (v38).
+
 ## [0.37.0] — Roadmap v37 "Foundations & unblockers" (post-1.0-roadmap, batch 1)
 
 First batch of the **Road to 1.0 and Beyond** (ROADMAP-1.0-AND-BEYOND.md) —

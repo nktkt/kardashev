@@ -121,6 +121,12 @@ gate; operator surface → metaprogramming parity.
 
 ### v38 — "The type system, completed I (the lifetime spine)" — moves: TS → 4
 
+> **Status (`v0.38.0`, partial):** ✅ SHIPPED — object-safety (dyn-safety)
+> completeness (Self-by-value return/param now rejected, naming the member).
+> ⛔ DEFERRED (multi-month type theory) — named lifetimes + region inference
+> (NLL), full GATs, variance inference, where-on-assoc-types, supertrait dyn
+> upcast. kardashev keeps its sound NLL-lite borrow check meanwhile.
+
 The headline parity gap and its prerequisites. This is the load-bearing version
 for memory-safety and concurrency downstream.
 
