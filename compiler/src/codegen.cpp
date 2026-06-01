@@ -12517,6 +12517,83 @@ private:
         return agg;
     }
 
+    // v33 Phase 181: build an `Option<i64>` value — `Some(value)` when `isSome`
+    // is true, else `None`. Reuses the prelude Option layout (tag + payload
+    // slot from enumPayloadIndices_), selecting the two aggregates on `isSome`.
+    llvm::Value* buildOptionI64(llvm::Value* value, llvm::Value* isSome) {
+        auto& ctx = *ctx_;
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        TypePtr optKd = optionType(makeInt());
+        auto* optLlvm = mapKardashevType(optKd);
+        std::string optMangled =
+            mangleStructInstance(optKd->enumName, optKd->typeArgs);
+        unsigned someIdx = variantIndexInEnum(optKd, "Some");
+        unsigned noneIdx = variantIndexInEnum(optKd, "None");
+        unsigned someSlot = enumPayloadIndices_[optMangled][someIdx][0];
+        llvm::Value* someV = llvm::UndefValue::get(optLlvm);
+        someV = builder_->CreateInsertValue(
+            someV, llvm::ConstantInt::get(i32Ty, someIdx), {0});
+        someV = builder_->CreateInsertValue(someV, value, {someSlot}, "some");
+        llvm::Value* noneV = llvm::UndefValue::get(optLlvm);
+        noneV = builder_->CreateInsertValue(
+            noneV, llvm::ConstantInt::get(i32Ty, noneIdx), {0}, "none");
+        return builder_->CreateSelect(isSome, someV, noneV, "opt");
+    }
+
+    // v33 Phase 181: emit a `checked_*` (-> Option<i64>) or `wrapping_*` (-> i64)
+    // integer-arithmetic builtin. Overflow is detected WITHOUT the
+    // `*.with.overflow` intrinsics (whose declaration helper was renamed across
+    // LLVM versions) — via the portable sign-bit identities for add/sub, a
+    // 128-bit widen-and-compare for mul, and the b==0 / INT_MIN/-1 guards for
+    // div. The default arithmetic policy stays 2's-complement wrap (`-fwrapv`).
+    llvm::Value* emitCheckedArith(const ast::CallExpr& call) {
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i128Ty = llvm::Type::getIntNTy(ctx, 128);
+        auto* zero = llvm::ConstantInt::get(i64Ty, 0);
+        llvm::Value* a = emitConsume(*call.args[0]);
+        llvm::Value* b = emitConsume(*call.args[1]);
+        const std::string& op = call.callee;
+        if (op == "wrapping_add") return builder_->CreateAdd(a, b, "wadd");
+        if (op == "wrapping_sub") return builder_->CreateSub(a, b, "wsub");
+        if (op == "wrapping_mul") return builder_->CreateMul(a, b, "wmul");
+        llvm::Value* result;
+        llvm::Value* overflow; // true => the result doesn't fit => None
+        if (op == "checked_add") {
+            result = builder_->CreateAdd(a, b, "sum");
+            // signed-add overflow iff a,b share a sign that differs from sum's.
+            auto* t = builder_->CreateAnd(builder_->CreateXor(a, result),
+                                          builder_->CreateXor(b, result));
+            overflow = builder_->CreateICmpSLT(t, zero, "ovf");
+        } else if (op == "checked_sub") {
+            result = builder_->CreateSub(a, b, "diff");
+            auto* t = builder_->CreateAnd(builder_->CreateXor(a, b),
+                                          builder_->CreateXor(a, result));
+            overflow = builder_->CreateICmpSLT(t, zero, "ovf");
+        } else if (op == "checked_mul") {
+            auto* p = builder_->CreateMul(builder_->CreateSExt(a, i128Ty),
+                                          builder_->CreateSExt(b, i128Ty),
+                                          "p128");
+            result = builder_->CreateTrunc(p, i64Ty, "mul");
+            // overflow iff sign-extending the i64 result back != the i128 product.
+            overflow = builder_->CreateICmpNE(
+                p, builder_->CreateSExt(result, i128Ty), "ovf");
+        } else { // checked_div
+            auto* bzero = builder_->CreateICmpEQ(b, zero, "bzero");
+            auto* aMin = builder_->CreateICmpEQ(
+                a, llvm::ConstantInt::getSigned(i64Ty, INT64_MIN), "amin");
+            auto* bm1 = builder_->CreateICmpEQ(
+                b, llvm::ConstantInt::getSigned(i64Ty, -1), "bm1");
+            overflow =
+                builder_->CreateOr(bzero, builder_->CreateAnd(aMin, bm1), "ovf");
+            // Guard the divisor so the sdiv never traps on the None path.
+            auto* bSafe = builder_->CreateSelect(
+                overflow, llvm::ConstantInt::get(i64Ty, 1), b, "bsafe");
+            result = builder_->CreateSDiv(a, bSafe, "div");
+        }
+        return buildOptionI64(result, builder_->CreateNot(overflow, "is_some"));
+    }
+
     llvm::Value* emitCall(const ast::CallExpr& call) {
         // Phase 52: a GENERIC static call `T::method()` — resolve the bound Var
         // to the concrete type at THIS monomorphization, then call that type's
@@ -12559,6 +12636,13 @@ private:
             return builder_->CreateCall(
                 fn, args,
                 fn->getReturnType()->isVoidTy() ? "" : "call_gstatic");
+        }
+        // v33 Phase 181: overflow-checked + wrapping integer arithmetic builtins.
+        if (call.callee == "checked_add" || call.callee == "checked_sub" ||
+            call.callee == "checked_mul" || call.callee == "checked_div" ||
+            call.callee == "wrapping_add" || call.callee == "wrapping_sub" ||
+            call.callee == "wrapping_mul") {
+            return emitCheckedArith(call);
         }
         // Phase 48: a qualified static call `Type::method(args)` resolved by the
         // typechecker to a concrete impl method (an associated / no-self trait

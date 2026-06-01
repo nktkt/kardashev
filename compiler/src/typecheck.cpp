@@ -1821,6 +1821,38 @@ public:
             fnSchemas_["timeout"] = std::move(sch);
         }
 
+        // v33 Phase 181: overflow-checked + wrapping integer arithmetic. The
+        // default arithmetic policy is 2's-complement WRAP (kardc compiles AOT
+        // under `-fwrapv` and the JIT matches), documented in ROADMAP/CHANGELOG.
+        // These give explicit control: `checked_<op>(a, b) -> Option<i64>` is
+        // `None` on signed overflow (or div-by-zero / INT_MIN/-1), `Some(r)`
+        // otherwise; `wrapping_<op>(a, b) -> i64` is the explicit wrapping op.
+        // checked_* need the prelude `Option`, so register after the enum loop.
+        if (enumSchemas_.count("Option")) {
+            const EnumSchema& optSchema = enumSchemas_["Option"];
+            TypePtr optI64;
+            if (!optSchema.genericVars.empty()) {
+                std::unordered_map<int, TypePtr> subst;
+                subst[optSchema.genericVars[0]->varId] = makeInt();
+                optI64 = instantiate(optSchema.type, subst);
+                optI64->typeArgs = {makeInt()};
+            } else {
+                optI64 = optSchema.type;
+            }
+            for (const char* nm :
+                 {"checked_add", "checked_sub", "checked_mul", "checked_div"}) {
+                FnSchema sch;
+                sch.signature = makeFunction({makeInt(), makeInt()}, optI64);
+                fnSchemas_[nm] = std::move(sch);
+            }
+            for (const char* nm :
+                 {"wrapping_add", "wrapping_sub", "wrapping_mul"}) {
+                FnSchema sch;
+                sch.signature = makeFunction({makeInt(), makeInt()}, makeInt());
+                fnSchemas_[nm] = std::move(sch);
+            }
+        }
+
         // Pass 1c: register trait declarations. Each trait gets a global
         // entry with its method signatures, used later to validate impl
         // blocks and to type-check method calls through bounded generic
