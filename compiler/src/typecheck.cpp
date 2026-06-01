@@ -897,6 +897,20 @@ public:
             sch.genericVars.push_back(joinVar);
             fnSchemas_["join"] = std::move(sch);
         }
+        // v32 Phase 173 built-in, generic:
+        //   `task_cancel<T>(h: JoinHandle<T>)` — cancel a spawned task.
+        // Consumes the move-only handle (so the task can't then be join()'d),
+        // marks the executor task done, and releases its frame+slot (shallow —
+        // a still-suspended task leaks its nested sub-frame; recursive cancel is
+        // future work). Synchronous + effect-free like spawn/join (the async
+        // executor is single-threaded — no thread boundary). Returns unit.
+        {
+            TypePtr cancelVar = makeFreshVar();
+            FnSchema sch;
+            sch.signature = makeFunction({mkJoinHandle(cancelVar)}, makeUnit());
+            sch.genericVars.push_back(cancelVar);
+            fnSchemas_["task_cancel"] = std::move(sch);
+        }
 
         // v32 Phase 172 built-in, generic: a Future COMBINATOR
         //   `map<T, U>(f: Future<T>, g: fn(T) -> U ! {e}) -> Future<U>`.

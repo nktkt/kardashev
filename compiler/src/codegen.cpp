@@ -6744,6 +6744,50 @@ private:
         return fn;
     }
 
+    // v32 Phase 173: `task_cancel<T>(h: JoinHandle<T>)` — cancel a spawned task.
+    // T-agnostic at the LLVM level (the handle is a bare i64 index), so a single
+    // shared `__kd_task_cancel(i64)` serves every T. It marks task[h] DONE (so
+    // __kd_exec_step stops polling it — step skips on TASK_DONE, NOT on a null
+    // frame, so the done flag is what actually retires it) and releases its
+    // frame + result slot. The release is SHALLOW (a bare free of the task's top
+    // frame): a still-suspended async-fn task leaks its nested in-flight
+    // sub-frame, the same documented limitation as future_select's loser-drop —
+    // recursive cancellation is future work. Out-of-range / already-released
+    // handles are a no-op (release is null-guarded). Consumes the (move-only)
+    // handle, so a cancelled task can't then be join()'d.
+    llvm::Function* getOrEmitTaskCancel() {
+        auto it = declaredFns_.find("__kd_task_cancel");
+        if (it != declaredFns_.end()) return it->second;
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* voidTy = llvm::Type::getVoidTy(ctx);
+        auto* fnTy = llvm::FunctionType::get(voidTy, {i64Ty}, false);
+        auto* fn = llvm::Function::Create(
+            fnTy, llvm::Function::InternalLinkage, "__kd_task_cancel",
+            module_.get());
+        fn->getArg(0)->setName("h");
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+        auto* doBB = llvm::BasicBlock::Create(ctx, "do", fn);
+        auto* retBB = llvm::BasicBlock::Create(ctx, "ret", fn);
+        llvm::IRBuilder<> b(entry);
+        auto* h = fn->getArg(0);
+        auto* count = b.CreateLoad(
+            i64Ty, b.CreateStructGEP(execTy_, execGlobal_, EXEC_COUNT, "cnt_p"),
+            "count");
+        b.CreateCondBr(b.CreateICmpULT(h, count, "in_range"), doBB, retBB);
+        b.SetInsertPoint(doBB);
+        auto* slot = b.CreateCall(execSlotFn_, {h}, "tslot");
+        // Mark done first (retire it from the round-robin) THEN release.
+        b.CreateStore(llvm::ConstantInt::get(i64Ty, 1),
+                      b.CreateStructGEP(taskTy_, slot, TASK_DONE, "done_p"));
+        if (execReleaseFn_) b.CreateCall(execReleaseFn_, {h});
+        b.CreateBr(retBB);
+        b.SetInsertPoint(retBB);
+        b.CreateRetVoid();
+        declaredFns_["__kd_task_cancel"] = fn;
+        return fn;
+    }
+
     // v32 Phase 172: `map<T, U>(f: Future<T>, g: fn(T) -> U) -> Future<U>` — a
     // Future COMBINATOR, synthesized per (T, U). The returned future's heap
     // frame holds the inner future `f` plus the closure `g` (its `{ fn, env }`
@@ -12740,6 +12784,16 @@ private:
                 args.reserve(call.args.size());
                 for (const auto& a : call.args) args.push_back(emitConsume(*a));
                 return builder_->CreateCall(fn, args, "call_join");
+            }
+            // v32 Phase 173: `task_cancel<T>(JoinHandle<T>)` — retire+release a
+            // task. T-agnostic codegen (the handle is an i64 index); returns
+            // void.
+            if (call.callee == "task_cancel" && !concreteTypeArgs.empty()) {
+                llvm::Function* fn = getOrEmitTaskCancel();
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(fn, args, "");
             }
             // v32 Phase 172: `map<T, U>(Future<T>, fn(T)->U) -> Future<U>` — a
             // Future combinator synthesized per (T, U). concreteTypeArgs are
