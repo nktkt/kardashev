@@ -37,6 +37,12 @@ TokenKind keywordOrIdent(std::string_view s) {
     if (s == "extern") return TokenKind::KwExtern;
     if (s == "const") return TokenKind::KwConst; // Phase 25
     if (s == "as") return TokenKind::KwAs;        // Phase 65 numeric cast
+    // v32 Phase 176: `effect`/`handle`/`with`/`perform` are CONTEXTUAL keywords
+    // (recognized by lexeme in the parser, like `async`/`await`/`use`/`type`),
+    // NOT reserved tokens — so existing code that names a variable `handle` (a
+    // task/thread/lock handle, common in the async + concurrency tests) keeps
+    // working. The KwEffect/KwHandle/KwWith/KwPerform enum values are retained
+    // (unused) to avoid re-shifting the token enum.
     // A bare `_` is the wildcard pattern; `_foo` stays an Identifier.
     if (s == "_") return TokenKind::Underscore;
     return TokenKind::Identifier;
@@ -468,6 +474,10 @@ std::string_view tokenKindName(TokenKind kind) {
     case TokenKind::KwExtern: return "KwExtern";
     case TokenKind::KwConst: return "KwConst";
     case TokenKind::KwAs: return "KwAs";
+    case TokenKind::KwEffect: return "KwEffect";
+    case TokenKind::KwHandle: return "KwHandle";
+    case TokenKind::KwWith: return "KwWith";
+    case TokenKind::KwPerform: return "KwPerform";
     case TokenKind::DoubleColon: return "DoubleColon";
     case TokenKind::Plus: return "Plus";
     case TokenKind::Minus: return "Minus";

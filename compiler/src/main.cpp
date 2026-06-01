@@ -1878,6 +1878,8 @@ bool resolveModules(const std::string& srcRaw,
     for (auto& sd : pr.program.structs) out.structs.push_back(std::move(sd));
     for (auto& ed : pr.program.enums) out.enums.push_back(std::move(ed));
     for (auto& td : pr.program.traits) out.traits.push_back(std::move(td));
+    // v32 Phase 176: carry user-declared effects across the module merge.
+    for (auto& ed : pr.program.effects) out.effects.push_back(std::move(ed));
     for (auto& impl : pr.program.impls) out.impls.push_back(std::move(impl));
     // Phase 24: carry `extern "C"` declarations across the module merge too,
     // so a program (or an imported `mod`) can declare + call C functions.

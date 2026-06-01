@@ -51,6 +51,10 @@ enum class TokenKind {
     KwExtern, // Phase 24: `extern "C" fn ...;` FFI declaration
     KwConst,  // Phase 25: `const NAME: T = ...;` item + `const fn` qualifier
     KwAs,     // Phase 65: `expr as Type` numeric cast operator
+    KwEffect,  // v32 Phase 176: `effect E { fn op(..) -> R; }` declaration
+    KwHandle,  // v32 Phase 176: `handle { body } with E { op(..) => .. }`
+    KwWith,    // v32 Phase 176: the `with` in a handle expression
+    KwPerform, // v32 Phase 176: `perform E::op(args)` — invoke an effect op
     // Note: `async` / `await` stay as Identifiers — they appear in
     // effect rows (`! { async }`) and need lexeme-level lookup in the
     // parser's top-level / postfix logic anyway. Making them keywords

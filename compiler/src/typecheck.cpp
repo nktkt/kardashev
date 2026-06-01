@@ -2262,6 +2262,29 @@ public:
             constDecls_[cd.name] = &cd;
         }
 
+        // v32 Phase 176: register user-declared effects BEFORE fn signatures,
+        // so an effect name is a valid concrete effect-row label on a fn that
+        // performs it (`fn work() ! { Logger }`). Op param/return types are
+        // resolved lazily at perform/handle sites.
+        for (const auto& ed : program.effects) {
+            if (userEffectNames_.count(ed.name) || isBuiltinEffect(ed.name)) {
+                error("effect redefined (or shadows a built-in effect): " +
+                          ed.name,
+                      ed.line, ed.column);
+                continue;
+            }
+            userEffectNames_.insert(ed.name);
+            for (const auto& op : ed.ops) {
+                if (effectOpDecls_[ed.name].count(op.name)) {
+                    error("effect operation redefined: " + ed.name +
+                              "::" + op.name,
+                          op.line, op.column);
+                    continue;
+                }
+                effectOpDecls_[ed.name][op.name] = &op;
+            }
+        }
+
         // Pass 1b: register every fn signature so calls can see siblings
         // (and the function can recurse into itself). For each fn, allocate
         // a fresh Var per generic parameter and resolve param / return type
@@ -2968,6 +2991,14 @@ private:
     // effect pass via `collectEffects`. Absent => fall back to the callee's
     // statically declared effects (the pre-Phase-10a behavior).
     std::unordered_map<const ast::Expr*, EffectSet> exprEffects_;
+    // v32 Phase 176: user-declared effects. `userEffectNames_` makes an effect
+    // name a valid (concrete) effect-row label; `effectOpDecls_` maps
+    // effect -> op -> the AST op signature (param/return TypeRefs resolved
+    // lazily at perform/handle sites).
+    std::unordered_set<std::string> userEffectNames_;
+    std::unordered_map<std::string,
+                       std::unordered_map<std::string, const ast::EffectOp*>>
+        effectOpDecls_;
     // Phase 10a: name -> Var for the effect-row variables of the fn whose
     // body is currently being checked. Lets us map a resolved Type Var back
     // to the row-var name it stands for (so a still-polymorphic row var
@@ -3144,6 +3175,10 @@ private:
             }
             if (usedInEffect) rowVars.insert(g.name);
         }
+        // v32 Phase 176: a user-declared effect name is a CONCRETE label, never
+        // an (implicit) effect-row variable — even if it appears in a fn-type
+        // row. Keep it out of the row-var set.
+        for (const auto& en : userEffectNames_) rowVars.erase(en);
         return rowVars;
     }
 
@@ -3237,6 +3272,33 @@ private:
                     out.unionWith(sit->second.declaredEffects);
                 }
             }
+            return;
+        }
+        // v32 Phase 176: performing an effect op contributes the effect E (plus
+        // the arg effects and the op's own declared effects).
+        if (auto* pe = dynamic_cast<const ast::PerformExpr*>(&e)) {
+            for (const auto& a : pe->args) collectEffects(*a, out);
+            out.add(pe->effectName);
+            auto eff = effectOpDecls_.find(pe->effectName);
+            if (eff != effectOpDecls_.end()) {
+                auto op = eff->second.find(pe->opName);
+                if (op != eff->second.end() && op->second)
+                    for (const auto& l : op->second->effects.labels)
+                        out.add(l);
+            }
+            return;
+        }
+        // v32 Phase 176: `handle { body } with E { … }` DISCHARGES E — body's
+        // effects flow through MINUS E, plus each handler arm's body effects
+        // (the arm runs when the op is performed during the handle).
+        if (auto* he = dynamic_cast<const ast::HandleExpr*>(&e)) {
+            EffectSet bodyEff;
+            collectEffects(*he->body, bodyEff);
+            for (const auto& l : bodyEff.labels)
+                if (l != he->effectName) out.add(l);
+            for (const auto& arm : he->arms)
+                if (arm.handler && arm.handler->body)
+                    collectEffects(*arm.handler->body, out);
             return;
         }
         if (auto* ie = dynamic_cast<const ast::IfExpr*>(&e)) {
@@ -3400,6 +3462,13 @@ private:
         EffectSet result;
         for (const auto& l : row.labels) {
             if (isBuiltinEffect(l)) {
+                result.add(l);
+                continue;
+            }
+            // v32 Phase 176: a user-declared effect name (`effect Logger {..}`)
+            // is a valid CONCRETE effect-row label — a fn that `perform`s it
+            // declares `! { Logger }`; a `handle … with Logger` discharges it.
+            if (userEffectNames_.count(l)) {
                 result.add(l);
                 continue;
             }
@@ -5328,6 +5397,12 @@ private:
         if (auto* cl = dynamic_cast<const ast::ClosureExpr*>(&e)) {
             return checkClosure(*cl);
         }
+        if (auto* pe = dynamic_cast<const ast::PerformExpr*>(&e)) {
+            return checkPerform(*pe);
+        }
+        if (auto* he = dynamic_cast<const ast::HandleExpr*>(&e)) {
+            return checkHandle(*he);
+        }
         if (auto* te = dynamic_cast<const ast::TryExpr*>(&e)) {
             return checkTry(*te);
         }
@@ -7168,6 +7243,107 @@ private:
         return "";
     }
 
+    // v32 Phase 176: `perform E::op(args)` — type-check against the declared op
+    // signature, contribute effect `E`, and yield the op's return type.
+    TypePtr checkPerform(const ast::PerformExpr& pe) {
+        auto eff = effectOpDecls_.find(pe.effectName);
+        if (eff == effectOpDecls_.end()) {
+            error("unknown effect `" + pe.effectName +
+                      "` (declare it with `effect " + pe.effectName + " { … }`)",
+                  pe.line, pe.column);
+            for (const auto& a : pe.args) checkExpr(*a);
+            return makeInt();
+        }
+        auto opIt = eff->second.find(pe.opName);
+        if (opIt == eff->second.end() || !opIt->second) {
+            error("effect `" + pe.effectName + "` has no operation `" +
+                      pe.opName + "`",
+                  pe.line, pe.column);
+            for (const auto& a : pe.args) checkExpr(*a);
+            return makeInt();
+        }
+        const ast::EffectOp& op = *opIt->second;
+        std::vector<TypePtr> paramTypes;
+        paramTypes.reserve(op.params.size());
+        for (const auto& p : op.params)
+            paramTypes.push_back(resolveTypeRef(p.type));
+        TypePtr ret = resolveTypeRef(op.returnType);
+        if (pe.args.size() != paramTypes.size())
+            error("`perform " + pe.effectName + "::" + pe.opName +
+                      "` expects " + std::to_string(paramTypes.size()) +
+                      " arg(s), got " + std::to_string(pe.args.size()),
+                  pe.line, pe.column);
+        std::size_t n = std::min(pe.args.size(), paramTypes.size());
+        for (std::size_t i = 0; i < n; ++i) {
+            TypePtr at = checkExpr(*pe.args[i]);
+            if (!coerceOrUnify(*pe.args[i], at, paramTypes[i]))
+                error("argument " + std::to_string(i + 1) + " to `perform " +
+                          pe.effectName + "::" + pe.opName + "` has type " +
+                          typeToString(at) + ", expected " +
+                          typeToString(paramTypes[i]),
+                      pe.args[i]->line, pe.args[i]->column);
+        }
+        // Record this site's effect contribution (E + the op's own effects).
+        EffectSet contrib;
+        contrib.add(pe.effectName);
+        for (const auto& l : op.effects.labels) contrib.add(l);
+        exprEffects_[&pe] = std::move(contrib);
+        return ret;
+    }
+
+    // v32 Phase 176: `handle { body } with E { op(p) => hbody, … }`. Each arm is
+    // a closure desugared at parse time; check it against the op's signature
+    // (params + return). The handle's value is the body's value. (Effect E is
+    // discharged from the body in collectEffects, not here.)
+    TypePtr checkHandle(const ast::HandleExpr& he) {
+        auto eff = effectOpDecls_.find(he.effectName);
+        if (eff == effectOpDecls_.end()) {
+            error("unknown effect `" + he.effectName +
+                      "` in `handle … with`",
+                  he.line, he.column);
+        }
+        for (const auto& arm : he.arms) {
+            if (!arm.handler) continue;
+            const ast::EffectOp* op = nullptr;
+            if (eff != effectOpDecls_.end()) {
+                auto opIt = eff->second.find(arm.opName);
+                if (opIt != eff->second.end()) op = opIt->second;
+            }
+            if (!op) {
+                if (eff != effectOpDecls_.end())
+                    error("effect `" + he.effectName + "` has no operation `" +
+                              arm.opName + "`",
+                          arm.line, arm.column);
+                checkExpr(*arm.handler); // still check the body
+                continue;
+            }
+            std::vector<TypePtr> paramTypes;
+            paramTypes.reserve(op->params.size());
+            for (const auto& p : op->params)
+                paramTypes.push_back(resolveTypeRef(p.type));
+            TypePtr ret = resolveTypeRef(op->returnType);
+            if (arm.handler->params.size() != paramTypes.size())
+                error("handler for `" + he.effectName + "::" + arm.opName +
+                          "` takes " +
+                          std::to_string(arm.handler->params.size()) +
+                          " param(s), but the operation declares " +
+                          std::to_string(paramTypes.size()),
+                      arm.line, arm.column);
+            // Drive closure-param inference from the op's signature, then
+            // require the handler body's type to match the op's return type.
+            expectedArgType_ = makeFunction(paramTypes, ret);
+            TypePtr clTy = resolve(checkExpr(*arm.handler));
+            if (clTy->kind == TypeKind::Function &&
+                !unify(clTy->ret, ret))
+                error("handler for `" + he.effectName + "::" + arm.opName +
+                          "` returns " + typeToString(clTy->ret) +
+                          ", but the operation returns " + typeToString(ret),
+                      arm.line, arm.column);
+        }
+        // The handle expression evaluates to its body's value.
+        return checkExpr(*he.body);
+    }
+
     // Phase 10b: type-check a capturing closure `|params| body`. Determines
     // the captured free variables (recorded on the AST node for codegen),
     // checks the body in a scope holding ONLY the params + captures (so an
@@ -7337,7 +7513,10 @@ private:
             ast::ClosureCapture cap;
             cap.name = name;
             cap.type = t;
-            cap.byRef = mutated;
+            // v32 Phase 176: a handler-arm closure captures EVERY free var by
+            // reference (see ClosureExpr::forceCaptureByRef) so all arms share
+            // the live handle-scope state (e.g. a State effect's cell).
+            cap.byRef = mutated || cl.forceCaptureByRef;
             cl.captures.push_back(std::move(cap));
             captureTypes.emplace_back(name, t);
             captureMut.push_back(enclosingMut);

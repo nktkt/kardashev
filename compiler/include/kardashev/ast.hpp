@@ -670,6 +670,46 @@ struct ClosureExpr : Expr {
     // reason as `captures`. Read at coercion sites to check it satisfies a
     // required `Fn(..)` / `FnMut(..)` / `FnOnce(..)` parameter bound.
     mutable ClosureKind kind = ClosureKind::Fn;
+    // v32 Phase 176: set for a closure synthesized from a `handle … with`
+    // arm. Such a handler runs synchronously within the handle's dynamic
+    // extent, so it captures EVERY free variable BY REFERENCE (even read-only
+    // ones) — this is both sound (the handle frame is live) and the correct
+    // semantics for shared mutable handler state (a `State` effect's `get`/`put`
+    // must see the same live cell, not per-arm by-value snapshots).
+    bool forceCaptureByRef = false;
+};
+
+// v32 Phase 176: `perform E::op(args)` — invoke an effect operation. Dispatches
+// to the dynamically-installed handler for `E::op` (a `handle ... with E` up the
+// dynamic call stack). Performing E adds effect `E` to the enclosing fn's row
+// unless an enclosing handle for E discharges it. Tail-resumptive: control
+// returns to the perform site with the handler arm's result.
+struct PerformExpr : Expr {
+    std::string effectName;
+    std::string opName;
+    std::vector<ExprPtr> args;
+};
+
+// v32 Phase 176: one arm of a `handle ... with E { ... }` — `op(params) => body`,
+// desugared at parse time to a closure `|params| body` so it reuses the closure
+// machinery (capture analysis, codegen, Fn/FnMut classification). Handler arms
+// run synchronously within the handle's dynamic extent, so by-reference captures
+// are sound (the handle frame is live) — unlike escaping closures.
+struct HandleArm {
+    std::string opName;
+    std::unique_ptr<ClosureExpr> handler; // |params| body
+    std::size_t line = 1;
+    std::size_t column = 1;
+};
+
+// v32 Phase 176: `handle { body } with E { op(a) => .. }`. Installs handlers for
+// effect E's operations for the dynamic extent of `body`, runs body, then
+// restores the previous handlers. DISCHARGES effect E from body's effect row
+// (the handler intercepts it). The handle expression's value is body's value.
+struct HandleExpr : Expr {
+    std::unique_ptr<BlockExpr> body;
+    std::string effectName;
+    std::vector<HandleArm> arms;
 };
 
 // Phase 4: a function's declared effect row. `labels` carries the
@@ -981,11 +1021,36 @@ struct UseDecl {
     std::size_t column = 1;
 };
 
+// v32 Phase 176: an effect operation signature `fn op(a: A) -> R ! {..};` in an
+// `effect` declaration — like a MethodSig but never carries a body (a handler
+// supplies it) and takes no `self`.
+struct EffectOp {
+    std::string name;
+    std::vector<Param> params;
+    TypeRef returnType;
+    EffectRow effects;
+    std::size_t line = 1;
+    std::size_t column = 1;
+};
+
+// v32 Phase 176: `effect E { fn op(..) -> R; ... }` — a user-declared effect
+// with one or more operations. `perform E::op(..)` invokes an op; a
+// `handle ... with E { ... }` supplies the op implementations and discharges E.
+struct EffectDecl {
+    std::string name;
+    std::vector<EffectOp> ops;
+    bool isPub = false;
+    std::size_t line = 1;
+    std::size_t column = 1;
+};
+
 struct Program {
     std::vector<FnDecl> functions;
     std::vector<StructDecl> structs;
     std::vector<EnumDecl> enums;
     std::vector<TraitDecl> traits;
+    // v32 Phase 176: user-declared effects (`effect E { ... }`).
+    std::vector<EffectDecl> effects;
     std::vector<ImplDecl> impls;
     std::vector<ModDecl> mods;
     // Phase 24: user-declared `extern "C"` function declarations.

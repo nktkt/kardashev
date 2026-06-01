@@ -2454,7 +2454,7 @@ void test_const_folds_to_literal_in_ir() {
 void test_unit_fn_tail_match_returns_void() {
     const char* src =
         "enum E { A(i64), B(i64) }\n"
-        "fn handle(e: &E, out: &mut Vec<i64>) ! { alloc } {\n"
+        "fn dispatch(e: &E, out: &mut Vec<i64>) ! { alloc } {\n"
         "    match e {\n"
         "        A(v) => { vec_push(out, *v); },\n"
         "        B(v) => { vec_push(out, *v * 2); },\n"
@@ -2463,8 +2463,8 @@ void test_unit_fn_tail_match_returns_void() {
         "fn main() -> i64 ! { alloc } {\n"
         "    let mut out = vec_new();\n"
         "    let ea = A(10); let eb = B(10);\n"
-        "    handle(&ea, &mut out);\n"
-        "    handle(&eb, &mut out);\n"
+        "    dispatch(&ea, &mut out);\n"
+        "    dispatch(&eb, &mut out);\n"
         "    vec_get(&out, 0) + vec_get(&out, 1)\n"
         "}\n";
     auto v = compileAndRun(src, "main", "unit_fn_tail_match_returns_void");

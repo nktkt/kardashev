@@ -53,6 +53,10 @@ public:
                 prog.enums.push_back(parseEnumDecl());
             } else if (check(TokenKind::KwTrait)) {
                 prog.traits.push_back(parseTraitDecl());
+            } else if (check(TokenKind::Identifier) &&
+                       peek().lexeme == "effect" &&
+                       peek(1).kind == TokenKind::Identifier) {
+                prog.effects.push_back(parseEffectDecl());
             } else if (check(TokenKind::KwImpl)) {
                 prog.impls.push_back(parseImplDecl());
             } else if (check(TokenKind::KwMod)) {
@@ -119,6 +123,12 @@ public:
                     auto tr = parseTraitDecl();
                     tr.isPub = pubReach;
                     prog.traits.push_back(std::move(tr));
+                } else if (check(TokenKind::Identifier) &&
+                           peek().lexeme == "effect" &&
+                           peek(1).kind == TokenKind::Identifier) {
+                    auto ef = parseEffectDecl();
+                    ef.isPub = pubReach;
+                    prog.effects.push_back(std::move(ef));
                 } else if (check(TokenKind::KwImpl)) {
                     auto im = parseImplDecl();
                     im.isPub = pubReach;
@@ -1311,6 +1321,116 @@ private:
         return decl;
     }
 
+    // v32 Phase 176: `effect E { fn op(a: A) -> R ! {..}; ... }` — an effect
+    // declaration. Each op is a no-self, no-body signature (a handler supplies
+    // the body). Mirrors parseTraitDecl, minus self/defaults/generics/supertraits.
+    ast::EffectDecl parseEffectDecl() {
+        Token effTok = consume(); // the contextual `effect` keyword (lexeme-checked)
+        ast::EffectDecl decl;
+        decl.line = effTok.line;
+        decl.column = effTok.column;
+        Token nameTok = expect(TokenKind::Identifier, "effect name");
+        decl.name = nameTok.lexeme;
+        expect(TokenKind::LBrace, "{");
+        while (!check(TokenKind::RBrace) && !check(TokenKind::EndOfInput)) {
+            if (errors_.size() > 20) break;
+            Token fnTok = expect(TokenKind::KwFn, "fn");
+            ast::EffectOp op;
+            op.line = fnTok.line;
+            op.column = fnTok.column;
+            Token opName = expect(TokenKind::Identifier, "effect operation name");
+            op.name = opName.lexeme;
+            expect(TokenKind::LParen, "(");
+            if (!check(TokenKind::RParen)) {
+                while (true) {
+                    op.params.push_back(parseParam());
+                    if (!accept(TokenKind::Comma)) break;
+                }
+            }
+            expect(TokenKind::RParen, ")");
+            op.returnType = parseOptionalReturnType();
+            op.effects = parseOptionalEffectRow();
+            expect(TokenKind::Semi, ";");
+            decl.ops.push_back(std::move(op));
+        }
+        expect(TokenKind::RBrace, "}");
+        return decl;
+    }
+
+    // v32 Phase 176: `perform E::op(args)` — invoke an effect operation.
+    ast::ExprPtr parsePerformExpr() {
+        Token kw = consume(); // the contextual `perform` keyword (lexeme-checked)
+        auto e = std::make_unique<ast::PerformExpr>();
+        e->line = kw.line;
+        e->column = kw.column;
+        Token effTok = expect(TokenKind::Identifier, "effect name after `perform`");
+        e->effectName = effTok.lexeme;
+        expect(TokenKind::DoubleColon, "`::` between effect and operation");
+        Token opTok = expect(TokenKind::Identifier, "operation name");
+        e->opName = opTok.lexeme;
+        expect(TokenKind::LParen, "(");
+        if (!check(TokenKind::RParen)) {
+            while (true) {
+                e->args.push_back(parseExpr());
+                if (!accept(TokenKind::Comma)) break;
+            }
+        }
+        expect(TokenKind::RParen, ")");
+        return e;
+    }
+
+    // v32 Phase 176: `handle { body } with E { op(params) => expr, ... }`. Each
+    // arm `op(params) => expr` is desugared here into a closure `|params| expr`
+    // so it reuses all the closure machinery (capture analysis, codegen, FnMut).
+    ast::ExprPtr parseHandleExpr() {
+        Token kw = consume(); // the contextual `handle` keyword (lexeme-checked)
+        auto e = std::make_unique<ast::HandleExpr>();
+        e->line = kw.line;
+        e->column = kw.column;
+        e->body = parseBlockExpr();
+        if (check(TokenKind::Identifier) && peek().lexeme == "with") {
+            consume(); // the contextual `with` keyword
+        } else {
+            errorHere("expected `with` after the handle body");
+        }
+        Token effTok = expect(TokenKind::Identifier, "effect name after `with`");
+        e->effectName = effTok.lexeme;
+        expect(TokenKind::LBrace, "{");
+        while (!check(TokenKind::RBrace) && !check(TokenKind::EndOfInput)) {
+            if (errors_.size() > 20) break;
+            ast::HandleArm arm;
+            Token opTok = expect(TokenKind::Identifier, "operation name in handler");
+            arm.opName = opTok.lexeme;
+            arm.line = opTok.line;
+            arm.column = opTok.column;
+            auto cl = std::make_unique<ast::ClosureExpr>();
+            cl->line = opTok.line;
+            cl->column = opTok.column;
+            cl->forceCaptureByRef = true; // handler arms share live handle-scope state
+            expect(TokenKind::LParen, "(");
+            if (!check(TokenKind::RParen)) {
+                while (true) {
+                    Token p = expect(TokenKind::Identifier,
+                                     "handler parameter name");
+                    ast::ClosureParam cp;
+                    cp.name = p.lexeme;
+                    cp.line = p.line;
+                    cp.column = p.column;
+                    cl->params.push_back(std::move(cp));
+                    if (!accept(TokenKind::Comma)) break;
+                }
+            }
+            expect(TokenKind::RParen, ")");
+            expect(TokenKind::FatArrow, "`=>` in a handler arm");
+            cl->body = parseExpr();
+            arm.handler = std::move(cl);
+            e->arms.push_back(std::move(arm));
+            accept(TokenKind::Comma); // optional separator between arms
+        }
+        expect(TokenKind::RBrace, "}");
+        return e;
+    }
+
     // v25 Phase 139: `const N: T;` in a trait -> a no-self method sig.
     ast::MethodSig parseTraitAssocConst() {
         Token c = expect(TokenKind::KwConst, "const");
@@ -2247,6 +2367,25 @@ private:
             e->column = tok.column;
             e->value = (tok.kind == TokenKind::KwTrue);
             return e;
+        }
+
+        // v32 Phase 176: contextual `perform E::op(..)` — `perform` followed by
+        // an identifier (the effect name). A bare/var/call use of `perform`
+        // (followed by `;`/`(`/`.`/…) stays an ordinary identifier. Must precede
+        // the generic Identifier branch below (which would otherwise consume
+        // `perform` as a plain name).
+        if (t.kind == TokenKind::Identifier && t.lexeme == "perform" &&
+            peek(1).kind == TokenKind::Identifier) {
+            return parsePerformExpr();
+        }
+        // v32 Phase 176: contextual `handle { body } with E { … }` — `handle`
+        // immediately followed by `{` in a VALUE position (NOT an if/while
+        // condition, where restrictStructLit_ is set and `handle` is the
+        // condition variable). A `handle` used as a plain identifier (a
+        // task/lock handle, common in the concurrency tests) is unaffected.
+        if (t.kind == TokenKind::Identifier && t.lexeme == "handle" &&
+            peek(1).kind == TokenKind::LBrace && !restrictStructLit_) {
+            return parseHandleExpr();
         }
 
         if (t.kind == TokenKind::Identifier) {

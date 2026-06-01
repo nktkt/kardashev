@@ -11698,6 +11698,12 @@ private:
         if (auto* ae = dynamic_cast<const ast::AwaitExpr*>(&e)) {
             return emitAwait(*ae);
         }
+        if (auto* pe = dynamic_cast<const ast::PerformExpr*>(&e)) {
+            return emitPerform(*pe);
+        }
+        if (auto* he = dynamic_cast<const ast::HandleExpr*>(&e)) {
+            return emitHandle(*he);
+        }
         errors_.push_back("codegen: unknown expression kind");
         return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*ctx_), 0);
     }
@@ -14021,6 +14027,94 @@ private:
     // captures are Copy scalars copied into the heap env, so there is no
     // dangling reference. (Freeing the env / FnMut / by-ref capture are
     // deferred; see the report.)
+    // v32 Phase 176: per-(effect, op) dynamically-scoped CURRENT-handler global,
+    // a `{ fn, env }` fat pointer (zero = no handler installed). `handle … with`
+    // save/sets it for the body's dynamic extent; `perform` reads the top one.
+    std::unordered_map<std::string, llvm::GlobalVariable*> effectHandlerGlobals_;
+    llvm::GlobalVariable* effectHandlerGlobal(const std::string& eff,
+                                              const std::string& op) {
+        std::string key = eff + "::" + op;
+        auto it = effectHandlerGlobals_.find(key);
+        if (it != effectHandlerGlobals_.end()) return it->second;
+        auto* g = new llvm::GlobalVariable(
+            *module_, fnValTy_, /*isConstant=*/false,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantAggregateZero::get(fnValTy_),
+            "__handler_" + eff + "__" + op);
+        effectHandlerGlobals_[key] = g;
+        return g;
+    }
+
+    // v32 Phase 176: `perform E::op(args)` — call the dynamically-current
+    // handler for E::op. The handler is a `{ fn, env }` fat pointer; we rebuild
+    // its env-calling-convention type from the perform site's arg + result
+    // types (the handler was checked against exactly `fn(opParams) -> opRet`),
+    // null-guard it (an unhandled performed effect traps), and call it.
+    llvm::Value* emitPerform(const ast::PerformExpr& pe) {
+        auto& ctx = *ctx_;
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* g = effectHandlerGlobal(pe.effectName, pe.opName);
+        std::vector<TypePtr> argTys;
+        argTys.reserve(pe.args.size());
+        for (const auto& a : pe.args) {
+            TypePtr at = lookupExprType(*a);
+            argTys.push_back(at ? at : makeInt());
+        }
+        TypePtr retTy = lookupExprType(pe);
+        if (!retTy) retTy = makeInt();
+        auto* callTy = envCalleeType(makeFunction(argTys, retTy));
+        auto* h = builder_->CreateLoad(fnValTy_, g, "handler");
+        auto* fnPtr = builder_->CreateExtractValue(h, {0}, "h.fn");
+        auto* envPtr = builder_->CreateExtractValue(h, {1}, "h.env");
+        // Null-handler guard: an effect performed with no installed handler is a
+        // logic error (the dynamic handler stack is empty) — trap rather than
+        // call a null fn pointer.
+        auto* isNull = builder_->CreateICmpEQ(
+            fnPtr, llvm::ConstantPointerNull::get(i8PtrTy), "no_handler");
+        auto* trapBB = llvm::BasicBlock::Create(ctx, "unhandled", currentFn_);
+        auto* okBB = llvm::BasicBlock::Create(ctx, "handled", currentFn_);
+        builder_->CreateCondBr(isNull, trapBB, okBB);
+        builder_->SetInsertPoint(trapBB);
+        auto* trapFn = llvm::Intrinsic::getOrInsertDeclaration(
+            module_.get(), llvm::Intrinsic::trap);
+        builder_->CreateCall(trapFn, {});
+        builder_->CreateUnreachable();
+        builder_->SetInsertPoint(okBB);
+        std::vector<llvm::Value*> args;
+        args.reserve(pe.args.size() + 1);
+        args.push_back(envPtr);
+        for (const auto& a : pe.args) args.push_back(emitConsume(*a));
+        const char* nm =
+            callTy->getReturnType()->isVoidTy() ? "" : "perform";
+        return builder_->CreateCall(callTy, fnPtr, args, nm);
+    }
+
+    // v32 Phase 176: `handle { body } with E { op(p) => hbody, … }`. Install each
+    // arm's handler closure into the per-op global (saving the previous value on
+    // the C stack), run the body, then restore. Dynamic scoping falls out of the
+    // save/restore: a `perform E::op` anywhere in the body's dynamic extent
+    // reads the global we just set. (Handler closure envs are heap-allocated and
+    // not freed here — a documented one-shot leak, like other closure envs; and
+    // a non-local exit out of `body` skips the restore — handle bodies should
+    // not `return` through the handle. Recursive cancellation / full
+    // continuation capture are out of scope — this is the tail-resumptive
+    // subset.)
+    llvm::Value* emitHandle(const ast::HandleExpr& he) {
+        std::vector<std::pair<llvm::GlobalVariable*, llvm::Value*>> saved;
+        saved.reserve(he.arms.size());
+        for (const auto& arm : he.arms) {
+            if (!arm.handler) continue;
+            auto* g = effectHandlerGlobal(he.effectName, arm.opName);
+            auto* old = builder_->CreateLoad(fnValTy_, g, "saved_handler");
+            saved.emplace_back(g, old);
+            llvm::Value* hv = emitExpr(*arm.handler); // the handler closure fnVal
+            builder_->CreateStore(hv, g);
+        }
+        llvm::Value* bodyVal = emitExpr(*he.body);
+        for (auto& [g, old] : saved) builder_->CreateStore(old, g);
+        return bodyVal;
+    }
+
     llvm::Value* emitClosure(const ast::ClosureExpr& cl) {
         auto& ctx = *ctx_;
         auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
