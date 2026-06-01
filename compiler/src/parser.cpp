@@ -1460,6 +1460,12 @@ private:
         // `<` here is unambiguous (it directly follows `impl`). These are in
         // scope for forType + every method.
         decl.genericParams = parseOptionalGenericParams();
+        // v31 Phase 167: a NEGATIVE marker impl `impl !Send for T {}`. The `!`
+        // (a standalone Bang here, since it is not followed by `=`) opts a type
+        // OUT of the auto-derived Send/Sync membership. Only legal as a trait
+        // impl (`for` form) of a marker trait, with an empty body — both
+        // enforced below / in typecheck.
+        bool isNegative = accept(TokenKind::Bang);
         // Three forms:
         //   impl Trait for Type { ... }        -- trait impl (since Phase 3.3)
         //   impl Trait<Args...> for Type { ... } -- generic trait impl (21a)
@@ -1487,7 +1493,14 @@ private:
             decl.traitName = nameTok.lexeme;
             decl.traitTypeArgs = std::move(leadingArgs);
             decl.forType = parseTypeRef();
+            decl.isNegative = isNegative; // v31 Phase 167
         } else {
+            // v31 Phase 167: a negative impl MUST name a trait (`impl !Send for
+            // T`); `impl !Type {}` is meaningless.
+            if (isNegative) {
+                errorAt("a negative impl `impl !Trait` must be `for` a type",
+                        nameTok.line, nameTok.column);
+            }
             // Inherent impl: `nameTok` + `leadingArgs` form the implementing
             // type's TypeRef (e.g. `impl Pair<T> { ... }`). traitName stays
             // empty.
@@ -1501,6 +1514,12 @@ private:
         // Phase 40: a `where` clause adds bounds onto the impl's generic params.
         parseOptionalWhereClause(decl.genericParams);
         expect(TokenKind::LBrace, "{");
+        // v31 Phase 167: a negative marker impl carries no methods.
+        if (decl.isNegative && !check(TokenKind::RBrace)) {
+            errorAt("a negative impl `impl !Trait for T` must have an empty "
+                    "body `{}`",
+                    decl.line, decl.column);
+        }
         while (!check(TokenKind::RBrace) && !check(TokenKind::EndOfInput)) {
             if (errors_.size() > 20) break;
             // Phase 21b: an associated-type definition `type Item = i64;`.

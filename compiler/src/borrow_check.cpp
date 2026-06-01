@@ -89,6 +89,17 @@ bool isCopyType(const TypePtr& t) {
         // mutex_get(m)` use the handle repeatedly without a move error and lets
         // it be captured by value into multiple thread closures.
         if (r->structName == "Mutex") return true;
+        // v31 Phase 168: `RwLock<T>` is a Copy i64 handle like Mutex (its
+        // lock+cell block is process-lifetime). The three RAII lock guards
+        // (MutexGuard/RwLockReadGuard/RwLockWriteGuard) are move-only (they fall
+        // through to the default `return false` below) so a guard is released
+        // exactly once, by its single owner, at scope exit.
+        if (r->structName == "RwLock") return true;
+        // v31 Phase 169: an atomic handle is a Copy i64 over a process-lifetime
+        // heap cell (no drop glue), like Mutex — copies freely and can be
+        // captured by value into multiple thread closures.
+        if (r->structName == "AtomicI64" || r->structName == "AtomicBool")
+            return true;
         // Phase 81 (v13 review fix): the channel endpoints `Sender<T>` /
         // `Receiver<T>` are now refcounted, move-only OWNERS (NOT Copy) — they
         // have drop glue that decrements the channel refcount, so copying a

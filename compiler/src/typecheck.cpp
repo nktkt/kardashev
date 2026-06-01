@@ -660,6 +660,50 @@ public:
             sch.genericVars.push_back(rcVar);
             fnSchemas_["rc_strong_count"] = std::move(sch);
         }
+
+        // v31 Phase 171: `Arc<T>` — an ATOMICALLY reference-counted shared owner
+        // (a pointer to a heap `{ i64 strong, i64 weak, T value }`), and its
+        // companion `Weak<T>` (a non-owning, upgradable handle). Unlike Rc,
+        // Arc's refcount is atomic, so it IS Send/Sync when T is (Send+Sync) —
+        // the answer to "share owned data across threads" without lifetimes.
+        // arc_new strong=1/weak=1 (all strong refs collectively hold one weak
+        // ref); the value is dropped when the last strong drops, the block freed
+        // when the last weak drops. Mirrors the Rc schema shape.
+        TypePtr arcVar = makeFreshVar();
+        TypePtr arcInst = makeStruct("Arc", {});
+        arcInst->typeArgs = {arcVar};
+        TypePtr weakInst = makeStruct("Weak", {});
+        weakInst->typeArgs = {arcVar};
+        {
+            StructSchema sch;
+            sch.type = arcInst;
+            sch.genericVars.push_back(arcVar);
+            structSchemas_["Arc"] = std::move(sch);
+        }
+        {
+            StructSchema sch;
+            sch.type = weakInst;
+            sch.genericVars.push_back(arcVar);
+            structSchemas_["Weak"] = std::move(sch);
+        }
+        auto regArc = [&](const std::string& nm, std::vector<TypePtr> params,
+                          TypePtr ret, bool alloc) {
+            FnSchema sch;
+            sch.signature = makeFunction(std::move(params), std::move(ret));
+            if (alloc) sch.declaredEffects.add("alloc");
+            sch.genericVars.push_back(arcVar);
+            fnSchemas_[nm] = std::move(sch);
+        };
+        regArc("arc_new", {arcVar}, arcInst, true);
+        regArc("arc_clone", {makeRef(arcInst, false)}, arcInst, false);
+        regArc("arc_get", {makeRef(arcInst, false)}, makeRef(arcVar, false),
+               false);
+        regArc("arc_strong_count", {makeRef(arcInst, false)}, makeInt(), false);
+        regArc("arc_weak_count", {makeRef(arcInst, false)}, makeInt(), false);
+        regArc("arc_downgrade", {makeRef(arcInst, false)}, weakInst, false);
+        regArc("weak_clone", {makeRef(weakInst, false)}, weakInst, false);
+        // weak_upgrade<T>(w: &Weak<T>) -> Option<Arc<T>> is registered AFTER the
+        // enum loop (Option is not yet in enumSchemas_ at this point).
         // hashset_new<T>() -> HashSet<T> ! { alloc }
         {
             FnSchema sch;
@@ -877,6 +921,40 @@ public:
             sch.declaredEffects.add("io");
             fnSchemas_["thread_join"] = std::move(sch);
         }
+        // v31 Phase 170: scoped threads. `Scope` is a phantom move-only i64
+        // handle (NON-Copy, NON-Send) to a heap list of spawned thread handles;
+        // its Drop joins them all (RAII join-before-scope-end). scope_new()
+        // creates one; scope_spawn(&s, f) spawns f into the scope (so the
+        // scope's end is guaranteed to outlive — and join — the worker).
+        {
+            StructSchema sch;
+            sch.type = makeStruct("Scope", {}); // non-generic
+            structSchemas_["Scope"] = std::move(sch);
+        }
+        //   scope_new() -> Scope ! { alloc }
+        {
+            FnSchema sch;
+            sch.signature = makeFunction({}, makeStruct("Scope", {}));
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["scope_new"] = std::move(sch);
+        }
+        //   scope_spawn(s: &Scope, f: fn() -> i64 ! {e}) -> i64 ! {io,share,e}
+        // Mirrors thread_spawn's effect-polymorphic closure, with the closure's
+        // effects flowing through the row var.
+        {
+            TypePtr rowVar = makeFreshVar();
+            TypePtr fnParam = makeFunction({}, makeInt(),
+                                           /*effectLabels=*/{}, rowVar);
+            TypePtr scopeRef =
+                makeRef(makeStruct("Scope", {}), /*isMut=*/false);
+            FnSchema sch;
+            sch.signature = makeFunction({scopeRef, fnParam}, makeInt());
+            sch.declaredEffects.add("io");
+            sch.declaredEffects.add("share");
+            sch.declaredEffects.add("e");
+            sch.effectRowVars.emplace_back("e", rowVar);
+            fnSchemas_["scope_spawn"] = std::move(sch);
+        }
         // Phase 19 / 123 built-in: `Mutex<T>` — a lock guarding a cell of type
         // T. It is a PHANTOM-TYPED i64 HANDLE: the value is a bare i64 (PtrToInt
         // of a heap `{ pthread_mutex_t, T value }` block) so it stays Copy and
@@ -955,6 +1033,166 @@ public:
             sch.declaredEffects.add("io");
             fnSchemas_["mutex_set"] = std::move(sch);
         }
+
+        // === v31 Phase 168: RwLock<T> + RAII lock guards ===
+        // `RwLock<T>` is a reader/writer lock — a Copy shareable i64 handle like
+        // Mutex (its heap block is `{ pthread_rwlock_t, T }`); Send iff T is.
+        // The three guard types (`MutexGuard<T>`, `RwLockReadGuard<T>`,
+        // `RwLockWriteGuard<T>`) are MOVE-ONLY RAII tokens whose Drop releases
+        // the held lock (the scoped-lock pattern, like C++ lock_guard /
+        // shared_lock / unique_lock). They carry T for type clarity; data is
+        // read/written through the lock's get/set while the guard holds it.
+        auto registerBuiltinGeneric = [&](const char* name) {
+            TypePtr v = makeFreshVar();
+            TypePtr inst = makeStruct(name, {});
+            inst->typeArgs = {v};
+            StructSchema sch;
+            sch.type = inst;
+            sch.genericVars.push_back(v);
+            structSchemas_[name] = std::move(sch);
+        };
+        registerBuiltinGeneric("RwLock");
+        registerBuiltinGeneric("MutexGuard");
+        registerBuiltinGeneric("RwLockReadGuard");
+        registerBuiltinGeneric("RwLockWriteGuard");
+        auto mkInst = [&](const char* name, const TypePtr& cell) {
+            TypePtr t = makeStruct(name, {});
+            t->typeArgs = {cell};
+            return t;
+        };
+        //   mutex_guard<T>(m: Mutex<T>) -> MutexGuard<T> ! { io }  (locks)
+        {
+            FnSchema sch;
+            TypePtr c = makeFreshVar();
+            sch.signature =
+                makeFunction({mkMutex(c)}, mkInst("MutexGuard", c));
+            sch.genericVars.push_back(c);
+            sch.declaredEffects.add("io");
+            fnSchemas_["mutex_guard"] = std::move(sch);
+        }
+        //   rwlock_new<T>(v: T) -> RwLock<T> ! { alloc }
+        {
+            FnSchema sch;
+            TypePtr c = makeFreshVar();
+            sch.signature = makeFunction({c}, mkInst("RwLock", c));
+            sch.genericVars.push_back(c);
+            sch.declaredEffects.add("alloc");
+            fnSchemas_["rwlock_new"] = std::move(sch);
+        }
+        //   rwlock_read<T>(rw: RwLock<T>) -> i64 ! { io }   (acquire read lock)
+        //   rwlock_write<T>(rw: RwLock<T>) -> i64 ! { io }  (acquire write lock)
+        //   rwlock_unlock<T>(rw: RwLock<T>) -> i64 ! { io }
+        for (const char* op : {"rwlock_read", "rwlock_write", "rwlock_unlock"}) {
+            FnSchema sch;
+            TypePtr c = makeFreshVar();
+            sch.signature = makeFunction({mkInst("RwLock", c)}, makeInt());
+            sch.genericVars.push_back(c);
+            sch.declaredEffects.add("io");
+            fnSchemas_[op] = std::move(sch);
+        }
+        //   rwlock_get<T>(rw: RwLock<T>) -> T          (read under a read/wr lock)
+        {
+            FnSchema sch;
+            TypePtr c = makeFreshVar();
+            sch.signature = makeFunction({mkInst("RwLock", c)}, c);
+            sch.genericVars.push_back(c);
+            fnSchemas_["rwlock_get"] = std::move(sch);
+        }
+        //   rwlock_set<T>(rw: RwLock<T>, v: T) -> i64  (write under a write lock)
+        {
+            FnSchema sch;
+            TypePtr c = makeFreshVar();
+            sch.signature = makeFunction({mkInst("RwLock", c), c}, makeInt());
+            sch.genericVars.push_back(c);
+            sch.declaredEffects.add("io");
+            fnSchemas_["rwlock_set"] = std::move(sch);
+        }
+        //   rwlock_read_guard<T>(rw: RwLock<T>) -> RwLockReadGuard<T> ! { io }
+        {
+            FnSchema sch;
+            TypePtr c = makeFreshVar();
+            sch.signature =
+                makeFunction({mkInst("RwLock", c)}, mkInst("RwLockReadGuard", c));
+            sch.genericVars.push_back(c);
+            sch.declaredEffects.add("io");
+            fnSchemas_["rwlock_read_guard"] = std::move(sch);
+        }
+        //   rwlock_write_guard<T>(rw: RwLock<T>) -> RwLockWriteGuard<T> ! { io }
+        {
+            FnSchema sch;
+            TypePtr c = makeFreshVar();
+            sch.signature = makeFunction({mkInst("RwLock", c)},
+                                         mkInst("RwLockWriteGuard", c));
+            sch.genericVars.push_back(c);
+            sch.declaredEffects.add("io");
+            fnSchemas_["rwlock_write_guard"] = std::move(sch);
+        }
+
+        // === v31 Phase 169: atomics + CAS + memory orderings ===
+        // `AtomicI64` / `AtomicBool` are NON-generic phantom builtin structs —
+        // Copy i64 handles over a naturally-aligned heap cell (process-lifetime,
+        // like Mutex), and Send+Sync (the legible POSITIVE Send witness, the
+        // mirror of Rc's negative one). The ops are NAME-SUFFIXED by memory
+        // ordering (atomic_i64_fetch_add_seqcst, …) so the LLVM AtomicOrdering
+        // is a COMPILE-TIME constant — there is no turbofish and an enum arg is
+        // a runtime value. The ergonomic `enum Ordering` + `impl AtomicI64`
+        // surface (prelude) matches the ordering and dispatches to these.
+        for (const char* an : {"AtomicI64", "AtomicBool"}) {
+            StructSchema sch;
+            sch.type = makeStruct(an, {}); // non-generic — no genericVars
+            structSchemas_[an] = std::move(sch);
+        }
+        auto atomicTy = [&](const char* n) { return makeStruct(n, {}); };
+        auto regAtomic = [&](const std::string& nm, std::vector<TypePtr> params,
+                             TypePtr ret, bool io, bool alloc) {
+            FnSchema sch;
+            sch.signature = makeFunction(std::move(params), std::move(ret));
+            if (io) sch.declaredEffects.add("io");
+            if (alloc) sch.declaredEffects.add("alloc");
+            fnSchemas_[nm] = std::move(sch);
+        };
+        // constructors (allocate the cell)
+        regAtomic("atomic_i64_new", {makeInt()}, atomicTy("AtomicI64"), false,
+                  true);
+        regAtomic("atomic_bool_new", {makeBool()}, atomicTy("AtomicBool"),
+                  false, true);
+        // AtomicI64: load (pure) / store / swap / fetch_* / cmpxchg.
+        for (const char* o : {"relaxed", "acquire", "seqcst"})
+            regAtomic(std::string("atomic_i64_load_") + o,
+                      {atomicTy("AtomicI64")}, makeInt(), false, false);
+        for (const char* o : {"relaxed", "release", "seqcst"})
+            regAtomic(std::string("atomic_i64_store_") + o,
+                      {atomicTy("AtomicI64"), makeInt()}, makeInt(), true,
+                      false);
+        for (const char* op : {"swap", "fetch_add", "fetch_sub", "fetch_and",
+                               "fetch_or", "fetch_xor"})
+            for (const char* o : {"relaxed", "acqrel", "seqcst"})
+                regAtomic(std::string("atomic_i64_") + op + "_" + o,
+                          {atomicTy("AtomicI64"), makeInt()}, makeInt(), true,
+                          false);
+        for (const char* o : {"relaxed", "acqrel", "seqcst"})
+            regAtomic(std::string("atomic_i64_cmpxchg_") + o,
+                      {atomicTy("AtomicI64"), makeInt(), makeInt()}, makeBool(),
+                      true, false);
+        // AtomicBool: load (pure) / store / swap / cmpxchg (no arithmetic).
+        for (const char* o : {"relaxed", "acquire", "seqcst"})
+            regAtomic(std::string("atomic_bool_load_") + o,
+                      {atomicTy("AtomicBool")}, makeBool(), false, false);
+        for (const char* o : {"relaxed", "release", "seqcst"})
+            regAtomic(std::string("atomic_bool_store_") + o,
+                      {atomicTy("AtomicBool"), makeBool()}, makeInt(), true,
+                      false);
+        for (const char* o : {"relaxed", "acqrel", "seqcst"})
+            regAtomic(std::string("atomic_bool_swap_") + o,
+                      {atomicTy("AtomicBool"), makeBool()}, makeBool(), true,
+                      false);
+        for (const char* o : {"relaxed", "acqrel", "seqcst"})
+            regAtomic(std::string("atomic_bool_cmpxchg_") + o,
+                      {atomicTy("AtomicBool"), makeBool(), makeBool()},
+                      makeBool(), true, false);
+        // standalone fences
+        for (const char* o : {"acquire", "release", "acqrel", "seqcst"})
+            regAtomic(std::string("fence_") + o, {}, makeInt(), true, false);
 
         // Phase 23 built-in: real panic + unwinding.
         //
@@ -1324,6 +1562,36 @@ public:
                     sch.genericVars.push_back(chanVar);
                     fnSchemas_["chan_try_recv"] = std::move(sch);
                 }
+                // v31 Phase 170: select2/3/4<T>(r0,..,rN-1: &Receiver<T>) ->
+                // SelectResult<T> ! { share } — block (poll-with-backoff) until
+                // one of N HOMOGENEOUS receivers is ready, returning
+                // Ready(idx, value) or Closed(idx). All receiver params share
+                // chanVar, so T is homogeneous by unification. A distinct
+                // fnSchema per arity (no variadic builtin path).
+                if (enumSchemas_.count("SelectResult")) {
+                    const EnumSchema& srSchema = enumSchemas_["SelectResult"];
+                    auto mkSelectResult = [&]() -> TypePtr {
+                        if (srSchema.genericVars.empty()) return srSchema.type;
+                        std::unordered_map<int, TypePtr> subst;
+                        subst[srSchema.genericVars[0]->varId] = chanVar;
+                        TypePtr t = instantiate(srSchema.type, subst);
+                        t->typeArgs = {chanVar};
+                        return t;
+                    };
+                    for (int n : {2, 3, 4}) {
+                        std::vector<TypePtr> params;
+                        for (int i = 0; i < n; ++i)
+                            params.push_back(
+                                makeRef(receiverT, /*isMut=*/false));
+                        FnSchema sch;
+                        sch.signature =
+                            makeFunction(std::move(params), mkSelectResult());
+                        sch.declaredEffects.add("share");
+                        sch.genericVars.push_back(chanVar);
+                        fnSchemas_["select" + std::to_string(n)] =
+                            std::move(sch);
+                    }
+                }
                 // chan_close<T>(s: Sender<T>) -> i64 ! { share } — takes the
                 // Sender BY VALUE (consumes it): the explicit "this producer is
                 // done" that decrements the live-sender count (closing only when
@@ -1337,6 +1605,32 @@ public:
                     fnSchemas_["chan_close"] = std::move(sch);
                 }
             }
+        }
+
+        // v31 Phase 171: weak_upgrade<T>(w: &Weak<T>) -> Option<Arc<T>>.
+        // Registered here (after the enum loop) because Option is not yet in
+        // enumSchemas_ at the Arc/Weak registration site above.
+        if (structSchemas_.count("Arc") && enumSchemas_.count("Option")) {
+            TypePtr wuVar = makeFreshVar();
+            TypePtr aInst = makeStruct("Arc", {});
+            aInst->typeArgs = {wuVar};
+            TypePtr wInst = makeStruct("Weak", {});
+            wInst->typeArgs = {wuVar};
+            const EnumSchema& optSchema = enumSchemas_["Option"];
+            TypePtr optArc;
+            if (!optSchema.genericVars.empty()) {
+                std::unordered_map<int, TypePtr> subst;
+                subst[optSchema.genericVars[0]->varId] = aInst;
+                optArc = instantiate(optSchema.type, subst);
+                optArc->typeArgs = {aInst};
+            } else {
+                optArc = optSchema.type;
+            }
+            FnSchema sch;
+            sch.signature = makeFunction({makeRef(wInst, false)}, optArc);
+            sch.declaredEffects.add("alloc");
+            sch.genericVars.push_back(wuVar);
+            fnSchemas_["weak_upgrade"] = std::move(sch);
         }
 
         // Pass 1c: register trait declarations. Each trait gets a global
@@ -1423,6 +1717,14 @@ public:
                 }
                 uniqueMethods.push_back(m);
             }
+            // v31 Phase 167: Send/Sync are pure MARKER traits — no methods, no
+            // vtable, no runtime cost. Reject a user adding behaviour to them.
+            if ((td.name == "Send" || td.name == "Sync") &&
+                !uniqueMethods.empty()) {
+                error("the marker trait `" + td.name +
+                          "` must have no methods",
+                      td.line, td.column);
+            }
             traits_[td.name] = std::move(uniqueMethods);
             traitSupertraits_[td.name] = td.supertraits; // v25 Phase 136
         }
@@ -1434,7 +1736,10 @@ public:
         {
             std::unordered_set<std::string> implemented;
             for (const auto& impl : program.impls)
-                if (!impl.traitName.empty())
+                // v31 Phase 167: a negative marker impl does NOT implement the
+                // trait — it opts out — so it must not satisfy a supertrait
+                // bound (`trait Foo: Send` over a type with `impl !Send`).
+                if (!impl.traitName.empty() && !impl.isNegative)
                     implemented.insert(impl.forType.name + "/" + impl.traitName);
             for (const auto& impl : program.impls) {
                 if (impl.traitName.empty()) continue;
@@ -1474,6 +1779,11 @@ public:
             std::unordered_set<std::string> seenImplPairs;
             for (const auto& impl : program.impls) {
                 if (impl.traitName.empty()) continue;
+                // v31 Phase 167: marker (Send/Sync) impls — positive and
+                // negative — are governed by the dedicated marker-oracle pass
+                // below, which owns their conflict/duplicate diagnostics.
+                if (impl.traitName == "Send" || impl.traitName == "Sync")
+                    continue;
                 std::string key = impl.forType.name +
                                   spellArgs(impl.forType.typeArgs) + "/" +
                                   impl.traitName + spellArgs(impl.traitTypeArgs);
@@ -1486,6 +1796,49 @@ public:
             }
         }
 
+        // v31 Phase 167: build the Send/Sync marker oracle. A positive `impl
+        // Send for T {}` forces T: Send (the legible witness for an opaque /
+        // handle type whose structural answer is wrong — e.g. a future Arc); a
+        // negative `impl !Send for T {}` opts T out (the principled replacement
+        // for hand-coded special-cases). This is the SOLE authority on marker
+        // impls — they are skipped by the supertrait/coherence checks above so
+        // their conflict diagnostics live here. A type with no marker impl is
+        // unspecified and gets the structural auto-derive in isSend/isSync.
+        for (const auto& impl : program.impls) {
+            const bool isMarker =
+                impl.traitName == "Send" || impl.traitName == "Sync";
+            if (impl.isNegative && !isMarker) {
+                error("negative impls are only allowed for the marker traits "
+                      "`Send` and `Sync`",
+                      impl.line, impl.column);
+                continue;
+            }
+            if (!isMarker) continue;
+            if (!impl.methods.empty()) {
+                error("a marker impl of `" + impl.traitName +
+                          "` must have no methods",
+                      impl.line, impl.column);
+                continue;
+            }
+            const std::string& tyName = impl.forType.name;
+            int sign = impl.isNegative ? -1 : +1;
+            auto& slot = markerImpls_[tyName];
+            auto existing = slot.find(impl.traitName);
+            if (existing != slot.end()) {
+                if (existing->second != sign)
+                    error("conflicting `impl " + impl.traitName +
+                              "` and `impl !" + impl.traitName + "` for type '" +
+                              tyName + "'",
+                          impl.line, impl.column);
+                else
+                    error("duplicate impl of marker trait `" + impl.traitName +
+                              "` for type '" + tyName + "'",
+                          impl.line, impl.column);
+                continue;
+            }
+            slot[impl.traitName] = sign;
+        }
+
         // Pass 1d: register impl blocks. We resolve the implementing type
         // and validate that each impl method's signature matches the
         // trait's after substituting Self -> implementing type.
@@ -1494,6 +1847,11 @@ public:
         for (std::size_t implIdx = 0; implIdx < program.impls.size();
              ++implIdx) {
             const auto& impl = program.impls[implIdx];
+            // v31 Phase 167: a negative marker impl (`impl !Send for T {}`)
+            // provides nothing — it is an opt-out recorded in markerImpls_, not
+            // a real impl. Skip it here so it is neither validated against a
+            // trait signature nor registered as providing a method.
+            if (impl.isNegative) continue;
             // Phase 15: inherent impls (`impl Type { ... }`) carry an empty
             // trait name and have no trait signature to validate methods
             // against. Trait impls keep the Phase 3.3 path (lookup + match).
@@ -2288,6 +2646,14 @@ private:
     std::unordered_map<std::string, std::vector<std::string>> traitAssocTypes_;
     // v25 Phase 136: trait -> its supertrait names.
     std::unordered_map<std::string, std::vector<std::string>> traitSupertraits_;
+    // v31 Phase 167: explicit Send/Sync marker membership, keyed
+    // [typeName]["Send"|"Sync"] -> +1 (an `impl Send for T {}` forces true,
+    // for opaque/handle types) or -1 (an `impl !Send for T {}` opts out). A
+    // type with NO entry (the common case) falls through to the structural
+    // auto-derive in isSend/isSync. This is the single source of truth the
+    // marker oracle consults; populated once after coherence (Pass 1c/1d).
+    std::unordered_map<std::string, std::unordered_map<std::string, int>>
+        markerImpls_;
     // v26 Phase 144: top-level type aliases (name -> aliased TypeRef).
     std::unordered_map<std::string, ast::TypeRef> typeAliases_;
     // Phase 21b: per (implementing-type-name, trait-name), the concrete type
@@ -6560,6 +6926,22 @@ private:
         return "";
     }
 
+    // v31 Phase 167: the first BY-VALUE capture of a closure whose type is not
+    // `Send` (the value is moved into the spawned thread, so it must be Send).
+    // Today every by-value-capturable type (scalars, the Mutex / Sender
+    // handles) is already Send, so this is the explicit Send FLOOR at the spawn
+    // boundary rather than a new restriction — it becomes load-bearing when
+    // richer captures land (scoped threads). By-ref captures are handled
+    // separately (closureByRefCaptureName) and rejected outright.
+    std::string closureNonSendCaptureName(const ast::Expr& e) {
+        if (auto* cl = dynamic_cast<const ast::ClosureExpr*>(&e)) {
+            for (const auto& cap : cl->captures)
+                if (!cap.byRef && cap.type && !isSend(cap.type))
+                    return cap.name;
+        }
+        return "";
+    }
+
     // Phase 10b: type-check a capturing closure `|params| body`. Determines
     // the captured free variables (recorded on the AST node for codegen),
     // checks the body in a scope holding ONLY the params + captures (so an
@@ -6623,6 +7005,15 @@ private:
             // captured value can't smuggle a non-Send across the boundary.
             if (rt->kind == TypeKind::Struct && rt->structName == "Mutex")
                 copyable = true;
+            // v31 Phase 168/169: a `RwLock<T>` and the atomic handles
+            // (`AtomicI64`/`AtomicBool`) are Copy i64 handles over a
+            // process-lifetime block, exactly like Mutex — capturing by value
+            // copies the handle so N threads share the one lock / atomic cell.
+            // (RwLock<T>'s cell is Send-gated at rwlock_new; atomics are Send.)
+            if (rt->kind == TypeKind::Struct &&
+                (rt->structName == "RwLock" || rt->structName == "AtomicI64" ||
+                 rt->structName == "AtomicBool"))
+                copyable = true;
             // Phase 81 (v13 review fix): a channel `Sender<T>` is Send, so it
             // may be captured into a producer thread's closure. It is no longer
             // Copy — capturing it CLONES it (codegen emits sender_clone when
@@ -6650,6 +7041,24 @@ private:
                               "hangs. Move it into the spawned worker by value "
                               "(e.g. `worker(.., " + name +
                               ")`) or `chan_close(" + name + ")` when done.",
+                          cl.line, cl.column);
+                }
+            }
+            // v31 Phase 171: an `Arc<T>`/`Weak<T>` captured into a thread closure
+            // is CLONED (arc_clone/weak_clone — atomic count bump) so each
+            // thread gets its own counted handle. The clone lives in the closure
+            // env (which never drops captures), so it MUST be moved out into the
+            // worker by value to be dropped (count released) on that thread —
+            // else the refcount leaks. Same move-out rule as Sender.
+            if (rt->kind == TypeKind::Struct &&
+                (rt->structName == "Arc" || rt->structName == "Weak")) {
+                copyable = true;
+                if (!hasBareIdentUse(*cl.body, name)) {
+                    error("closure captures the `" + rt->structName + "` `" +
+                              name + "` but never moves it out (every use is `&" +
+                              name + "`), so its atomic refcount is never "
+                              "released. Move it into the spawned worker by value "
+                              "(e.g. `worker(.., " + name + ")`).",
                           cl.line, cl.column);
                 }
             }
@@ -6692,7 +7101,9 @@ private:
             // Phase 145: fold this capture into the closure-kind rank. A
             // mutated capture ⇒ FnMut; a captured `Sender` (moved out into the
             // worker, hence consumed after one call) ⇒ FnOnce.
-            if (rt->kind == TypeKind::Struct && rt->structName == "Sender")
+            if (rt->kind == TypeKind::Struct &&
+                (rt->structName == "Sender" || rt->structName == "Arc" ||
+                 rt->structName == "Weak"))
                 kindRank = std::max(kindRank, 2);
             else if (mutated)
                 kindRank = std::max(kindRank, 1);
@@ -7196,18 +7607,39 @@ private:
             // use-after-free once the spawning frame returns. By-VALUE captures
             // (i64 / bool / &T, incl. a Mutex i64 handle) are moved into the
             // thread and are fine. This is the enforced Send floor.
-            if (call.callee == "thread_spawn" && !call.args.empty()) {
+            // v31 Phase 170: scope_spawn carries the same Send-capture floor as
+            // thread_spawn — its closure is arg[1] (arg[0] is `&Scope`).
+            if ((call.callee == "thread_spawn" || call.callee == "scope_spawn") &&
+                call.args.size() >
+                    (call.callee == "scope_spawn" ? 1u : 0u)) {
+                size_t ci = call.callee == "scope_spawn" ? 1 : 0;
+                const char* which =
+                    call.callee == "scope_spawn" ? "scope_spawn" : "thread_spawn";
                 std::string offending =
-                    closureByRefCaptureName(*call.args[0]);
+                    closureByRefCaptureName(*call.args[ci]);
                 if (!offending.empty()) {
-                    error("cannot send a by-reference capture across a thread "
-                          "boundary: closure passed to `thread_spawn` captures "
-                          "`" + offending +
+                    error(std::string("cannot send a by-reference capture across "
+                          "a thread boundary: closure passed to `") + which +
+                              "` captures `" + offending +
                               "` by reference (FnMut), which would alias the "
                               "spawning frame's stack across threads (data race "
                               "+ use-after-free). Capture it by value (move a "
                               "Copy value, or share via a Mutex handle) instead",
-                          call.args[0]->line, call.args[0]->column);
+                          call.args[ci]->line, call.args[ci]->column);
+                }
+                // v31 Phase 167: the Send FLOOR, made explicit at the spawn
+                // boundary — every by-value capture is moved into the thread,
+                // so its type must be `Send`. Goes through the marker oracle,
+                // so an `impl !Send for T {}` makes capturing a T into a thread
+                // a hard error (and an `impl Send for Opaque {}` permits it).
+                std::string nonSend = closureNonSendCaptureName(*call.args[ci]);
+                if (!nonSend.empty()) {
+                    error(std::string("cannot move a non-`Send` value across a "
+                          "thread boundary: closure passed to `") + which +
+                              "` captures `" + nonSend +
+                              "` by value, but its type is not `Send`. Only "
+                              "`Send` data may cross a thread boundary",
+                          call.args[ci]->line, call.args[ci]->column);
                 }
             }
             // Phase 77 (v13): the value sent on a channel crosses a thread
@@ -7259,6 +7691,32 @@ private:
                               "cell could be smuggled across a thread boundary). "
                               "Store an owned Send value — not a borrow / "
                               "Receiver / Rc",
+                          ln, col);
+                }
+            }
+            // v31 Phase 168: the RwLock cell is gated exactly like the Mutex
+            // cell — a `RwLock<T>` is a shareable handle, so a non-Send / shared-
+            // handle cell would be smuggled across a thread boundary.
+            if (call.callee == "rwlock_new" && !typeArgs.empty()) {
+                TypePtr cell = resolve(typeArgs[0]);
+                size_t ln = call.args.empty() ? call.line : call.args[0]->line;
+                size_t col =
+                    call.args.empty() ? call.column : call.args[0]->column;
+                bool handleTy = cell->kind == TypeKind::Struct &&
+                                (cell->structName == "Rc" ||
+                                 cell->structName == "Sender" ||
+                                 cell->structName == "Receiver");
+                if (handleTy) {
+                    error("cannot store a `" + cell->structName +
+                              "` in a RwLock: it is a shared handle, not owned "
+                              "data — share it across threads via a channel "
+                              "instead of a RwLock cell",
+                          ln, col);
+                } else if (cell->kind != TypeKind::Var && !isSend(cell)) {
+                    error("cannot store a value of type " + typeToString(cell) +
+                              " in a RwLock: it is not `Send`, and the RwLock "
+                              "handle is shareable across threads. Store an owned "
+                              "Send value — not a borrow / Receiver / Rc",
                           ln, col);
                 }
             }
@@ -7733,6 +8191,16 @@ private:
     // closure / fn value (may capture by reference) are NOT Send. The MPSC
     // contract — only the Sender crosses, never the Receiver — and the
     // no-dangling-borrow guarantee both fall out of this.
+    // v31 Phase 167: the marker oracle. +1 if an `impl Send/Sync for T {}`
+    // grants membership, -1 if an `impl !Send/!Sync for T {}` opts out, 0 if
+    // unspecified (the type gets the structural auto-derive). Consulted at the
+    // TOP of the Struct/Enum arms of isSend/isSync so an explicit impl wins.
+    int markerStatus(const std::string& tyName, const char* marker) const {
+        auto it = markerImpls_.find(tyName);
+        if (it == markerImpls_.end()) return 0;
+        auto jt = it->second.find(marker);
+        return jt == it->second.end() ? 0 : jt->second;
+    }
     bool isSend(const TypePtr& t) {
         std::unordered_set<std::string> seen;
         return isSendImpl(t, seen);
@@ -7743,6 +8211,9 @@ private:
         case TypeKind::Int:
         case TypeKind::Float:
         case TypeKind::Bool:
+        case TypeKind::Char: // v27 Copy scalar — Send (was a latent gap: fell
+                             // through to default:false, wrongly rejecting
+                             // chan_send(char) / Mutex<char>).
         case TypeKind::Unit:
             return true;
         case TypeKind::Box:
@@ -7754,18 +8225,45 @@ private:
                 if (!isSendImpl(el, seen)) return false;
             return true;
         case TypeKind::Struct: {
+            // v31 Phase 167: an explicit `impl Send`/`impl !Send` overrides the
+            // structural rule (the principled hook for opaque/handle types).
+            if (int ms = markerStatus(r->structName, "Send")) return ms > 0;
             // String owns its bytes (Send); the channel Sender is Send. The
             // Receiver (single-consumer) and an Rc (non-atomic refcount) are NOT.
             if (r->structName == "String" || r->structName == "Sender")
                 return true;
+            // v31 Phase 169: an atomic handle IS the safe-sharing primitive —
+            // Send (and Sync). The legible POSITIVE witness opposite Rc.
+            if (r->structName == "AtomicI64" || r->structName == "AtomicBool")
+                return true;
+            // v31 Phase 171: `Arc<T>`/`Weak<T>` are atomically refcounted, so
+            // (unlike Rc) they ARE Send when T is — specifically T: Send + Sync
+            // (the Rust bound: a shared owner can both move T to another thread
+            // and be aliased from several threads).
+            if (r->structName == "Arc" || r->structName == "Weak") {
+                for (const auto& a : r->typeArgs)
+                    if (!isSendImpl(a, seen) || !isSync(a)) return false;
+                return true;
+            }
             if (r->structName == "Receiver" || r->structName == "Rc")
                 return false;
-            // Containers + the Mutex handle carry their element(s)/cell in
-            // typeArgs, not structFields. A `Mutex<T>` is Send iff its cell T is
-            // (the cell is also Send-gated at mutex_new, so this is belt-and-
-            // braces — sharing a Mutex<NonSend> across threads is rejected).
+            // v31 Phase 168: a lock GUARD is bound to the locking thread — never
+            // Send (it must be released by the thread that took the lock).
+            // v31 Phase 170: a `Scope` is bound to its defining thread (it joins
+            // on drop there) — never Send.
+            if (r->structName == "MutexGuard" ||
+                r->structName == "RwLockReadGuard" ||
+                r->structName == "RwLockWriteGuard" ||
+                r->structName == "Scope")
+                return false;
+            // Containers + the Mutex/RwLock handle carry their element(s)/cell in
+            // typeArgs, not structFields. A `Mutex<T>`/`RwLock<T>` is Send iff
+            // its cell T is (the cell is also Send-gated at construction, so this
+            // is belt-and-braces — sharing a Mutex<NonSend> across threads is
+            // rejected).
             if (r->structName == "Vec" || r->structName == "HashMap" ||
-                r->structName == "HashSet" || r->structName == "Mutex") {
+                r->structName == "HashSet" || r->structName == "Mutex" ||
+                r->structName == "RwLock") {
                 for (const auto& a : r->typeArgs)
                     if (!isSendImpl(a, seen)) return false;
                 return true;
@@ -7777,6 +8275,7 @@ private:
             return true;
         }
         case TypeKind::Enum: {
+            if (int ms = markerStatus(r->enumName, "Send")) return ms > 0;
             if (!seen.insert(r->enumName).second) return true;
             for (const auto& v : r->enumVariants)
                 for (const auto& p : v.payloadTypes)
@@ -7787,6 +8286,103 @@ private:
         // lifetime can't be proven to outlive the thread); a closure may
         // capture by reference; an unsolved Var / dyn is conservatively unsafe.
         case TypeKind::Ref:
+        case TypeKind::Function:
+        case TypeKind::Dyn:
+        case TypeKind::Var:
+        default:
+            return false;
+        }
+    }
+
+    // v31 Phase 167: `Sync` — a type is Sync iff it is safe to SHARE a `&T`
+    // across threads. Decided structurally, mirroring isSend, with the
+    // interior-mutability inversion for Mutex. Sync has no enforcement site in
+    // this MVP (a `&T` cannot yet cross a thread — by-ref captures are rejected
+    // outright at thread_spawn), so it carries no teeth until scoped threads
+    // (a later v31 phase) let a borrow cross a thread scope; it is defined now
+    // so that machinery can consult it. The marker oracle (`impl Sync` / `impl
+    // !Sync`) overrides the structural answer, exactly like Send.
+    bool isSync(const TypePtr& t) {
+        std::unordered_set<std::string> seen;
+        return isSyncImpl(t, seen);
+    }
+    bool isSyncImpl(const TypePtr& t, std::unordered_set<std::string>& seen) {
+        TypePtr r = resolve(t);
+        switch (r->kind) {
+        case TypeKind::Int:
+        case TypeKind::Float:
+        case TypeKind::Bool:
+        case TypeKind::Char:
+        case TypeKind::Unit:
+            return true;
+        case TypeKind::Box:
+            return isSyncImpl(r->refInner, seen);
+        // `&T` / `&mut T` is itself Sync iff the pointee is Sync (sharing the
+        // reference is sharing the data).
+        case TypeKind::Ref:
+            return isSyncImpl(r->refInner, seen);
+        case TypeKind::Array:
+            return isSyncImpl(r->arrayElem, seen);
+        case TypeKind::Tuple:
+            for (const auto& el : r->tupleElems)
+                if (!isSyncImpl(el, seen)) return false;
+            return true;
+        case TypeKind::Struct: {
+            if (int ms = markerStatus(r->structName, "Sync")) return ms > 0;
+            // String is immutable-once-shared (Sync). The Sender only appends
+            // under the channel's own mutex, so concurrent &Sender use is race
+            // free (Sync). The single-consumer Receiver and the non-atomic Rc
+            // are NOT Sync.
+            if (r->structName == "String" || r->structName == "Sender")
+                return true;
+            // v31 Phase 169: atomic handles are Sync (concurrent &Atomic access
+            // is race-free — that is their purpose).
+            if (r->structName == "AtomicI64" || r->structName == "AtomicBool")
+                return true;
+            // v31 Phase 171: Arc<T>/Weak<T> are Sync iff T is Send + Sync.
+            if (r->structName == "Arc" || r->structName == "Weak") {
+                for (const auto& a : r->typeArgs)
+                    if (!isSendImpl(a, seen) || !isSyncImpl(a, seen))
+                        return false;
+                return true;
+            }
+            if (r->structName == "Receiver" || r->structName == "Rc")
+                return false;
+            // v31 Phase 168: a lock guard is thread-bound — not Sync.
+            if (r->structName == "MutexGuard" ||
+                r->structName == "RwLockReadGuard" ||
+                r->structName == "RwLockWriteGuard")
+                return false;
+            // A Mutex<T> / RwLock<T> is Sync iff its cell T is SEND — the
+            // interior-mutability inversion: the lock serialises access, so a
+            // Send-but-not-Sync T becomes safely shareable behind the lock.
+            if (r->structName == "Mutex" || r->structName == "RwLock") {
+                for (const auto& a : r->typeArgs)
+                    if (!isSendImpl(a, seen)) return false;
+                return true;
+            }
+            if (r->structName == "Vec" || r->structName == "HashMap" ||
+                r->structName == "HashSet") {
+                for (const auto& a : r->typeArgs)
+                    if (!isSyncImpl(a, seen)) return false;
+                return true;
+            }
+            // A user struct is Sync iff every field is.
+            if (!seen.insert(r->structName).second) return true; // recursive
+            for (const auto& f : r->structFields)
+                if (!isSyncImpl(f.second, seen)) return false;
+            return true;
+        }
+        case TypeKind::Enum: {
+            if (int ms = markerStatus(r->enumName, "Sync")) return ms > 0;
+            if (!seen.insert(r->enumName).second) return true;
+            for (const auto& v : r->enumVariants)
+                for (const auto& p : v.payloadTypes)
+                    if (!isSyncImpl(p, seen)) return false;
+            return true;
+        }
+        // A closure (may hold by-ref captures), a dyn object, and an unsolved
+        // Var are conservatively NOT Sync.
         case TypeKind::Function:
         case TypeKind::Dyn:
         case TypeKind::Var:

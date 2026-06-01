@@ -2354,6 +2354,251 @@ void test_thread_spawn_propagates_closure_io_effect() {
         "thread_spawn_propagates_closure_io_effect");
 }
 
+// v31 Phase 167: real Send/Sync MARKER traits + the marker oracle. A type with
+// no marker impl falls through to the structural rule (auto-derive); an
+// explicit `impl Send`/`impl !Send` overrides it; misuse is rejected.
+void test_marker_traits_send_sync() {
+    // The Send oracle is enforced at mutex_new (the cell must be Send). char is
+    // now Send (a Copy scalar); before the fix it fell through to NOT-Send and
+    // a Mutex<char> was wrongly rejected.
+    expectOk(
+        "fn main() -> i64 ! { alloc } {\n"
+        "  let m = mutex_new('a');\n"
+        "  0\n"
+        "}",
+        "marker_char_is_send");
+
+    // OPT-OUT: `impl !Send for W {}` removes a structurally-Send struct from
+    // Send, so storing it in a Mutex is rejected.
+    expectErr(
+        "trait Send { }\n"
+        "struct W { x: i64 }\n"
+        "impl !Send for W { }\n"
+        "fn main() -> i64 ! { alloc } {\n"
+        "  let m = mutex_new(W { x: 1 });\n"
+        "  0\n"
+        "}",
+        "marker_optout_negative_impl");
+
+    // The same program without the opt-out compiles (structural Send).
+    expectOk(
+        "struct W { x: i64 }\n"
+        "fn main() -> i64 ! { alloc } {\n"
+        "  let m = mutex_new(W { x: 1 });\n"
+        "  0\n"
+        "}",
+        "marker_optout_off_structural_send");
+
+    // OPT-IN OVERRIDE: a Holder structurally contains an Rc, so it is NOT Send
+    // by the structural rule — storing it in a Mutex is rejected...
+    expectErr(
+        "struct Holder { r: Rc<i64> }\n"
+        "fn main() -> i64 ! { alloc } {\n"
+        "  let m = mutex_new(Holder { r: rc_new(7) });\n"
+        "  0\n"
+        "}",
+        "marker_optin_off_structural_not_send");
+
+    // ...but an explicit `impl Send for Holder {}` GRANTS Send (the audited
+    // override an opaque/handle type like Arc relies on), so it now compiles.
+    expectOk(
+        "trait Send { }\n"
+        "struct Holder { r: Rc<i64> }\n"
+        "impl Send for Holder { }\n"
+        "fn main() -> i64 ! { alloc } {\n"
+        "  let m = mutex_new(Holder { r: rc_new(7) });\n"
+        "  0\n"
+        "}",
+        "marker_optin_grants_send");
+
+    // A negative impl is only allowed for the marker traits.
+    expectErr(
+        "struct W { x: i64 }\n"
+        "impl !Clone for W { }\n"
+        "fn main() -> i64 { 0 }",
+        "marker_negative_nonmarker_rejected");
+
+    // A marker trait must have no methods.
+    expectErr(
+        "trait Send { fn f(&self) -> i64; }\n"
+        "fn main() -> i64 { 0 }",
+        "marker_with_method_rejected");
+
+    // Conflicting positive + negative marker impls for the same type.
+    expectErr(
+        "trait Send { }\n"
+        "struct W { x: i64 }\n"
+        "impl Send for W { }\n"
+        "impl !Send for W { }\n"
+        "fn main() -> i64 { 0 }",
+        "marker_conflicting_impls_rejected");
+}
+
+// v31 Phase 168: RwLock<T> + RAII lock guards.
+void test_rwlock_and_guards() {
+    // RwLock<i64> manual API typechecks (read/write/get/set/unlock).
+    expectOk(
+        "fn main() -> i64 ! { alloc, io } {\n"
+        "  let rw = rwlock_new(0);\n"
+        "  rwlock_write(rw);\n"
+        "  rwlock_set(rw, rwlock_get(rw) + 1);\n"
+        "  rwlock_unlock(rw);\n"
+        "  rwlock_read(rw);\n"
+        "  let v = rwlock_get(rw);\n"
+        "  rwlock_unlock(rw);\n"
+        "  v\n"
+        "}",
+        "rwlock_manual_ok");
+    // A Mutex RAII guard typechecks; data is accessed via the lock's get/set.
+    expectOk(
+        "fn main() -> i64 ! { alloc, io } {\n"
+        "  let m = mutex_new(0);\n"
+        "  let g = mutex_guard(m);\n"
+        "  mutex_set(m, mutex_get(m) + 1);\n"
+        "  0\n"
+        "}",
+        "mutex_guard_ok");
+    // RwLock read/write guards typecheck.
+    expectOk(
+        "fn main() -> i64 ! { alloc, io } {\n"
+        "  let rw = rwlock_new(0);\n"
+        "  let w = rwlock_write_guard(rw);\n"
+        "  rwlock_set(rw, 1);\n"
+        "  0\n"
+        "}",
+        "rwlock_write_guard_ok");
+    // The RwLock cell must be Send + owned (like a Mutex cell).
+    expectErr(
+        "fn main() -> i64 ! { alloc, share } {\n"
+        "  let rw = rwlock_new(rc_new(1));\n"
+        "  0\n"
+        "}",
+        "rwlock_rc_cell_rejected");
+    // A lock guard is thread-bound — it cannot cross into a spawned thread.
+    expectErr(
+        "fn main() -> i64 ! { alloc, io, share } {\n"
+        "  let m = mutex_new(0);\n"
+        "  let g = mutex_guard(m);\n"
+        "  let t = thread_spawn(|| { let gg = g; 0 });\n"
+        "  thread_join(t);\n"
+        "  0\n"
+        "}",
+        "guard_not_sendable");
+}
+
+// v31 Phase 169: atomics. (Unit tests run prelude-free, so they use the raw
+// name-suffixed builtins; the ergonomic Ordering/method layer is prelude sugar
+// covered by the smoke test.)
+void test_atomics() {
+    // Raw atomic builtins typecheck; fetch_add/store are io, load is pure.
+    expectOk(
+        "fn main() -> i64 ! { alloc, io } {\n"
+        "  let a = atomic_i64_new(0);\n"
+        "  atomic_i64_fetch_add_seqcst(a, 1);\n"
+        "  atomic_i64_store_relaxed(a, 5);\n"
+        "  atomic_i64_load_acquire(a)\n"
+        "}",
+        "atomics_raw_ok");
+    // compare_exchange (cmpxchg) returns the bool success bit.
+    expectOk(
+        "fn main() -> bool ! { alloc, io } {\n"
+        "  let a = atomic_i64_new(0);\n"
+        "  atomic_i64_cmpxchg_seqcst(a, 0, 1)\n"
+        "}",
+        "atomics_cmpxchg_bool");
+    // AtomicBool ops typecheck.
+    expectOk(
+        "fn main() -> bool ! { alloc, io } {\n"
+        "  let b = atomic_bool_new(false);\n"
+        "  atomic_bool_store_release(b, true);\n"
+        "  atomic_bool_swap_acqrel(b, false)\n"
+        "}",
+        "atomics_bool_ok");
+    // An atomic handle is Send — capturable by value into a spawned thread.
+    expectOk(
+        "fn work(a: AtomicI64) -> i64 ! { io } {\n"
+        "  atomic_i64_fetch_add_seqcst(a, 1)\n"
+        "}\n"
+        "fn main() -> i64 ! { alloc, io, share } {\n"
+        "  let a = atomic_i64_new(0);\n"
+        "  let t = thread_spawn(|| work(a));\n"
+        "  thread_join(t)\n"
+        "}",
+        "atomic_is_send_into_thread");
+    // An atomic store performs io — calling it from a pure fn is rejected.
+    expectErr(
+        "fn bad(a: AtomicI64) -> i64 { atomic_i64_store_seqcst(a, 1) }\n"
+        "fn main() -> i64 { 0 }",
+        "atomic_store_requires_io");
+}
+
+// v31 Phase 170: scoped threads. (select needs the prelude SelectResult enum,
+// so it is covered by the smoke test; Scope/scope_* are prelude-free builtins.)
+void test_scoped_threads() {
+    // scope_new + scope_spawn typecheck; the worker captures a Copy/Send Mutex.
+    expectOk(
+        "fn work(c: Mutex<i64>) -> i64 ! { io } {\n"
+        "  mutex_lock(c); mutex_unlock(c); 0\n"
+        "}\n"
+        "fn main() -> i64 ! { alloc, io, share } {\n"
+        "  let c = mutex_new(0);\n"
+        "  let s = scope_new();\n"
+        "  scope_spawn(&s, || work(c));\n"
+        "  0\n"
+        "}",
+        "scope_spawn_ok");
+    // A scope_spawn worker capturing a `let mut` BY REFERENCE is rejected.
+    expectErr(
+        "fn main() -> i64 ! { alloc, io, share } {\n"
+        "  let s = scope_new();\n"
+        "  let mut n = 0;\n"
+        "  scope_spawn(&s, || { n = n + 1; n });\n"
+        "  0\n"
+        "}",
+        "scope_byref_rejected");
+    // A Scope is not Send/Copy — it cannot be moved into a thread.
+    expectErr(
+        "fn main() -> i64 ! { alloc, io, share } {\n"
+        "  let s = scope_new();\n"
+        "  let t = thread_spawn(|| { let inner = s; 0 });\n"
+        "  thread_join(t)\n"
+        "}",
+        "scope_not_sendable");
+}
+
+// v31 Phase 171: Arc<T>/Weak<T>. (weak_upgrade returns Option<Arc<T>> and needs
+// the prelude Option enum, so it is covered by the smoke test; the other Arc
+// ops + the Send rules are prelude-free.)
+void test_arc() {
+    // An Arc is Send when T is Send+Sync -> capturable by value into a thread.
+    expectOk(
+        "fn work(a: Arc<i64>) -> i64 { arc_strong_count(&a) }\n"
+        "fn main() -> i64 ! { alloc, io, share } {\n"
+        "  let a = arc_new(0);\n"
+        "  let t = thread_spawn(|| work(a));\n"
+        "  thread_join(t)\n"
+        "}",
+        "arc_is_send");
+    // An Rc is still NOT Send (the contrast).
+    expectErr(
+        "fn work(r: Rc<i64>) -> i64 { rc_strong_count(&r) }\n"
+        "fn main() -> i64 ! { alloc, io, share } {\n"
+        "  let r = rc_new(0);\n"
+        "  let t = thread_spawn(|| work(r));\n"
+        "  thread_join(t)\n"
+        "}",
+        "rc_not_send");
+    // arc_new/clone/get/counts/downgrade typecheck.
+    expectOk(
+        "fn main() -> i64 ! { alloc } {\n"
+        "  let a = arc_new(5);\n"
+        "  let b = arc_clone(&a);\n"
+        "  let w = arc_downgrade(&a);\n"
+        "  arc_strong_count(&a) + arc_weak_count(&b)\n"
+        "}",
+        "arc_ops_ok");
+}
+
 void test_mutex_ops_typecheck_ok() {
     expectOk(
         "fn main() -> i64 ! { alloc, io } {\n"
@@ -3244,6 +3489,11 @@ int main() {
     test_thread_spawn_byvalue_closure_ok();
     test_thread_spawn_byref_capture_rejected();
     test_thread_spawn_propagates_closure_io_effect();
+    test_marker_traits_send_sync(); // v31 Phase 167
+    test_rwlock_and_guards();       // v31 Phase 168
+    test_atomics();                 // v31 Phase 169
+    test_scoped_threads();          // v31 Phase 170
+    test_arc();                     // v31 Phase 171
     test_mutex_ops_typecheck_ok();
     test_mutex_new_requires_alloc_effect();
     test_panic_carries_panic_effect_ok();
@@ -3331,6 +3581,6 @@ int main() {
     test_const_type_mismatch_errors();
     test_const_array_len_bool_errors();
     test_const_array_len_calls_nonconst_fn_errors();
-    std::cout << "All typecheck tests passed (311 cases)\n";
+    std::cout << "All typecheck tests passed (316 cases)\n";
     return 0;
 }

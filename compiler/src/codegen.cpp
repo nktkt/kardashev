@@ -834,12 +834,24 @@ private:
     llvm::Function* pthreadMutexInitFn_ = nullptr;   // pthread_mutex_init
     llvm::Function* pthreadMutexLockFn_ = nullptr;   // pthread_mutex_lock
     llvm::Function* pthreadMutexUnlockFn_ = nullptr; // pthread_mutex_unlock
+    // v31 Phase 168: pthread_rwlock_* externs backing RwLock<T> (a reader/writer
+    // lock, mirrors the Mutex block but over a pthread_rwlock_t at field 0).
+    llvm::Function* pthreadRwlockInitFn_ = nullptr;   // pthread_rwlock_init
+    llvm::Function* pthreadRwlockRdlockFn_ = nullptr;  // pthread_rwlock_rdlock
+    llvm::Function* pthreadRwlockWrlockFn_ = nullptr;  // pthread_rwlock_wrlock
+    llvm::Function* pthreadRwlockUnlockFn_ = nullptr;  // pthread_rwlock_unlock
     // The thread control block `{ i64 tid, i8* fn, i8* env, i64 result }` and
     // the Mutex block `{ [64 x i8] pthread_mutex_t storage, i64 value }`.
     // 64 bytes covers pthread_mutex_t on both Linux (40) and macOS (64); the
     // value cell is i64 (the MVP payload). Built once in declareThreadRuntime.
     llvm::StructType* threadBlkTy_ = nullptr;
     llvm::StructType* mutexBlkTy_ = nullptr;
+    // v31 Phase 168: the RwLock block `{ [200 x i8] pthread_rwlock_t, i64 }`.
+    // 200 bytes covers pthread_rwlock_t on glibc (56) and macOS (200, the
+    // binding limit) — a deliberate over-allocation (the lock lives on the heap;
+    // a too-small pad would corrupt the adjacent cell). Built in
+    // declareThreadRuntime; the per-T value layout lives in rwlockBlkTyFor.
+    llvm::StructType* rwlockBlkTy_ = nullptr;
     llvm::Function* threadTrampolineFn_ = nullptr; // __kd_thread_trampoline
 
     // --- Phase 76 (v13): typed MPSC channels (pthread mutex + condvar) ---
@@ -2285,6 +2297,19 @@ private:
         return inst;
     }
 
+    // v31 Phase 170: SelectResult<T> (the prelude enum select2/3/4 returns).
+    TypePtr selectResultType(const TypePtr& V) {
+        auto eit = tc_.enums.find("SelectResult");
+        if (eit == tc_.enums.end()) return nullptr;
+        const EnumSchema& schema = eit->second;
+        if (schema.genericVars.empty()) return schema.type;
+        std::unordered_map<int, TypePtr> subst;
+        subst[schema.genericVars[0]->varId] = V;
+        TypePtr inst = instantiate(schema.type, subst);
+        inst->typeArgs = {V};
+        return inst;
+    }
+
     // Phase 17b: lazily emit a per-value-type specialization of the HashMap
     // runtime. On first call for a given V we emit all five mangled fns
     // (`__hm_raw_insert__<V>`, `hashmap_new__<V>`, `hashmap_insert__<V>`,
@@ -3404,6 +3429,22 @@ private:
         pthreadMutexUnlockFn_ = llvm::Function::Create(
             pmLockTy, llvm::Function::ExternalLinkage, "pthread_mutex_unlock",
             module_.get());
+        // v31 Phase 168: pthread_rwlock_* externs (POSIX, no platform guard).
+        //   int pthread_rwlock_init(pthread_rwlock_t*, const attr*)
+        pthreadRwlockInitFn_ = llvm::Function::Create(
+            llvm::FunctionType::get(i32Ty, {i8PtrTy, i8PtrTy}, false),
+            llvm::Function::ExternalLinkage, "pthread_rwlock_init",
+            module_.get());
+        //   int pthread_rwlock_rdlock/wrlock/unlock(pthread_rwlock_t*)
+        pthreadRwlockRdlockFn_ = llvm::Function::Create(
+            pmLockTy, llvm::Function::ExternalLinkage, "pthread_rwlock_rdlock",
+            module_.get());
+        pthreadRwlockWrlockFn_ = llvm::Function::Create(
+            pmLockTy, llvm::Function::ExternalLinkage, "pthread_rwlock_wrlock",
+            module_.get());
+        pthreadRwlockUnlockFn_ = llvm::Function::Create(
+            pmLockTy, llvm::Function::ExternalLinkage, "pthread_rwlock_unlock",
+            module_.get());
 
         // Control-block types.
         threadBlkTy_ = llvm::StructType::create(
@@ -3412,6 +3453,12 @@ private:
             llvm::Type::getInt8Ty(ctx), 64);
         mutexBlkTy_ = llvm::StructType::create(
             ctx, {mtxStorageTy, i64Ty}, "kd.mutex_blk");
+        // v31 Phase 168: the T-agnostic RwLock block (rwlock at field 0, used by
+        // the fixed rdlock/wrlock/unlock ops which only touch field 0).
+        auto* rwStorageTy = llvm::ArrayType::get(
+            llvm::Type::getInt8Ty(ctx), 200);
+        rwlockBlkTy_ = llvm::StructType::create(
+            ctx, {rwStorageTy, i64Ty}, "kd.rwlock_blk");
         // The closure's fn pointer has the env-calling-convention type for a
         // `fn() -> i64` value: i64(i8* env).
         auto* closureCallTy =
@@ -3495,6 +3542,111 @@ private:
             declaredFns_["thread_join"] = fn;
         }
 
+        // v31 Phase 170: scoped threads. A `Scope` is an i64 handle to a heap
+        // `{ i64* handles, i64 count, i64 cap }` block — a growable list of the
+        // thread handles spawned via scope_spawn. The Scope is move-only and
+        // its Drop calls scope_join_all (RAII join-before-scope-end): every
+        // spawned worker is joined before the scope binding goes out of scope.
+        auto* scopeBlkTy = llvm::StructType::create(
+            ctx, {i8PtrTy, i64Ty, i64Ty}, "kd.scope_blk");
+        // i64 scope_new()
+        {
+            auto* fn = llvm::Function::Create(
+                llvm::FunctionType::get(i64Ty, {}, false),
+                llvm::Function::ExternalLinkage, "scope_new", module_.get());
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            uint64_t sz = module_->getDataLayout().getTypeAllocSize(scopeBlkTy);
+            auto* blk = b.CreateCall(
+                mallocFn_, {llvm::ConstantInt::get(i64Ty, sz)}, "scope_blk");
+            b.CreateStore(llvm::ConstantPointerNull::get(i8PtrTy),
+                          b.CreateStructGEP(scopeBlkTy, blk, 0, "handles"));
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, 0),
+                          b.CreateStructGEP(scopeBlkTy, blk, 1, "count"));
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, 0),
+                          b.CreateStructGEP(scopeBlkTy, blk, 2, "cap"));
+            b.CreateRet(b.CreatePtrToInt(blk, i64Ty, "h"));
+            declaredFns_["scope_new"] = fn;
+        }
+        // i64 scope_push(i64 scope, i64 threadHandle) — append, growing the
+        // handles array (realloc-doubling) when full.
+        {
+            auto* fn = llvm::Function::Create(
+                llvm::FunctionType::get(i64Ty, {i64Ty, i64Ty}, false),
+                llvm::Function::ExternalLinkage, "scope_push", module_.get());
+            fn->getArg(0)->setName("scope");
+            fn->getArg(1)->setName("th");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* growBB = llvm::BasicBlock::Create(ctx, "grow", fn);
+            auto* afterBB = llvm::BasicBlock::Create(ctx, "after", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* blk = b.CreateIntToPtr(fn->getArg(0), i8PtrTy, "blk");
+            auto* countP = b.CreateStructGEP(scopeBlkTy, blk, 1, "countP");
+            auto* capP = b.CreateStructGEP(scopeBlkTy, blk, 2, "capP");
+            auto* handlesP = b.CreateStructGEP(scopeBlkTy, blk, 0, "handlesP");
+            auto* count = b.CreateLoad(i64Ty, countP, "count");
+            auto* cap = b.CreateLoad(i64Ty, capP, "cap");
+            b.CreateCondBr(b.CreateICmpEQ(count, cap, "full"), growBB, afterBB);
+            b.SetInsertPoint(growBB);
+            // newCap = cap == 0 ? 8 : cap * 2
+            auto* dbl = b.CreateMul(cap, llvm::ConstantInt::get(i64Ty, 2));
+            auto* newCap = b.CreateSelect(
+                b.CreateICmpEQ(cap, llvm::ConstantInt::get(i64Ty, 0)),
+                llvm::ConstantInt::get(i64Ty, 8), dbl, "newCap");
+            auto* bytes =
+                b.CreateMul(newCap, llvm::ConstantInt::get(i64Ty, 8), "bytes");
+            auto* oldH = b.CreateLoad(i8PtrTy, handlesP, "oldH");
+            auto* newH = b.CreateCall(reallocFn_, {oldH, bytes}, "newH");
+            b.CreateStore(newH, handlesP);
+            b.CreateStore(newCap, capP);
+            b.CreateBr(afterBB);
+            b.SetInsertPoint(afterBB);
+            auto* handles = b.CreateLoad(i8PtrTy, handlesP, "handles");
+            auto* slot = b.CreateGEP(i64Ty, handles, {count}, "slot");
+            b.CreateStore(fn->getArg(1), slot);
+            b.CreateStore(
+                b.CreateAdd(count, llvm::ConstantInt::get(i64Ty, 1)), countP);
+            b.CreateRet(llvm::ConstantInt::get(i64Ty, 0));
+            declaredFns_["scope_push"] = fn;
+        }
+        // i64 scope_join_all(i64 scope) — join every recorded thread, then free
+        // the handles array + the scope block.
+        {
+            auto* fn = llvm::Function::Create(
+                llvm::FunctionType::get(i64Ty, {i64Ty}, false),
+                llvm::Function::ExternalLinkage, "scope_join_all",
+                module_.get());
+            fn->getArg(0)->setName("scope");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* loopBB = llvm::BasicBlock::Create(ctx, "loop", fn);
+            auto* bodyBB = llvm::BasicBlock::Create(ctx, "body", fn);
+            auto* doneBB = llvm::BasicBlock::Create(ctx, "done", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* blk = b.CreateIntToPtr(fn->getArg(0), i8PtrTy, "blk");
+            auto* count = b.CreateLoad(
+                i64Ty, b.CreateStructGEP(scopeBlkTy, blk, 1, "countP"), "count");
+            auto* handles = b.CreateLoad(
+                i8PtrTy, b.CreateStructGEP(scopeBlkTy, blk, 0, "handlesP"),
+                "handles");
+            auto* iA = b.CreateAlloca(i64Ty, nullptr, "i");
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, 0), iA);
+            b.CreateBr(loopBB);
+            b.SetInsertPoint(loopBB);
+            auto* i = b.CreateLoad(i64Ty, iA, "i");
+            b.CreateCondBr(b.CreateICmpSLT(i, count, "more"), bodyBB, doneBB);
+            b.SetInsertPoint(bodyBB);
+            auto* h = b.CreateLoad(
+                i64Ty, b.CreateGEP(i64Ty, handles, {i}, "hslot"), "h");
+            b.CreateCall(declaredFns_["thread_join"], {h});
+            b.CreateStore(b.CreateAdd(i, llvm::ConstantInt::get(i64Ty, 1)), iA);
+            b.CreateBr(loopBB);
+            b.SetInsertPoint(doneBB);
+            b.CreateCall(freeFn_, {handles}); // free(null) is a no-op
+            b.CreateCall(freeFn_, {blk});
+            b.CreateRet(llvm::ConstantInt::get(i64Ty, 0));
+            declaredFns_["scope_join_all"] = fn;
+        }
+
         // mutex_new/get/set are GENERIC over the cell type T (Phase 123) — they
         // are emitted per-T by getOrEmitMutexOp (a per-T block `{[64 x i8], T}`),
         // not here. Only the T-agnostic lock/unlock (which touch the
@@ -3518,6 +3670,198 @@ private:
         };
         emitMutexLockOp("mutex_lock", pthreadMutexLockFn_);
         emitMutexLockOp("mutex_unlock", pthreadMutexUnlockFn_);
+
+        // v31 Phase 168: T-agnostic RwLock lock/unlock (touch the
+        // pthread_rwlock_t at field 0 of the rwlock block). rdlock/wrlock/unlock
+        // each take the i64 handle and return 0 (composable). The guard-acquire
+        // builtins call rdlock/wrlock; a guard's Drop calls rwlock_unlock.
+        auto emitRwlockLockOp = [&](const char* name, llvm::Function* op) {
+            auto* fnTy =
+                llvm::FunctionType::get(i64Ty, {i64Ty}, /*isVarArg=*/false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, name, module_.get());
+            fn->getArg(0)->setName("h");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* blk = b.CreateIntToPtr(fn->getArg(0), i8PtrTy, "blk");
+            auto* rwPtr = b.CreateStructGEP(rwlockBlkTy_, blk, 0, "rw_ptr");
+            b.CreateCall(op, {rwPtr});
+            b.CreateRet(llvm::ConstantInt::get(i64Ty, 0));
+            declaredFns_[name] = fn;
+        };
+        emitRwlockLockOp("rwlock_rdlock", pthreadRwlockRdlockFn_);
+        emitRwlockLockOp("rwlock_wrlock", pthreadRwlockWrlockFn_);
+        emitRwlockLockOp("rwlock_unlock", pthreadRwlockUnlockFn_);
+
+        // === v31 Phase 169: atomics (inline LLVM atomicrmw/cmpxchg/load/store/
+        // fence — no pthread, no libcall; i64/i8 are lock-free at natural
+        // alignment on x86-64/arm64). The cell is a malloc'd, naturally-aligned
+        // slot; its PtrToInt is the Copy i64 handle (process-lifetime, like the
+        // mutex block). Each op's memory ordering is baked into its NAME so the
+        // LLVM AtomicOrdering is a compile-time constant. AtomicBool uses an i8
+        // cell (atomics need >= 1 addressable byte) with i1<->i8 bridging.
+        {
+            auto* i8Ty = llvm::Type::getInt8Ty(ctx);
+            auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+            using AO = llvm::AtomicOrdering;
+            auto ordOf = [](const std::string& o) -> AO {
+                if (o == "relaxed") return AO::Monotonic;
+                if (o == "acquire") return AO::Acquire;
+                if (o == "release") return AO::Release;
+                if (o == "acqrel") return AO::AcquireRelease;
+                return AO::SequentiallyConsistent; // seqcst
+            };
+            // cmpxchg failure ordering: never Release/AcqRel, never stronger
+            // than success (LLVM verifier rejects otherwise).
+            auto failOf = [](AO s) -> AO {
+                if (s == AO::Release) return AO::Monotonic;
+                if (s == AO::AcquireRelease) return AO::Acquire;
+                return s; // Monotonic / Acquire / SeqCst legal as-is
+            };
+            auto handlePtr = [&](llvm::IRBuilder<>& b, llvm::Function* fn) {
+                return b.CreateIntToPtr(fn->getArg(0), i8PtrTy, "cell");
+            };
+            auto startFn = [&](const std::string& name, llvm::Type* ret,
+                               std::vector<llvm::Type*> args) {
+                auto* fn = llvm::Function::Create(
+                    llvm::FunctionType::get(ret, args, false),
+                    llvm::Function::ExternalLinkage, name, module_.get());
+                auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+                return std::make_pair(fn, entry);
+            };
+            // constructors: malloc the cell, plain-store the initial value
+            // (the handle isn't published to other threads until returned).
+            {
+                auto [fn, entry] = startFn("atomic_i64_new", i64Ty, {i64Ty});
+                llvm::IRBuilder<> b(entry);
+                auto* blk = b.CreateCall(
+                    mallocFn_, {llvm::ConstantInt::get(i64Ty, 8)}, "atom");
+                b.CreateAlignedStore(fn->getArg(0), blk, llvm::Align(8));
+                b.CreateRet(b.CreatePtrToInt(blk, i64Ty, "h"));
+                declaredFns_["atomic_i64_new"] = fn;
+            }
+            {
+                auto [fn, entry] = startFn("atomic_bool_new", i64Ty, {i1Ty});
+                llvm::IRBuilder<> b(entry);
+                auto* blk = b.CreateCall(
+                    mallocFn_, {llvm::ConstantInt::get(i64Ty, 1)}, "atom");
+                b.CreateAlignedStore(b.CreateZExt(fn->getArg(0), i8Ty), blk,
+                                     llvm::Align(1));
+                b.CreateRet(b.CreatePtrToInt(blk, i64Ty, "h"));
+                declaredFns_["atomic_bool_new"] = fn;
+            }
+            // load: atomic load of the cell, (trunc to i1 for bool).
+            auto emitLoad = [&](const std::string& name, llvm::Type* cellTy,
+                                llvm::Type* retTy, AO ord, unsigned al) {
+                auto [fn, entry] = startFn(name, retTy, {i64Ty});
+                llvm::IRBuilder<> b(entry);
+                auto* ld = b.CreateLoad(cellTy, handlePtr(b, fn), "aload");
+                ld->setAtomic(ord);
+                ld->setAlignment(llvm::Align(al));
+                llvm::Value* r = ld;
+                if (retTy == i1Ty) r = b.CreateTrunc(ld, i1Ty);
+                b.CreateRet(r);
+                declaredFns_[name] = fn;
+            };
+            // store: atomic store, ret 0.
+            auto emitStore = [&](const std::string& name, llvm::Type* cellTy,
+                                 llvm::Type* valTy, AO ord, unsigned al) {
+                auto [fn, entry] = startFn(name, i64Ty, {i64Ty, valTy});
+                llvm::IRBuilder<> b(entry);
+                llvm::Value* v = fn->getArg(1);
+                if (valTy == i1Ty) v = b.CreateZExt(v, cellTy);
+                auto* st = b.CreateStore(v, handlePtr(b, fn));
+                st->setAtomic(ord);
+                st->setAlignment(llvm::Align(al));
+                b.CreateRet(llvm::ConstantInt::get(i64Ty, 0));
+                declaredFns_[name] = fn;
+            };
+            // rmw (i64 arithmetic + xchg): returns the OLD value.
+            auto emitRMW = [&](const std::string& name,
+                               llvm::AtomicRMWInst::BinOp op, AO ord) {
+                auto [fn, entry] = startFn(name, i64Ty, {i64Ty, i64Ty});
+                llvm::IRBuilder<> b(entry);
+                auto* old = b.CreateAtomicRMW(op, handlePtr(b, fn),
+                                              fn->getArg(1), llvm::MaybeAlign(8),
+                                              ord);
+                b.CreateRet(old);
+                declaredFns_[name] = fn;
+            };
+            // bool swap (xchg over i8): returns the OLD value as i1.
+            auto emitBoolSwap = [&](const std::string& name, AO ord) {
+                auto [fn, entry] = startFn(name, i1Ty, {i64Ty, i1Ty});
+                llvm::IRBuilder<> b(entry);
+                auto* old = b.CreateAtomicRMW(
+                    llvm::AtomicRMWInst::Xchg, handlePtr(b, fn),
+                    b.CreateZExt(fn->getArg(1), i8Ty), llvm::MaybeAlign(1), ord);
+                b.CreateRet(b.CreateTrunc(old, i1Ty));
+                declaredFns_[name] = fn;
+            };
+            // cmpxchg: returns the i1 success bit.
+            auto emitCmpxchg = [&](const std::string& name, llvm::Type* cellTy,
+                                   llvm::Type* valTy, AO ord, unsigned al) {
+                auto [fn, entry] =
+                    startFn(name, i1Ty, {i64Ty, valTy, valTy});
+                llvm::IRBuilder<> b(entry);
+                llvm::Value* exp = fn->getArg(1);
+                llvm::Value* nw = fn->getArg(2);
+                if (valTy == i1Ty) {
+                    exp = b.CreateZExt(exp, cellTy);
+                    nw = b.CreateZExt(nw, cellTy);
+                }
+                auto* cx = b.CreateAtomicCmpXchg(handlePtr(b, fn), exp, nw,
+                                                 llvm::MaybeAlign(al), ord,
+                                                 failOf(ord));
+                b.CreateRet(b.CreateExtractValue(cx, {1}, "ok"));
+                declaredFns_[name] = fn;
+            };
+            // fence: ret 0.
+            auto emitFence = [&](const std::string& name, AO ord) {
+                auto [fn, entry] = startFn(name, i64Ty, {});
+                llvm::IRBuilder<> b(entry);
+                b.CreateFence(ord);
+                b.CreateRet(llvm::ConstantInt::get(i64Ty, 0));
+                declaredFns_[name] = fn;
+            };
+
+            for (const char* o : {"relaxed", "acquire", "seqcst"}) {
+                emitLoad(std::string("atomic_i64_load_") + o, i64Ty, i64Ty,
+                         ordOf(o), 8);
+                emitLoad(std::string("atomic_bool_load_") + o, i8Ty, i1Ty,
+                         ordOf(o), 1);
+            }
+            for (const char* o : {"relaxed", "release", "seqcst"}) {
+                emitStore(std::string("atomic_i64_store_") + o, i64Ty, i64Ty,
+                          ordOf(o), 8);
+                emitStore(std::string("atomic_bool_store_") + o, i8Ty, i1Ty,
+                          ordOf(o), 1);
+            }
+            struct RmwSpec {
+                const char* op;
+                llvm::AtomicRMWInst::BinOp binop;
+            };
+            const RmwSpec rmws[] = {
+                {"swap", llvm::AtomicRMWInst::Xchg},
+                {"fetch_add", llvm::AtomicRMWInst::Add},
+                {"fetch_sub", llvm::AtomicRMWInst::Sub},
+                {"fetch_and", llvm::AtomicRMWInst::And},
+                {"fetch_or", llvm::AtomicRMWInst::Or},
+                {"fetch_xor", llvm::AtomicRMWInst::Xor},
+            };
+            for (const auto& rs : rmws)
+                for (const char* o : {"relaxed", "acqrel", "seqcst"})
+                    emitRMW(std::string("atomic_i64_") + rs.op + "_" + o,
+                            rs.binop, ordOf(o));
+            for (const char* o : {"relaxed", "acqrel", "seqcst"}) {
+                emitCmpxchg(std::string("atomic_i64_cmpxchg_") + o, i64Ty, i64Ty,
+                            ordOf(o), 8);
+                emitBoolSwap(std::string("atomic_bool_swap_") + o, ordOf(o));
+                emitCmpxchg(std::string("atomic_bool_cmpxchg_") + o, i8Ty, i1Ty,
+                            ordOf(o), 1);
+            }
+            for (const char* o : {"acquire", "release", "acqrel", "seqcst"})
+                emitFence(std::string("fence_") + o, ordOf(o));
+        }
         (void)voidTy;
     }
 
@@ -3616,6 +3960,98 @@ private:
             b.CreateStore(fn->getArg(1), valP);
             b.CreateRet(llvm::ConstantInt::get(i64Ty, 0));
             declaredFns_["mutex_set__mx_" + mangle] = fn;
+        }
+        auto it = declaredFns_.find(want);
+        return it != declaredFns_.end() ? it->second : nullptr;
+    }
+
+    // v31 Phase 168: the per-T `RwLock<T>` block `{ [200 x i8] pthread_rwlock_t,
+    // T value }`. Mirrors mutexBlkTyFor.
+    llvm::StructType* rwlockBlkTyFor(const TypePtr& T) {
+        auto& ctx = *ctx_;
+        std::string mangle = mangleType(T);
+        auto it = rwlockBlkTys_.find(mangle);
+        if (it != rwlockBlkTys_.end()) return it->second;
+        auto* rwStorageTy =
+            llvm::ArrayType::get(llvm::Type::getInt8Ty(ctx), 200);
+        auto* valTy = mapKardashevType(T);
+        auto* blkTy = llvm::StructType::create(
+            ctx, {rwStorageTy, valTy}, "kd.rwlock_blk." + mangle);
+        rwlockBlkTys_[mangle] = blkTy;
+        return blkTy;
+    }
+    std::unordered_map<std::string, llvm::StructType*> rwlockBlkTys_;
+
+    // v31 Phase 168: per-T RwLock cell ops (new/get/set), mirroring
+    // getOrEmitMutexOp. rdlock/wrlock/unlock are T-agnostic (declareThreadRuntime).
+    llvm::Function* getOrEmitRwLockOp(const std::string& op, const TypePtr& T) {
+        ensureThreadRuntime();
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        std::string mangle = mangleType(T);
+        std::string want = op + "__rw_" + mangle;
+        if (auto it = declaredFns_.find(want); it != declaredFns_.end())
+            return it->second;
+        auto* blkTy = rwlockBlkTyFor(T);
+        auto* valTy = mapKardashevType(T);
+
+        // rwlock_new__rw_<T>(T v) -> i64 : malloc block, init rwlock (field 0),
+        // store v (field 1), return (i64)block.
+        {
+            auto* fnTy =
+                llvm::FunctionType::get(i64Ty, {valTy}, /*isVarArg=*/false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage,
+                "rwlock_new__rw_" + mangle, module_.get());
+            fn->getArg(0)->setName("v");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            uint64_t sz = module_->getDataLayout().getTypeAllocSize(blkTy);
+            auto* blk = b.CreateCall(
+                mallocFn_, {llvm::ConstantInt::get(i64Ty, sz)}, "rwlock_blk");
+            b.CreateCall(
+                pthreadRwlockInitFn_,
+                {b.CreateStructGEP(blkTy, blk, 0, "rw_ptr"),
+                 llvm::ConstantPointerNull::get(i8PtrTy)});
+            b.CreateStore(fn->getArg(0),
+                          b.CreateStructGEP(blkTy, blk, 1, "value_slot"));
+            b.CreateRet(b.CreatePtrToInt(blk, i64Ty, "handle"));
+            declaredFns_["rwlock_new__rw_" + mangle] = fn;
+        }
+        // rwlock_get__rw_<T>(i64 h) -> T : read the cell BY VALUE (clone, like
+        // mutex_get, so a non-Copy T isn't aliased).
+        {
+            auto* fnTy =
+                llvm::FunctionType::get(valTy, {i64Ty}, /*isVarArg=*/false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage,
+                "rwlock_get__rw_" + mangle, module_.get());
+            fn->getArg(0)->setName("h");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* blk = b.CreateIntToPtr(fn->getArg(0), i8PtrTy, "blk");
+            auto* valP = b.CreateStructGEP(blkTy, blk, 1, "value_ptr");
+            b.CreateRet(b.CreateCall(getOrEmitCloneFn(T), {valP}, "value"));
+            declaredFns_["rwlock_get__rw_" + mangle] = fn;
+        }
+        // rwlock_set__rw_<T>(i64 h, T v) -> i64 : drop old cell, store v, ret 0.
+        {
+            auto* fnTy = llvm::FunctionType::get(
+                i64Ty, {i64Ty, valTy}, /*isVarArg=*/false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage,
+                "rwlock_set__rw_" + mangle, module_.get());
+            fn->getArg(0)->setName("h");
+            fn->getArg(1)->setName("v");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* blk = b.CreateIntToPtr(fn->getArg(0), i8PtrTy, "blk");
+            auto* valP = b.CreateStructGEP(blkTy, blk, 1, "value_ptr");
+            b.CreateCall(getOrEmitDropThunk(T), {valP});
+            b.CreateStore(fn->getArg(1), valP);
+            b.CreateRet(llvm::ConstantInt::get(i64Ty, 0));
+            declaredFns_["rwlock_set__rw_" + mangle] = fn;
         }
         auto it = declaredFns_.find(want);
         return it != declaredFns_.end() ? it->second : nullptr;
@@ -4025,6 +4461,118 @@ private:
             declaredFns_[mangled] = fn;
             return fn;
         }
+        // v31 Phase 170: select2/3/4 — poll the N receivers (each under its own
+        // block mutex) for a ready item; return Ready(idx, value) on the first
+        // hit, Closed(idx) if a drained-and-closed receiver is seen and none is
+        // ready, else nanosleep a fixed backoff and sweep again. Ready always
+        // wins over Closed within a sweep (Closed is only remembered, returned
+        // after the full sweep). Reuses chan_try_recv's exact pop sequence.
+        if (op == "select2" || op == "select3" || op == "select4") {
+            int N = op[6] - '0';
+            TypePtr srTy = selectResultType(T);
+            mapKardashevType(srTy);
+            const std::string srMangled =
+                mangleStructInstance(srTy->enumName, srTy->typeArgs);
+            auto* srLlvm = enumTypes_[srMangled];
+            unsigned readyIdx = variantIndexInEnum(srTy, "Ready");
+            unsigned closedIdx = variantIndexInEnum(srTy, "Closed");
+            unsigned readyIdxSlot = enumPayloadIndices_[srMangled][readyIdx][0];
+            unsigned readyValSlot = enumPayloadIndices_[srMangled][readyIdx][1];
+            unsigned closedIdxSlot =
+                enumPayloadIndices_[srMangled][closedIdx][0];
+            std::vector<llvm::Type*> argtys(N, i8PtrTy);
+            auto* fn = mkFn(llvm::FunctionType::get(srLlvm, argtys, false));
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* sweep = llvm::BasicBlock::Create(ctx, "sweep", fn);
+            llvm::IRBuilder<> b(entry);
+            std::vector<llvm::Value*> blks;
+            for (int i = 0; i < N; ++i) {
+                fn->getArg(i)->setName("r");
+                auto* h = b.CreateLoad(i64Ty, fn->getArg(i), "h");
+                blks.push_back(b.CreateIntToPtr(h, i8PtrTy, "blk"));
+            }
+            auto* closedSlotA = b.CreateAlloca(i64Ty, nullptr, "closedIdx");
+            b.CreateBr(sweep);
+            b.SetInsertPoint(sweep);
+            // -1 = "no closed receiver seen this sweep".
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, -1), closedSlotA);
+            for (int i = 0; i < N; ++i) {
+                auto* popBB = llvm::BasicBlock::Create(ctx, "pop", fn);
+                auto* nrBB = llvm::BasicBlock::Create(ctx, "notready", fn);
+                auto* clrBB = llvm::BasicBlock::Create(ctx, "cleartail", fn);
+                auto* afterBB = llvm::BasicBlock::Create(ctx, "after", fn);
+                auto* contBB = llvm::BasicBlock::Create(ctx, "cont", fn);
+                b.CreateCall(pthreadMutexLockFn_, {mtxOf(b, blks[i])});
+                auto* cntP = b.CreateStructGEP(chanBlkTy_, blks[i], 4, "cntP");
+                auto* cnt = b.CreateLoad(i64Ty, cntP, "cnt");
+                b.CreateCondBr(b.CreateICmpSGT(cnt, z64, "has"), popBB, nrBB);
+                // pop (verbatim chan_try_recv): load head/val/next, advance,
+                // dec, free, clear tail if drained; unlock; return Ready(i,val).
+                b.SetInsertPoint(popBB);
+                auto* headP = b.CreateStructGEP(chanBlkTy_, blks[i], 2, "headP");
+                auto* head = b.CreateLoad(i8PtrTy, headP, "head");
+                auto* val = b.CreateLoad(
+                    elemTy, b.CreateStructGEP(nodeTy, head, 0, "hval"), "val");
+                auto* next = b.CreateLoad(
+                    i8PtrTy, b.CreateStructGEP(nodeTy, head, 1, "hnext"),
+                    "next");
+                b.CreateStore(next, headP);
+                b.CreateStore(b.CreateSub(cnt, one64, "cntm1"), cntP);
+                b.CreateCall(freeFn_, {head});
+                b.CreateCondBr(b.CreateICmpEQ(next, nullp, "drained"), clrBB,
+                               afterBB);
+                b.SetInsertPoint(clrBB);
+                b.CreateStore(nullp,
+                              b.CreateStructGEP(chanBlkTy_, blks[i], 3, "tailP"));
+                b.CreateBr(afterBB);
+                b.SetInsertPoint(afterBB);
+                b.CreateCall(pthreadMutexUnlockFn_, {mtxOf(b, blks[i])});
+                llvm::Value* ready = llvm::UndefValue::get(srLlvm);
+                ready = b.CreateInsertValue(
+                    ready, llvm::ConstantInt::get(i32Ty, readyIdx), {0});
+                ready = b.CreateInsertValue(
+                    ready, llvm::ConstantInt::get(i64Ty, i), {readyIdxSlot});
+                ready = b.CreateInsertValue(ready, val, {readyValSlot}, "ready");
+                b.CreateRet(ready);
+                // not ready: note if closed+drained, unlock, continue.
+                b.SetInsertPoint(nrBB);
+                auto* closed = b.CreateLoad(
+                    i64Ty, b.CreateStructGEP(chanBlkTy_, blks[i], 5, "closedP"),
+                    "closed");
+                b.CreateCall(pthreadMutexUnlockFn_, {mtxOf(b, blks[i])});
+                auto* isClosed = b.CreateICmpNE(closed, z64, "isClosed");
+                auto* cur = b.CreateLoad(i64Ty, closedSlotA, "curClosed");
+                b.CreateStore(
+                    b.CreateSelect(isClosed,
+                                   llvm::ConstantInt::get(i64Ty, i), cur),
+                    closedSlotA);
+                b.CreateBr(contBB);
+                b.SetInsertPoint(contBB);
+            }
+            // sweep done with nothing ready: return Closed(idx) if any closed,
+            // else nanosleep 100us and sweep again.
+            auto* finalClosed = b.CreateLoad(i64Ty, closedSlotA, "finalClosed");
+            auto* retClosedBB = llvm::BasicBlock::Create(ctx, "retClosed", fn);
+            auto* sleepBB = llvm::BasicBlock::Create(ctx, "sleep", fn);
+            b.CreateCondBr(b.CreateICmpSGE(finalClosed, z64, "anyClosed"),
+                           retClosedBB, sleepBB);
+            b.SetInsertPoint(retClosedBB);
+            llvm::Value* closedV = llvm::UndefValue::get(srLlvm);
+            closedV = b.CreateInsertValue(
+                closedV, llvm::ConstantInt::get(i32Ty, closedIdx), {0});
+            closedV =
+                b.CreateInsertValue(closedV, finalClosed, {closedIdxSlot});
+            b.CreateRet(closedV);
+            b.SetInsertPoint(sleepBB);
+            auto* ts = b.CreateAlloca(timespecTy_, nullptr, "ts");
+            b.CreateStore(z64, b.CreateStructGEP(timespecTy_, ts, 0, "tsec"));
+            b.CreateStore(llvm::ConstantInt::get(i64Ty, 100000),
+                          b.CreateStructGEP(timespecTy_, ts, 1, "tnsec"));
+            b.CreateCall(nanosleepFn_, {ts, nullp});
+            b.CreateBr(sweep);
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
         return nullptr;
     }
 
@@ -4103,6 +4651,149 @@ private:
     llvm::StructType* rcBlockType(const TypePtr& T) {
         return llvm::StructType::get(
             *ctx_, {llvm::Type::getInt64Ty(*ctx_), mapKardashevType(T)});
+    }
+
+    // v31 Phase 171: the `{ i64 strong, i64 weak, T value }` layout of an
+    // Arc<T> block (the strong refs collectively hold ONE weak ref, so the
+    // block frees only when weak hits 0).
+    llvm::StructType* arcBlockType(const TypePtr& T) {
+        auto* i64Ty = llvm::Type::getInt64Ty(*ctx_);
+        return llvm::StructType::get(*ctx_,
+                                     {i64Ty, i64Ty, mapKardashevType(T)});
+    }
+    // v31 Phase 171: the per-T Arc<T>/Weak<T> ops, with ATOMIC refcounts (the
+    // first atomics-in-an-Arc lowering — clone Relaxed, drop Release + the
+    // last-strong Acquire fence, upgrade a CAS loop). Mirrors getOrEmitRcOp.
+    llvm::Function* getOrEmitArcOp(const std::string& op, const TypePtr& T) {
+        std::string suffix = mangleType(T);
+        std::string mangled = op + "__" + suffix;
+        if (auto it = declaredFns_.find(mangled); it != declaredFns_.end())
+            return it->second;
+        auto& ctx = *ctx_;
+        auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+        auto* i1Ty = llvm::Type::getInt1Ty(ctx);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx);
+        auto* i8PtrTy = llvm::PointerType::get(ctx, 0);
+        auto* one = llvm::ConstantInt::get(i64Ty, 1);
+        using AO = llvm::AtomicOrdering;
+        llvm::Type* elemTy = mapKardashevType(T);
+        auto* blkTy = arcBlockType(T);
+        auto* blkSzK = llvm::ConstantInt::get(
+            i64Ty, module_->getDataLayout().getTypeAllocSize(blkTy));
+        auto mk = [&](llvm::FunctionType* ty) {
+            return llvm::Function::Create(
+                ty, llvm::Function::ExternalLinkage, mangled, module_.get());
+        };
+        if (op == "arc_new") {
+            auto* fn = mk(llvm::FunctionType::get(i8PtrTy, {elemTy}, false));
+            fn->getArg(0)->setName("v");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto* blk = b.CreateCall(mallocFn_, {blkSzK}, "arc_blk");
+            b.CreateStore(one, b.CreateStructGEP(blkTy, blk, 0, "strong"));
+            b.CreateStore(one, b.CreateStructGEP(blkTy, blk, 1, "weak"));
+            b.CreateStore(fn->getArg(0),
+                          b.CreateStructGEP(blkTy, blk, 2, "value"));
+            b.CreateRet(blk);
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        if (op == "arc_clone" || op == "arc_downgrade" || op == "weak_clone") {
+            // Bump the strong (clone) or weak (downgrade/weak_clone) count
+            // atomically; return the same block pointer.
+            auto* fn = mk(llvm::FunctionType::get(i8PtrTy, {i8PtrTy}, false));
+            fn->getArg(0)->setName("a");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto* blk = b.CreateLoad(i8PtrTy, fn->getArg(0), "blk");
+            unsigned field = (op == "arc_clone") ? 0 : 1;
+            b.CreateAtomicRMW(llvm::AtomicRMWInst::Add,
+                              b.CreateStructGEP(blkTy, blk, field, "cntP"), one,
+                              llvm::MaybeAlign(8), AO::Monotonic);
+            b.CreateRet(blk);
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        if (op == "arc_get") {
+            auto* fn = mk(llvm::FunctionType::get(i8PtrTy, {i8PtrTy}, false));
+            fn->getArg(0)->setName("a");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto* blk = b.CreateLoad(i8PtrTy, fn->getArg(0), "blk");
+            b.CreateRet(b.CreateStructGEP(blkTy, blk, 2, "valueP"));
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        if (op == "arc_strong_count" || op == "arc_weak_count") {
+            auto* fn = mk(llvm::FunctionType::get(i64Ty, {i8PtrTy}, false));
+            fn->getArg(0)->setName("a");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx, "entry", fn));
+            auto* blk = b.CreateLoad(i8PtrTy, fn->getArg(0), "blk");
+            unsigned field = (op == "arc_strong_count") ? 0 : 1;
+            auto* ld = b.CreateLoad(
+                i64Ty, b.CreateStructGEP(blkTy, blk, field, "cntP"), "cnt");
+            ld->setAtomic(AO::Monotonic);
+            ld->setAlignment(llvm::Align(8));
+            b.CreateRet(ld);
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        if (op == "weak_upgrade") {
+            // CAS-loop on the strong count: bump only if non-zero. Returns
+            // Option<Arc<T>> (Some(blk) on success, None if strong hit 0).
+            TypePtr optTy = optionType(T); // Option<Arc<T>>: caller passes Arc T
+            // NOTE: T here is the Arc's element type; the Option is over
+            // Arc<T>. Build the Option<Arc<T>> LLVM type from the result.
+            // (Handled at the call site's expected type; here we build Some/None
+            // over the i8* block pointer, which IS the Arc<T> repr.)
+            TypePtr arcT = std::make_shared<Type>();
+            arcT->kind = TypeKind::Struct;
+            arcT->structName = "Arc";
+            arcT->typeArgs = {T};
+            TypePtr optArc = optionType(arcT);
+            mapKardashevType(optArc);
+            const std::string optMangled =
+                mangleStructInstance(optArc->enumName, optArc->typeArgs);
+            auto* optLlvm = enumTypes_[optMangled];
+            unsigned someIdx = variantIndexInEnum(optArc, "Some");
+            unsigned noneIdx = variantIndexInEnum(optArc, "None");
+            unsigned someSlot = enumPayloadIndices_[optMangled][someIdx][0];
+            auto* fn = mk(llvm::FunctionType::get(optLlvm, {i8PtrTy}, false));
+            fn->getArg(0)->setName("w");
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
+            auto* loopBB = llvm::BasicBlock::Create(ctx, "cas", fn);
+            auto* okBB = llvm::BasicBlock::Create(ctx, "ok", fn);
+            auto* noneBB = llvm::BasicBlock::Create(ctx, "none", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* blk = b.CreateLoad(i8PtrTy, fn->getArg(0), "blk");
+            auto* strongP = b.CreateStructGEP(blkTy, blk, 0, "strongP");
+            b.CreateBr(loopBB);
+            b.SetInsertPoint(loopBB);
+            auto* cur = b.CreateLoad(i64Ty, strongP, "cur");
+            cur->setAtomic(AO::Monotonic);
+            cur->setAlignment(llvm::Align(8));
+            auto* isZero = b.CreateICmpEQ(cur, llvm::ConstantInt::get(i64Ty, 0));
+            auto* tryBB = llvm::BasicBlock::Create(ctx, "try", fn);
+            b.CreateCondBr(isZero, noneBB, tryBB);
+            b.SetInsertPoint(tryBB);
+            auto* cx = b.CreateAtomicCmpXchg(
+                strongP, cur, b.CreateAdd(cur, one), llvm::MaybeAlign(8),
+                AO::Acquire, AO::Monotonic);
+            b.CreateCondBr(b.CreateExtractValue(cx, {1}, "won"), okBB, loopBB);
+            b.SetInsertPoint(okBB);
+            llvm::Value* some = llvm::UndefValue::get(optLlvm);
+            some = b.CreateInsertValue(
+                some, llvm::ConstantInt::get(i32Ty, someIdx), {0});
+            some = b.CreateInsertValue(some, blk, {someSlot}, "some");
+            b.CreateRet(some);
+            b.SetInsertPoint(noneBB);
+            llvm::Value* none = llvm::UndefValue::get(optLlvm);
+            none = b.CreateInsertValue(
+                none, llvm::ConstantInt::get(i32Ty, noneIdx), {0}, "none");
+            b.CreateRet(none);
+            (void)i1Ty;
+            (void)optTy;
+            declaredFns_[mangled] = fn;
+            return fn;
+        }
+        return nullptr;
     }
 
     // --- Phase 23: real panic + unwinding (setjmp/longjmp + cleanup stack) ---
@@ -4718,6 +5409,16 @@ private:
             if (r->structName == "Mutex")
                 return builder_->CreateLoad(mapKardashevType(r), src,
                                             "clone.mutex");
+            // v31 Phase 168: RwLock<T> is a Copy i64 handle (bit-copy clone,
+            // like Mutex). The lock guards are move-only and not normally
+            // cloned, but bit-copy them too (rather than fall through to the
+            // empty-field loop that would return undef).
+            if (r->structName == "RwLock" ||
+                r->structName == "MutexGuard" ||
+                r->structName == "RwLockReadGuard" ||
+                r->structName == "RwLockWriteGuard")
+                return builder_->CreateLoad(mapKardashevType(r), src,
+                                            "clone.lock");
             // User struct: clone each field.
             llvm::Type* st = mapKardashevType(r);
             llvm::Value* agg = llvm::UndefValue::get(st);
@@ -6914,9 +7615,32 @@ private:
                 // threads). The per-T block layout lives in getOrEmitMutexOp.
                 if (r->structName == "Mutex")
                     return llvm::Type::getInt64Ty(*ctx_);
+                // v31 Phase 168: `RwLock<T>` is a Copy i64 handle (like Mutex);
+                // the three RAII lock guards (`MutexGuard<T>`,
+                // `RwLockReadGuard<T>`, `RwLockWriteGuard<T>`) are move-only i64
+                // handles carrying the locked block's pointer — their Drop
+                // releases the lock. All lower to a bare i64 regardless of T.
+                if (r->structName == "RwLock" ||
+                    r->structName == "MutexGuard" ||
+                    r->structName == "RwLockReadGuard" ||
+                    r->structName == "RwLockWriteGuard")
+                    return llvm::Type::getInt64Ty(*ctx_);
+                // v31 Phase 169: `AtomicI64` / `AtomicBool` are Copy i64 handles
+                // (PtrToInt of a naturally-aligned heap cell) — bare i64 ABI.
+                if (r->structName == "AtomicI64" ||
+                    r->structName == "AtomicBool")
+                    return llvm::Type::getInt64Ty(*ctx_);
+                // v31 Phase 170: a `Scope` is an i64 handle to the heap scope
+                // block (move-only; its Drop joins all spawned threads).
+                if (r->structName == "Scope")
+                    return llvm::Type::getInt64Ty(*ctx_);
                 // Phase 78 (v13): `Rc<T>` is a pointer to a heap
                 // `{ i64 strong, T value }` refcount block.
                 if (r->structName == "Rc")
+                    return llvm::PointerType::get(*ctx_, 0);
+                // v31 Phase 171: `Arc<T>`/`Weak<T>` are pointers to a heap
+                // `{ i64 strong, i64 weak, T value }` atomic-refcount block.
+                if (r->structName == "Arc" || r->structName == "Weak")
                     return llvm::PointerType::get(*ctx_, 0);
                 // Built-in single-layout generics: `Vec<T>`, `String`,
                 // `Slice`, `HashMap<V>` and `Future<T>` always lower to one
@@ -8588,6 +9312,9 @@ private:
             // Phase 78 (v13): Rc<T> owns a refcount block — droppable (its drop
             // decrements + frees at zero).
             if (r->structName == "Rc") return true;
+            // v31 Phase 171: Arc<T>/Weak<T> own an atomic refcount block —
+            // droppable (atomic dec; value freed at strong==0, block at weak==0).
+            if (r->structName == "Arc" || r->structName == "Weak") return true;
             // Phase 81 (v13 review fix): Sender/Receiver are now refcounted
             // OWNERS of the channel block — droppable. A Sender drop decrements
             // the live-sender count (closing the channel at zero) and the
@@ -8596,13 +9323,27 @@ private:
             // an i64, so they lower as scalars, but they are no longer Copy.)
             if (r->structName == "Sender" || r->structName == "Receiver")
                 return true;
+            // v31 Phase 168: the three RAII lock guards are move-only OWNERS of
+            // a held lock — droppable: their Drop releases the lock (mutex_unlock
+            // / rwlock_unlock). The handle is an i64, so they lower as scalars,
+            // but they are no longer Copy.
+            if (r->structName == "MutexGuard" ||
+                r->structName == "RwLockReadGuard" ||
+                r->structName == "RwLockWriteGuard")
+                return true;
+            // v31 Phase 170: a Scope owns its spawned-thread handles — droppable
+            // (its Drop joins them all and frees the block).
+            if (r->structName == "Scope") return true;
             // Slice / Range / fn-value / future structs own no heap (Slice is
             // a borrow; Range/Future are plain scalars in the MVP). A `Mutex<T>`
-            // is a Copy i64 handle whose lock+cell block is process-lifetime
-            // (never freed — like the pre-123 raw-i64 Mutex), so it is NOT
-            // dropped (the cell's final contents leak with the block, by design).
+            // and a `RwLock<T>` (v31 Phase 168) are Copy i64 handles whose
+            // lock+cell block is process-lifetime (never freed — like the
+            // pre-123 raw-i64 Mutex), so they are NOT dropped (the cell's final
+            // contents leak with the block, by design — owned free arrives with
+            // Arc<Mutex<T>>).
             if (r->structName == "Slice" || r->structName == "Range" ||
-                r->structName == "Future" || r->structName == "Mutex")
+                r->structName == "Future" || r->structName == "Mutex" ||
+                r->structName == "RwLock")
                 return false;
             std::string key = mangleStructInstance(r->structName, r->typeArgs);
             if (!seen.insert("S:" + key).second) return false;
@@ -8798,6 +9539,93 @@ private:
             builder_->CreateCall(freeFn_, {blk});
             builder_->CreateBr(contBB);
             builder_->SetInsertPoint(contBB);
+            return;
+        }
+
+        // v31 Phase 171: Arc<T> / Weak<T> drop — ATOMIC refcount, the Rust
+        // pattern. Strong drop: atomic-Sub strong with Release; the LAST strong
+        // (old==1) acquire-fences, drops the value, then releases the strong
+        // refs' collective weak ref. The block frees only when weak hits 0.
+        // Weak drop: atomic-Sub weak; the last weak frees the block (the value
+        // was already dropped when strong hit 0).
+        if (r->kind == TypeKind::Struct &&
+            (r->structName == "Arc" || r->structName == "Weak") &&
+            !r->typeArgs.empty()) {
+            using AO = llvm::AtomicOrdering;
+            auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+            auto* one = llvm::ConstantInt::get(i64Ty, 1);
+            TypePtr inner = resolveInInstance(r->typeArgs[0]);
+            auto* blkTy = arcBlockType(inner);
+            auto* blk = builder_->CreateLoad(i8PtrTy, valuePtr, "arc.ptr");
+            auto* curFn = builder_->GetInsertBlock()->getParent();
+            bool isArc = r->structName == "Arc";
+            auto* weakP = builder_->CreateStructGEP(blkTy, blk, 1, "arc.weakP");
+            // Decrement weak (and free at 0) — shared by the Weak path and the
+            // tail of the Arc strong-zero path.
+            auto emitWeakDec = [&]() {
+                auto* oldW = builder_->CreateAtomicRMW(
+                    llvm::AtomicRMWInst::Sub, weakP, one, llvm::MaybeAlign(8),
+                    AO::Release);
+                auto* wfreeBB = llvm::BasicBlock::Create(ctx, "arc.wfree", curFn);
+                auto* wcontBB = llvm::BasicBlock::Create(ctx, "arc.wcont", curFn);
+                builder_->CreateCondBr(builder_->CreateICmpEQ(oldW, one),
+                                       wfreeBB, wcontBB);
+                builder_->SetInsertPoint(wfreeBB);
+                builder_->CreateFence(AO::Acquire);
+                builder_->CreateCall(freeFn_, {blk});
+                builder_->CreateBr(wcontBB);
+                builder_->SetInsertPoint(wcontBB);
+            };
+            if (!isArc) {
+                emitWeakDec();
+                return;
+            }
+            auto* strongP =
+                builder_->CreateStructGEP(blkTy, blk, 0, "arc.strongP");
+            auto* oldS = builder_->CreateAtomicRMW(
+                llvm::AtomicRMWInst::Sub, strongP, one, llvm::MaybeAlign(8),
+                AO::Release);
+            auto* lastBB = llvm::BasicBlock::Create(ctx, "arc.last", curFn);
+            auto* doneBB = llvm::BasicBlock::Create(ctx, "arc.done", curFn);
+            builder_->CreateCondBr(builder_->CreateICmpEQ(oldS, one), lastBB,
+                                   doneBB);
+            builder_->SetInsertPoint(lastBB);
+            builder_->CreateFence(AO::Acquire); // order value destruction after
+                                                // all other threads' accesses
+            if (isDroppable(inner))
+                emitDropGlue(builder_->CreateStructGEP(blkTy, blk, 2, "arc.val"),
+                             inner);
+            emitWeakDec(); // release the strong refs' collective weak ref
+            builder_->CreateBr(doneBB);
+            builder_->SetInsertPoint(doneBB);
+            return;
+        }
+
+        // v31 Phase 168: a lock GUARD drop releases the held lock. The storage
+        // holds the i64 lock-block handle; a MutexGuard routes to the T-agnostic
+        // mutex_unlock, a RwLock read/write guard to rwlock_unlock. The lock
+        // block itself is NOT freed here (the Mutex/RwLock owns it, and is a
+        // Copy process-lifetime handle) — only the lock is released.
+        if (r->kind == TypeKind::Struct &&
+            (r->structName == "MutexGuard" ||
+             r->structName == "RwLockReadGuard" ||
+             r->structName == "RwLockWriteGuard")) {
+            ensureThreadRuntime();
+            auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+            auto* handle = builder_->CreateLoad(i64Ty, valuePtr, "guard.handle");
+            const char* unlockFn =
+                (r->structName == "MutexGuard") ? "mutex_unlock" : "rwlock_unlock";
+            builder_->CreateCall(declaredFns_[unlockFn], {handle});
+            return;
+        }
+
+        // v31 Phase 170: a Scope drop joins all threads it spawned (RAII
+        // join-before-scope-end) and frees the scope block.
+        if (r->kind == TypeKind::Struct && r->structName == "Scope") {
+            ensureThreadRuntime();
+            auto* i64Ty = llvm::Type::getInt64Ty(ctx);
+            auto* handle = builder_->CreateLoad(i64Ty, valuePtr, "scope.handle");
+            builder_->CreateCall(declaredFns_["scope_join_all"], {handle});
             return;
         }
 
@@ -10832,8 +11660,37 @@ private:
         if (call.callee == "thread_spawn" || call.callee == "thread_join" ||
             call.callee == "mutex_new" || call.callee == "mutex_lock" ||
             call.callee == "mutex_unlock" || call.callee == "mutex_get" ||
-            call.callee == "mutex_set") {
+            call.callee == "mutex_set" || call.callee == "mutex_guard" ||
+            call.callee == "rwlock_new" || call.callee == "rwlock_read" ||
+            call.callee == "rwlock_write" || call.callee == "rwlock_unlock" ||
+            call.callee == "rwlock_get" || call.callee == "rwlock_set" ||
+            call.callee == "rwlock_read_guard" ||
+            call.callee == "rwlock_write_guard" ||
+            call.callee.rfind("atomic_", 0) == 0 ||
+            call.callee.rfind("fence_", 0) == 0 ||
+            call.callee == "scope_new" || call.callee == "scope_spawn") {
             ensureThreadRuntime();
+        }
+        // v31 Phase 170: scoped threads. These are NON-generic builtins (no type
+        // args), so they are dispatched HERE (before the generic-instantiation
+        // branch the channel/mutex ops use). scope_new() returns the scope
+        // handle; scope_spawn(&s, f) spawns f via the existing thread_spawn
+        // runtime and records the handle so the scope's Drop joins it.
+        if (call.callee == "scope_new") {
+            ensureThreadRuntime();
+            return builder_->CreateCall(declaredFns_["scope_new"], {},
+                                        "scope_new");
+        }
+        if (call.callee == "scope_spawn") {
+            ensureThreadRuntime();
+            auto* i64Ty = llvm::Type::getInt64Ty(*ctx_);
+            llvm::Value* scopeRef = emitConsume(*call.args[0]); // &Scope
+            auto* scopeH = builder_->CreateLoad(i64Ty, scopeRef, "scope.h");
+            llvm::Value* closure = emitConsume(*call.args[1]); // {fn,env}
+            auto* th = builder_->CreateCall(declaredFns_["thread_spawn"],
+                                            {closure}, "scoped_th");
+            builder_->CreateCall(declaredFns_["scope_push"], {scopeH, th});
+            return th;
         }
         // (Phase 77: the channel ops are GENERIC builtins — they route through
         // the generic dispatch to getOrEmitChannelOp, which ensures the channel
@@ -10925,7 +11782,9 @@ private:
             if ((call.callee == "channel" || call.callee == "chan_send" ||
                  call.callee == "chan_recv" || call.callee == "chan_close" ||
                  call.callee == "chan_try_recv" ||
-                 call.callee == "sender_clone") &&
+                 call.callee == "sender_clone" ||
+                 call.callee == "select2" || call.callee == "select3" ||
+                 call.callee == "select4") &&
                 !concreteTypeArgs.empty()) {
                 llvm::Function* fn =
                     getOrEmitChannelOp(call.callee, concreteTypeArgs[0]);
@@ -10949,6 +11808,31 @@ private:
                 !concreteTypeArgs.empty()) {
                 llvm::Function* fn =
                     getOrEmitRcOp(call.callee, concreteTypeArgs[0]);
+                if (!fn) {
+                    errors_.push_back("codegen: cannot specialize " +
+                                      call.callee);
+                    return llvm::ConstantInt::get(
+                        llvm::Type::getInt64Ty(*ctx_), 0);
+                }
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(
+                    fn, args,
+                    fn->getReturnType()->isVoidTy() ? "" : "call_" + call.callee);
+            }
+            // v31 Phase 171: the per-T Arc<T>/Weak<T> ops (atomic refcount).
+            if ((call.callee == "arc_new" || call.callee == "arc_clone" ||
+                 call.callee == "arc_get" ||
+                 call.callee == "arc_strong_count" ||
+                 call.callee == "arc_weak_count" ||
+                 call.callee == "arc_downgrade" ||
+                 call.callee == "weak_clone" ||
+                 call.callee == "weak_upgrade") &&
+                !concreteTypeArgs.empty()) {
+                TypePtr at = resolve(concreteTypeArgs[0]);
+                if (at->kind == TypeKind::Var) at = makeInt();
+                llvm::Function* fn = getOrEmitArcOp(call.callee, at);
                 if (!fn) {
                     errors_.push_back("codegen: cannot specialize " +
                                       call.callee);
@@ -11096,6 +11980,57 @@ private:
                 TypePtr mt = resolve(concreteTypeArgs[0]);
                 if (mt->kind == TypeKind::Var) mt = makeInt();
                 llvm::Function* fn = getOrEmitMutexOp(call.callee, mt);
+                if (!fn) {
+                    errors_.push_back(
+                        "codegen: cannot specialize " + call.callee);
+                    return llvm::ConstantInt::get(
+                        llvm::Type::getInt64Ty(*ctx_), 0);
+                }
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(fn, args, "call_" + call.callee);
+            }
+            // v31 Phase 168: a lock-GUARD acquire — lock the handle, then yield
+            // it AS the guard value (a MutexGuard/RwLock*Guard is the same i64
+            // handle). The guard's scope-exit Drop releases the lock. The lock
+            // arg is a Copy handle, so emitConsume just loads it.
+            if (call.callee == "mutex_guard" ||
+                call.callee == "rwlock_read_guard" ||
+                call.callee == "rwlock_write_guard") {
+                ensureThreadRuntime();
+                llvm::Value* h = emitConsume(*call.args[0]);
+                const char* lockFn = call.callee == "mutex_guard"
+                                         ? "mutex_lock"
+                                         : call.callee == "rwlock_read_guard"
+                                               ? "rwlock_rdlock"
+                                               : "rwlock_wrlock";
+                builder_->CreateCall(declaredFns_[lockFn], {h});
+                return h; // the locked handle IS the guard
+            }
+            // v31 Phase 168: RwLock<T> — manual read/write/unlock are T-agnostic
+            // (field 0), like mutex_lock/unlock; get/set are per-T (like the
+            // mutex cell ops) over the `{ pthread_rwlock_t, T }` block.
+            if (call.callee == "rwlock_read" || call.callee == "rwlock_write" ||
+                call.callee == "rwlock_unlock") {
+                ensureThreadRuntime();
+                const char* fixed = call.callee == "rwlock_read"
+                                        ? "rwlock_rdlock"
+                                        : call.callee == "rwlock_write"
+                                              ? "rwlock_wrlock"
+                                              : "rwlock_unlock";
+                llvm::Function* fn = declaredFns_[fixed];
+                std::vector<llvm::Value*> args;
+                args.reserve(call.args.size());
+                for (const auto& a : call.args) args.push_back(emitConsume(*a));
+                return builder_->CreateCall(fn, args, "call_" + call.callee);
+            }
+            if ((call.callee == "rwlock_new" || call.callee == "rwlock_get" ||
+                 call.callee == "rwlock_set") &&
+                !concreteTypeArgs.empty()) {
+                TypePtr rt = resolve(concreteTypeArgs[0]);
+                if (rt->kind == TypeKind::Var) rt = makeInt();
+                llvm::Function* fn = getOrEmitRwLockOp(call.callee, rt);
                 if (!fn) {
                     errors_.push_back(
                         "codegen: cannot specialize " + call.callee);
@@ -12234,6 +13169,22 @@ private:
                     capR->structName == "Sender" && !capR->typeArgs.empty()) {
                     llvm::Function* cloneFn = getOrEmitChannelOp(
                         "sender_clone", resolveInInstance(capR->typeArgs[0]));
+                    llvm::Value* h = builder_->CreateCall(cloneFn, {lit->second},
+                                                          "cap_clone_" + name);
+                    builder_->CreateStore(h, slot);
+                    continue;
+                }
+                // v31 Phase 171: capturing an Arc<T>/Weak<T> CLONES it (atomic
+                // count bump) — each thread gets its own counted handle, dropped
+                // by the worker it is moved into. The enclosing binding keeps
+                // its own handle (no flag-clear), dropped at its scope exit.
+                if (capR->kind == TypeKind::Struct &&
+                    (capR->structName == "Arc" || capR->structName == "Weak") &&
+                    !capR->typeArgs.empty()) {
+                    const char* cloneOp =
+                        capR->structName == "Arc" ? "arc_clone" : "weak_clone";
+                    llvm::Function* cloneFn = getOrEmitArcOp(
+                        cloneOp, resolveInInstance(capR->typeArgs[0]));
                     llvm::Value* h = builder_->CreateCall(cloneFn, {lit->second},
                                                           "cap_clone_" + name);
                     builder_->CreateStore(h, slot);

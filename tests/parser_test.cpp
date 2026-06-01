@@ -1960,6 +1960,38 @@ void test_array_repeat() {
     assert(arr2 && arr2->elements.size() == 3 && !arr2->repeatCount);
 }
 
+// v31 Phase 167: negative marker impl `impl !Send for T {}` parsing.
+void test_negative_marker_impl() {
+    auto r = parse("impl !Send for W { }");
+    assert(r.ok());
+    assert(r.program.impls.size() == 1);
+    assert(r.program.impls[0].isNegative);
+    assert(r.program.impls[0].traitName == "Send");
+    assert(r.program.impls[0].forType.name == "W");
+    assert(r.program.impls[0].methods.empty());
+
+    // A positive trait impl is not negative.
+    auto r2 = parse("impl Send for W { }");
+    assert(r2.ok());
+    assert(r2.program.impls.size() == 1);
+    assert(!r2.program.impls[0].isNegative);
+    assert(r2.program.impls[0].traitName == "Send");
+
+    // The parser only records isNegative; the marker-only restriction is a
+    // typecheck rule, so a negative non-marker impl still PARSES.
+    auto r3 = parse("impl !Clone for W { }");
+    assert(r3.ok());
+    assert(r3.program.impls[0].isNegative);
+
+    // A negative impl with a method body is a parse error.
+    auto r4 = parse("impl !Send for W { fn g(&self) -> i64 { 0 } }");
+    assert(!r4.ok());
+
+    // A negative impl must be `for` a type.
+    auto r5 = parse("impl !W { }");
+    assert(!r5.ok());
+}
+
 } // namespace
 
 int main() {
@@ -2117,6 +2149,7 @@ int main() {
     test_tuple_let_annotation();
     test_nested_tuple_field_access(); // v10 regression
     test_array_repeat(); // Phase 62
-    std::cout << "All parser tests passed (138 cases)\n";
+    test_negative_marker_impl(); // v31 Phase 167
+    std::cout << "All parser tests passed (139 cases)\n";
     return 0;
 }

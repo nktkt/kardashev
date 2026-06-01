@@ -18,6 +18,72 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.31.0] — Roadmap v31 "concurrency, hardened (differentiator I)" (Phases 167-171)
+
+Theme: take the concurrency story from "structural Send + a type-erased i64
+`Mutex` + i64-only threads" to a hardened, modern surface — real `Send`/`Sync`
+marker traits, RAII lock guards + `RwLock`, real lock-free atomics, channel
+`select` + scoped threads, and atomically-refcounted `Arc`/`Weak`. Every phase
+is differentially gated (JIT vs AOT, and the concurrent ones by a
+deterministic-over-N-runs stress oracle — a lost update / data race fails
+flakily, which repeating catches; the RAII/refcount ones also under
+`MALLOC_CHECK_`).
+
+### Added
+- **Real `Send`/`Sync` marker traits** (Phase 167) — `Send` and `Sync` are now
+  declarable zero-method marker traits (in the prelude), auto-derived
+  structurally, manually grantable (`impl Send for Opaque {}`), and opt-out-able
+  via a new negative-impl syntax `impl !Send for T {}`. A marker oracle consults
+  explicit positive/negative impls and otherwise falls through to the
+  (byte-identical) structural rule — so the three live enforcement sites
+  (`chan_send` value, `mutex_new` cell, by-value `thread_spawn` capture) are now
+  overridable. Fixes a latent gap: `char` (a Copy scalar) is now `Send`/`Sync`.
+  Zero runtime cost.
+- **Type-safe `RwLock<T>` + RAII lock guards** (Phase 168) — a new reader/writer
+  lock (`pthread_rwlock_t`-backed, mirrors `Mutex`) plus move-only RAII guards
+  `MutexGuard<T>` / `RwLockReadGuard<T>` / `RwLockWriteGuard<T>` that auto-release
+  the lock on `Drop` (the scoped-lock pattern, à la C++ `lock_guard` /
+  `shared_lock`). `RwLock`'s cell is `Send`-gated like `Mutex`'s.
+- **Atomics + CAS + memory orderings** (Phase 169) — `AtomicI64` / `AtomicBool`
+  (Copy `Send`+`Sync` handles) with `load`/`store`/`swap`/`fetch_add`/`sub`/`and`
+  /`or`/`xor`/`compare_exchange`, lowered to real LLVM `atomicrmw`/`cmpxchg`/
+  atomic-load/store/`fence`. The memory ordering is baked into the op name so the
+  LLVM `AtomicOrdering` is a compile-time constant; an ergonomic
+  `enum Ordering { Relaxed, Acquire, Release, AcqRel, SeqCst }` + `impl` layer
+  (prelude) dispatches to the statically-named builtins. (`--emit-c` refuses
+  atomics — the LLVM path is the oracle.)
+- **Channel `select` + scoped threads** (Phase 170) — `select2`/`select3`/
+  `select4(&r0,..)` block (poll-with-backoff) until one of N homogeneous
+  `&Receiver<T>` is ready, returning a prelude
+  `SelectResult<T> { Ready(idx, value), Closed(idx) }`. Scoped threads: a
+  move-only `Scope` (`scope_new` / `scope_spawn(&s, f)`) whose `Drop` JOINS every
+  thread it spawned — the roadmap's "all threads join before the scope ends", via
+  RAII. (True cross-thread *borrow* capture is deferred — it needs a
+  region/lifetime system; workers capture by value as `thread_spawn` does.)
+- **`Arc<T>` / `Weak<T>`** (Phase 171) — atomically reference-counted shared
+  ownership: a pointer to `{ i64 strong, i64 weak, T value }` with atomic
+  refcounts (clone Relaxed, drop Release + an Acquire fence on the last strong;
+  value dropped at strong==0, block freed at weak==0). `Weak<T>` is a non-owning,
+  upgradable handle (`weak_upgrade -> Option<Arc<T>>` via an atomic CAS loop).
+  Unlike `Rc`, `Arc`/`Weak` ARE `Send`+`Sync` when `T` is (`Send`+`Sync`) — the
+  answer to "share owned data across threads" without lifetimes. Capturing an
+  `Arc` into a thread clones it. Proven atomic by a 4-thread × 50k clone+drop
+  stress (final `strong_count == 1`).
+
+### Deferred / honest notes
+- **Generic `thread_join<T>`** (the non-i64 thread-result half of Phase 171) is
+  deferred to a follow-on: it rewrites the core OS-thread runtime (per-`T`
+  control block + trampoline) the whole v31 test surface depends on. OS threads
+  still return `i64` (the sound current behavior); `Arc<T>` is the shipped half.
+- `select` is poll-with-backoff (a true blocking multi-channel wait needs a
+  shared-condvar ABI change). Scoped threads deliver join-before-scope-end but
+  not borrow-capture (needs lifetimes).
+
+### Tests
+- New smoke targets `smoke_test_phase167`–`171` (JIT-vs-AOT differential; the
+  concurrent ones deterministic-over-N-runs + `MALLOC_CHECK_`). Unit:
+  `typecheck_test` 311 → 316, `parser_test` 138 → 139.
+
 ## [0.30.0] — Roadmap v30 "the C backend, finished II (heap + RAII + generics)" (Phases 162-166)
 
 Theme: take the `--emit-c` C-source backend (v23/v29) from the i64/bool/struct/

@@ -349,6 +349,49 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v31 Phase 167: real Send/Sync marker traits (declarable + auto-derived +
+# opt-out), the marker oracle, and the char Send fix.
+sh_test(
+    name = "smoke_test_phase167",
+    srcs = ["smoke_test_phase167.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v31 Phase 168: type-safe RwLock<T> + RAII lock guards (MutexGuard /
+# RwLockReadGuard / RwLockWriteGuard, auto-unlock on Drop).
+sh_test(
+    name = "smoke_test_phase168",
+    srcs = ["smoke_test_phase168.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v31 Phase 169: atomics + CAS + memory orderings (AtomicI64 / AtomicBool,
+# LLVM atomicrmw/cmpxchg, Ordering enum). Includes a concurrency stress oracle.
+sh_test(
+    name = "smoke_test_phase169",
+    srcs = ["smoke_test_phase169.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v31 Phase 170: channel select (multiplexed wait) + scoped threads (RAII
+# join-before-scope-end). Thread-based — flaky=True for the macOS arm64-JIT
+# teardown flake, like the other thread/executor tests.
+sh_test(
+    name = "smoke_test_phase170",
+    srcs = ["smoke_test_phase170.sh"],
+    data = ["//compiler:kardc"],
+    flaky = True,
+)
+
+# v31 Phase 171: Arc<T> / Weak<T> (atomic-refcount shared ownership). Thread-
+# based stress -> flaky=True like the other thread tests.
+sh_test(
+    name = "smoke_test_phase171",
+    srcs = ["smoke_test_phase171.sh"],
+    data = ["//compiler:kardc"],
+    flaky = True,
+)
+
 # v30 Phase 165: C backend closures + fn values (differential + ASan).
 sh_test(
     name = "smoke_test_phase165",

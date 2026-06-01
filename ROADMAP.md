@@ -171,9 +171,24 @@ Continue v23 (`--emit-c`), each phase differentially gated vs LLVM.
 - **166** C backend: **generics / monomorphization** — after which `--emit-c` is
   a near-complete second backend (async excepted; see Mega-arcs).
 
-### v31 — concurrency, hardened (differentiator I)
-*(Survey `memory-effects-concurrency`: type-erased `Mutex`, structural `Send`,
-no atomics/select/scoped-threads, OS-thread i64-only, no `Rc`/`Arc` weak.)*
+### v31 — concurrency, hardened (differentiator I) — *done (v0.31.0)*
+*Shipped: 167 real **`Send`/`Sync`** marker traits (declarable, structurally
+auto-derived, manually grantable, opt-out-able via `impl !Send for T {}` — a
+marker oracle the 3 live enforcement sites consult; `char` Send gap fixed);
+168 type-safe **`RwLock<T>`** + move-only **RAII lock guards** (Mutex/RwLock
+read/write guards, auto-unlock on `Drop`); 169 **atomics** (`AtomicI64`/
+`AtomicBool`, `fetch_*`/`compare_exchange`, `Ordering` enum) lowered to real LLVM
+`atomicrmw`/`cmpxchg`/`fence` (ordering baked into the op name = compile-time
+constant); 170 channel **`select`** (`select2/3/4` → `SelectResult { Ready,
+Closed }`, poll-with-backoff) + **scoped threads** (a RAII `Scope` joining every
+spawned thread on scope exit); 171 **`Arc<T>`/`Weak<T>`** — atomic-refcounted
+shared ownership, `Send`+`Sync` when `T` is (`Send`+`Sync`), Weak upgrade via an
+atomic CAS loop, proven atomic by a 4-thread × 50k clone+drop stress.
+Differentially gated JIT-vs-AOT (concurrent phases deterministic-over-N-runs +
+`MALLOC_CHECK_`). Documented deferrals: the generic **`thread_join<T>`** half of
+171 (threads still return `i64` — the per-`T` runtime rewrite is a follow-on);
+`select` is poll-based (a true blocking multi-wait needs a shared-condvar ABI
+change); scoped threads join-but-don't-borrow-capture (needs lifetimes).*
 - **167** real **`Send`/`Sync`** marker traits (declarable + auto-derived),
   backing/replacing the structural rule with hard enforcement.
 - **168** a **type-safe named `Mutex<T>`** (retire the type-erased i64 handle) +

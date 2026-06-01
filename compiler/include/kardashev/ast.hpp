@@ -895,6 +895,11 @@ struct ImplDecl {
     TypeRef forType;
     std::vector<FnDecl> methods;
     bool isPub = false; // Phase 15: `pub impl` — parsed + stored.
+    // v31 Phase 167: a negative marker impl `impl !Send for T {}` /
+    // `impl !Sync for T {}`. Only legal for the marker traits Send/Sync, must
+    // have an empty body, and opts a type OUT of the auto-derived structural
+    // membership. Distinct from a missing impl (unspecified -> structural).
+    bool isNegative = false;
     bool isInherent() const { return traitName.empty(); }
     std::size_t line = 1;
     std::size_t column = 1;
