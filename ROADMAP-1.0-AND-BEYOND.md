@@ -146,6 +146,12 @@ borrow-check (MS), borrow-capturing scoped threads (CC), drop-check.
 
 ### v39 — "FFI maturity, no_std & async parity I" — moves: SL/EC (FFI+no_std), CC, AE, TS
 
+> **Status (`v0.39.0`, partial):** ✅ SHIPPED — raw-pointer arithmetic
+> (`ptr_offset`) + write (`ptr_write`), unsafe-gated (retires part of the Phase
+> 177 deferral). ⛔ DEFERRED — `repr(C)` struct-by-value + C callbacks, `kard
+> bindgen`, `no_std`/`GlobalAlloc`, generic `thread_join<T>`, kqueue/poll
+> reactor, blocking multi-wait select + async Mutex, recursive Future-drop, HRTB.
+
 With lifetimes in place we (a) finish the **systems-language unblockers the v33
 roadmap deferred** — mature C FFI and `no_std`/freestanding/allocator — and (b)
 finish the parallel runtime primitives. FFI + no_std are sequenced here because they
