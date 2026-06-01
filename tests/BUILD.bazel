@@ -392,6 +392,16 @@ sh_test(
     flaky = True,
 )
 
+# v32 Phase 172: Future combinators (future_map/and_then/join2/select) + Either.
+# select_right_timing / *_pending lean on the real wall-clock timer (sleep_ms),
+# so mark flaky like the other timing-sensitive async tests.
+sh_test(
+    name = "smoke_test_phase172",
+    srcs = ["smoke_test_phase172.sh"],
+    data = ["//compiler:kardc"],
+    flaky = True,
+)
+
 # v30 Phase 165: C backend closures + fn values (differential + ASan).
 sh_test(
     name = "smoke_test_phase165",

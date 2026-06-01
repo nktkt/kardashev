@@ -255,6 +255,13 @@ std::string applyPrelude(const std::string& userSrc) {
     // through the existing enum/match codegen with zero new lowering.
     if (userSrc.find("enum SelectResult") == std::string::npos)
         prelude += "enum SelectResult<T> { Ready(i64, T), Closed(i64) }\n";
+    // v32 Phase 172: the Future `select` combinator's result — `Left(a)` if the
+    // first future won, `Right(b)` if the second did. A plain prelude enum so
+    // `match block_on(select(fa, fb)) { Left(a) => .., Right(b) => .. }` works
+    // through the existing enum/match codegen. (Distinct from the arity-1
+    // channel `SelectResult<T>` above — this is the canonical 2-type sum.)
+    if (userSrc.find("enum Either") == std::string::npos)
+        prelude += "enum Either<A, B> { Left(A), Right(B) }\n";
     // v31 Phase 169: the ergonomic atomics surface. `enum Ordering` + inherent
     // `impl AtomicI64 / AtomicBool` whose methods MATCH on the ordering and
     // dispatch to the statically-named builtins (atomic_i64_fetch_add_seqcst,

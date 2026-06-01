@@ -870,6 +870,81 @@ public:
             fnSchemas_["join"] = std::move(sch);
         }
 
+        // v32 Phase 172 built-in, generic: a Future COMBINATOR
+        //   `map<T, U>(f: Future<T>, g: fn(T) -> U ! {e}) -> Future<U>`.
+        // Builds a NEW future that, when polled, drives the inner future `f`
+        // to `Ready(x)`, then applies `g(x)` exactly once and becomes
+        // `Ready(g(x))`. `map` itself is synchronous (it only allocates the
+        // combinator frame); the effect-row var `e` carries the continuation
+        // `g`'s effects to map's call site. This is a conservative attribution:
+        // composing an effectful continuation is treated as performing it (the
+        // effect actually fires later, when the future is polled by
+        // `block_on`/`.await`). Like `thread_spawn`, the closure is stored in a
+        // heap frame and called AFTER `map` returns, so it must be `Fn` — a
+        // by-reference (FnMut) capture would dangle by poll time (enforced in
+        // checkCall). Codegen synthesizes a per-(T,U) leaf future (getOrEmitMap),
+        // mirroring `sleep_ms`/`spawn`; there is no AST body.
+        {
+            TypePtr mapT = makeFreshVar();
+            TypePtr mapU = makeFreshVar();
+            TypePtr mapRow = makeFreshVar();
+            TypePtr mapFn =
+                makeFunction({mapT}, mapU, /*effectLabels=*/{}, mapRow);
+            FnSchema sch;
+            sch.signature =
+                makeFunction({makeFuture(mapT), mapFn}, makeFuture(mapU));
+            sch.genericVars.push_back(mapT);
+            sch.genericVars.push_back(mapU);
+            sch.declaredEffects.add("e"); // row-var name (flows g's effects)
+            sch.effectRowVars.emplace_back("e", mapRow);
+            fnSchemas_["future_map"] = std::move(sch);
+        }
+
+        // v32 Phase 172 built-in, generic: the monadic Future combinator
+        //   `and_then<T, U>(f: Future<T>, g: fn(T) -> Future<U> ! {e})
+        //      -> Future<U>`.
+        // Like `map`, but the continuation `g` returns ANOTHER future, which
+        // `and_then` then drives to completion (futures' `flatMap` / monadic
+        // bind — the building block for sequencing async steps). Same effect
+        // attribution as `map` (the row var `e` carries `g`'s effects to the
+        // call site) and the same `Fn`-closure rule (the continuation is stored
+        // and called at poll time, after `and_then` returns). Codegen
+        // synthesizes a two-state leaf future (getOrEmitAndThen).
+        {
+            TypePtr atT = makeFreshVar();
+            TypePtr atU = makeFreshVar();
+            TypePtr atRow = makeFreshVar();
+            TypePtr atFn =
+                makeFunction({atT}, makeFuture(atU), /*effectLabels=*/{}, atRow);
+            FnSchema sch;
+            sch.signature =
+                makeFunction({makeFuture(atT), atFn}, makeFuture(atU));
+            sch.genericVars.push_back(atT);
+            sch.genericVars.push_back(atU);
+            sch.declaredEffects.add("e"); // row-var name (flows g's effects)
+            sch.effectRowVars.emplace_back("e", atRow);
+            fnSchemas_["future_and_then"] = std::move(sch);
+        }
+
+        // v32 Phase 172 built-in, generic: the structured "wait for all" Future
+        // combinator `join2<A, B>(fa: Future<A>, fb: Future<B>)
+        //   -> Future<(A, B)>`. Runs both futures concurrently and completes
+        // with both results as a tuple (vs `select`'s "wait for any"). Pure (it
+        // only allocates the combinator frame — no continuation, so no effect
+        // row). Codegen synthesizes a per-(A,B) leaf future (getOrEmitJoin2)
+        // that latches each sub-future's value as it completes.
+        {
+            TypePtr jA = makeFreshVar();
+            TypePtr jB = makeFreshVar();
+            FnSchema sch;
+            sch.signature = makeFunction(
+                {makeFuture(jA), makeFuture(jB)},
+                makeFuture(makeTuple({jA, jB})));
+            sch.genericVars.push_back(jA);
+            sch.genericVars.push_back(jB);
+            fnSchemas_["future_join2"] = std::move(sch);
+        }
+
         // Phase 19 built-in: OS threads on pthread.
         //
         //   thread_spawn(f: fn() -> i64) -> i64 ! { io }
@@ -1631,6 +1706,52 @@ public:
             sch.declaredEffects.add("alloc");
             sch.genericVars.push_back(wuVar);
             fnSchemas_["weak_upgrade"] = std::move(sch);
+        }
+
+        // v32 Phase 172: the "wait for any" Future combinator
+        //   `select<A, B>(fa: Future<A>, fb: Future<B>)
+        //      -> Future<Either<A, B>>`.
+        // Completes as soon as EITHER future is ready (`Left(a)` / `Right(b)`)
+        // and drops the loser. Registered here (after the enum loop) because
+        // the prelude enum `Either` is not yet in `enumSchemas_` at the early
+        // built-in registration site (same ordering constraint as
+        // `weak_upgrade`/`select2`). Pure (no continuation). Codegen
+        // synthesizes a per-(A,B) leaf future (getOrEmitSelect).
+        // Defensive (review #3): codegen's getOrEmitSelect hard-codes Either's
+        // shape — exactly 2 type params and variants `Left`/`Right`, whose
+        // payload slots it indexes by name. Only expose future_select if the
+        // in-scope `Either` actually has that shape; if a user shadowed it with
+        // a different-shaped `enum Either`, skip registration (future_select is
+        // then simply an unknown function — a clear error — rather than
+        // mis-indexing a payload at codegen time).
+        if (enumSchemas_.count("Either")) {
+            const EnumSchema& eitherSchema = enumSchemas_["Either"];
+            bool shapeOk = eitherSchema.genericVars.size() == 2 &&
+                           eitherSchema.type->enumVariants.size() == 2;
+            if (shapeOk) {
+                bool hasLeft = false, hasRight = false;
+                for (const auto& v : eitherSchema.type->enumVariants) {
+                    if (v.name == "Left") hasLeft = true;
+                    else if (v.name == "Right") hasRight = true;
+                }
+                shapeOk = hasLeft && hasRight;
+            }
+            if (shapeOk) {
+                TypePtr selA = makeFreshVar();
+                TypePtr selB = makeFreshVar();
+                std::unordered_map<int, TypePtr> subst;
+                subst[eitherSchema.genericVars[0]->varId] = selA;
+                subst[eitherSchema.genericVars[1]->varId] = selB;
+                TypePtr eitherInst = instantiate(eitherSchema.type, subst);
+                eitherInst->typeArgs = {selA, selB};
+                FnSchema sch;
+                sch.signature = makeFunction(
+                    {makeFuture(selA), makeFuture(selB)},
+                    makeFuture(eitherInst));
+                sch.genericVars.push_back(selA);
+                sch.genericVars.push_back(selB);
+                fnSchemas_["future_select"] = std::move(sch);
+            }
         }
 
         // Pass 1c: register trait declarations. Each trait gets a global
@@ -7730,6 +7851,59 @@ private:
                 resolve(typeArgs[0])->kind == TypeKind::Unit) {
                 error("Vec element type cannot be unit", call.line,
                       call.column);
+            }
+            // v32 Phase 172: a Future combinator's inner result type T becomes
+            // the closure's parameter type, and `unit` lowers to `void`, which
+            // cannot be a fn parameter. Reject a unit inner type (combine a
+            // non-unit future). T is typeArgs[0].
+            if ((call.callee == "future_map" || call.callee == "future_and_then") &&
+                !typeArgs.empty() &&
+                resolve(typeArgs[0])->kind == TypeKind::Unit) {
+                error("`" + call.callee +
+                          "`'s inner future result type cannot be unit (its "
+                          "value is handed to the closure)",
+                      call.line, call.column);
+            }
+            // v32 Phase 172: `join2` latches each sub-future's value into the
+            // result tuple, so neither result type may be unit (`void` has no
+            // storable value). A and B are typeArgs[0] / typeArgs[1].
+            if (call.callee == "future_join2" && typeArgs.size() >= 2 &&
+                (resolve(typeArgs[0])->kind == TypeKind::Unit ||
+                 resolve(typeArgs[1])->kind == TypeKind::Unit)) {
+                error("`future_join2` future result types cannot be unit (each value "
+                      "is latched into the result tuple)",
+                      call.line, call.column);
+            }
+            // v32 Phase 172: `select` carries the winning future's value in an
+            // `Either` payload, so neither result type may be unit (`void` has
+            // no storable payload). A and B are typeArgs[0] / typeArgs[1].
+            if (call.callee == "future_select" && typeArgs.size() >= 2 &&
+                (resolve(typeArgs[0])->kind == TypeKind::Unit ||
+                 resolve(typeArgs[1])->kind == TypeKind::Unit)) {
+                error("`future_select` future result types cannot be unit (the "
+                      "winner's value is carried in an `Either` payload)",
+                      call.line, call.column);
+            }
+            // v32 Phase 172: the closure handed to a Future combinator (`map` /
+            // `and_then`) is stored in the heap combinator frame and called
+            // LATER, when the future is polled — after this call has returned. A
+            // by-reference (FnMut) capture aliases the caller's stack frame,
+            // which is dead by poll time (use-after-free). Require a by-value
+            // (`Fn`) closure, exactly like the thread_spawn Send floor. The
+            // closure is arg[1] (arg[0] is the inner Future).
+            if ((call.callee == "future_map" || call.callee == "future_and_then") &&
+                call.args.size() > 1) {
+                std::string offending = closureByRefCaptureName(*call.args[1]);
+                if (!offending.empty()) {
+                    error("closure passed to `" + call.callee + "` captures `" +
+                              offending +
+                              "` by reference (FnMut), but a Future "
+                              "combinator's closure is stored and called later "
+                              "(when the future is polled), after this call "
+                              "returns — a by-ref capture would dangle. Capture "
+                              "it by value (`Fn`) instead",
+                          call.args[1]->line, call.args[1]->column);
+                }
             }
             if (!schema.genericVars.empty()) {
                 callInstantiations_[&call] = std::move(typeArgs);
