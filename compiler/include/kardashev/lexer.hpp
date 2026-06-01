@@ -105,6 +105,7 @@ enum class TokenKind {
     Colon,
     Dot,
     Underscore,
+    Dollar, // v34 Phase 182: `$` — macro_rules! metavariable / repetition marker
 
     // v24 Phase 134: a `///` doc comment. The lexeme is the text after `///`
     // (one leading space trimmed). The parser filters these out of the token
