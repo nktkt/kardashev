@@ -452,6 +452,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v34 Phase 183: user-defined `#[derive(...)]` via derive_* macros.
+sh_test(
+    name = "smoke_test_phase183",
+    srcs = ["smoke_test_phase183.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 184: operator overloading (Add/Sub/Mul/Div via traits).
 sh_test(
     name = "smoke_test_phase184",

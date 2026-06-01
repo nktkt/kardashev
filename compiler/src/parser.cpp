@@ -142,14 +142,24 @@ long mtConsumeFrag(const std::string& frag, const std::vector<Token>& a,
     return j > ai ? static_cast<long>(j - ai) : -1;
 }
 
-// Match a flat matcher m[mi..mEnd) (no repetition) as a PREFIX of a[ai..aEnd).
-// Returns the new arg index on success, or -1. `tailFollow` is the follow
-// token for a trailing metavariable (used inside a repetition iteration).
-long mtMatchFlat(const std::vector<Token>& m, std::size_t mi, std::size_t mEnd,
-                 const std::vector<Token>& a, std::size_t ai, std::size_t aEnd,
-                 const Token* tailFollow, MacroBindings& b, std::string& err) {
+bool mtMatchRange(const std::vector<Token>& m, std::size_t mi0,
+                  std::size_t mEnd, const std::vector<Token>& a,
+                  std::size_t ai0, std::size_t aEnd, MacroBindings& b,
+                  std::string& err);
+
+// Match matcher m[mi..mEnd) as a PREFIX of args a[ai..aEnd). This range must
+// contain no TOP-LEVEL repetition (delimiter groups inside it may, and are
+// matched recursively via mtMatchRange on the group's contents). Returns the
+// arg index after the consumed prefix, or -1 on mismatch. `tailFollow` is the
+// follow token for a trailing metavariable (used inside a repetition iter).
+long mtMatchExactPrefix(const std::vector<Token>& m, std::size_t mi,
+                        std::size_t mEnd, const std::vector<Token>& a,
+                        std::size_t ai, std::size_t aEnd,
+                        const Token* tailFollow, MacroBindings& b,
+                        std::string& err) {
     while (mi < mEnd) {
-        if (m[mi].kind == TokenKind::Dollar && mi + 1 < mEnd &&
+        const Token& mt = m[mi];
+        if (mt.kind == TokenKind::Dollar && mi + 1 < mEnd &&
             m[mi + 1].kind == TokenKind::Identifier) {
             if (mi + 3 >= mEnd || m[mi + 2].kind != TokenKind::Colon ||
                 m[mi + 3].kind != TokenKind::Identifier) {
@@ -165,8 +175,21 @@ long mtMatchFlat(const std::vector<Token>& m, std::size_t mi, std::size_t mEnd,
             b.simple[name].assign(a.begin() + ai, a.begin() + ai + n);
             mi += 4;
             ai += static_cast<std::size_t>(n);
+        } else if (mtIsOpen(mt.kind)) {
+            // A literal delimiter group in the matcher: the argument must open
+            // with the same delimiter; match the contents recursively (they
+            // may contain a repetition), then skip past both groups. This is
+            // what lets a derive matcher destructure `struct N { $($f:ident :
+            // $t:ty),* }` — the repetition lives inside the braces.
+            if (ai >= aEnd || a[ai].kind != mt.kind) return -1;
+            std::size_t mClose = mtSkipTree(m, mi) - 1;
+            std::size_t aClose = mtSkipTree(a, ai) - 1;
+            if (!mtMatchRange(m, mi + 1, mClose, a, ai + 1, aClose, b, err))
+                return -1;
+            mi = mClose + 1;
+            ai = aClose + 1;
         } else {
-            if (ai >= aEnd || !mtTokEq(m[mi], a[ai])) return -1;
+            if (ai >= aEnd || !mtTokEq(mt, a[ai])) return -1;
             ++mi;
             ++ai;
         }
@@ -174,12 +197,14 @@ long mtMatchFlat(const std::vector<Token>& m, std::size_t mi, std::size_t mEnd,
     return static_cast<long>(ai);
 }
 
-// Match a full matcher against a full argument token list, handling at most one
-// top-level repetition. Returns true on a complete match (all args consumed).
-bool mtMatchSeq(const std::vector<Token>& m, std::size_t mi0, std::size_t mEnd,
-                const std::vector<Token>& a, std::size_t ai0, std::size_t aEnd,
-                MacroBindings& b, std::string& err) {
-    // Locate the first top-level repetition `$(`.
+// Match a matcher range against an argument range fully (all of [ai0,aEnd)
+// consumed), handling at most one repetition AT THIS LEVEL. Repetitions nested
+// inside delimiter groups are reached by the recursion in mtMatchExactPrefix.
+bool mtMatchRange(const std::vector<Token>& m, std::size_t mi0,
+                  std::size_t mEnd, const std::vector<Token>& a,
+                  std::size_t ai0, std::size_t aEnd, MacroBindings& b,
+                  std::string& err) {
+    // Locate the first top-level repetition `$(` in this range.
     std::size_t rstart = mEnd;
     {
         int depth = 0;
@@ -194,7 +219,7 @@ bool mtMatchSeq(const std::vector<Token>& m, std::size_t mi0, std::size_t mEnd,
         }
     }
     if (rstart == mEnd) {
-        long r = mtMatchFlat(m, mi0, mEnd, a, ai0, aEnd, nullptr, b, err);
+        long r = mtMatchExactPrefix(m, mi0, mEnd, a, ai0, aEnd, nullptr, b, err);
         return r >= 0 && static_cast<std::size_t>(r) == aEnd;
     }
     std::size_t gOpen = rstart + 1;
@@ -216,11 +241,13 @@ bool mtMatchSeq(const std::vector<Token>& m, std::size_t mi0, std::size_t mEnd,
         return false;
     }
     std::size_t afterOp = p + 1;
-    // Prefix m[mi0..rstart): match as a flat prefix of the args.
-    long aAfterPrefix = mtMatchFlat(m, mi0, rstart, a, ai0, aEnd, nullptr, b, err);
+    // Prefix m[mi0..rstart).
+    long aAfterPrefix =
+        mtMatchExactPrefix(m, mi0, rstart, a, ai0, aEnd, nullptr, b, err);
     if (aAfterPrefix < 0) return false;
     std::size_t ai = static_cast<std::size_t>(aAfterPrefix);
-    // Suffix m[afterOp..mEnd): literal tokens only, peeled off the arg tail.
+    // Suffix m[afterOp..mEnd): literal tokens only (no metavariable), peeled
+    // off the argument tail.
     for (std::size_t s = afterOp; s < mEnd; ++s) {
         if (m[s].kind == TokenKind::Dollar) {
             err = "a metavariable after a `$( … )*` repetition is not "
@@ -237,23 +264,32 @@ bool mtMatchSeq(const std::vector<Token>& m, std::size_t mi0, std::size_t mEnd,
     }
     // Repetition group m[gOpen+1..gClose): repeated iterations, `sep`-separated.
     std::vector<std::string> subVars;
-    for (std::size_t k = gOpen + 1; k < gClose; ++k)
-        if (m[k].kind == TokenKind::Dollar && k + 1 < gClose &&
-            m[k + 1].kind == TokenKind::Identifier)
-            subVars.push_back(m[k + 1].lexeme);
+    {
+        int depth = 0;
+        for (std::size_t k = gOpen + 1; k < gClose; ++k) {
+            if (mtIsOpen(m[k].kind)) ++depth;
+            else if (mtIsClose(m[k].kind)) --depth;
+            else if (m[k].kind == TokenKind::Dollar && k + 1 < gClose &&
+                     m[k + 1].kind == TokenKind::Identifier)
+                subVars.push_back(m[k + 1].lexeme);
+        }
+    }
     for (const auto& v : subVars) b.rep[v]; // register (possibly 0 iterations)
     b.repCount = 0;
     bool first = true;
     while (ai < aEnd) {
-        if (!first) {
-            if (sep) {
-                if (ai < aEnd && mtTokEq(*sep, a[ai])) ++ai;
-                else break;
+        if (!first && sep) {
+            if (ai < aEnd && mtTokEq(*sep, a[ai])) {
+                ++ai;
+                if (ai >= aEnd) break; // tolerate a trailing separator
+            } else {
+                break;
             }
         }
         MacroBindings iter;
         std::string ierr;
-        long r = mtMatchFlat(m, gOpen + 1, gClose, a, ai, aEnd, sep, iter, ierr);
+        long r =
+            mtMatchExactPrefix(m, gOpen + 1, gClose, a, ai, aEnd, sep, iter, ierr);
         if (r < 0) {
             if (first) break; // zero iterations
             return false;     // a separator promised another iteration
@@ -395,6 +431,88 @@ std::vector<Token> expandMacros(std::vector<Token> toks,
         ++i;
     }
 
+    // v34 Phase 183: user-defined `#[derive(Foo)]`. When a struct / enum is
+    // annotated with a derive whose name has a matching `derive_Foo!` macro,
+    // synthesize a `derive_Foo! { <the item> }` invocation right after the
+    // item — the user's macro then expands it into an `impl`. (Built-in
+    // derives like Clone / Eq / Debug carry no `derive_*` macro and are left
+    // for the AST-level expander in main.cpp.) This is how a library author
+    // writes a custom derive: a `macro_rules! derive_Foo` that destructures
+    // `struct $name { $($f:ident : $t:ty),* }` and emits the impl.
+    {
+        std::vector<Token> withDerives;
+        withDerives.reserve(body.size());
+        std::size_t k = 0;
+        while (k < body.size()) {
+            if (body[k].kind == TokenKind::Pound ||
+                body[k].kind == TokenKind::DocComment) {
+                // Consume a run of attributes / doc comments, collecting any
+                // derive names that have a `derive_<name>` macro.
+                std::size_t scan = k;
+                std::vector<std::string> userDerives;
+                while (scan < body.size() &&
+                       (body[scan].kind == TokenKind::DocComment ||
+                        (body[scan].kind == TokenKind::Pound &&
+                         scan + 1 < body.size() &&
+                         body[scan + 1].kind == TokenKind::LBracket))) {
+                    if (body[scan].kind == TokenKind::DocComment) {
+                        ++scan;
+                        continue;
+                    }
+                    std::size_t br = mtSkipTree(body, scan + 1); // past `]`
+                    if (scan + 2 < body.size() &&
+                        body[scan + 2].kind == TokenKind::Identifier &&
+                        body[scan + 2].lexeme == "derive") {
+                        for (std::size_t z = scan + 3; z + 1 < br; ++z)
+                            if (body[z].kind == TokenKind::Identifier &&
+                                defs.count("derive_" + body[z].lexeme))
+                                userDerives.push_back(body[z].lexeme);
+                    }
+                    scan = br;
+                }
+                // Copy the attributes / docs verbatim.
+                for (std::size_t z = k; z < scan; ++z)
+                    withDerives.push_back(body[z]);
+                std::size_t it = scan;
+                bool isItem =
+                    it < body.size() &&
+                    (body[it].kind == TokenKind::KwStruct ||
+                     body[it].kind == TokenKind::KwEnum ||
+                     (body[it].kind == TokenKind::KwPub && it + 1 < body.size() &&
+                      (body[it + 1].kind == TokenKind::KwStruct ||
+                       body[it + 1].kind == TokenKind::KwEnum)));
+                if (!userDerives.empty() && isItem) {
+                    std::size_t lb = it;
+                    while (lb < body.size() &&
+                           body[lb].kind != TokenKind::LBrace)
+                        ++lb;
+                    if (lb < body.size()) {
+                        std::size_t rb = mtSkipTree(body, lb) - 1; // item `}`
+                        for (std::size_t z = it; z <= rb; ++z)
+                            withDerives.push_back(body[z]);
+                        for (const auto& dn : userDerives) {
+                            std::size_t ln = body[it].line, cn = body[it].column;
+                            withDerives.push_back({TokenKind::Identifier,
+                                                   "derive_" + dn, ln, cn});
+                            withDerives.push_back({TokenKind::Bang, "!", ln, cn});
+                            withDerives.push_back({TokenKind::LBrace, "{", ln, cn});
+                            for (std::size_t z = it; z <= rb; ++z)
+                                withDerives.push_back(body[z]);
+                            withDerives.push_back({TokenKind::RBrace, "}", ln, cn});
+                        }
+                        k = rb + 1;
+                        continue;
+                    }
+                }
+                k = scan;
+                continue;
+            }
+            withDerives.push_back(body[k]);
+            ++k;
+        }
+        body = std::move(withDerives);
+    }
+
     const int kExpansionCap = 200000;
     int expansions = 0;
     std::size_t pos = 0;
@@ -413,8 +531,8 @@ std::vector<Token> expandMacros(std::vector<Token> toks,
             for (const auto& rule : def.rules) {
                 MacroBindings b;
                 std::string err;
-                if (mtMatchSeq(rule.matcher, 0, rule.matcher.size(), args, 0,
-                               args.size(), b, err)) {
+                if (mtMatchRange(rule.matcher, 0, rule.matcher.size(), args, 0,
+                                 args.size(), b, err)) {
                     std::string terr;
                     std::vector<Token> out;
                     if (!mtTranscribe(rule.transcriber, 0,
