@@ -1512,6 +1512,46 @@ std::string applyPrelude(const std::string& userSrc) {
             "    match r { Ok(x) => true, Err(e) => false }\n"
             "}\n";
     }
+    // v35 Phase 190: the error-handling ecosystem. The `Error` trait (a
+    // describable error) + GENERIC Result inspectors/converters (the existing
+    // result_* helpers above are i64-only; these work for any T/E). `?`-with-
+    // `From` conversion is handled in the type checker + codegen (checkTry /
+    // emitTry), so a `?` on a `Result<_, E1>` inside a fn returning
+    // `Result<_, E2>` converts via `E2::from(e1)` when an `impl From<E1> for
+    // E2` exists.
+    if (userSrc.find("trait Error") == std::string::npos) {
+        prelude += "trait Error { fn message(&self) -> String ! { alloc }; }\n";
+    }
+    // NOTE: these use the canonical generic letters T / U / V (the Err type is
+    // U, not E) — using `E`/`F` would make `E`/`F` NEW reserved names that
+    // shadow any user type named `E`/`F` (`enum E { … }`), which several
+    // existing programs define. T/U/V are already reserved by vec_map /
+    // HashMap, so this adds no new collisions.
+    if (userSrc.find("fn result_is_err") == std::string::npos) {
+        prelude +=
+            "fn result_is_err<T, U>(r: &Result<T, U>) -> bool {\n"
+            "    match r { Ok(x) => false, Err(e) => true }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn result_ok") == std::string::npos) {
+        prelude +=
+            "fn result_ok<T, U>(r: Result<T, U>) -> Option<T> {\n"
+            "    match r { Ok(x) => Some(x), Err(e) => None }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn result_err") == std::string::npos) {
+        prelude +=
+            "fn result_err<T, U>(r: Result<T, U>) -> Option<U> {\n"
+            "    match r { Ok(x) => None, Err(e) => Some(e) }\n"
+            "}\n";
+    }
+    if (userSrc.find("fn result_map_err") == std::string::npos) {
+        prelude +=
+            "fn result_map_err<T, U, V, e>(r: Result<T, U>, f: fn(U) -> V ! {e})"
+            " -> Result<T, V> ! {e} {\n"
+            "    match r { Ok(x) => Ok(x), Err(er) => Err(f(er)) }\n"
+            "}\n";
+    }
     return prelude + userSrc;
 }
 

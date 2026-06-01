@@ -2803,6 +2803,7 @@ public:
         result.staticCallGeneric = std::move(staticCallGeneric_);
         result.methodResolutions = std::move(methodResolutions_);
         result.binOpMethod = std::move(binOpMethod_); // v34 Phase 184
+        result.tryFromConv = std::move(tryFromConv_);  // v35 Phase 190
         result.dynCoercions = std::move(dynCoercions_);
         result.dynVtablesNeeded = std::move(dynVtablesNeeded_);
         result.assocProjections = std::move(assocProjections_);
@@ -3035,6 +3036,7 @@ private:
     // v34 Phase 184: an operator-overloaded binary op (`a + b` on a user type) ->
     // the mangled impl-method fn name codegen should call instead of LLVM arith.
     std::unordered_map<const ast::BinaryExpr*, std::string> binOpMethod_;
+    std::unordered_map<const ast::TryExpr*, std::string> tryFromConv_; // v35 P190
     // v32 Phase 176: user-declared effects. `userEffectNames_` makes an effect
     // name a valid (concrete) effect-row label; `effectOpDecls_` maps
     // effect -> op -> the AST op signature (param/return TypeRefs resolved
@@ -6445,13 +6447,52 @@ private:
             return okV->payloadTypes[0];
         }
         if (!unify(errV->payloadTypes[0], retErr->payloadTypes[0])) {
-            error("`?` Err payload type " +
-                      typeToString(errV->payloadTypes[0]) +
-                      " does not match enclosing fn's Err payload type " +
-                      typeToString(retErr->payloadTypes[0]),
-                  te.line, te.column);
+            // v35 Phase 190: the operand's Err type (E1) differs from the
+            // enclosing fn's Err type (E2). Accept the `?` if an `impl From<E1>
+            // for E2` exists — codegen will convert via `E2::from(e1)`. Else it
+            // is a genuine mismatch.
+            TypePtr e1 = resolve(errV->payloadTypes[0]);
+            TypePtr e2 = resolve(retErr->payloadTypes[0]);
+            std::string conv = lookupFromConversion(e1, e2);
+            if (!conv.empty()) {
+                tryFromConv_[&te] = conv;
+            } else {
+                error("`?` Err payload type " + typeToString(e1) +
+                          " does not match enclosing fn's Err payload type " +
+                          typeToString(e2) +
+                          " and no `impl From<" + typeToString(e1) + "> for " +
+                          typeToString(e2) + "` exists to convert it",
+                      te.line, te.column);
+            }
         }
         return okV->payloadTypes[0];
+    }
+
+    // v35 Phase 190: find an `impl From<src> for dst` and return the mangled
+    // name of its `from` method (empty if none / not applicable). Both types
+    // must be concrete (struct/enum); the single-`from`-per-type method-lookup
+    // model means `dst` may carry at most one `From` impl.
+    std::string lookupFromConversion(const TypePtr& src, const TypePtr& dst) {
+        TypePtr d = resolve(dst);
+        if (d->kind != TypeKind::Struct && d->kind != TypeKind::Enum)
+            return "";
+        std::string dstName =
+            d->kind == TypeKind::Struct ? d->structName : d->enumName;
+        auto tIt = methodImplLookup_.find(dstName);
+        if (tIt == methodImplLookup_.end()) return "";
+        auto mIt = tIt->second.find("from");
+        if (mIt == tIt->second.end() || mIt->second.first != "From" ||
+            !mIt->second.second)
+            return "";
+        const ast::FnDecl* fn = mIt->second.second;
+        if (fn->params.size() != 1) return "";
+        // The `from(x: T)` parameter type must match the source error type
+        // (concrete error types — compare by their canonical string form).
+        TypePtr paramT = resolve(resolveTypeRef(fn->params[0].type));
+        if (typeToString(paramT) != typeToString(resolve(src))) return "";
+        auto mangIt = implMethodMangled_.find(fn);
+        if (mangIt == implMethodMangled_.end()) return "";
+        return mangIt->second;
     }
 
     TypePtr checkStructLit(const ast::StructLitExpr& sl) {

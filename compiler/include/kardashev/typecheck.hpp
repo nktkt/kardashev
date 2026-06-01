@@ -261,6 +261,11 @@ struct TypeCheckResult {
     // type maps to the mangled impl-method fn name codegen calls (e.g.
     // `__impl_Add_for_Vec2__add`) instead of emitting LLVM arithmetic.
     std::unordered_map<const ast::BinaryExpr*, std::string> binOpMethod;
+    // v35 Phase 190: `?`-with-`From`. When a `?` propagates an error of type
+    // E1 from a fn whose Err type is E2 (E1 != E2) and an `impl From<E1> for
+    // E2` exists, this maps the TryExpr to that `from`'s mangled fn name;
+    // codegen calls it on the error value before wrapping it in the return.
+    std::unordered_map<const ast::TryExpr*, std::string> tryFromConv;
     // Phase 11: per-Expr coercion of a thin `&T` / `Box<T>` into a fat
     // `&dyn Trait` / `Box<dyn Trait>`. Codegen reads this at the coerced
     // expression to emit the data+vtable fat pointer.
