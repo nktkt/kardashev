@@ -833,6 +833,122 @@ std::string applyPrelude(const std::string& userSrc) {
             "    acc\n"
             "}\n";
     }
+    // v35 Phase 187: VecDeque<T> — a double-ended queue, O(1) AMORTIZED at both
+    // ends, written in kardashev over two `Vec` stacks (`f` = front, `b` =
+    // back). The deque order front->back is `f` read top->bottom followed by
+    // `b` read bottom->top. A pop from an empty side first flips the other side
+    // into it (each element is moved at most twice → amortized O(1)). Pops
+    // return `Option<T>` (`None` when empty); `! { alloc }` because the Vec ops
+    // allocate.
+    if (userSrc.find("struct VecDeque") == std::string::npos) {
+        prelude +=
+            "struct VecDeque<T> { f: Vec<T>, b: Vec<T> }\n"
+            "fn vecdeque_new<T>() -> VecDeque<T> ! { alloc } { VecDeque { f: vec_new(), b: vec_new() } }\n"
+            "fn vecdeque_len<T>(d: &VecDeque<T>) -> i64 ! { alloc } { vec_len(&d.f) + vec_len(&d.b) }\n"
+            "fn vecdeque_is_empty<T>(d: &VecDeque<T>) -> bool ! { alloc } { vecdeque_len(d) == 0 }\n"
+            "fn vecdeque_push_front<T>(d: &mut VecDeque<T>, x: T) ! { alloc } { vec_push(&mut d.f, x); }\n"
+            "fn vecdeque_push_back<T>(d: &mut VecDeque<T>, x: T) ! { alloc } { vec_push(&mut d.b, x); }\n"
+            "fn vecdeque_pop_front<T>(d: &mut VecDeque<T>) -> Option<T> ! { alloc } {\n"
+            "    if vec_len(&d.f) == 0 {\n"
+            "        while vec_len(&d.b) > 0 { let x = vec_pop(&mut d.b); vec_push(&mut d.f, x); }\n"
+            "    } else {}\n"
+            "    if vec_len(&d.f) == 0 { None } else { Some(vec_pop(&mut d.f)) }\n"
+            "}\n"
+            "fn vecdeque_pop_back<T>(d: &mut VecDeque<T>) -> Option<T> ! { alloc } {\n"
+            "    if vec_len(&d.b) == 0 {\n"
+            "        while vec_len(&d.f) > 0 { let x = vec_pop(&mut d.f); vec_push(&mut d.b, x); }\n"
+            "    } else {}\n"
+            "    if vec_len(&d.b) == 0 { None } else { Some(vec_pop(&mut d.b)) }\n"
+            "}\n";
+    }
+    // v35 Phase 187: BTreeMap<K: Ord, V> — an ORDERED map kept as two parallel
+    // `Vec`s (keys + values) held in sorted-by-key order, over the existing
+    // `Ord` trait (`cmp -> i64`, negative / zero / positive). Lookups are
+    // binary search (O(log n)); insert/remove shift the tails (O(n));
+    // iteration via `btreemap_key_at` is in ascending key order — the property
+    // that distinguishes it from the (unordered) HashMap. `btreemap_lb` returns
+    // the lower-bound index (the first key not less than `key`).
+    if (userSrc.find("struct BTreeMap") == std::string::npos) {
+        prelude +=
+            "struct BTreeMap<K, V> { keys: Vec<K>, vals: Vec<V> }\n"
+            "fn btreemap_new<K, V>() -> BTreeMap<K, V> ! { alloc } { BTreeMap { keys: vec_new(), vals: vec_new() } }\n"
+            "fn btreemap_len<K, V>(m: &BTreeMap<K, V>) -> i64 ! { alloc } { vec_len(&m.keys) }\n"
+            "fn btreemap_is_empty<K, V>(m: &BTreeMap<K, V>) -> bool ! { alloc } { vec_len(&m.keys) == 0 }\n"
+            "fn btreemap_lb<K: Ord, V>(m: &BTreeMap<K, V>, key: &K) -> i64 ! { alloc } {\n"
+            "    let mut lo = 0;\n"
+            "    let mut hi = vec_len(&m.keys);\n"
+            "    while lo < hi {\n"
+            "        let mid = (lo + hi) / 2;\n"
+            "        if vec_get_ref(&m.keys, mid).cmp(key) < 0 { lo = mid + 1; } else { hi = mid; }\n"
+            "    }\n"
+            "    lo\n"
+            "}\n"
+            "fn btreemap_contains<K: Ord, V>(m: &BTreeMap<K, V>, key: &K) -> bool ! { alloc } {\n"
+            "    let i = btreemap_lb(m, key);\n"
+            "    if i < vec_len(&m.keys) { vec_get_ref(&m.keys, i).cmp(key) == 0 } else { false }\n"
+            "}\n"
+            "fn btreemap_get<K: Ord, V: Clone>(m: &BTreeMap<K, V>, key: &K) -> Option<V> ! { alloc } {\n"
+            "    let i = btreemap_lb(m, key);\n"
+            "    if i < vec_len(&m.keys) {\n"
+            "        if vec_get_ref(&m.keys, i).cmp(key) == 0 { Some(vec_get_ref(&m.vals, i).clone()) } else { None }\n"
+            "    } else { None }\n"
+            "}\n"
+            "fn btreemap_insert<K: Ord, V>(m: &mut BTreeMap<K, V>, key: K, val: V) ! { alloc } {\n"
+            "    let i = btreemap_lb(m, &key);\n"
+            "    let present = if i < vec_len(&m.keys) { vec_get_ref(&m.keys, i).cmp(&key) == 0 } else { false };\n"
+            "    if present {\n"
+            "        vec_remove(&mut m.vals, i);\n"
+            "        vec_insert(&mut m.vals, i, val);\n"
+            "    } else {\n"
+            "        vec_insert(&mut m.keys, i, key);\n"
+            "        vec_insert(&mut m.vals, i, val);\n"
+            "    }\n"
+            "}\n"
+            "fn btreemap_remove<K: Ord, V>(m: &mut BTreeMap<K, V>, key: &K) -> bool ! { alloc } {\n"
+            "    let i = btreemap_lb(m, key);\n"
+            "    if i < vec_len(&m.keys) {\n"
+            "        if vec_get_ref(&m.keys, i).cmp(key) == 0 {\n"
+            "            vec_remove(&mut m.keys, i); vec_remove(&mut m.vals, i); true\n"
+            "        } else { false }\n"
+            "    } else { false }\n"
+            "}\n"
+            "fn btreemap_key_at<K: Clone, V>(m: &BTreeMap<K, V>, i: i64) -> K ! { alloc } { vec_get_ref(&m.keys, i).clone() }\n";
+    }
+    // v35 Phase 187: BTreeSet<T: Ord> — an ORDERED set, a sorted `Vec<T>` with
+    // binary-search membership and dedup-on-insert. `btreeset_at` gives
+    // ascending-order iteration. Same Ord-based shape as BTreeMap.
+    if (userSrc.find("struct BTreeSet") == std::string::npos) {
+        prelude +=
+            "struct BTreeSet<T> { items: Vec<T> }\n"
+            "fn btreeset_new<T>() -> BTreeSet<T> ! { alloc } { BTreeSet { items: vec_new() } }\n"
+            "fn btreeset_len<T>(s: &BTreeSet<T>) -> i64 ! { alloc } { vec_len(&s.items) }\n"
+            "fn btreeset_is_empty<T>(s: &BTreeSet<T>) -> bool ! { alloc } { vec_len(&s.items) == 0 }\n"
+            "fn btreeset_lb<T: Ord>(s: &BTreeSet<T>, x: &T) -> i64 ! { alloc } {\n"
+            "    let mut lo = 0;\n"
+            "    let mut hi = vec_len(&s.items);\n"
+            "    while lo < hi {\n"
+            "        let mid = (lo + hi) / 2;\n"
+            "        if vec_get_ref(&s.items, mid).cmp(x) < 0 { lo = mid + 1; } else { hi = mid; }\n"
+            "    }\n"
+            "    lo\n"
+            "}\n"
+            "fn btreeset_contains<T: Ord>(s: &BTreeSet<T>, x: &T) -> bool ! { alloc } {\n"
+            "    let i = btreeset_lb(s, x);\n"
+            "    if i < vec_len(&s.items) { vec_get_ref(&s.items, i).cmp(x) == 0 } else { false }\n"
+            "}\n"
+            "fn btreeset_insert<T: Ord>(s: &mut BTreeSet<T>, x: T) -> bool ! { alloc } {\n"
+            "    let i = btreeset_lb(s, &x);\n"
+            "    let present = if i < vec_len(&s.items) { vec_get_ref(&s.items, i).cmp(&x) == 0 } else { false };\n"
+            "    if present { false } else { vec_insert(&mut s.items, i, x); true }\n"
+            "}\n"
+            "fn btreeset_remove<T: Ord>(s: &mut BTreeSet<T>, x: &T) -> bool ! { alloc } {\n"
+            "    let i = btreeset_lb(s, x);\n"
+            "    if i < vec_len(&s.items) {\n"
+            "        if vec_get_ref(&s.items, i).cmp(x) == 0 { vec_remove(&mut s.items, i); true } else { false }\n"
+            "    } else { false }\n"
+            "}\n"
+            "fn btreeset_at<T: Clone>(s: &BTreeSet<T>, i: i64) -> T ! { alloc } { vec_get_ref(&s.items, i).clone() }\n";
+    }
     // Phase 55 (v9): enumerate a HashMap's entries as a Vec of (key, value)
     // tuples (each deep-cloned, so the Vec owns them), so a map can be ranked /
     // printed without manual key lookups. Bucket-order; the caller sorts (e.g.
