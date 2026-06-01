@@ -1552,6 +1552,41 @@ std::string applyPrelude(const std::string& userSrc) {
             "    match r { Ok(x) => Ok(x), Err(er) => Err(f(er)) }\n"
             "}\n";
     }
+    // v35 Phase 191: a seeded pseudo-random generator — a 64-bit linear
+    // congruential generator (the SplitMix/PCG-style constants). DETERMINISTIC:
+    // the same seed yields the same sequence (so it is unit-testable, unlike a
+    // wall-clock or OS-entropy source). Uses only `*` / `+` (which wrap in
+    // 2's-complement under the default `-fwrapv` policy) and `%`. `rng_below`
+    // gives a value in [0, n); `rng_range` in [lo, hi); `rng_bool` a coin flip.
+    if (userSrc.find("struct Rng") == std::string::npos) {
+        prelude +=
+            "struct Rng { state: i64 }\n"
+            "fn rng_new(seed: i64) -> Rng { Rng { state: seed } }\n"
+            "fn rng_next(r: &mut Rng) -> i64 {\n"
+            "    r.state = r.state * 6364136223846793005 + 1442695040888963407;\n"
+            "    r.state\n"
+            "}\n"
+            "fn rng_below(r: &mut Rng, n: i64) -> i64 {\n"
+            "    if n <= 0 { 0 } else {\n"
+            "        let v = rng_next(r);\n"
+            "        let m = v % n;\n"
+            "        if m < 0 { m + n } else { m }\n"
+            "    }\n"
+            "}\n"
+            "fn rng_range(r: &mut Rng, lo: i64, hi: i64) -> i64 {\n"
+            "    if hi <= lo { lo } else { lo + rng_below(r, hi - lo) }\n"
+            "}\n"
+            "fn rng_bool(r: &mut Rng) -> bool { rng_below(r, 2) == 1 }\n"
+            // Fisher-Yates in-place shuffle over a Vec<T>, driven by the Rng.
+            "fn vec_shuffle<T>(v: &mut Vec<T>, r: &mut Rng) ! { alloc } {\n"
+            "    let mut i = vec_len(v);\n"
+            "    while i > 1 {\n"
+            "        i = i - 1;\n"
+            "        let j = rng_below(r, i + 1);\n"
+            "        vec_swap(v, i, j);\n"
+            "    }\n"
+            "}\n";
+    }
     return prelude + userSrc;
 }
 

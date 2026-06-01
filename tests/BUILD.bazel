@@ -480,6 +480,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v35 Phase 191: seeded PRNG (Rng) + vec_shuffle.
+sh_test(
+    name = "smoke_test_phase191",
+    srcs = ["smoke_test_phase191.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 184: operator overloading (Add/Sub/Mul/Div via traits).
 sh_test(
     name = "smoke_test_phase184",
