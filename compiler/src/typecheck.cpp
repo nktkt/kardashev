@@ -2802,6 +2802,7 @@ public:
         result.staticCallMangled = std::move(staticCallMangled_);
         result.staticCallGeneric = std::move(staticCallGeneric_);
         result.methodResolutions = std::move(methodResolutions_);
+        result.binOpMethod = std::move(binOpMethod_); // v34 Phase 184
         result.dynCoercions = std::move(dynCoercions_);
         result.dynVtablesNeeded = std::move(dynVtablesNeeded_);
         result.assocProjections = std::move(assocProjections_);
@@ -3023,6 +3024,9 @@ private:
     // effect pass via `collectEffects`. Absent => fall back to the callee's
     // statically declared effects (the pre-Phase-10a behavior).
     std::unordered_map<const ast::Expr*, EffectSet> exprEffects_;
+    // v34 Phase 184: an operator-overloaded binary op (`a + b` on a user type) ->
+    // the mangled impl-method fn name codegen should call instead of LLVM arith.
+    std::unordered_map<const ast::BinaryExpr*, std::string> binOpMethod_;
     // v32 Phase 176: user-declared effects. `userEffectNames_` makes an effect
     // name a valid (concrete) effect-row label; `effectOpDecls_` maps
     // effect -> op -> the AST op signature (param/return TypeRefs resolved
@@ -3230,6 +3234,10 @@ private:
         if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(&e)) {
             collectEffects(*bin->lhs, out);
             collectEffects(*bin->rhs, out);
+            // v34 Phase 184: an operator-overloaded op runs its impl method, so
+            // contribute that method's recorded effects.
+            if (auto it = exprEffects_.find(bin); it != exprEffects_.end())
+                out.unionWith(it->second);
             return;
         }
         if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
@@ -6604,6 +6612,64 @@ private:
                 return isComparison ? makeBool() : resolve(lhs);
             }
             return isComparison ? makeBool() : resolve(lhs);
+        }
+        // v34 Phase 184: operator overloading. For an arithmetic op `+ - * /`
+        // whose LHS is a user STRUCT/ENUM, desugar to the matching operator
+        // trait's method (`Add::add` / `Sub::sub` / `Mul::mul` / `Div::div`)
+        // resolved for that type. Homogeneous: the RHS must be the same type;
+        // the result is that type. Records the impl method's mangled name so
+        // codegen emits the call instead of LLVM arithmetic.
+        {
+            TypePtr rl = resolve(lhs);
+            const char* opMethod = nullptr;
+            const char* opTrait = nullptr;
+            switch (bin.op) {
+                case ast::BinOp::Add: opTrait = "Add"; opMethod = "add"; break;
+                case ast::BinOp::Sub: opTrait = "Sub"; opMethod = "sub"; break;
+                case ast::BinOp::Mul: opTrait = "Mul"; opMethod = "mul"; break;
+                case ast::BinOp::Div: opTrait = "Div"; opMethod = "div"; break;
+                default: break;
+            }
+            if (opMethod &&
+                (rl->kind == TypeKind::Struct || rl->kind == TypeKind::Enum)) {
+                std::string typeName = rl->kind == TypeKind::Struct
+                                           ? rl->structName
+                                           : rl->enumName;
+                auto tIt = methodImplLookup_.find(typeName);
+                if (tIt != methodImplLookup_.end()) {
+                    auto mIt = tIt->second.find(opMethod);
+                    if (mIt != tIt->second.end() &&
+                        mIt->second.first == opTrait && mIt->second.second) {
+                        const ast::FnDecl* mfn = mIt->second.second;
+                        // RHS must be the same (Self) type.
+                        if (!coerceOrUnify(*bin.rhs, rhs, lhs))
+                            error(std::string("operator `") +
+                                      (opMethod[0] == 'a' ? "+" :
+                                       opMethod[0] == 's' ? "-" :
+                                       opMethod[0] == 'm' ? "*" : "/") +
+                                      "` on `" + typeName +
+                                      "` requires the right operand to be `" +
+                                      typeName + "`, got " + typeToString(rhs),
+                                  bin.rhs->line, bin.rhs->column);
+                        auto mangIt = implMethodMangled_.find(mfn);
+                        if (mangIt != implMethodMangled_.end())
+                            binOpMethod_[&bin] = mangIt->second;
+                        // Attribute the operator method's declared effects.
+                        auto sIt = fnSchemas_.find(
+                            mangIt != implMethodMangled_.end() ? mangIt->second
+                                                               : std::string());
+                        if (sIt != fnSchemas_.end())
+                            exprEffects_[&bin] = sIt->second.declaredEffects;
+                        return lhs; // result is Self
+                    }
+                }
+                error(std::string("operator is not defined for `") + typeName +
+                          "` — implement `" + opTrait + "` for it (`impl " +
+                          opTrait + " for " + typeName + " { fn " + opMethod +
+                          "(self, rhs: Self) -> Self { … } }`)",
+                      bin.line, bin.column);
+                return lhs;
+            }
         }
         // v11: integer arithmetic/comparison over the sized-int tower. Both
         // operands must be the SAME int type; an i64 LITERAL operand narrows to

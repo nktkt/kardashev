@@ -445,6 +445,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v34 Phase 184: operator overloading (Add/Sub/Mul/Div via traits).
+sh_test(
+    name = "smoke_test_phase184",
+    srcs = ["smoke_test_phase184.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v30 Phase 165: C backend closures + fn values (differential + ASan).
 sh_test(
     name = "smoke_test_phase165",

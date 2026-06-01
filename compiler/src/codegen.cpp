@@ -12224,6 +12224,20 @@ private:
     }
 
     llvm::Value* emitBinary(const ast::BinaryExpr& bin) {
+        // v34 Phase 184: an operator-overloaded binary op (`a + b` on a user
+        // type) was resolved by the typechecker to an impl method — emit a
+        // direct call `<method>(lhs, rhs)` (both by value) instead of LLVM
+        // arithmetic.
+        if (auto it = tc_.binOpMethod.find(&bin); it != tc_.binOpMethod.end()) {
+            auto fit = declaredFns_.find(it->second);
+            if (fit != declaredFns_.end()) {
+                llvm::Value* l = emitConsume(*bin.lhs);
+                llvm::Value* r = emitConsume(*bin.rhs);
+                return builder_->CreateCall(fit->second, {l, r}, "op_call");
+            }
+            errors_.push_back("codegen: operator method not emitted: " +
+                              it->second);
+        }
         // Phase 33: `&&` short-circuits — evaluate rhs only when lhs is true.
         // `a && b` == `lhs ? rhs : false`, via a branch + phi (mirrors how the
         // eager path below would evaluate both, but skips rhs when lhs fails).

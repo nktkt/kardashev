@@ -530,6 +530,19 @@ std::string applyPrelude(const std::string& userSrc) {
     if (userSrc.find("trait Into") == std::string::npos) {
         prelude += "trait Into<U> { fn into(self) -> U; }\n";
     }
+    // v34 Phase 184: operator-overloading traits. A user type opts into an
+    // arithmetic operator by impl'ing the matching trait; `a + b` on that type
+    // desugars (in the typechecker) to `<type>::add(a, b)`. Homogeneous +
+    // by-value form (`self`, `rhs: Self` -> `Self`); primitives keep built-in
+    // arithmetic. Each is gated on the user not already declaring it.
+    if (userSrc.find("trait Add") == std::string::npos)
+        prelude += "trait Add { fn add(self, rhs: Self) -> Self; }\n";
+    if (userSrc.find("trait Sub") == std::string::npos)
+        prelude += "trait Sub { fn sub(self, rhs: Self) -> Self; }\n";
+    if (userSrc.find("trait Mul") == std::string::npos)
+        prelude += "trait Mul { fn mul(self, rhs: Self) -> Self; }\n";
+    if (userSrc.find("trait Div") == std::string::npos)
+        prelude += "trait Div { fn div(self, rhs: Self) -> Self; }\n";
     // Phase 43: runtime string escape decode/encode for JSON-style strings,
     // written in kardashev over str_push_byte / str_char_at. `\\uXXXX` decodes
     // the Latin-1 subset (cp < 256); higher code points become '?' (documented).

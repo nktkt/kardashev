@@ -257,6 +257,10 @@ struct TypeCheckResult {
     // uses this to mangle the LLVM function name.
     std::unordered_map<const ast::MethodCallExpr*, ResolvedMethod>
         methodResolutions;
+    // v34 Phase 184: operator overloading — a binary op (`a + b`) on a user
+    // type maps to the mangled impl-method fn name codegen calls (e.g.
+    // `__impl_Add_for_Vec2__add`) instead of emitting LLVM arithmetic.
+    std::unordered_map<const ast::BinaryExpr*, std::string> binOpMethod;
     // Phase 11: per-Expr coercion of a thin `&T` / `Box<T>` into a fat
     // `&dyn Trait` / `Box<dyn Trait>`. Codegen reads this at the coerced
     // expression to emit the data+vtable fat pointer.
