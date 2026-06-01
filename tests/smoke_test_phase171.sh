@@ -27,6 +27,14 @@ echo "Using kardc at: $KARDC"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
+# Portable timeout: macOS/BSD ships neither `timeout` nor (usually) `gtimeout`,
+# so fall back to running the command directly (the timeout is only a
+# deadlock safety-net; Bazel's own test timeout still bounds a true hang).
+if command -v timeout >/dev/null 2>&1; then _TO=timeout
+elif command -v gtimeout >/dev/null 2>&1; then _TO=gtimeout
+else _TO=""; fi
+run_to() { if [[ -n "$_TO" ]]; then "$_TO" "$@"; else shift; "$@"; fi; }
+
 # ---------------------------------------------------------------------------
 # 1. Arc refcount + DROP-ONCE: clone bumps the count; the inner value is
 #    dropped EXACTLY once when the last Arc drops. JIT + AOT.
@@ -98,7 +106,7 @@ EOF
 "$KARDC" --no-cache -o "$TMP/mt" "$TMP/mt.kd" >/dev/null 2>&1 || {
     echo "FAIL [arc-atomic-stress]: compile failed"; "$KARDC" "$TMP/mt.kd" 2>&1 | head -5; exit 1; }
 for run in $(seq 1 15); do
-    v=$(timeout 30 "$TMP/mt" 2>/dev/null | tail -1)
+    v=$(run_to 30 "$TMP/mt" 2>/dev/null | tail -1)
     [[ "$v" == "1" ]] || { echo "FAIL [arc-atomic-stress]: run $run strong_count='$v' (expected 1 — non-atomic count?)"; exit 1; }
 done
 echo "PASS [arc-atomic-stress]: 4 threads x 50k clone+drop of a shared Arc -> strong_count==1 on all 15 runs"

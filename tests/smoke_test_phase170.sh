@@ -29,14 +29,22 @@ echo "Using kardc at: $KARDC"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
+# Portable timeout: macOS/BSD ships neither `timeout` nor (usually) `gtimeout`,
+# so fall back to running the command directly (the timeout is only a
+# deadlock safety-net; Bazel's own test timeout still bounds a true hang).
+if command -v timeout >/dev/null 2>&1; then _TO=timeout
+elif command -v gtimeout >/dev/null 2>&1; then _TO=gtimeout
+else _TO=""; fi
+run_to() { if [[ -n "$_TO" ]]; then "$_TO" "$@"; else shift; "$@"; fi; }
+
 # JIT last-line value == $2 AND AOT exit code == ($2 mod 256).
 jit_aot() { # $1=file $2=expected $3=label
     set +e
-    local jv; jv=$(timeout 15 "$KARDC" "$1" 2>/dev/null | tail -1)
+    local jv; jv=$(run_to 15 "$KARDC" "$1" 2>/dev/null | tail -1)
     "$KARDC" --no-cache -o "$1.out" "$1" >/dev/null 2>&1; local crc=$?
     set -e
     [[ "$crc" -eq 0 ]] || { echo "FAIL [$3]: AOT compile failed"; "$KARDC" "$1" 2>&1 | head -5; exit 1; }
-    set +e; timeout 15 "$1.out"; local arc=$?; set -e
+    set +e; run_to 15 "$1.out"; local arc=$?; set -e
     [[ "$jv" == "$2" ]] || { echo "FAIL [$3/jit]: '$jv' != $2"; exit 1; }
     [[ "$arc" -eq $(( $2 % 256 )) ]] || { echo "FAIL [$3/aot]: exit $arc != $(($2 % 256))"; exit 1; }
     echo "PASS [$3]: JIT==$2, AOT exit==$(($2 % 256))"
@@ -124,7 +132,7 @@ EOF
 "$KARDC" --no-cache -o "$TMP/drain.out" "$TMP/drain.kd" >/dev/null 2>&1 || {
     echo "FAIL [select-cross-thread-drain]: compile failed"; "$KARDC" "$TMP/drain.kd" 2>&1 | head -5; exit 1; }
 for run in $(seq 1 12); do
-    v=$(timeout 20 "$TMP/drain.out" 2>/dev/null | tail -1)
+    v=$(run_to 20 "$TMP/drain.out" 2>/dev/null | tail -1)
     [[ "$v" == "530" ]] || { echo "FAIL [select-cross-thread-drain]: run $run got '$v' (expected 530)"; exit 1; }
 done
 echo "PASS [select-cross-thread-drain]: 2 producers x5 drained via select2 == 530 on all 12 runs"
@@ -158,7 +166,7 @@ EOF
 "$KARDC" --no-cache -o "$TMP/scope.out" "$TMP/scope.kd" >/dev/null 2>&1 || {
     echo "FAIL [scope-raii-join]: compile failed"; "$KARDC" "$TMP/scope.kd" 2>&1 | head -5; exit 1; }
 for run in $(seq 1 12); do
-    v=$(timeout 25 "$TMP/scope.out" 2>/dev/null | tail -1)
+    v=$(run_to 25 "$TMP/scope.out" 2>/dev/null | tail -1)
     [[ "$v" == "100000" ]] || { echo "FAIL [scope-raii-join]: run $run got '$v' (expected 100000 — workers not joined?)"; exit 1; }
 done
 echo "PASS [scope-raii-join]: 4 scope_spawn workers joined on scope Drop -> exactly 100000 (12 runs)"

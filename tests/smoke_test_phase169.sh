@@ -35,6 +35,14 @@ echo "Using kardc at: $KARDC"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
+# Portable timeout: macOS/BSD ships neither `timeout` nor (usually) `gtimeout`,
+# so fall back to running the command directly (the timeout is only a
+# deadlock safety-net; Bazel's own test timeout still bounds a true hang).
+if command -v timeout >/dev/null 2>&1; then _TO=timeout
+elif command -v gtimeout >/dev/null 2>&1; then _TO=gtimeout
+else _TO=""; fi
+run_to() { if [[ -n "$_TO" ]]; then "$_TO" "$@"; else shift; "$@"; fi; }
+
 # Compile (AOT) + run; assert the process exit code == $2.
 run_exit() { # $1=file $2=expected_exit $3=label
     "$KARDC" --no-cache -o "$1.out" "$1" >/dev/null 2>&1 || {
@@ -120,7 +128,7 @@ EOF
     echo "FAIL [atomic-counter-stress]: compile failed"; "$KARDC" "$TMP/stress.kd" 2>&1 | head -5; exit 1; }
 RUNS=20
 for run in $(seq 1 "$RUNS"); do
-    v=$(timeout 30 "$TMP/stress.out" 2>/dev/null | head -1)
+    v=$(run_to 30 "$TMP/stress.out" 2>/dev/null | head -1)
     [[ "$v" == "400000" ]] || { echo "FAIL [atomic-counter-stress]: run $run got '$v' (expected 400000 — lost update)"; exit 1; }
 done
 echo "PASS [atomic-counter-stress]: 8 threads x 50k fetch_add == 400000 on all $RUNS runs"
@@ -153,8 +161,8 @@ fn main() -> i64 ! { alloc, io, share } {
 EOF
 "$KARDC" --no-cache -o "$TMP/mtx.out" "$TMP/mtx.kd" >/dev/null 2>&1 || {
     echo "FAIL [atomic-vs-mutex-crosscheck]: mutex compile failed"; exit 1; }
-mv=$(timeout 30 "$TMP/mtx.out" 2>/dev/null | head -1)
-av=$(timeout 30 "$TMP/stress.out" 2>/dev/null | head -1)
+mv=$(run_to 30 "$TMP/mtx.out" 2>/dev/null | head -1)
+av=$(run_to 30 "$TMP/stress.out" 2>/dev/null | head -1)
 [[ "$mv" == "400000" && "$av" == "400000" ]] || {
     echo "FAIL [atomic-vs-mutex-crosscheck]: atomic=$av mutex=$mv (both should be 400000)"; exit 1; }
 echo "PASS [atomic-vs-mutex-crosscheck]: atomic counter agrees with the Mutex path (both 400000)"

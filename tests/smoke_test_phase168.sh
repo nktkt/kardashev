@@ -33,18 +33,26 @@ echo "Using kardc at: $KARDC"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
+# Portable timeout: macOS/BSD ships neither `timeout` nor (usually) `gtimeout`,
+# so fall back to running the command directly (the timeout is only a
+# deadlock safety-net; Bazel's own test timeout still bounds a true hang).
+if command -v timeout >/dev/null 2>&1; then _TO=timeout
+elif command -v gtimeout >/dev/null 2>&1; then _TO=gtimeout
+else _TO=""; fi
+run_to() { if [[ -n "$_TO" ]]; then "$_TO" "$@"; else shift; "$@"; fi; }
+
 # Run a program on BOTH paths and assert it yields $2. The JIT prints main's
 # return as the last stdout line (the kardc process itself exits 0); the AOT
 # binary's process exit code IS main's return. A deadlock (missing
 # unlock-on-Drop) trips the `timeout` -> the JIT value is empty / AOT exit 124.
 run_both() { # $1=file $2=expected $3=label
     set +e
-    local jout; jout=$(timeout 15 "$KARDC" "$1" 2>/dev/null); local jrc=$?
+    local jout; jout=$(run_to 15 "$KARDC" "$1" 2>/dev/null); local jrc=$?
     local jval; jval=$(tail -1 <<<"$jout")
     "$KARDC" --no-cache -o "$1.out" "$1" >/dev/null 2>&1; local crc=$?
     set -e
     [[ "$crc" -eq 0 ]] || { echo "FAIL [$3]: AOT compile failed"; "$KARDC" "$1" 2>&1 | head -4; exit 1; }
-    set +e; timeout 15 "$1.out"; local arc=$?; set -e
+    set +e; run_to 15 "$1.out"; local arc=$?; set -e
     [[ "$jrc" -eq 0 && "$jval" == "$2" ]] || { echo "FAIL [$3/jit]: value '$jval' rc $jrc (want $2; 124=deadlock)"; exit 1; }
     [[ "$arc" -eq "$2" ]] || { echo "FAIL [$3/aot]: exit $arc (want $2; 124=deadlock)"; exit 1; }
     echo "PASS [$3]: JIT==AOT==$2"
