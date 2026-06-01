@@ -12146,6 +12146,19 @@ private:
     // `xor i1 x, true`). The typechecker has already constrained the operand
     // to i64 / bool respectively.
     llvm::Value* emitUnary(const ast::UnaryExpr& un) {
+        // v37 full operator surface: a unary `-`/`!` on a user type calls the
+        // resolved `Neg::neg` / `Not::not` impl method (operand by value).
+        if (auto it = tc_.unaryOpMethod.find(&un);
+            it != tc_.unaryOpMethod.end()) {
+            auto fit = declaredFns_.find(it->second);
+            if (fit != declaredFns_.end()) {
+                llvm::Value* operand = emitConsume(*un.operand);
+                return builder_->CreateCall(fit->second, {operand},
+                                            "unop_call");
+            }
+            errors_.push_back("codegen: unary operator method not emitted: " +
+                              it->second);
+        }
         llvm::Value* v = emitExpr(*un.operand);
         switch (un.op) {
         case ast::UnaryOp::Neg:

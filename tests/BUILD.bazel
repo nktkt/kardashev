@@ -515,6 +515,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v37: full operator-trait surface (Rem/bitops + unary Neg/Not).
+sh_test(
+    name = "smoke_test_operator_overload2",
+    srcs = ["smoke_test_operator_overload2.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",

@@ -261,6 +261,9 @@ struct TypeCheckResult {
     // type maps to the mangled impl-method fn name codegen calls (e.g.
     // `__impl_Add_for_Vec2__add`) instead of emitting LLVM arithmetic.
     std::unordered_map<const ast::BinaryExpr*, std::string> binOpMethod;
+    // v37 full operator surface: unary `-x` / `!x` on a user type maps to the
+    // mangled `Neg::neg` / `Not::not` impl-method codegen calls.
+    std::unordered_map<const ast::UnaryExpr*, std::string> unaryOpMethod;
     // v35 Phase 190: `?`-with-`From`. When a `?` propagates an error of type
     // E1 from a fn whose Err type is E2 (E1 != E2) and an `impl From<E1> for
     // E2` exists, this maps the TryExpr to that `from`'s mangled fn name;

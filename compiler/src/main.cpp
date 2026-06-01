@@ -553,6 +553,26 @@ std::string applyPrelude(const std::string& userSrc) {
         prelude += "trait Mul { fn mul(self, rhs: Self) -> Self; }\n";
     if (userSrc.find("trait Div") == std::string::npos)
         prelude += "trait Div { fn div(self, rhs: Self) -> Self; }\n";
+    // v37 Phase (full operator surface): the rest of the homogeneous binary
+    // operator traits — `%` and the bitwise/shift family — mirror Add/Sub/Mul/
+    // Div exactly (by-value `self`+`rhs: Self` -> `Self`; primitives keep their
+    // built-in ops). Plus the UNARY operator traits Neg (`-x`) and Not (`!x`).
+    if (userSrc.find("trait Rem") == std::string::npos)
+        prelude += "trait Rem { fn rem(self, rhs: Self) -> Self; }\n";
+    if (userSrc.find("trait BitAnd") == std::string::npos)
+        prelude += "trait BitAnd { fn bitand(self, rhs: Self) -> Self; }\n";
+    if (userSrc.find("trait BitOr") == std::string::npos)
+        prelude += "trait BitOr { fn bitor(self, rhs: Self) -> Self; }\n";
+    if (userSrc.find("trait BitXor") == std::string::npos)
+        prelude += "trait BitXor { fn bitxor(self, rhs: Self) -> Self; }\n";
+    if (userSrc.find("trait Shl") == std::string::npos)
+        prelude += "trait Shl { fn shl(self, rhs: Self) -> Self; }\n";
+    if (userSrc.find("trait Shr") == std::string::npos)
+        prelude += "trait Shr { fn shr(self, rhs: Self) -> Self; }\n";
+    if (userSrc.find("trait Neg") == std::string::npos)
+        prelude += "trait Neg { fn neg(self) -> Self; }\n";
+    if (userSrc.find("trait Not") == std::string::npos)
+        prelude += "trait Not { fn not(self) -> Self; }\n";
     // Phase 43: runtime string escape decode/encode for JSON-style strings,
     // written in kardashev over str_push_byte / str_char_at. `\\uXXXX` decodes
     // the Latin-1 subset (cp < 256); higher code points become '?' (documented).

@@ -2803,6 +2803,7 @@ public:
         result.staticCallGeneric = std::move(staticCallGeneric_);
         result.methodResolutions = std::move(methodResolutions_);
         result.binOpMethod = std::move(binOpMethod_); // v34 Phase 184
+        result.unaryOpMethod = std::move(unaryOpMethod_); // v37 operator surface
         result.tryFromConv = std::move(tryFromConv_);  // v35 Phase 190
         result.dynCoercions = std::move(dynCoercions_);
         result.dynVtablesNeeded = std::move(dynVtablesNeeded_);
@@ -3036,6 +3037,7 @@ private:
     // v34 Phase 184: an operator-overloaded binary op (`a + b` on a user type) ->
     // the mangled impl-method fn name codegen should call instead of LLVM arith.
     std::unordered_map<const ast::BinaryExpr*, std::string> binOpMethod_;
+    std::unordered_map<const ast::UnaryExpr*, std::string> unaryOpMethod_; // v37
     std::unordered_map<const ast::TryExpr*, std::string> tryFromConv_; // v35 P190
     // v32 Phase 176: user-declared effects. `userEffectNames_` makes an effect
     // name a valid (concrete) effect-row label; `effectOpDecls_` maps
@@ -6749,6 +6751,13 @@ private:
                 case ast::BinOp::Sub: opTrait = "Sub"; opMethod = "sub"; break;
                 case ast::BinOp::Mul: opTrait = "Mul"; opMethod = "mul"; break;
                 case ast::BinOp::Div: opTrait = "Div"; opMethod = "div"; break;
+                // v37 full operator surface: `%` + bitwise/shift on user types.
+                case ast::BinOp::Mod: opTrait = "Rem"; opMethod = "rem"; break;
+                case ast::BinOp::BitAnd: opTrait = "BitAnd"; opMethod = "bitand"; break;
+                case ast::BinOp::BitOr: opTrait = "BitOr"; opMethod = "bitor"; break;
+                case ast::BinOp::BitXor: opTrait = "BitXor"; opMethod = "bitxor"; break;
+                case ast::BinOp::Shl: opTrait = "Shl"; opMethod = "shl"; break;
+                case ast::BinOp::Shr: opTrait = "Shr"; opMethod = "shr"; break;
                 default: break;
             }
             if (opMethod &&
@@ -6763,15 +6772,27 @@ private:
                         mIt->second.first == opTrait && mIt->second.second) {
                         const ast::FnDecl* mfn = mIt->second.second;
                         // RHS must be the same (Self) type.
-                        if (!coerceOrUnify(*bin.rhs, rhs, lhs))
-                            error(std::string("operator `") +
-                                      (opMethod[0] == 'a' ? "+" :
-                                       opMethod[0] == 's' ? "-" :
-                                       opMethod[0] == 'm' ? "*" : "/") +
-                                      "` on `" + typeName +
+                        if (!coerceOrUnify(*bin.rhs, rhs, lhs)) {
+                            const char* sym = "?";
+                            switch (bin.op) {
+                                case ast::BinOp::Add: sym = "+"; break;
+                                case ast::BinOp::Sub: sym = "-"; break;
+                                case ast::BinOp::Mul: sym = "*"; break;
+                                case ast::BinOp::Div: sym = "/"; break;
+                                case ast::BinOp::Mod: sym = "%"; break;
+                                case ast::BinOp::BitAnd: sym = "&"; break;
+                                case ast::BinOp::BitOr: sym = "|"; break;
+                                case ast::BinOp::BitXor: sym = "^"; break;
+                                case ast::BinOp::Shl: sym = "<<"; break;
+                                case ast::BinOp::Shr: sym = ">>"; break;
+                                default: break;
+                            }
+                            error(std::string("operator `") + sym + "` on `" +
+                                      typeName +
                                       "` requires the right operand to be `" +
                                       typeName + "`, got " + typeToString(rhs),
                                   bin.rhs->line, bin.rhs->column);
+                        }
                         auto mangIt = implMethodMangled_.find(mfn);
                         if (mangIt != implMethodMangled_.end())
                             binOpMethod_[&bin] = mangIt->second;
@@ -8618,26 +8639,73 @@ private:
         return dst;
     }
 
+    // v37 full operator surface: a unary `-`/`!` on a user STRUCT/ENUM desugars
+    // to the matching trait method (`Neg::neg` / `Not::not`). Records the
+    // mangled impl method for codegen + attributes its declared effects.
+    // Returns true if a matching impl was found and recorded.
+    bool resolveUnaryOp(const ast::UnaryExpr& un, const TypePtr& ro,
+                        const char* opTrait, const char* opMethod) {
+        std::string typeName =
+            ro->kind == TypeKind::Struct ? ro->structName : ro->enumName;
+        auto tIt = methodImplLookup_.find(typeName);
+        if (tIt == methodImplLookup_.end()) return false;
+        auto mIt = tIt->second.find(opMethod);
+        if (mIt == tIt->second.end() || mIt->second.first != opTrait ||
+            !mIt->second.second)
+            return false;
+        auto mangIt = implMethodMangled_.find(mIt->second.second);
+        if (mangIt == implMethodMangled_.end()) return false;
+        unaryOpMethod_[&un] = mangIt->second;
+        auto sIt = fnSchemas_.find(mangIt->second);
+        if (sIt != fnSchemas_.end())
+            exprEffects_[&un] = sIt->second.declaredEffects;
+        return true;
+    }
+
     TypePtr checkUnary(const ast::UnaryExpr& un) {
         TypePtr operand = checkExpr(*un.operand);
         switch (un.op) {
-        case ast::UnaryOp::Neg:
+        case ast::UnaryOp::Neg: {
             // Phase 39/67: `-x` negates an i64 OR a float of either width.
             if (resolve(operand)->kind == TypeKind::Float)
                 return resolve(operand);
+            // v37: operator overloading via `impl Neg`.
+            TypePtr ro = resolve(operand);
+            if (ro->kind == TypeKind::Struct || ro->kind == TypeKind::Enum) {
+                if (resolveUnaryOp(un, ro, "Neg", "neg")) return ro;
+                error("unary `-` on `" +
+                          (ro->kind == TypeKind::Struct ? ro->structName
+                                                        : ro->enumName) +
+                          "` requires an `impl Neg` for it",
+                      un.operand->line, un.operand->column);
+                return ro;
+            }
             if (!unify(operand, makeInt())) {
                 error("unary `-` requires an i64 or f64 operand, got " +
                           typeToString(operand),
                       un.operand->line, un.operand->column);
             }
             return makeInt();
-        case ast::UnaryOp::Not:
+        }
+        case ast::UnaryOp::Not: {
+            // v37: operator overloading via `impl Not`.
+            TypePtr ro = resolve(operand);
+            if (ro->kind == TypeKind::Struct || ro->kind == TypeKind::Enum) {
+                if (resolveUnaryOp(un, ro, "Not", "not")) return ro;
+                error("unary `!` on `" +
+                          (ro->kind == TypeKind::Struct ? ro->structName
+                                                        : ro->enumName) +
+                          "` requires an `impl Not` for it",
+                      un.operand->line, un.operand->column);
+                return ro;
+            }
             if (!unify(operand, makeBool())) {
                 error("unary `!` requires a bool operand, got " +
                           typeToString(operand),
                       un.operand->line, un.operand->column);
             }
             return makeBool();
+        }
         case ast::UnaryOp::BitNot: {
             // Phase 66: `~x` is the bitwise complement of an integer of any
             // width/signedness; the result is that same int type.
