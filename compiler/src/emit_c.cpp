@@ -52,6 +52,14 @@ struct CEmitter {
     std::set<std::string> fnThunks_;     // top-level fns used as values
     bool sawClosureOrFnVal_ = false;     // set by the pre-scan
     bool inReturnPos_ = false;           // emitting a fn-value return position
+    // v30 Phase 166 (generics): the generic-param names of the fn currently
+    // being emitted (or of the generic fn whose call args we're typing). A
+    // TypeRef whose name is one of these lowers to `int64_t` — every scalar the
+    // C backend supports (i64/bool/char/unit) is int64_t, so a generic fn over a
+    // SCALAR type param has a SINGLE monomorphic int64_t instance. A non-scalar
+    // (struct/String/Vec) instantiation needs a distinct instance — a documented
+    // follow-on — and is refused at the call site.
+    std::set<std::string> currentGenericParams_;
 
     void err(const std::string& m) { errors.push_back("emit-c: " + m); }
     bool ok() const { return errors.empty(); }
@@ -155,14 +163,17 @@ struct CEmitter {
         // the subset (the kdfn type is all-int64_t). Used for a higher-order fn
         // parameter (`fn apply(f: fn(i64) -> i64, x: i64)`).
         if (t.isFn) {
+            auto scalarish = [&](const std::string& n) {
+                return isScalarName(n) || n == "unit" ||
+                       currentGenericParams_.count(n) > 0; // v30 P166: T -> i64
+            };
             for (const auto& p : t.fnParams)
-                if (!isScalarName(p.name) && p.name != "unit") {
+                if (!scalarish(p.name)) {
                     err("a fn-type parameter with a non-scalar argument is "
                         "outside the C-backend subset");
                     return "";
                 }
-            if (t.fnRet && !isScalarName(t.fnRet->name) &&
-                t.fnRet->name != "unit") {
+            if (t.fnRet && !scalarish(t.fnRet->name)) {
                 err("a fn-type parameter with a non-scalar return is outside "
                     "the C-backend subset");
                 return "";
@@ -184,6 +195,9 @@ struct CEmitter {
         // which the caller (an ExprStmt) discards. Keeps the uniform
         // `return <block value>;` lowering for a void-like function.
         if (t.name == "unit") return "int64_t";
+        // v30 Phase 166: a generic type parameter in scope -> int64_t (the
+        // single scalar monomorphization the C backend supports).
+        if (currentGenericParams_.count(t.name)) return "int64_t";
         // v30 Phase 162: String -> the C runtime's `struct kdstr`.
         if (t.name == "String") { usesString_ = true; return "struct kdstr"; }
         // v30 Phase 163: Vec<T> -> the C runtime's `struct kdvec`, but only for a
@@ -207,6 +221,17 @@ struct CEmitter {
                 return "";
             }
             return "struct " + t.name;
+        }
+        // An unknown bare type name. If it looks like an unbound generic param
+        // (single uppercase, common convention) give a more specific hint: the
+        // C backend monomorphizes a generic fn ONLY at scalar (int64_t) type, so
+        // a struct/String/Vec instantiation is out of subset.
+        if (t.name.size() <= 2 && !t.name.empty() && t.name[0] >= 'A' &&
+            t.name[0] <= 'Z') {
+            err("a generic instantiation at a non-scalar type (`" + t.name +
+                "`) is outside the C-backend subset (only the single scalar/"
+                "int64_t monomorphization is emitted)");
+            return "";
         }
         err("type `" + t.name + "` is outside the C-backend subset "
             "(i64/bool/struct/enum only)");
@@ -295,7 +320,17 @@ struct CEmitter {
             auto vi = variantInfo_.find(call->callee);
             if (vi != variantInfo_.end()) return "struct " + vi->second.enumName;
             auto fit = fns_.find(call->callee);
-            if (fit != fns_.end()) return ctype(fit->second->returnType);
+            if (fit != fns_.end()) {
+                // v30 Phase 166: a call to a generic fn returns its return type
+                // with the CALLEE's generic params bound to int64_t (the scalar
+                // instance) — else `ctype(T)` sees an unbound `T`.
+                auto savedG = currentGenericParams_;
+                for (const auto& gp : fit->second->genericParams)
+                    if (!gp.isConst) currentGenericParams_.insert(gp.name);
+                std::string r = ctype(fit->second->returnType);
+                currentGenericParams_ = savedG;
+                return r.empty() ? "int64_t" : r;
+            }
             // v30 Phase 162: String-returning builtins.
             if (call->callee == "string_new" ||
                 call->callee == "int_to_string" ||
@@ -453,6 +488,32 @@ struct CEmitter {
                     if (ctypeOfExpr(elem) != "int64_t") {
                         err("Vec with a non-scalar element is outside the "
                             "C-backend subset (Vec<i64>/Vec<bool> only for now)");
+                        return "0";
+                    }
+                }
+            }
+            // v30 Phase 166 (soundness): a call to a GENERIC user fn whose arg
+            // at a generic-param position is NON-scalar (struct/String/Vec/fn)
+            // would pass that value into the fn's single int64_t monomorphization
+            // — the C compiler rejects the type mismatch, so refuse it here (the
+            // backend must never emit C that doesn't compile). A param typed by a
+            // generic param is detected by ctype-ing it WITHOUT the generics
+            // bound: an unbound generic name yields "" (recorded an error we
+            // swallow) — meaning "this slot is generic".
+            if (auto fit = fns_.find(call->callee);
+                fit != fns_.end() && !fit->second->genericParams.empty()) {
+                const FnDecl* fd = fit->second;
+                std::set<std::string> gp;
+                for (const auto& g : fd->genericParams) gp.insert(g.name);
+                for (std::size_t i = 0;
+                     i < call->args.size() && i < fd->params.size(); ++i) {
+                    if (!gp.count(fd->params[i].type.name)) continue; // concrete
+                    std::string at = ctypeOfExpr(*call->args[i]);
+                    if (at != "int64_t") {
+                        err("a generic fn `" + call->callee +
+                            "` instantiated at a non-scalar type (argument is `" +
+                            at + "`) is outside the C-backend subset (only the "
+                            "scalar/int64_t monomorphization is emitted)");
                         return "0";
                     }
                 }
@@ -982,19 +1043,30 @@ struct CEmitter {
     }
 
     bool fnInSubset(const FnDecl& fn) {
-        if (!fn.genericParams.empty()) {
-            err("generic fn `" + fn.name + "` is outside the C-backend subset");
-            return false;
-        }
         if (fn.isAsync) {
             err("async fn `" + fn.name + "` is outside the C-backend subset");
             return false;
         }
-        // ctype() of the return + each param validates they're in the subset.
-        if (ctype(fn.returnType).empty()) return false;
-        for (const auto& p : fn.params)
-            if (ctype(p.type).empty()) return false;
-        return true;
+        // v30 Phase 166: a generic fn over SCALAR type params has a single
+        // int64_t monomorphization — bind its params to int64_t while validating
+        // (and emitting) it. A const-generic param is not lowerable here (the C
+        // backend has no const-eval) — refuse.
+        auto saved = currentGenericParams_;
+        for (const auto& gp : fn.genericParams) {
+            if (gp.isConst) {
+                err("a const-generic fn `" + fn.name +
+                    "` is outside the C-backend subset");
+                currentGenericParams_ = saved;
+                return false;
+            }
+            currentGenericParams_.insert(gp.name);
+        }
+        bool ok = !ctype(fn.returnType).empty();
+        if (ok)
+            for (const auto& p : fn.params)
+                if (ctype(p.type).empty()) { ok = false; break; }
+        currentGenericParams_ = saved;
+        return ok;
     }
 
     // v29 Phase 157: emit struct typedefs, inner-before-outer so a struct field
@@ -1338,7 +1410,13 @@ struct CEmitter {
         std::string protos;
         for (const auto& fn : program.functions) {
             if (!fnInSubset(fn)) return;
+            // v30 Phase 166: bind generic params to int64_t for the prototype
+            // too (else `signature` sees an unknown `T`).
+            auto savedG = currentGenericParams_;
+            for (const auto& gp : fn.genericParams)
+                if (!gp.isConst) currentGenericParams_.insert(gp.name);
             std::string sig = signature(fn);
+            currentGenericParams_ = savedG;
             if (sig.empty()) return;
             protos += sig + ";\n";
             if (fn.name == "main") hasMain = true;
@@ -1355,15 +1433,20 @@ struct CEmitter {
                 err("fn `" + fn.name + "` has no body");
                 return;
             }
+            // v30 Phase 166: bind this fn's generic params to int64_t while
+            // emitting it (a single scalar monomorphization).
+            auto savedGenerics = currentGenericParams_;
+            for (const auto& gp : fn.genericParams)
+                if (!gp.isConst) currentGenericParams_.insert(gp.name);
             varCType_.clear();
             for (const auto& p : fn.params)
                 varCType_[p.name] = ctype(p.type);
             std::string sig = signature(fn);
-            if (sig.empty()) return;
+            if (sig.empty()) { currentGenericParams_ = savedGenerics; return; }
             // v30 Phase 164: drop non-escaping heap-owning top-level locals at
             // function exit (RAII). retCTy types the captured tail value.
             std::string retCTy = ctype(fn.returnType);
-            if (retCTy.empty()) return;
+            if (retCTy.empty()) { currentGenericParams_ = savedGenerics; return; }
             // v30 Phase 165: a fn whose RETURN type is itself a fn value
             // (`fn mk() -> fn(i64)->i64`) returns a closure with a stack env —
             // refuse (it would dangle). Setting inReturnPos_ makes any closure
@@ -1372,6 +1455,7 @@ struct CEmitter {
             if (retCTy.rfind("struct kdfn", 0) == 0) inReturnPos_ = true;
             std::string bodyC = fnBodyWithDrops(fn, retCTy);
             inReturnPos_ = prevRet;
+            currentGenericParams_ = savedGenerics;
             defs += sig + " {\n  return " + bodyC + ";\n}\n\n";
             if (!ok()) return;
         }
