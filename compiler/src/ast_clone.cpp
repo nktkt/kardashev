@@ -150,6 +150,7 @@ ExprPtr cloneExpr(const Expr& e) {
         n->callee = c->callee;
         n->wasPath = c->wasPath;
         n->pathQualifier = c->pathQualifier;
+        n->explicitTypeArgs = c->explicitTypeArgs; // v37 turbofish
         for (const auto& a : c->args) n->args.push_back(cloneOpt(a));
         out = std::move(n);
     } else if (auto* cv = dynamic_cast<const CallValueExpr*>(&e)) {

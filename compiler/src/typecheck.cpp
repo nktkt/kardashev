@@ -8082,6 +8082,30 @@ private:
                 subst[gv->varId] = fresh;
                 typeArgs.push_back(fresh);
             }
+            // v37 turbofish: explicit `f::<T1, T2>(...)` type args bind the
+            // callee's generic params positionally (constraining inference;
+            // arg unification below then agrees or reports a conflict).
+            if (!call.explicitTypeArgs.empty()) {
+                if (call.explicitTypeArgs.size() > schema.genericVars.size()) {
+                    error("function '" + call.callee + "' takes " +
+                              std::to_string(schema.genericVars.size()) +
+                              " type argument(s), but " +
+                              std::to_string(call.explicitTypeArgs.size()) +
+                              " were supplied via `::<…>`",
+                          call.line, call.column);
+                } else {
+                    for (std::size_t i = 0; i < call.explicitTypeArgs.size();
+                         ++i) {
+                        TypePtr ex = resolveTypeRef(call.explicitTypeArgs[i]);
+                        if (!unify(typeArgs[i], ex))
+                            error("explicit type argument " +
+                                      std::to_string(i + 1) + " (`" +
+                                      typeToString(ex) + "`) for '" +
+                                      call.callee + "' conflicts with inference",
+                                  call.line, call.column);
+                    }
+                }
+            }
             // Phase 10a: also freshen effect-row vars so each call site gets
             // its own row var to bind (they live outside genericVars to stay
             // out of monomorphization, but still need per-call instantiation

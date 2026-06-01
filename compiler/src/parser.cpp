@@ -3106,8 +3106,24 @@ private:
             Token tok = first;
             Token prevSeg = first; // Phase 48: the segment just before `tok`
             bool wasPath = false;
+            std::vector<ast::TypeRef> turbofishArgs; // v37: `::<T,...>`
             while (check(TokenKind::DoubleColon)) {
                 consume();
+                // v37 turbofish: `::<` introduces explicit generic type args
+                // (`f::<i64>(x)`, `Vec::<i64>::new()`). They bind the callee's
+                // generic params; `continue` lets a `::method` segment follow.
+                if (check(TokenKind::Lt)) {
+                    consume(); // <
+                    if (!check(TokenKind::Gt)) {
+                        while (true) {
+                            turbofishArgs.push_back(parseTypeRef());
+                            if (!accept(TokenKind::Comma)) break;
+                            if (check(TokenKind::Gt)) break; // trailing comma
+                        }
+                    }
+                    expect(TokenKind::Gt, "> after turbofish type arguments");
+                    continue;
+                }
                 prevSeg = tok;
                 tok = expect(TokenKind::Identifier,
                               "identifier after `::`");
@@ -3140,6 +3156,7 @@ private:
                 call->callee = tok.lexeme;
                 call->wasPath = wasPath;
                 if (wasPath) call->pathQualifier = prevSeg.lexeme; // Phase 48
+                call->explicitTypeArgs = std::move(turbofishArgs); // v37
                 bool prevCallRestrict = restrictStructLit_;
                 restrictStructLit_ = false;
                 if (!check(TokenKind::RParen)) {

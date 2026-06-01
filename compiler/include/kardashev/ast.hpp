@@ -249,6 +249,10 @@ struct CallExpr : Expr {
     // `method`; for an ordinary module path (`foo::bar()`) it stays unused and
     // the call falls back to the flat-merged bare-name lookup of `callee`.
     std::string pathQualifier;
+    // v37 turbofish: explicit generic type arguments `f::<T1, T2>(args)` /
+    // `Vec::<i64>::new()`. Empty for the common inferred form; the typechecker
+    // binds the callee's generic params to these (constraining inference).
+    std::vector<TypeRef> explicitTypeArgs;
 };
 
 // Phase 17a: call a fn VALUE produced by an arbitrary expression — e.g.

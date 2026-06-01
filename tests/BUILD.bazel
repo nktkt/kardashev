@@ -529,6 +529,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v37: turbofish — explicit generic type args f::<T>(args).
+sh_test(
+    name = "smoke_test_turbofish",
+    srcs = ["smoke_test_turbofish.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",
