@@ -10,7 +10,7 @@ full numeric tower, async, and threads. It is well above the median hobby/studen
 compiler in breadth and test discipline. It is **not** a production language: it
 is pre-ecosystem, pre-performance-proven, and MVP-shaped in places.
 
-**Shipped: v1–v36** (Phases 0–196, through `v0.36.0`; Phases 189/193/195 deferred). The full numbered roadmap (v1–v36) is now released; what remains are the four XL **Mega-arcs** below. The per-version themes are
+**Shipped: v1–v36** (Phases 0–196, through `v0.36.0`; Phases 189/193/195 deferred). The full numbered roadmap (v1–v36) is now released; what remains are the four XL **Mega-arcs** below. **For the road past production parity to a shippable 1.0 — taking every dimension to best-in-class (6/6) — see [ROADMAP-1.0-AND-BEYOND.md](ROADMAP-1.0-AND-BEYOND.md)** (versions v37→1.0→1.x, the 4 mega-arcs with entry/exit criteria, and a 17-gate production-readiness checklist). The per-version themes are
 in the [README roadmap table](README.md#roadmap); every phase's detail is in
 [CHANGELOG.md](CHANGELOG.md). v15–v19 built a self-hosted *mini* compiler and a
 differential-fuzzing test surface; v20 took it to real LLVM IR; v21 added a
