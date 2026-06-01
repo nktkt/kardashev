@@ -5634,10 +5634,38 @@ private:
                           "dispatched through a trait object)",
                       line, col);
             }
+            // v38: a method that RETURNS `Self` by value is not object-safe —
+            // the concrete size/type isn't known through the erased trait
+            // object (`&dyn Trait` would have to return an unsized value).
+            // `&self`/`&Self`/`Self::Assoc` returns are fine; a bare `Self`
+            // value return is the offender.
+            if (m.returnType.name == "Self" && !m.returnType.isRef &&
+                m.returnType.assocName.empty()) {
+                error("trait '" + traitName + "' is not dyn-safe: method '" +
+                          m.name +
+                          "' returns `Self` by value (the concrete type is "
+                          "unknown through a trait object; return `Box<Self>` "
+                          "or a concrete type instead)",
+                      line, col);
+            }
+            // v38: a non-receiver parameter of type `Self` by value is also not
+            // object-safe (same reason — its size is erased). A `&Self` param
+            // is fine.
+            for (std::size_t pi = (hasSelf ? 1 : 0); pi < m.params.size();
+                 ++pi) {
+                const auto& pt = m.params[pi].type;
+                if (pt.name == "Self" && !pt.isRef && pt.assocName.empty()) {
+                    error("trait '" + traitName +
+                              "' is not dyn-safe: method '" + m.name +
+                              "' takes a `Self`-by-value parameter `" +
+                              m.params[pi].name +
+                              "` (use `&Self` to keep the trait object-safe)",
+                          line, col);
+                }
+            }
             // MethodSig has no generic-param list in the grammar today, so a
-            // generic trait method isn't expressible; the rule is stated here
-            // so it's enforced the moment generic methods land. (Kept as a
-            // one-line note per the dyn-safety requirement.)
+            // generic trait method isn't expressible; that rule activates the
+            // moment generic trait methods land.
         }
     }
 

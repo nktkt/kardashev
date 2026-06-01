@@ -536,6 +536,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v38: object-safety (dyn-safety) completeness.
+sh_test(
+    name = "smoke_test_object_safety",
+    srcs = ["smoke_test_object_safety.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
 sh_test(
     name = "smoke_test_phase185",
