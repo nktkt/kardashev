@@ -18,6 +18,44 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.30.0] — Roadmap v30 "the C backend, finished II (heap + RAII + generics)" (Phases 162-166)
+
+Theme: take the `--emit-c` C-source backend (v23/v29) from the i64/bool/struct/
+enum/ref/control subset all the way to the heap + RAII + the generic surface,
+each phase differentially gated against LLVM (and the memory-safety phases ALSO
+gated by an AddressSanitizer + LeakSanitizer oracle — a leak/double-free/stack-
+use-after-scope signal the exit-code gate can't see).
+
+### Added (C backend, `kardc --emit-c`)
+- **`String` + heap strings** (Phase 162) — a faithful C `struct kdstr { char*
+  data; int64_t len; int64_t cap; }` runtime (cap==0 = borrowed literal, copy-on-
+  write), mirroring the LLVM builtins exactly (string_new, str_len, str_char_at,
+  str_push_byte, string_push_str, str_eq, str_substring, int_to_string, the print
+  family). Emitted only when the program uses String.
+- **scalar-element `Vec`** (Phase 163) — a `struct kdvec` runtime for `Vec<i64>`/
+  `Vec<bool>` (push/get/get_ref/len/pop/remove/insert/reverse/swap). Also a
+  soundness fix: an unimplemented builtin is now refused instead of emitting an
+  undefined-symbol call.
+- **`Drop` / RAII** (Phase 164) — frees non-escaping heap-owning locals AND owned
+  by-value params at function exit; a binding is dropped only when every use is a
+  borrow and the fn has no early return (escaping/uncertain cases leak rather
+  than risk a double-free). ASan-verified.
+- **closures + fn-pointers** (Phase 165) — a closure → a hoisted `__cl_<n>(void*
+  env, args)` over a stack capture env (scalar by-value captures, free vars the
+  backend computes itself); a fn value → the fat pointer `struct kdfn<arity>`; a
+  top-level fn → a thunk. An escaping fn value (returned closure) or an FnMut
+  closure is refused (ASan caught the stack-env dangle).
+- **generics** (Phase 166) — a generic fn is monomorphized ONCE at int64_t (every
+  scalar shares one C representation); a non-scalar or const-generic
+  instantiation is refused (the backend never emits C that fails to compile).
+
+### Deferred (documented follow-ons)
+- `HashMap`/`HashSet` (a keyed-hash C runtime); non-scalar `Vec`/generic
+  instances (struct/String elements); user `impl Drop`; heap locals in nested
+  blocks / on early-return paths.
+
+718 unit cases (6 suites) + the full smoke sweep green, JIT and AOT.
+
 ## [0.29.0] — Roadmap v29 "the C backend, finished I (aggregates + control)" (Phases 157–161)
 
 Theme: grow the `--emit-c` C-source backend (v23) from the i64/bool scalar

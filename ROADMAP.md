@@ -162,7 +162,8 @@ Continue v23 (`--emit-c`), each phase differentially gated vs LLVM.
 - **161** wire the arith / control / memsafety **fuzzers as a randomized
   C-vs-LLVM oracle** (`emit-c` == LLVM == reference).
 
-### v30 — the C backend, finished II (heap + RAII + generics)
+### v30 — the C backend, finished II (heap + RAII + generics) — *done (v0.30.0)*
+*Shipped: the `--emit-c` C backend grew to 162 `String` + heap strings, 163 scalar-element `Vec` (`Vec<i64>`/`Vec<bool>`), 164 `Drop`/RAII (scope-exit frees for non-escaping heap locals + owned params, ASan-verified leak/double-free clean), 165 closures + fn-pointers (hoisted fns + a stack capture env, fat-pointer `kdfn<N>`, escaping/FnMut refused — ASan stack-use-after-scope caught the escape unsoundness), 166 generics via scalar monomorphization (one int64_t instance; non-scalar/const-generic instantiations refused). Each phase differentially gated vs LLVM (and 164/165 ALSO ASan-gated). HashMap/HashSet refused (keyed-hash runtime deferred). Documented follow-ons: non-scalar `Vec`/generic instances, user `impl Drop`, nested-block + early-return heap locals.*
 - **162** C backend: **`String`** + heap strings.
 - **163** C backend: **`Vec` / `HashMap` / `HashSet`** (the runtime, in C).
 - **164** C backend: **`Drop` / RAII** (deterministic destructors + drop flags).
