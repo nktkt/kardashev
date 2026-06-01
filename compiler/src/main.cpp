@@ -344,6 +344,23 @@ std::string applyPrelude(const std::string& userSrc) {
             "    AcqRel => atomic_bool_cmpxchg_acqrel(*self, expected, new),\n"
             "    _ => atomic_bool_cmpxchg_seqcst(*self, expected, new) } }\n"
             "}\n";
+    // v40 structured concurrency: a cooperative CANCELLATION TOKEN. It is a
+    // shared Send+Sync `AtomicBool` flag — the handle is Copy, so passing the
+    // token by value to a worker thread (or holding it in the parent) shares
+    // the SAME underlying cell. `cancel` (from any thread) requests
+    // cancellation; cooperating workers/loops poll `is_cancelled` and stop. A
+    // full multi-threaded work-stealing executor + borrow-capturing scoped
+    // threads (the deferred Phase 174) remain future work — this is the
+    // primitive they build cancellation on.
+    if (userSrc.find("fn cancel_token_new") == std::string::npos) {
+        prelude +=
+            "fn cancel_token_new() -> AtomicBool ! { alloc } "
+            "{ atomic_bool_new(false) }\n"
+            "fn cancel(t: AtomicBool) -> i64 ! { io } "
+            "{ t.store(true, Ordering::SeqCst) }\n"
+            "fn is_cancelled(t: AtomicBool) -> bool "
+            "{ t.load(Ordering::SeqCst) }\n";
+    }
     if (userSrc.find("trait Clone") == std::string::npos) {
         prelude +=
             "trait Clone { fn clone(&self) -> Self ! { alloc }; }\n"
