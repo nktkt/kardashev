@@ -7912,6 +7912,59 @@ private:
     }
 
     TypePtr checkCall(const ast::CallExpr& call) {
+        // v39 raw-pointer arithmetic / write — the systems-FFI primitives the
+        // Phase 177 raw-pointer work deferred. Both are UNCHECKED (like a raw
+        // deref) and require an `unsafe` block.
+        //   ptr_offset(p: *const/*mut T, n: i64) -> same type   (GEP by element)
+        //   ptr_write(p: *mut T, v: T)                          (store)
+        if (call.callee == "ptr_offset") {
+            if (call.args.size() != 2) {
+                error("ptr_offset(p, n) takes a raw pointer and an i64 offset",
+                      call.line, call.column);
+                return makeInt();
+            }
+            TypePtr pt = resolve(checkExpr(*call.args[0]));
+            TypePtr nt = checkExpr(*call.args[1]);
+            if (pt->kind != TypeKind::Ref || !pt->isRawPtr) {
+                error("ptr_offset expects a raw pointer (`*const T` / `*mut T`) "
+                      "as its first argument, got " + typeToString(pt),
+                      call.args[0]->line, call.args[0]->column);
+                return pt;
+            }
+            if (!unify(nt, makeInt()))
+                error("ptr_offset offset must be an i64, got " +
+                          typeToString(nt),
+                      call.args[1]->line, call.args[1]->column);
+            if (unsafeDepth_ == 0)
+                error("ptr_offset (raw-pointer arithmetic) requires an "
+                      "`unsafe` block",
+                      call.line, call.column);
+            return pt; // same raw-pointer type
+        }
+        if (call.callee == "ptr_write") {
+            if (call.args.size() != 2) {
+                error("ptr_write(p, v) takes a `*mut T` and a `T` value",
+                      call.line, call.column);
+                return makeUnit();
+            }
+            TypePtr pt = resolve(checkExpr(*call.args[0]));
+            TypePtr vt = checkExpr(*call.args[1]);
+            if (pt->kind != TypeKind::Ref || !pt->isRawPtr || !pt->refIsMut) {
+                error("ptr_write expects a `*mut T` first argument, got " +
+                          typeToString(pt),
+                      call.args[0]->line, call.args[0]->column);
+                return makeUnit();
+            }
+            if (!coerceOrUnify(*call.args[1], vt, resolve(pt->refInner)))
+                error("ptr_write value type " + typeToString(vt) +
+                          " does not match the pointee type " +
+                          typeToString(resolve(pt->refInner)),
+                      call.args[1]->line, call.args[1]->column);
+            if (unsafeDepth_ == 0)
+                error("ptr_write (raw-pointer write) requires an `unsafe` block",
+                      call.line, call.column);
+            return makeUnit();
+        }
         // Phase 30: note any use of a file-I/O / CLI-args builtin so codegen
         // emits that runtime (which references libc free/fopen) ONLY for
         // programs that actually touch it — keeping I/O-free programs (and the
