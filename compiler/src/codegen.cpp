@@ -12018,10 +12018,23 @@ private:
         llvm::Type* elemLlvm = mapKardashevType(objTy->arrayElem);
         llvm::Value* idx = emitExpr(*ix.index);
 
+        // v36 Phase 196: bounds-check ELISION. When the index is a compile-time
+        // integer constant provably in [0, len), the access is statically known
+        // in-bounds — skip the runtime check (and its branch) entirely. A hot
+        // loop body like `a[0] + a[1] + a[2]` then carries no per-access
+        // compare+branch. (An out-of-range constant is left to the runtime
+        // check so behavior is unchanged — we only remove provably-dead checks.)
+        bool staticallyInBounds = false;
+        if (auto* lit =
+                dynamic_cast<const ast::IntLitExpr*>(ix.index.get())) {
+            if (lit->value >= 0 && lit->value < objTy->arrayLen)
+                staticallyInBounds = true;
+        }
+
         // Phase 23: runtime bounds check. `programMayPanic_` is always true here
         // (an IndexExpr makes the whole program may-panic), so panicOobFn_ is
         // emitted. Branch to the panic helper when idx is negative or >= len.
-        if (programMayPanic_ && panicOobFn_) {
+        if (programMayPanic_ && panicOobFn_ && !staticallyInBounds) {
             auto* i64Ty = llvm::Type::getInt64Ty(*ctx_);
             auto* len = llvm::ConstantInt::get(i64Ty, objTy->arrayLen);
             auto* idx64 = idx->getType()->isIntegerTy(64)

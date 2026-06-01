@@ -494,6 +494,13 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v36 Phase 196: bounds-check elision (constant in-range array index).
+sh_test(
+    name = "smoke_test_phase196",
+    srcs = ["smoke_test_phase196.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v34 Phase 184: operator overloading (Add/Sub/Mul/Div via traits).
 sh_test(
     name = "smoke_test_phase184",
