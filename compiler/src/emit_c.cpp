@@ -39,6 +39,27 @@ struct CEmitter {
     // `break <value>` writes the loop's value). Only `loop` (not for/while) can
     // break WITH a value, so for/while pushes nothing.
     std::vector<std::string> loopResultVars_;
+    // v30 Phase 165 (closures + fn values): each closure is lowered to a hoisted
+    // top-level C function `__cl_<n>(void* env, args...)` over a generated env
+    // struct `struct __clenv_<n> { int64_t <cap>; ... }` (scalar captures only).
+    // The fat-pointer fn value is `struct kdfn<arity> { int64_t(*fn)(void*, ...);
+    // void* env; }`. closureDefs_ accumulates the hoisted fn + env-struct C text
+    // (emitted before the user fns); fnArities_ records which kdfn<N> types are
+    // used (emitted up front).
+    int closureCounter_ = 0;
+    std::string closureDefs_;           // hoisted __cl_/__clenv_ definitions
+    std::set<int> fnArities_;            // kdfn<N> fat-pointer types needed
+    std::set<std::string> fnThunks_;     // top-level fns used as values
+    bool sawClosureOrFnVal_ = false;     // set by the pre-scan
+    bool inReturnPos_ = false;           // emitting a fn-value return position
+    // v30 Phase 166 (generics): the generic-param names of the fn currently
+    // being emitted (or of the generic fn whose call args we're typing). A
+    // TypeRef whose name is one of these lowers to `int64_t` — every scalar the
+    // C backend supports (i64/bool/char/unit) is int64_t, so a generic fn over a
+    // SCALAR type param has a SINGLE monomorphic int64_t instance. A non-scalar
+    // (struct/String/Vec) instantiation needs a distinct instance — a documented
+    // follow-on — and is refused at the call site.
+    std::set<std::string> currentGenericParams_;
 
     void err(const std::string& m) { errors.push_back("emit-c: " + m); }
     bool ok() const { return errors.empty(); }
@@ -69,6 +90,57 @@ struct CEmitter {
         return structs_.count(n) > 0;
     }
     bool isEnumName(const std::string& n) const { return enums_.count(n) > 0; }
+    // v30 Phase 162: the set of String builtins this program calls (so the C
+    // runtime emits only what's used). A call to one of these (or a String type
+    // / string literal) opts the program into the String runtime.
+    bool usesString_ = false;
+    bool programCallsStringBuiltin_ = false; // set by the pre-scan
+    // v30 Phase 162: escape a kardashev string's bytes into a C string literal.
+    static std::string cStringLit(const std::string& s) {
+        std::string out = "\"";
+        for (unsigned char c : s) {
+            switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\t': out += "\\t"; break;
+            case '\r': out += "\\r"; break;
+            default:
+                if (c >= 0x20 && c < 0x7F) out += static_cast<char>(c);
+                else {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\x%02x", c);
+                    out += buf;
+                }
+            }
+        }
+        return out + "\"";
+    }
+    static bool isStringBuiltin(const std::string& n) {
+        static const std::set<std::string> b = {
+            "string_new", "str_len", "str_char_at", "str_push_byte",
+            "string_push_str", "print_str", "print_string", "print_no_nl",
+            "println", "int_to_string", "str_eq", "str_substring", "print"};
+        return b.count(n) > 0;
+    }
+    // v30 Phase 163: scalar-element Vec builtins with a C runtime (int64_t
+    // elements: Vec<i64> / Vec<bool>). Struct/String-element Vecs are refused
+    // for now (a later piece monomorphizes per element type).
+    bool usesVec_ = false;
+    bool sawVecCall_ = false; // set by the pre-scan (exprUsesString walk)
+    static bool isVecBuiltin(const std::string& n) {
+        static const std::set<std::string> b = {
+            "vec_new", "vec_push", "vec_get", "vec_get_ref", "vec_len",
+            "vec_pop", "vec_remove", "vec_insert", "vec_reverse", "vec_swap"};
+        return b.count(n) > 0;
+    }
+    // v30 Phase 163: the builtins for which the C backend emits a real runtime.
+    // Currently the String + scalar-Vec sets; HashMap/HashSet etc. are added as
+    // their C runtimes land. A call to anything not here (and not a user fn) is
+    // refused (Phase 163 part 1).
+    static bool isImplementedBuiltin(const std::string& n) {
+        return isStringBuiltin(n) || isVecBuiltin(n);
+    }
 
     // v29 Phase 157: the C type of a kardashev TypeRef. Scalars -> int64_t, a
     // user struct -> `struct <Name>`. Anything else (refs, generics, enums,
@@ -86,10 +158,35 @@ struct CEmitter {
             std::string ci = ctype(inner);
             return ci.empty() ? "" : ci + "*";
         }
-        if (t.isFn || t.isSlice || t.isArray || t.isTuple || t.isDyn ||
+        // v30 Phase 165: a function type `fn(A, B) -> R ! eff` -> the fat-pointer
+        // `struct kdfn<arity>`. Only SCALAR params + a scalar/unit return are in
+        // the subset (the kdfn type is all-int64_t). Used for a higher-order fn
+        // parameter (`fn apply(f: fn(i64) -> i64, x: i64)`).
+        if (t.isFn) {
+            auto scalarish = [&](const std::string& n) {
+                return isScalarName(n) || n == "unit" ||
+                       currentGenericParams_.count(n) > 0; // v30 P166: T -> i64
+            };
+            for (const auto& p : t.fnParams)
+                if (!scalarish(p.name)) {
+                    err("a fn-type parameter with a non-scalar argument is "
+                        "outside the C-backend subset");
+                    return "";
+                }
+            if (t.fnRet && !scalarish(t.fnRet->name)) {
+                err("a fn-type parameter with a non-scalar return is outside "
+                    "the C-backend subset");
+                return "";
+            }
+            int arity = static_cast<int>(t.fnParams.size());
+            fnArities_.insert(arity);
+            sawClosureOrFnVal_ = true;
+            return "struct kdfn" + std::to_string(arity);
+        }
+        if (t.isSlice || t.isArray || t.isTuple || t.isDyn ||
             !t.assocName.empty()) {
             err("type `" + (t.name.empty() ? std::string("<complex>") : t.name) +
-                "` (slice/array/tuple/fn/dyn/assoc) is outside the "
+                "` (slice/array/tuple/dyn/assoc) is outside the "
                 "C-backend subset");
             return "";
         }
@@ -98,6 +195,24 @@ struct CEmitter {
         // which the caller (an ExprStmt) discards. Keeps the uniform
         // `return <block value>;` lowering for a void-like function.
         if (t.name == "unit") return "int64_t";
+        // v30 Phase 166: a generic type parameter in scope -> int64_t (the
+        // single scalar monomorphization the C backend supports).
+        if (currentGenericParams_.count(t.name)) return "int64_t";
+        // v30 Phase 162: String -> the C runtime's `struct kdstr`.
+        if (t.name == "String") { usesString_ = true; return "struct kdstr"; }
+        // v30 Phase 163: Vec<T> -> the C runtime's `struct kdvec`, but only for a
+        // SCALAR element (i64/bool, both -> int64_t in C). Vec<struct>/Vec<String>
+        // need a per-element-type monomorphized runtime (a later piece) — refuse
+        // them cleanly rather than emit a wrong int64_t-element vec.
+        if (t.name == "Vec") {
+            if (t.typeArgs.size() == 1 && isScalarName(t.typeArgs[0].name)) {
+                usesVec_ = true;
+                return "struct kdvec";
+            }
+            err("Vec with a non-scalar element is outside the C-backend subset "
+                "(Vec<i64>/Vec<bool> only for now)");
+            return "";
+        }
         if (isScalarName(t.name)) return "int64_t";
         if (isStructName(t.name) || isEnumName(t.name)) {
             if (!t.typeArgs.empty()) {
@@ -106,6 +221,17 @@ struct CEmitter {
                 return "";
             }
             return "struct " + t.name;
+        }
+        // An unknown bare type name. If it looks like an unbound generic param
+        // (single uppercase, common convention) give a more specific hint: the
+        // C backend monomorphizes a generic fn ONLY at scalar (int64_t) type, so
+        // a struct/String/Vec instantiation is out of subset.
+        if (t.name.size() <= 2 && !t.name.empty() && t.name[0] >= 'A' &&
+            t.name[0] <= 'Z') {
+            err("a generic instantiation at a non-scalar type (`" + t.name +
+                "`) is outside the C-backend subset (only the single scalar/"
+                "int64_t monomorphization is emitted)");
+            return "";
         }
         err("type `" + t.name + "` is outside the C-backend subset "
             "(i64/bool/struct/enum only)");
@@ -141,6 +267,11 @@ struct CEmitter {
     // `let` with no annotation, a compound literal, etc.). The AST is already
     // typechecked, so this structural derivation is sound for the subset.
     std::string ctypeOfExpr(const Expr& e) {
+        // v30 Phase 162: a string literal + the String-returning builtins.
+        if (dynamic_cast<const StringLitExpr*>(&e)) {
+            usesString_ = true;
+            return "struct kdstr";
+        }
         if (auto* sl = dynamic_cast<const StructLitExpr*>(&e))
             return "struct " + sl->structName;
         if (auto* id = dynamic_cast<const IdentExpr*>(&e)) {
@@ -153,6 +284,11 @@ struct CEmitter {
         }
         if (auto* mx = dynamic_cast<const MatchExpr*>(&e))
             return mx->arms.empty() ? "int64_t" : ctypeOfExpr(*mx->arms[0].body);
+        // v30 Phase 165: a closure literal -> kdfn<arity>; a call through a fn
+        // value -> its scalar (int64_t) result.
+        if (auto* cl = dynamic_cast<const ClosureExpr*>(&e))
+            return "struct kdfn" + std::to_string(cl->params.size());
+        if (dynamic_cast<const CallValueExpr*>(&e)) return "int64_t";
         // v29 Phase 159: `&x` -> a pointer; `*r` -> the pointee.
         if (auto* re = dynamic_cast<const RefExpr*>(&e))
             return ctypeOfExpr(*re->operand) + "*";
@@ -184,8 +320,29 @@ struct CEmitter {
             auto vi = variantInfo_.find(call->callee);
             if (vi != variantInfo_.end()) return "struct " + vi->second.enumName;
             auto fit = fns_.find(call->callee);
-            if (fit != fns_.end()) return ctype(fit->second->returnType);
-            return "int64_t"; // a builtin / scalar call
+            if (fit != fns_.end()) {
+                // v30 Phase 166: a call to a generic fn returns its return type
+                // with the CALLEE's generic params bound to int64_t (the scalar
+                // instance) — else `ctype(T)` sees an unbound `T`.
+                auto savedG = currentGenericParams_;
+                for (const auto& gp : fit->second->genericParams)
+                    if (!gp.isConst) currentGenericParams_.insert(gp.name);
+                std::string r = ctype(fit->second->returnType);
+                currentGenericParams_ = savedG;
+                return r.empty() ? "int64_t" : r;
+            }
+            // v30 Phase 162: String-returning builtins.
+            if (call->callee == "string_new" ||
+                call->callee == "int_to_string" ||
+                call->callee == "str_substring") {
+                usesString_ = true;
+                return "struct kdstr";
+            }
+            // v30 Phase 163: Vec-returning / Vec-element builtins.
+            if (call->callee == "vec_new") { usesVec_ = true; return "struct kdvec"; }
+            if (call->callee == "vec_get_ref") return "int64_t*";
+            // vec_get/pop/remove/len/push/insert/reverse/swap -> int64_t
+            return "int64_t"; // a scalar builtin call
         }
         if (auto* iff = dynamic_cast<const IfExpr*>(&e))
             return ctypeOfExpr(*iff->thenBranch);
@@ -200,12 +357,34 @@ struct CEmitter {
             return "INT64_C(" + std::to_string(il->value) + ")";
         if (auto* bl = dynamic_cast<const BoolLitExpr*>(&e))
             return bl->value ? "INT64_C(1)" : "INT64_C(0)";
+        // v30 Phase 162: a string literal -> a borrowed kdstr { data, len,
+        // cap=0 } over a C string literal (cap==0 = read-only, never freed,
+        // copy-on-write on mutation — same convention as the LLVM backend).
+        if (auto* sl = dynamic_cast<const StringLitExpr*>(&e)) {
+            usesString_ = true;
+            return "((struct kdstr){ .data = (char*)" + cStringLit(sl->value) +
+                   ", .len = INT64_C(" + std::to_string(sl->value.size()) +
+                   "), .cap = INT64_C(0) })";
+        }
         if (auto* id = dynamic_cast<const IdentExpr*>(&e)) {
             // v29 Phase 158: a bare unit-variant constructor (`None`).
             auto vi = variantInfo_.find(id->name);
             if (vi != variantInfo_.end())
                 return "((struct " + vi->second.enumName + "){ .tag = " +
                        std::to_string(vi->second.tag) + " })";
+            // v30 Phase 165: a bare top-level fn NAME used as a VALUE (`apply(inc,
+            // ..)`, `let f = inc;`) -> a fat pointer over a thunk that ignores
+            // env. (A local of the same name shadows; varCType_ only holds value
+            // locals, so a name that's a known fn and NOT a local is the fn.)
+            auto fit = fns_.find(id->name);
+            if (fit != fns_.end() && !varCType_.count(id->name)) {
+                int arity = static_cast<int>(fit->second->params.size());
+                fnArities_.insert(arity);
+                sawClosureOrFnVal_ = true;
+                fnThunks_.insert(id->name);
+                return "((struct kdfn" + std::to_string(arity) +
+                       "){ .fn = __fnthunk_" + id->name + ", .env = 0 })";
+            }
             return vname(id->name);
         }
         if (auto* un = dynamic_cast<const UnaryExpr*>(&e)) {
@@ -263,6 +442,81 @@ struct CEmitter {
                     s += ", .p" + std::to_string(i) + " = " +
                          expr(*call->args[i]);
                 return s + " })";
+            }
+            // v30 Phase 165: a bare `f(args)` where `f` is a fn-VALUE local /
+            // param (a `struct kdfnN`) -> unpack the fat pointer and call it.
+            // (The parser produces a CallExpr for `ident(args)`, so a HOF param
+            // call lands here, not in CallValueExpr.)
+            {
+                auto vit = varCType_.find(call->callee);
+                if (vit != varCType_.end() &&
+                    vit->second.rfind("struct kdfn", 0) == 0) {
+                    std::string s = "({ " + vit->second + " __f = " +
+                                    vname(call->callee) + "; __f.fn(__f.env";
+                    for (auto& a : call->args) s += ", " + expr(*a);
+                    return s + "); })";
+                }
+            }
+            // v30 Phase 163 (soundness): a call must resolve to a user fn, a
+            // variant ctor (handled above), or an IMPLEMENTED builtin. Anything
+            // else (an unimplemented stdlib builtin — vec_*, hashmap_*, thread_*,
+            // async, …) would emit `kd_<name>(...)` with no definition = broken
+            // C. Refuse it instead, preserving "never emit wrong C". (Earlier
+            // phases silently emitted undefined-symbol calls for these; the
+            // phase129 smoke never exercised a builtin so it went unnoticed.)
+            if (!fns_.count(call->callee) &&
+                !isImplementedBuiltin(call->callee)) {
+                err("call to `" + call->callee +
+                    "` is outside the C-backend subset (no C runtime for this "
+                    "builtin yet)");
+                return "0";
+            }
+            // v30 Phase 162: a String builtin opts the program into the C
+            // String runtime (emitted up front as `kd_<name>` definitions).
+            if (isStringBuiltin(call->callee)) usesString_ = true;
+            // v30 Phase 163: a Vec builtin opts into the scalar-Vec runtime. A
+            // vec_push/insert whose pushed element isn't a scalar (int64_t)
+            // means a Vec<struct>/Vec<String> — refuse (no monomorphized runtime
+            // yet) rather than store a struct into an int64_t slot.
+            if (isVecBuiltin(call->callee)) {
+                usesVec_ = true;
+                if ((call->callee == "vec_push" && call->args.size() == 2) ||
+                    (call->callee == "vec_insert" && call->args.size() == 3)) {
+                    const Expr& elem = (call->callee == "vec_push")
+                                           ? *call->args[1]
+                                           : *call->args[2];
+                    if (ctypeOfExpr(elem) != "int64_t") {
+                        err("Vec with a non-scalar element is outside the "
+                            "C-backend subset (Vec<i64>/Vec<bool> only for now)");
+                        return "0";
+                    }
+                }
+            }
+            // v30 Phase 166 (soundness): a call to a GENERIC user fn whose arg
+            // at a generic-param position is NON-scalar (struct/String/Vec/fn)
+            // would pass that value into the fn's single int64_t monomorphization
+            // — the C compiler rejects the type mismatch, so refuse it here (the
+            // backend must never emit C that doesn't compile). A param typed by a
+            // generic param is detected by ctype-ing it WITHOUT the generics
+            // bound: an unbound generic name yields "" (recorded an error we
+            // swallow) — meaning "this slot is generic".
+            if (auto fit = fns_.find(call->callee);
+                fit != fns_.end() && !fit->second->genericParams.empty()) {
+                const FnDecl* fd = fit->second;
+                std::set<std::string> gp;
+                for (const auto& g : fd->genericParams) gp.insert(g.name);
+                for (std::size_t i = 0;
+                     i < call->args.size() && i < fd->params.size(); ++i) {
+                    if (!gp.count(fd->params[i].type.name)) continue; // concrete
+                    std::string at = ctypeOfExpr(*call->args[i]);
+                    if (at != "int64_t") {
+                        err("a generic fn `" + call->callee +
+                            "` instantiated at a non-scalar type (argument is `" +
+                            at + "`) is outside the C-backend subset (only the "
+                            "scalar/int64_t monomorphization is emitted)");
+                        return "0";
+                    }
+                }
             }
             std::string s = "kd_" + call->callee + "(";
             for (std::size_t i = 0; i < call->args.size(); ++i) {
@@ -339,6 +593,22 @@ struct CEmitter {
         }
         if (dynamic_cast<const ContinueExpr*>(&e))
             return "({ continue; INT64_C(0); })";
+        // v30 Phase 165: a closure literal -> a hoisted fn + stack env fat ptr.
+        if (auto* cl = dynamic_cast<const ClosureExpr*>(&e))
+            return emitClosure(*cl);
+        // v30 Phase 165: a call through a fn VALUE `(f)(args)` / `f(args)` where
+        // f is a fn-typed local/param -> unpack the fat pointer and call
+        // `f.fn(f.env, args)`. The callee is a place expression (an ident, a
+        // parenthesized expr); compute it once into a temp so .fn/.env aren't
+        // double-evaluated.
+        if (auto* cv = dynamic_cast<const CallValueExpr*>(&e)) {
+            std::string fv = expr(*cv->callee);
+            std::string s = "({ struct kdfn" +
+                            std::to_string(cv->args.size()) + " __f = (" + fv +
+                            "); __f.fn(__f.env";
+            for (auto& a : cv->args) s += ", " + expr(*a);
+            return s + "); })";
+        }
         err("unsupported expression in the C backend (outside the subset)");
         return "0";
     }
@@ -434,6 +704,277 @@ struct CEmitter {
         return s;
     }
 
+    // v30 Phase 165: collect the FREE identifiers of a closure body — names used
+    // but not bound by the closure's own params / nested lets. The C backend has
+    // no typecheck info, so we compute captures ourselves. `bound` accumulates
+    // names shadowed as we descend; `order`/`seen` collect free names in first-
+    // use order (deterministic). Also flags `mutated` if a free name is the LHS
+    // of an assignment or the operand of `&mut` (an FnMut by-ref capture — out of
+    // the C-backend subset, refused by the caller).
+    void freeVars(const Expr* e, std::set<std::string>& bound,
+                  std::vector<std::string>& order,
+                  std::set<std::string>& seen, bool& mutated) {
+        if (!e) return;
+        if (auto* id = dynamic_cast<const IdentExpr*>(e)) {
+            if (!bound.count(id->name) && !seen.count(id->name) &&
+                !fns_.count(id->name) && !variantInfo_.count(id->name)) {
+                seen.insert(id->name);
+                order.push_back(id->name);
+            }
+            return;
+        }
+        if (auto* re = dynamic_cast<const RefExpr*>(e)) {
+            if (re->isMut)
+                if (auto* iid = dynamic_cast<const IdentExpr*>(re->operand.get()))
+                    if (!bound.count(iid->name)) mutated = true;
+            freeVars(re->operand.get(), bound, order, seen, mutated);
+            return;
+        }
+        if (auto* u = dynamic_cast<const UnaryExpr*>(e)) { freeVars(u->operand.get(), bound, order, seen, mutated); return; }
+        if (auto* b = dynamic_cast<const BinaryExpr*>(e)) { freeVars(b->lhs.get(), bound, order, seen, mutated); freeVars(b->rhs.get(), bound, order, seen, mutated); return; }
+        if (auto* f = dynamic_cast<const FieldExpr*>(e)) { freeVars(f->object.get(), bound, order, seen, mutated); return; }
+        if (auto* iff = dynamic_cast<const IfExpr*>(e)) { freeVars(iff->cond.get(), bound, order, seen, mutated); freeVars(iff->thenBranch.get(), bound, order, seen, mutated); freeVars(iff->elseBranch.get(), bound, order, seen, mutated); return; }
+        if (auto* w = dynamic_cast<const WhileExpr*>(e)) { freeVars(w->cond.get(), bound, order, seen, mutated); freeVars(w->body.get(), bound, order, seen, mutated); return; }
+        if (auto* c = dynamic_cast<const CallExpr*>(e)) { for (auto& a : c->args) freeVars(a.get(), bound, order, seen, mutated); return; }
+        if (auto* cv = dynamic_cast<const CallValueExpr*>(e)) { freeVars(cv->callee.get(), bound, order, seen, mutated); for (auto& a : cv->args) freeVars(a.get(), bound, order, seen, mutated); return; }
+        if (auto* blk = dynamic_cast<const BlockExpr*>(e)) {
+            std::set<std::string> inner = bound;
+            for (auto& st : blk->stmts) {
+                if (auto* l = dynamic_cast<const LetStmt*>(st.get())) { freeVars(l->value.get(), inner, order, seen, mutated); inner.insert(l->name); }
+                else if (auto* es = dynamic_cast<const ExprStmt*>(st.get())) freeVars(es->expr.get(), inner, order, seen, mutated);
+                else if (auto* as = dynamic_cast<const AssignStmt*>(st.get())) {
+                    if (auto* tid = dynamic_cast<const IdentExpr*>(as->target.get()))
+                        if (!inner.count(tid->name)) mutated = true;
+                    freeVars(as->target.get(), inner, order, seen, mutated);
+                    freeVars(as->value.get(), inner, order, seen, mutated);
+                } else if (auto* rs = dynamic_cast<const ReturnStmt*>(st.get())) freeVars(rs->value.get(), inner, order, seen, mutated);
+            }
+            freeVars(blk->tail.get(), inner, order, seen, mutated);
+            return;
+        }
+        if (auto* mx = dynamic_cast<const MatchExpr*>(e)) { freeVars(mx->scrutinee.get(), bound, order, seen, mutated); for (auto& arm : mx->arms) freeVars(arm.body.get(), bound, order, seen, mutated); return; }
+        if (auto* cl = dynamic_cast<const ClosureExpr*>(e)) {
+            std::set<std::string> inner = bound;
+            for (auto& p : cl->params) inner.insert(p.name);
+            freeVars(cl->body.get(), inner, order, seen, mutated);
+            return;
+        }
+        // literals / break / continue: no free vars of interest.
+    }
+
+    // v30 Phase 165: lower a closure to a hoisted top-level function + a stack
+    // env, returning the fat-pointer compound literal `((struct kdfnN){ .fn =
+    // __cl_n, .env = &(struct __clenv_n){...} })`. Captures are scalar (int64_t)
+    // by value; a mut / by-ref capture is refused (out of subset). The env is a
+    // C99 block-scoped compound literal — STACK lifetime, so the fn value MUST
+    // NOT escape its statement (escape is refused at let / return). A
+    // zero-capture closure passes a null env. The hoisted fn re-binds each
+    // capture from the env in its prologue.
+    std::string emitClosure(const ClosureExpr& cl) {
+        int arity = static_cast<int>(cl.params.size());
+        fnArities_.insert(arity);
+        sawClosureOrFnVal_ = true;
+        // v30 Phase 165 (soundness): the closure's env is a STACK compound
+        // literal (block lifetime), so the fn value MUST NOT escape its
+        // enclosing fn. A closure used in a return-position would dangle (LLVM
+        // heap-allocates the env and can return it; the C backend can't without
+        // a heap env + a Drop story). Refuse it. `inReturnPos_` is set while
+        // emitting a return value / a fn whose return type is itself fn(..).
+        if (inReturnPos_) {
+            err("a closure that escapes its function (returned as a fn value) is "
+                "outside the C-backend subset (its captured env lives on the "
+                "stack)");
+            return "0";
+        }
+        // compute captures
+        std::set<std::string> bound;
+        for (auto& p : cl.params) bound.insert(p.name);
+        std::vector<std::string> caps;
+        std::set<std::string> seen;
+        bool mutated = false;
+        freeVars(cl.body.get(), bound, caps, seen, mutated);
+        if (mutated) { err("a closure that mutates a captured binding (FnMut) is outside the C-backend subset"); return "0"; }
+        // a capture must be a known scalar local/param (int64_t)
+        for (const auto& cn : caps) {
+            auto it = varCType_.find(cn);
+            if (it == varCType_.end() || it->second != "int64_t") {
+                err("a closure capturing the non-scalar / unknown binding `" + cn +
+                    "` is outside the C-backend subset (i64/bool captures only)");
+                return "0";
+            }
+        }
+        int id = closureCounter_++;
+        const std::string envTy = "struct __clenv_" + std::to_string(id);
+        const std::string fnName = "__cl_" + std::to_string(id);
+        // env struct typedef (omit when no captures).
+        std::string def;
+        if (!caps.empty()) {
+            def += envTy + " { ";
+            for (const auto& cn : caps) def += "int64_t " + vname(cn) + "; ";
+            def += "};\n";
+        }
+        // hoisted function. Save + restore varCType_ so the body types against
+        // the captures + params (all int64_t).
+        auto savedVarCType = varCType_;
+        varCType_.clear();
+        for (const auto& cn : caps) varCType_[cn] = "int64_t";
+        for (auto& p : cl.params) varCType_[p.name] = "int64_t";
+        def += "static int64_t " + fnName + "(void* __envp";
+        for (auto& p : cl.params) def += ", int64_t " + vname(p.name);
+        def += ") {\n";
+        if (!caps.empty()) {
+            def += "  " + envTy + "* __env = (" + envTy + "*)__envp;\n";
+            for (const auto& cn : caps)
+                def += "  int64_t " + vname(cn) + " = __env->" + vname(cn) + ";\n";
+        }
+        std::string bodyC = expr(*cl.body);
+        def += "  return " + bodyC + ";\n}\n";
+        closureDefs_ += def;
+        varCType_ = savedVarCType;
+        // the fat-pointer value, with a stack env compound literal.
+        std::string s = "((struct kdfn" + std::to_string(arity) +
+                        "){ .fn = " + fnName + ", .env = ";
+        if (caps.empty()) {
+            s += "0 })";
+        } else {
+            s += "&(" + envTy + "){ ";
+            for (std::size_t i = 0; i < caps.size(); ++i) {
+                if (i) s += ", ";
+                s += "." + vname(caps[i]) + " = " + vname(caps[i]);
+            }
+            s += " } })";
+        }
+        return s;
+    }
+
+    // v30 Phase 164 (Drop / RAII): count occurrences of the identifier `name`
+    // that are NOT a borrow (`&name` / `&mut name`). A borrow keeps ownership in
+    // this scope; a BARE occurrence (returned as a value, moved into a call,
+    // reassigned, used as a field/index base that could move it out) means the
+    // binding may escape, so it is NOT safe to drop at scope exit. Conservative:
+    // any bare use ⇒ don't drop (a leak is sound; a wrong drop double-frees).
+    int bareUses(const Expr* e, const std::string& name) {
+        if (!e) return 0;
+        if (auto* re = dynamic_cast<const RefExpr*>(e)) {
+            // `&name` / `&mut name` is a borrow, not a bare use. A `&(other
+            // expr)` still recurses to find bare uses inside it.
+            if (dynamic_cast<const IdentExpr*>(re->operand.get())) return 0;
+            return bareUses(re->operand.get(), name);
+        }
+        if (auto* id = dynamic_cast<const IdentExpr*>(e))
+            return id->name == name ? 1 : 0;
+        int n = 0;
+        if (auto* u = dynamic_cast<const UnaryExpr*>(e)) n += bareUses(u->operand.get(), name);
+        else if (auto* b = dynamic_cast<const BinaryExpr*>(e)) { n += bareUses(b->lhs.get(), name); n += bareUses(b->rhs.get(), name); }
+        else if (auto* f = dynamic_cast<const FieldExpr*>(e)) n += bareUses(f->object.get(), name);
+        else if (auto* iff = dynamic_cast<const IfExpr*>(e)) { n += bareUses(iff->cond.get(), name); n += bareUses(iff->thenBranch.get(), name); n += bareUses(iff->elseBranch.get(), name); }
+        else if (auto* w = dynamic_cast<const WhileExpr*>(e)) { n += bareUses(w->cond.get(), name); n += bareUses(w->body.get(), name); }
+        else if (auto* lp = dynamic_cast<const LoopExpr*>(e)) n += bareUses(lp->body.get(), name);
+        else if (auto* fo = dynamic_cast<const ForExpr*>(e)) { n += bareUses(fo->iter.get(), name); n += bareUses(fo->body.get(), name); }
+        else if (auto* c = dynamic_cast<const CallExpr*>(e)) { for (auto& a : c->args) n += bareUses(a.get(), name); }
+        else if (auto* mx = dynamic_cast<const MatchExpr*>(e)) { n += bareUses(mx->scrutinee.get(), name); for (auto& arm : mx->arms) n += bareUses(arm.body.get(), name); }
+        else if (auto* sl = dynamic_cast<const StructLitExpr*>(e)) { for (auto& fld : sl->fields) n += bareUses(fld.second.get(), name); }
+        else if (auto* br = dynamic_cast<const BreakExpr*>(e)) n += bareUses(br->value.get(), name);
+        else if (auto* blk = dynamic_cast<const BlockExpr*>(e)) {
+            for (auto& st : blk->stmts) {
+                if (auto* l = dynamic_cast<const LetStmt*>(st.get())) n += bareUses(l->value.get(), name);
+                else if (auto* es = dynamic_cast<const ExprStmt*>(st.get())) n += bareUses(es->expr.get(), name);
+                else if (auto* as = dynamic_cast<const AssignStmt*>(st.get())) { n += bareUses(as->target.get(), name); n += bareUses(as->value.get(), name); }
+                else if (auto* rs = dynamic_cast<const ReturnStmt*>(st.get())) n += bareUses(rs->value.get(), name);
+            }
+            n += bareUses(blk->tail.get(), name);
+        }
+        return n;
+    }
+
+    // v30 Phase 164: does any statement (at any depth) early-`return`? If so we
+    // disable scope-exit drops for the whole fn (a drop placed only at the tail
+    // would be skipped on the early-return path — a leak; never a double-free).
+    bool hasEarlyReturn(const Expr* e) {
+        if (!e) return false;
+        if (auto* iff = dynamic_cast<const IfExpr*>(e))
+            return hasEarlyReturn(iff->cond.get()) || hasEarlyReturn(iff->thenBranch.get()) || hasEarlyReturn(iff->elseBranch.get());
+        if (auto* w = dynamic_cast<const WhileExpr*>(e)) return hasEarlyReturn(w->cond.get()) || hasEarlyReturn(w->body.get());
+        if (auto* lp = dynamic_cast<const LoopExpr*>(e)) return hasEarlyReturn(lp->body.get());
+        if (auto* fo = dynamic_cast<const ForExpr*>(e)) return hasEarlyReturn(fo->iter.get()) || hasEarlyReturn(fo->body.get());
+        if (auto* mx = dynamic_cast<const MatchExpr*>(e)) { if (hasEarlyReturn(mx->scrutinee.get())) return true; for (auto& arm : mx->arms) if (hasEarlyReturn(arm.body.get())) return true; return false; }
+        if (auto* blk = dynamic_cast<const BlockExpr*>(e)) {
+            for (auto& st : blk->stmts) {
+                if (dynamic_cast<const ReturnStmt*>(st.get())) return true;
+                if (auto* es = dynamic_cast<const ExprStmt*>(st.get())) if (hasEarlyReturn(es->expr.get())) return true;
+                if (auto* l = dynamic_cast<const LetStmt*>(st.get())) if (hasEarlyReturn(l->value.get())) return true;
+            }
+            return hasEarlyReturn(blk->tail.get());
+        }
+        return false;
+    }
+
+    // v30 Phase 164: emit a FUNCTION body that drops its non-escaping heap-owning
+    // top-level locals (String -> kd__str_drop, Vec -> kd__vec_drop) at exit.
+    // The tail is captured to `__ret` FIRST (so a tail that borrows a local is
+    // computed before the drop), then drops run, then `__ret` is yielded. Only
+    // top-level lets are considered, only when the binding has zero BARE uses
+    // (all uses are borrows) and the body has no early `return` — otherwise the
+    // local is left alone (a sound leak). retCTy types the captured result.
+    std::string fnBodyWithDrops(const FnDecl& fn, const std::string& retCTy) {
+        const BlockExpr& b = *fn.body;
+        // total bare (non-borrow) uses of `name` across the whole body.
+        auto totalBare = [&](const std::string& name, const Stmt* skip) -> int {
+            int bare = 0;
+            for (const auto& st2 : b.stmts) {
+                if (st2.get() == skip) continue; // skip a let's own decl
+                if (auto* l2 = dynamic_cast<const LetStmt*>(st2.get())) bare += bareUses(l2->value.get(), name);
+                else if (auto* es = dynamic_cast<const ExprStmt*>(st2.get())) bare += bareUses(es->expr.get(), name);
+                else if (auto* as = dynamic_cast<const AssignStmt*>(st2.get())) { bare += bareUses(as->target.get(), name); bare += bareUses(as->value.get(), name); }
+                else if (auto* rs = dynamic_cast<const ReturnStmt*>(st2.get())) bare += bareUses(rs->value.get(), name);
+            }
+            bare += bareUses(b.tail.get(), name);
+            return bare;
+        };
+        const char* helperFor = nullptr; // (set per check below)
+        auto heapHelper = [](const std::string& cty) -> const char* {
+            if (cty == "struct kdstr") return "kd__str_drop";
+            if (cty == "struct kdvec") return "kd__vec_drop";
+            return nullptr;
+        };
+        (void)helperFor;
+        // Collect droppable bindings: a by-value heap PARAM (the callee owns the
+        // moved-in value), then top-level heap LOCALS — both only when every use
+        // is a borrow and the fn has no early return. Params drop AFTER locals
+        // (reverse declaration order overall is fine — independent buffers).
+        std::vector<std::pair<std::string, std::string>> drops; // (cname, helper)
+        bool earlyRet = hasEarlyReturn(&b);
+        if (!earlyRet) {
+            for (const auto& st : b.stmts) {
+                auto* let = dynamic_cast<const LetStmt*>(st.get());
+                if (!let || !let->tupleNames.empty()) continue;
+                std::string cty = let->annotation ? ctype(*let->annotation)
+                                                  : ctypeOfExpr(*let->value);
+                const char* helper = heapHelper(cty);
+                if (helper && totalBare(let->name, st.get()) == 0)
+                    drops.emplace_back(vname(let->name), helper);
+            }
+            // v30 Phase 164 (fix): a by-value heap PARAM is owned by this fn (the
+            // caller moved it in), so drop it at exit unless it escapes (bare use
+            // / moved on). A `&T` / `&mut T` param is a borrow (its C type ends
+            // in `*`) — never dropped.
+            for (const auto& p : fn.params) {
+                std::string pty = ctype(p.type);
+                const char* helper = heapHelper(pty);
+                if (helper && totalBare(p.name, nullptr) == 0)
+                    drops.emplace_back(vname(p.name), helper);
+            }
+        }
+        if (drops.empty()) return blockValue(b); // nothing to drop: as before
+        std::string s = "({ ";
+        for (const auto& st : b.stmts) s += stmt(*st) + " ";
+        s += retCTy + " __ret = (" +
+             (b.tail ? expr(*b.tail) : std::string("INT64_C(0)")) + "); ";
+        for (const auto& [cn, helper] : drops) s += helper + ("(&" + cn + "); ");
+        s += "__ret; })";
+        return s;
+    }
+
     // A block used for EFFECT (a while body): `{ stmts...; tail-for-effect; }`.
     std::string blockStmts(const BlockExpr& b) {
         std::string s = "{ ";
@@ -459,8 +1000,13 @@ struct CEmitter {
                    ";";
         }
         if (auto* ret = dynamic_cast<const ReturnStmt*>(&s)) {
-            return ret->value ? ("return " + expr(*ret->value) + ";")
-                              : "return INT64_C(0);";
+            // v30 Phase 165: a `return <closure>` escapes — mark return position
+            // so emitClosure refuses (its env is on the stack).
+            bool prev = inReturnPos_;
+            inReturnPos_ = true;
+            std::string v = ret->value ? expr(*ret->value) : std::string("INT64_C(0)");
+            inReturnPos_ = prev;
+            return "return " + v + ";";
         }
         if (auto* es = dynamic_cast<const ExprStmt*>(&s))
             return expr(*es->expr) + ";";
@@ -497,19 +1043,30 @@ struct CEmitter {
     }
 
     bool fnInSubset(const FnDecl& fn) {
-        if (!fn.genericParams.empty()) {
-            err("generic fn `" + fn.name + "` is outside the C-backend subset");
-            return false;
-        }
         if (fn.isAsync) {
             err("async fn `" + fn.name + "` is outside the C-backend subset");
             return false;
         }
-        // ctype() of the return + each param validates they're in the subset.
-        if (ctype(fn.returnType).empty()) return false;
-        for (const auto& p : fn.params)
-            if (ctype(p.type).empty()) return false;
-        return true;
+        // v30 Phase 166: a generic fn over SCALAR type params has a single
+        // int64_t monomorphization — bind its params to int64_t while validating
+        // (and emitting) it. A const-generic param is not lowerable here (the C
+        // backend has no const-eval) — refuse.
+        auto saved = currentGenericParams_;
+        for (const auto& gp : fn.genericParams) {
+            if (gp.isConst) {
+                err("a const-generic fn `" + fn.name +
+                    "` is outside the C-backend subset");
+                currentGenericParams_ = saved;
+                return false;
+            }
+            currentGenericParams_.insert(gp.name);
+        }
+        bool ok = !ctype(fn.returnType).empty();
+        if (ok)
+            for (const auto& p : fn.params)
+                if (ctype(p.type).empty()) { ok = false; break; }
+        currentGenericParams_ = saved;
+        return ok;
     }
 
     // v29 Phase 157: emit struct typedefs, inner-before-outer so a struct field
@@ -575,6 +1132,230 @@ struct CEmitter {
         if (!program.enums.empty()) out << "\n";
     }
 
+    // v30 Phase 162: does any signature mention String? (A pre-scan so the C
+    // String runtime is emitted before the fns that use it. A String-builtin
+    // call inside a body also opts in, but a program that calls a string builtin
+    // necessarily has a String value somewhere a signature/let exposes; to be
+    // safe we also scan const/fn return+param types here.)
+    // v30 Phase 162: recursively scan an expression for a String-builtin call or
+    // a string literal (so the runtime is emitted up front, before the bodies).
+    bool exprUsesString(const Expr* e) {
+        if (!e) return false;
+        if (dynamic_cast<const StringLitExpr*>(e)) return true;
+        if (auto* c = dynamic_cast<const CallExpr*>(e)) {
+            // v30 Phase 163: piggyback Vec detection on this whole-tree walk;
+            // always recurse args (for the sawVecCall_ side-effect) before
+            // returning the String result.
+            if (isVecBuiltin(c->callee)) sawVecCall_ = true;
+            bool found = isStringBuiltin(c->callee);
+            for (auto& a : c->args) found |= exprUsesString(a.get());
+            return found;
+        }
+        if (auto* b = dynamic_cast<const BinaryExpr*>(e))
+            return exprUsesString(b->lhs.get()) || exprUsesString(b->rhs.get());
+        if (auto* u = dynamic_cast<const UnaryExpr*>(e))
+            return exprUsesString(u->operand.get());
+        if (auto* r = dynamic_cast<const RefExpr*>(e))
+            return exprUsesString(r->operand.get());
+        if (auto* f = dynamic_cast<const FieldExpr*>(e))
+            return exprUsesString(f->object.get());
+        if (auto* iff = dynamic_cast<const IfExpr*>(e))
+            return exprUsesString(iff->cond.get()) ||
+                   exprUsesString(iff->thenBranch.get()) ||
+                   exprUsesString(iff->elseBranch.get());
+        if (auto* w = dynamic_cast<const WhileExpr*>(e))
+            return exprUsesString(w->cond.get()) ||
+                   exprUsesString(w->body.get());
+        if (auto* lp = dynamic_cast<const LoopExpr*>(e))
+            return exprUsesString(lp->body.get());
+        if (auto* fo = dynamic_cast<const ForExpr*>(e))
+            return exprUsesString(fo->iter.get()) ||
+                   exprUsesString(fo->body.get());
+        if (auto* mx = dynamic_cast<const MatchExpr*>(e)) {
+            if (exprUsesString(mx->scrutinee.get())) return true;
+            for (auto& arm : mx->arms)
+                if (exprUsesString(arm.body.get())) return true;
+            return false;
+        }
+        if (auto* sl = dynamic_cast<const StructLitExpr*>(e)) {
+            for (auto& f : sl->fields)
+                if (exprUsesString(f.second.get())) return true;
+            return false;
+        }
+        if (auto* blk = dynamic_cast<const BlockExpr*>(e)) {
+            // v30 Phase 163: visit ALL statements (don't short-circuit) so the
+            // sawVecCall_ side-effect is set even when an earlier statement
+            // already used a String; accumulate the String result.
+            bool found = false;
+            for (auto& st : blk->stmts) {
+                if (auto* l = dynamic_cast<const LetStmt*>(st.get()))
+                    found |= exprUsesString(l->value.get());
+                if (auto* es = dynamic_cast<const ExprStmt*>(st.get()))
+                    found |= exprUsesString(es->expr.get());
+                if (auto* as = dynamic_cast<const AssignStmt*>(st.get()))
+                    found |= exprUsesString(as->value.get()) ||
+                             exprUsesString(as->target.get());
+                if (auto* rs = dynamic_cast<const ReturnStmt*>(st.get()))
+                    found |= exprUsesString(rs->value.get());
+            }
+            found |= exprUsesString(blk->tail.get());
+            return found;
+        }
+        return false;
+    }
+
+    bool programUsesString(const Program& program) {
+        auto mentions = [](const TypeRef& t) {
+            return t.name == "String";
+        };
+        for (const auto& c : program.consts)
+            if (mentions(c.type)) return true;
+        for (const auto& s : program.structs)
+            for (const auto& f : s.fields)
+                if (mentions(f.type)) return true;
+        for (const auto& fn : program.functions) {
+            if (mentions(fn.returnType)) return true;
+            for (const auto& p : fn.params)
+                if (mentions(p.type)) return true;
+        }
+        // Fall back to a textual probe of the whole program's call names: a
+        // program may only touch String via builtins (e.g. print_str(&"x")).
+        return programCallsStringBuiltin_;
+    }
+
+    // v30 Phase 163: does any signature / field / const type mention Vec<T>?
+    // (sawVecCall_ separately covers a vec builtin call in a body.)
+    bool programUsesVec(const Program& program) {
+        auto mentions = [](const TypeRef& t) { return t.name == "Vec"; };
+        for (const auto& c : program.consts)
+            if (mentions(c.type)) return true;
+        for (const auto& s : program.structs)
+            for (const auto& f : s.fields)
+                if (mentions(f.type)) return true;
+        for (const auto& fn : program.functions) {
+            if (mentions(fn.returnType)) return true;
+            for (const auto& p : fn.params)
+                if (mentions(p.type)) return true;
+        }
+        return false;
+    }
+
+    // v30 Phase 162: a faithful C re-implementation of the String runtime the
+    // LLVM backend builds as IR. `struct kdstr { char* data; int64_t len;
+    // int64_t cap; }`; cap==0 marks a borrowed/read-only literal (never freed),
+    // so a mutation copies-on-write to a heap buffer first. Reads work uniformly
+    // on borrowed + heap strings. Semantics mirror codegen.cpp's builtins
+    // exactly (so the differential gate holds): str_char_at clamps OOB to -1,
+    // str_substring clamps, str_eq is byte-exact, push grows by doubling,
+    // int_to_string is decimal, the print fns use the same printf formats.
+    void emitStringRuntime() {
+        out << "#include <stdlib.h>\n#include <string.h>\n#include <stdio.h>\n";
+        out << "struct kdstr { char* data; int64_t len; int64_t cap; };\n";
+        out <<
+"static void kd__str_reserve(struct kdstr* s, int64_t need) {\n"
+"  if (s->cap == 0) { /* borrowed: copy-on-write */\n"
+"    int64_t nc = need > 8 ? need : 8; char* nb = (char*)malloc((size_t)nc);\n"
+"    if (s->len > 0 && s->data) memcpy(nb, s->data, (size_t)s->len);\n"
+"    s->data = nb; s->cap = nc; return; }\n"
+"  if (s->cap >= need) return;\n"
+"  int64_t nc = s->cap * 2; if (nc < need) nc = need;\n"
+"  s->data = (char*)realloc(s->data, (size_t)nc); s->cap = nc;\n"
+"}\n"
+"static struct kdstr kd_string_new(void) {\n"
+"  struct kdstr s; s.data = 0; s.len = 0; s.cap = 0; return s; /* lazy alloc */\n"
+"}\n"
+"static int64_t kd_str_len(struct kdstr* s) { return s->len; }\n"
+"static int64_t kd_str_char_at(struct kdstr* s, int64_t i) {\n"
+"  if (i < 0 || i >= s->len) return -1;\n"
+"  return (int64_t)(unsigned char)s->data[i];\n"
+"}\n"
+"static int64_t kd_str_push_byte(struct kdstr* s, int64_t b) {\n"
+"  kd__str_reserve(s, s->len + 1); s->data[s->len] = (char)(unsigned char)b;\n"
+"  s->len += 1; return 0;\n"
+"}\n"
+"static int64_t kd_string_push_str(struct kdstr* s, struct kdstr o) {\n"
+"  if (o.len > 0) { kd__str_reserve(s, s->len + o.len);\n"
+"    memcpy(s->data + s->len, o.data, (size_t)o.len); s->len += o.len; }\n"
+"  if (o.cap != 0) free(o.data); /* `other` is moved-in: free a heap-owned arg */\n"
+"  return 0;\n"
+"}\n"
+"static int64_t kd_str_eq(struct kdstr* a, struct kdstr* b) {\n"
+"  if (a->len != b->len) return 0;\n"
+"  return memcmp(a->data, b->data, (size_t)a->len) == 0 ? 1 : 0;\n"
+"}\n"
+"static struct kdstr kd_str_substring(struct kdstr* s, int64_t start, int64_t len) {\n"
+"  if (start < 0) start = 0; if (start > s->len) start = s->len;\n"
+"  if (len < 0) len = 0; if (start + len > s->len) len = s->len - start;\n"
+"  struct kdstr r; r.cap = len > 0 ? len : 1; r.data = (char*)malloc((size_t)r.cap);\n"
+"  if (len > 0) memcpy(r.data, s->data + start, (size_t)len); r.len = len; return r;\n"
+"}\n"
+"static struct kdstr kd_int_to_string(int64_t v) {\n"
+"  char buf[24]; int n = snprintf(buf, sizeof(buf), \"%lld\", (long long)v);\n"
+"  struct kdstr r; r.cap = n > 0 ? n : 1; r.data = (char*)malloc((size_t)r.cap);\n"
+"  if (n > 0) memcpy(r.data, buf, (size_t)n); r.len = n > 0 ? n : 0; return r;\n"
+"}\n"
+"static int64_t kd_print_str(struct kdstr* s) { printf(\"%.*s\\n\", (int)s->len, s->data); return 0; }\n"
+"static int64_t kd_print_string(struct kdstr* s) { return kd_print_str(s); }\n"
+"static int64_t kd_println(struct kdstr* s) { return kd_print_str(s); }\n"
+"static int64_t kd_print_no_nl(struct kdstr* s) { printf(\"%.*s\", (int)s->len, s->data); return 0; }\n"
+"static int64_t kd_print(int64_t v) { printf(\"%lld\\n\", (long long)v); return 0; }\n"
+// v30 Phase 164: drop a String — free only a heap-owned buffer (cap != 0); a
+// borrowed literal (cap == 0) points at a C string literal and must NOT be freed.
+"static void kd__str_drop(struct kdstr* s) { if (s->cap != 0 && s->data) free(s->data); }\n";
+        out << "\n";
+    }
+
+    // v30 Phase 163: the scalar-element Vec runtime (int64_t elements: Vec<i64>/
+    // Vec<bool>). `struct kdvec { int64_t* data; int64_t len; int64_t cap; }`.
+    // Mirrors the LLVM Vec builtins: vec_new {null,0,0}; push doubles from 4;
+    // get/get_ref/pop/remove bounds-check (OOB read -> 0 / null) like the LLVM
+    // backend; remove/insert memmove the tail; reverse in place; swap by value.
+    void emitVecRuntime() {
+        out << "#include <stdlib.h>\n#include <string.h>\n";
+        out << "struct kdvec { int64_t* data; int64_t len; int64_t cap; };\n";
+        out <<
+"static struct kdvec kd_vec_new(void) { struct kdvec v; v.data=0; v.len=0; v.cap=0; return v; }\n"
+"static int64_t kd_vec_len(struct kdvec* v) { return v->len; }\n"
+"static int64_t kd_vec_push(struct kdvec* v, int64_t x) {\n"
+"  if (v->len == v->cap) { int64_t nc = v->cap ? v->cap*2 : 4;\n"
+"    v->data = (int64_t*)realloc(v->data, (size_t)nc*sizeof(int64_t)); v->cap = nc; }\n"
+"  v->data[v->len++] = x; return 0;\n"
+"}\n"
+"static int64_t kd_vec_get(struct kdvec* v, int64_t i) {\n"
+"  if (i < 0 || i >= v->len || !v->data) return 0; return v->data[i];\n"
+"}\n"
+"static int64_t* kd_vec_get_ref(struct kdvec* v, int64_t i) {\n"
+"  if (i < 0 || i >= v->len || !v->data) return 0; return &v->data[i];\n"
+"}\n"
+"static int64_t kd_vec_pop(struct kdvec* v) {\n"
+"  if (v->len <= 0 || !v->data) return 0; return v->data[--v->len];\n"
+"}\n"
+"static int64_t kd_vec_remove(struct kdvec* v, int64_t i) {\n"
+"  if (i < 0 || i >= v->len || !v->data) return 0; int64_t e = v->data[i];\n"
+"  memmove(&v->data[i], &v->data[i+1], (size_t)(v->len-i-1)*sizeof(int64_t));\n"
+"  v->len--; return e;\n"
+"}\n"
+"static int64_t kd_vec_insert(struct kdvec* v, int64_t i, int64_t x) {\n"
+"  if (i < 0 || i > v->len) return 0;\n"
+"  if (v->len == v->cap) { int64_t nc = v->cap ? v->cap*2 : 4;\n"
+"    v->data = (int64_t*)realloc(v->data, (size_t)nc*sizeof(int64_t)); v->cap = nc; }\n"
+"  memmove(&v->data[i+1], &v->data[i], (size_t)(v->len-i)*sizeof(int64_t));\n"
+"  v->data[i] = x; v->len++; return 0;\n"
+"}\n"
+"static int64_t kd_vec_reverse(struct kdvec* v) {\n"
+"  for (int64_t a=0,b=v->len-1; a<b; a++,b--) { int64_t t=v->data[a]; v->data[a]=v->data[b]; v->data[b]=t; }\n"
+"  return 0;\n"
+"}\n"
+"static int64_t kd_vec_swap(struct kdvec* v, int64_t i, int64_t j) {\n"
+"  if (i<0||j<0||i>=v->len||j>=v->len||!v->data||i==j) return 0;\n"
+"  int64_t t=v->data[i]; v->data[i]=v->data[j]; v->data[j]=t; return 0;\n"
+"}\n"
+// v30 Phase 164: drop a Vec — free its (scalar-element) heap buffer. data is
+// null for an empty Vec; free(NULL) is a no-op, so this is unconditional.
+"static void kd__vec_drop(struct kdvec* v) { free(v->data); }\n";
+        out << "\n";
+    }
+
     void emitProgram(const Program& program) {
         // v29 Phase 157/158: structs + enums are in the subset; traits/impls/
         // extern/mod remain refused (later phases).
@@ -593,13 +1374,27 @@ struct CEmitter {
                     en.name, i, &en.variants[i].payloadTypes};
         }
 
-        out << "/* Generated by kardashev --emit-c (v29 Phase 158). */\n";
-        out << "#include <stdint.h>\n\n";
+        out << "/* Generated by kardashev --emit-c (v30 Phase 162). */\n";
+        out << "#include <stdint.h>\n";
 
         emitStructDefs(program);
         if (!ok()) return;
         emitEnumDefs(program);
         if (!ok()) return;
+        // v30 Phase 162: the String runtime (emitted only if the program uses
+        // String). Pre-scan every fn body for a string literal / builtin call so
+        // the runtime is emitted before the fns that reference it.
+        for (const auto& fn : program.functions)
+            if (fn.body && exprUsesString(fn.body.get()))
+                programCallsStringBuiltin_ = true;
+        for (const auto& c : program.consts)
+            if (exprUsesString(c.value.get()))
+                programCallsStringBuiltin_ = true;
+        if (programUsesString(program)) emitStringRuntime();
+        // v30 Phase 163: the scalar-Vec runtime, gated on a vec builtin call
+        // (sawVecCall_, set during the pre-scan above) or a Vec<T> in a
+        // signature / field / const type.
+        if (sawVecCall_ || programUsesVec(program)) emitVecRuntime();
 
         // Top-level consts (a const may reference an earlier one, so keep order).
         for (const auto& c : program.consts) {
@@ -612,29 +1407,88 @@ struct CEmitter {
 
         // Forward prototypes first — kardashev allows calling a fn defined later
         // (forward references + mutual recursion).
+        std::string protos;
         for (const auto& fn : program.functions) {
             if (!fnInSubset(fn)) return;
+            // v30 Phase 166: bind generic params to int64_t for the prototype
+            // too (else `signature` sees an unknown `T`).
+            auto savedG = currentGenericParams_;
+            for (const auto& gp : fn.genericParams)
+                if (!gp.isConst) currentGenericParams_.insert(gp.name);
             std::string sig = signature(fn);
+            currentGenericParams_ = savedG;
             if (sig.empty()) return;
-            out << sig << ";\n";
+            protos += sig + ";\n";
             if (fn.name == "main") hasMain = true;
         }
-        out << "\n";
 
-        // Definitions.
+        // v30 Phase 165: emit user-fn definitions into a BUFFER first — emitting
+        // a closure appends a hoisted `__cl_<n>` to closureDefs_ and may mark a
+        // kdfn<N> arity / a fn-as-value thunk. The final layout is then:
+        //   kdfn<N> typedefs  ->  user-fn prototypes  ->  __fnthunk_<f>  ->
+        //   hoisted closures  ->  user-fn definitions.
+        std::string defs;
         for (const auto& fn : program.functions) {
             if (!fn.body) {
                 err("fn `" + fn.name + "` has no body");
                 return;
             }
+            // v30 Phase 166: bind this fn's generic params to int64_t while
+            // emitting it (a single scalar monomorphization).
+            auto savedGenerics = currentGenericParams_;
+            for (const auto& gp : fn.genericParams)
+                if (!gp.isConst) currentGenericParams_.insert(gp.name);
             varCType_.clear();
             for (const auto& p : fn.params)
                 varCType_[p.name] = ctype(p.type);
             std::string sig = signature(fn);
-            if (sig.empty()) return;
-            out << sig << " {\n  return " << blockValue(*fn.body) << ";\n}\n\n";
+            if (sig.empty()) { currentGenericParams_ = savedGenerics; return; }
+            // v30 Phase 164: drop non-escaping heap-owning top-level locals at
+            // function exit (RAII). retCTy types the captured tail value.
+            std::string retCTy = ctype(fn.returnType);
+            if (retCTy.empty()) { currentGenericParams_ = savedGenerics; return; }
+            // v30 Phase 165: a fn whose RETURN type is itself a fn value
+            // (`fn mk() -> fn(i64)->i64`) returns a closure with a stack env —
+            // refuse (it would dangle). Setting inReturnPos_ makes any closure
+            // emitted in this body error.
+            bool prevRet = inReturnPos_;
+            if (retCTy.rfind("struct kdfn", 0) == 0) inReturnPos_ = true;
+            std::string bodyC = fnBodyWithDrops(fn, retCTy);
+            inReturnPos_ = prevRet;
+            currentGenericParams_ = savedGenerics;
+            defs += sig + " {\n  return " + bodyC + ";\n}\n\n";
             if (!ok()) return;
         }
+
+        // v30 Phase 165: the kdfn<N> fat-pointer typedefs (before any use). Each
+        // is `struct kdfnN { int64_t (*fn)(void*, N x int64_t); void* env; }`.
+        for (int arity : fnArities_) {
+            out << "struct kdfn" << arity << " { int64_t (*fn)(void*";
+            for (int i = 0; i < arity; ++i) out << ", int64_t";
+            out << "); void* env; };\n";
+        }
+        if (!fnArities_.empty()) out << "\n";
+
+        out << protos << "\n";
+
+        // v30 Phase 165: thunks for top-level fns used as values (ignore env).
+        for (const auto& fname : fnThunks_) {
+            const FnDecl* fd = fns_[fname];
+            out << "static int64_t __fnthunk_" << fname << "(void* __e";
+            for (std::size_t i = 0; i < fd->params.size(); ++i)
+                out << ", int64_t __a" << i;
+            out << ") { (void)__e; return kd_" << fname << "(";
+            for (std::size_t i = 0; i < fd->params.size(); ++i) {
+                if (i) out << ", ";
+                out << "__a" << i;
+            }
+            out << "); }\n";
+        }
+        if (!fnThunks_.empty()) out << "\n";
+
+        out << closureDefs_;
+        if (!closureDefs_.empty()) out << "\n";
+        out << defs;
 
         // The C entry point: kardashev `main` (no params in the subset) becomes
         // the process exit code, matching the LLVM backend's `ret i64` from main
