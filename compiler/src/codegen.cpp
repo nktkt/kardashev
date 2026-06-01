@@ -8276,6 +8276,13 @@ private:
                 // T, like the Mutex handle.
                 if (r->structName == "Sender" || r->structName == "Receiver")
                     return llvm::Type::getInt64Ty(*ctx_);
+                // v32 Phase 172: `JoinHandle<T>` is a move-only i64 HANDLE (the
+                // executor task index) phantom-typed over the task's result T —
+                // spawn returns it, join consumes it. Lowers to i64 like the
+                // channel/Mutex handles, so getOrEmitSpawn/getOrEmitJoin keep
+                // their existing i64 ABI unchanged.
+                if (r->structName == "JoinHandle")
+                    return llvm::Type::getInt64Ty(*ctx_);
                 // Phase 123 (v21): `Mutex<T>` is a Copy i64 HANDLE (PtrToInt of
                 // the heap `{ pthread_mutex_t, T value }` block) — phantom-typed
                 // over T so mutex_get/set are tied to the cell type, but the ABI
@@ -10013,6 +10020,11 @@ private:
                 r->structName == "Future" || r->structName == "Mutex" ||
                 r->structName == "RwLock")
                 return false;
+            // v32 Phase 172: a JoinHandle is a bare i64 task index. It is
+            // move-only (so it can't be double-joined) but owns no heap of its
+            // own — `join` reclaims the task; an un-joined handle leaks it, like
+            // the pre-172 raw-i64 handle. So it is explicitly NOT dropped.
+            if (r->structName == "JoinHandle") return false;
             std::string key = mangleStructInstance(r->structName, r->typeArgs);
             if (!seen.insert("S:" + key).second) return false;
             if (dropImpls_.count(r->structName)) return true;

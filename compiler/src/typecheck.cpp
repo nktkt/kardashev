@@ -844,28 +844,56 @@ public:
             sch.declaredEffects.add("async");
             fnSchemas_["sleep_ms"] = std::move(sch);
         }
-        // Phase 18 built-in, generic: `spawn<T>(f: Future<T>) -> i64`.
+        // v32 Phase 172: `JoinHandle<T>` — a type-safe, move-only handle to a
+        // spawned task. Lowers to the same i64 task index as the old bare handle
+        // (codegen maps JoinHandle<T> -> i64, like Sender/Mutex), but carries
+        // the result type T statically (so `join` needs no binding-context
+        // inference and can't read the slot at the wrong width) and is NON-Copy
+        // (a plain struct, not in isCopyType): `join` consumes it by value, so
+        // double-joining the same handle (which would double-release the task
+        // slot) is a compile error. Like the old i64 handle, a JoinHandle that
+        // is dropped WITHOUT being joined leaks its task (no Drop glue — joining
+        // is the explicit reclaim); a recursive-drop story arrives in Phase 173.
+        TypePtr joinHandleVar = makeFreshVar();
+        TypePtr joinHandleInst = makeStruct("JoinHandle", {});
+        joinHandleInst->typeArgs = {joinHandleVar};
+        {
+            StructSchema sch;
+            sch.type = joinHandleInst;
+            sch.genericVars.push_back(joinHandleVar);
+            structSchemas_["JoinHandle"] = std::move(sch);
+        }
+        // Helper: a fresh `JoinHandle<X>` instance for a given element var.
+        auto mkJoinHandle = [&](const TypePtr& elem) -> TypePtr {
+            TypePtr h = makeStruct("JoinHandle", {});
+            h->typeArgs = {elem};
+            return h;
+        };
+        // Phase 18 / v32 Phase 172 built-in, generic:
+        //   `spawn<T>(f: Future<T>) -> JoinHandle<T>`.
         // Registers `f` as a concurrent task with the process-global executor
-        // and returns an i64 task handle. Synchronous (no `async` effect): it
+        // and returns a type-safe handle. Synchronous (no `async` effect): it
         // only enqueues; the task makes progress when the executor is driven
         // (by `block_on`/`join`). Codegen specializes per T so the handle's
         // result slot is sized for T (read back by `join<T>`).
         {
             TypePtr spawnVar = makeFreshVar();
             FnSchema sch;
-            sch.signature = makeFunction({makeFuture(spawnVar)}, makeInt());
+            sch.signature =
+                makeFunction({makeFuture(spawnVar)}, mkJoinHandle(spawnVar));
             sch.genericVars.push_back(spawnVar);
             fnSchemas_["spawn"] = std::move(sch);
         }
-        // Phase 18 built-in, generic: `join<T>(handle: i64) -> T`.
-        // Drives the executor until the task named by `handle` completes, then
-        // yields its result. Synchronous (it runs the executor, not suspends).
-        // T is inferred from the binding context; codegen reads the handle's
-        // result slot as T.
+        // Phase 18 / v32 Phase 172 built-in, generic:
+        //   `join<T>(h: JoinHandle<T>) -> T`.
+        // Drives the executor until the task named by `h` completes, then yields
+        // its result and releases the task. Synchronous (it runs the executor,
+        // not suspends). T comes from the handle's type (no binding-context
+        // guess); the handle is CONSUMED (move-only) so it can't be re-joined.
         {
             TypePtr joinVar = makeFreshVar();
             FnSchema sch;
-            sch.signature = makeFunction({makeInt()}, joinVar);
+            sch.signature = makeFunction({mkJoinHandle(joinVar)}, joinVar);
             sch.genericVars.push_back(joinVar);
             fnSchemas_["join"] = std::move(sch);
         }

@@ -263,4 +263,44 @@ got=$(MALLOC_CHECK_=3 run_to 60 "$TMP/leak" 2>&1)
 [[ "$got" == "350000" ]] || { echo "FAIL [leak]: expected 350000 got: $got"; exit 1; }
 echo "PASS: combinator_loop_no_leak_no_double_free (350000)"
 
+# ---------------------------------------------------------------------------
+# 9. JoinHandle<T> — the type-safe task API. spawn returns JoinHandle<T> (lowers
+#    to the i64 task index, phantom over T); join consumes it (move-only, so
+#    double-join is a compile error). T is carried by the handle (no binding-
+#    context inference), incl. non-i64 results and results of a combinator
+#    future. An un-joined handle leaks its task (no Drop), like the old i64.
+# ---------------------------------------------------------------------------
+diff_run joinhandle_basic $'30' '
+async fn add(a: i64, b: i64) -> i64 { a + b }
+fn main() -> i64 ! { io } { let h = spawn(add(10, 20)); print(join(h)); 0 }
+'
+# T carried through JoinHandle for a non-i64 result.
+diff_run joinhandle_bool $'1' '
+async fn gt(a: i64, b: i64) -> bool { a > b }
+fn main() -> i64 ! { io } {
+    let h = spawn(gt(9, 4));
+    if join(h) { print(1); } else { print(0); }   // true -> 1
+    0
+}
+'
+# spawn a COMBINATOR future, join its handle.
+diff_run joinhandle_of_combinator $'42' '
+async fn base() -> i64 { 41 }
+fn main() -> i64 ! { io } {
+    let h = spawn(future_map(base(), |x| x + 1));
+    print(join(h));   // 42
+    0
+}
+'
+# NEGATIVE: a JoinHandle is move-only — joining it twice is rejected.
+expect_err joinhandle_double_join 'moved' '
+async fn one() -> i64 { 1 }
+fn main() -> i64 ! { io } {
+    let h = spawn(one());
+    print(join(h));
+    print(join(h));   // h already moved into the first join
+    0
+}
+'
+
 echo "ALL PHASE 172 SMOKE TESTS PASSED"
