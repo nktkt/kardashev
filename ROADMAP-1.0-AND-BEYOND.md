@@ -181,6 +181,13 @@ since v37) now has real cross-language fixtures.
 
 ### v40 — "The parallel executor & structured concurrency" — moves: CC, AE → 5/5
 
+> **Status (`v0.40.0`, partial):** ✅ SHIPPED — cooperative cancellation token
+> (shared Send+Sync AtomicBool; cross-thread + single-threaded). ⛔ DEFERRED —
+> the multi-threaded work-stealing executor (Phase 174), borrow-capturing scoped
+> threads, blocking multi-channel select (shared waker), async scope + recursive
+> cancel-drop. These need a core-runtime rewrite + a TSan CI job + a macOS kqueue
+> env to verify; the executor stays single-threaded.
+
 The deferred Phase 174 and the structured-concurrency capstone. **Every "race-free"
 / "deterministic" claim below runs under the v37 TSan job in addition to ASan.**
 

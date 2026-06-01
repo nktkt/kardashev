@@ -18,6 +18,31 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.40.0] — Roadmap v40 "Parallel executor & structured concurrency" (partial)
+
+The concurrency capstone. Its headline — the multi-threaded work-stealing
+executor (the deferred Phase 174) — is genuinely XL and environment-bound
+(its "race-free / deterministic-over-200-runs" gates need a ThreadSanitizer CI
+job + a macOS kqueue environment). This release ships the tractable,
+locally-verifiable structured-concurrency primitive.
+
+### Added
+- **Cooperative cancellation token** — `cancel_token_new()` is a shared
+  Send+Sync `AtomicBool` flag (Copy handle → passing it by value to a worker
+  thread shares the same cell). `cancel(t)` (from any thread) requests
+  cancellation; cooperating workers/loops poll `is_cancelled(t)` and stop.
+  Works single-threaded (deterministic) and across real OS threads (a worker
+  shares the token, observes main's cancel, finishes, join returns). This is
+  the primitive structured cancellation builds on.
+
+### Deferred / honest limitations
+- The v40 headline remains (tracked in ROADMAP-1.0-AND-BEYOND.md, v40): the
+  multi-threaded work-stealing executor (deferred Phase 174), borrow-capturing
+  scoped threads, blocking multi-channel select via a shared waker (retiring
+  poll-backoff), and async scope + recursive cancel-drop. These need a
+  core-runtime rewrite plus a TSan CI job + a macOS kqueue environment to
+  verify — none exercisable in this sandbox; the executor stays single-threaded.
+
 ## [0.39.0] — Roadmap v39 "FFI maturity, no_std & async parity I" (partial)
 
 The systems-language unblocker version. Most of its phases are large or
