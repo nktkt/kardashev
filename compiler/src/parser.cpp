@@ -4,6 +4,7 @@
 #include "kardashev/lexer.hpp"
 
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -11,12 +12,573 @@
 namespace kardashev {
 namespace {
 
+// ======================================================================
+// v34 Phase 182: declarative (`macro_rules!`) macros.
+//
+// Implemented as a TOKEN-LEVEL expansion pass that runs after lexing and
+// before parsing (see `parse()` at the bottom of this file). The expander
+// (1) extracts every `macro_rules! name { (matcher) => { body }; ... }`
+// definition and removes its tokens, then (2) repeatedly rewrites each
+// `name!( … )` / `name![ … ]` / `name!{ … }` invocation into the body of
+// the first matching rule, splicing the resulting tokens back in place.
+// The fully-expanded token stream is then parsed normally — so a macro can
+// expand in expression, statement, or item position for free.
+//
+// Supported: multiple rules (tried in order); fragment metavariables
+// `$x:expr|ident|literal|ty|pat|block|stmt|path|tt`; one level of
+// repetition `$( … )sep* / + / ?` (with an optional single-token
+// separator). Fragment matching is heuristic — an open-ended fragment
+// (expr/ty/…) consumes a delimiter-balanced run up to the next literal
+// matcher token (its "follow"). NOT supported (rejected, never
+// miscompiled): nested repetitions, a metavariable in the matcher AFTER a
+// repetition, and hygiene (expansions are unhygienic — document & avoid
+// capturing). Recursion is bounded by a hard expansion cap.
+// ======================================================================
+
+bool mtIsOpen(TokenKind k) {
+    return k == TokenKind::LParen || k == TokenKind::LBrace ||
+           k == TokenKind::LBracket;
+}
+bool mtIsClose(TokenKind k) {
+    return k == TokenKind::RParen || k == TokenKind::RBrace ||
+           k == TokenKind::RBracket;
+}
+// Two tokens are "equal" as literal matcher elements when their kinds agree
+// (and, for tokens whose lexeme carries meaning, their lexemes too).
+bool mtTokEq(const Token& a, const Token& b) {
+    if (a.kind != b.kind) return false;
+    switch (a.kind) {
+        case TokenKind::Identifier:
+        case TokenKind::Integer:
+        case TokenKind::Float:
+        case TokenKind::StringLit:
+        case TokenKind::CharLit:
+            return a.lexeme == b.lexeme;
+        default:
+            return true;
+    }
+}
+// Index just past one token tree starting at `i`: a single token, or a whole
+// balanced (...)/{...}/[...] group. Returns t.size() on an unbalanced group.
+std::size_t mtSkipTree(const std::vector<Token>& t, std::size_t i) {
+    if (i >= t.size()) return i;
+    if (mtIsOpen(t[i].kind)) {
+        int depth = 0;
+        for (std::size_t j = i; j < t.size(); ++j) {
+            if (mtIsOpen(t[j].kind)) ++depth;
+            else if (mtIsClose(t[j].kind)) {
+                if (--depth == 0) return j + 1;
+            }
+        }
+        return t.size();
+    }
+    return i + 1;
+}
+
+struct MacroRule {
+    std::vector<Token> matcher;
+    std::vector<Token> transcriber;
+};
+struct MacroDef {
+    std::vector<MacroRule> rules;
+};
+// Metavariable bindings from one rule match. `simple` holds a top-level
+// metavariable's captured tokens; `rep` holds, for a metavariable inside the
+// (single) repetition group, one token sequence per iteration. `repCount` is
+// the number of iterations matched.
+struct MacroBindings {
+    std::map<std::string, std::vector<Token>> simple;
+    std::map<std::string, std::vector<std::vector<Token>>> rep;
+    int repCount = -1;
+};
+
+bool mtIsOpTok(TokenKind k) {
+    return k == TokenKind::Star || k == TokenKind::Plus ||
+           k == TokenKind::Question;
+}
+
+// Tokens consumed by `$x:frag` starting at `ai` (bounded by `aEnd`). For an
+// open-ended fragment we take a delimiter-balanced run up to the first depth-0
+// token equal to `follow` (nullptr => up to aEnd). Returns -1 on failure.
+long mtConsumeFrag(const std::string& frag, const std::vector<Token>& a,
+                   std::size_t ai, std::size_t aEnd, const Token* follow) {
+    if (ai >= aEnd) return -1;
+    if (frag == "ident") {
+        return a[ai].kind == TokenKind::Identifier ? 1 : -1;
+    }
+    if (frag == "literal") {
+        TokenKind k = a[ai].kind;
+        if (k == TokenKind::Minus && ai + 1 < aEnd &&
+            (a[ai + 1].kind == TokenKind::Integer ||
+             a[ai + 1].kind == TokenKind::Float))
+            return 2; // negative numeric literal
+        bool lit = k == TokenKind::Integer || k == TokenKind::Float ||
+                   k == TokenKind::StringLit || k == TokenKind::CharLit ||
+                   k == TokenKind::KwTrue || k == TokenKind::KwFalse;
+        return lit ? 1 : -1;
+    }
+    if (frag == "tt") {
+        return static_cast<long>(mtSkipTree(a, ai) - ai);
+    }
+    // expr / ty / pat / block / stmt / path / meta: balanced run to `follow`.
+    // A top-level `,` or `;` always terminates the fragment too — a macro
+    // argument's expression/type/pattern can never span one (they only appear
+    // nested inside delimiters, which the depth counter accounts for). Without
+    // this, `pick!(8, 3)` would match a one-argument `($a:expr)` rule with `$a`
+    // swallowing `8, 3`.
+    int depth = 0;
+    std::size_t j = ai;
+    for (; j < aEnd; ++j) {
+        TokenKind k = a[j].kind;
+        if (depth == 0 && follow && mtTokEq(a[j], *follow)) break;
+        if (depth == 0 && (k == TokenKind::Comma || k == TokenKind::Semi))
+            break;
+        if (mtIsOpen(k)) ++depth;
+        else if (mtIsClose(k)) {
+            if (depth == 0) break;
+            --depth;
+        }
+    }
+    return j > ai ? static_cast<long>(j - ai) : -1;
+}
+
+bool mtMatchRange(const std::vector<Token>& m, std::size_t mi0,
+                  std::size_t mEnd, const std::vector<Token>& a,
+                  std::size_t ai0, std::size_t aEnd, MacroBindings& b,
+                  std::string& err);
+
+// Match matcher m[mi..mEnd) as a PREFIX of args a[ai..aEnd). This range must
+// contain no TOP-LEVEL repetition (delimiter groups inside it may, and are
+// matched recursively via mtMatchRange on the group's contents). Returns the
+// arg index after the consumed prefix, or -1 on mismatch. `tailFollow` is the
+// follow token for a trailing metavariable (used inside a repetition iter).
+long mtMatchExactPrefix(const std::vector<Token>& m, std::size_t mi,
+                        std::size_t mEnd, const std::vector<Token>& a,
+                        std::size_t ai, std::size_t aEnd,
+                        const Token* tailFollow, MacroBindings& b,
+                        std::string& err) {
+    while (mi < mEnd) {
+        const Token& mt = m[mi];
+        if (mt.kind == TokenKind::Dollar && mi + 1 < mEnd &&
+            m[mi + 1].kind == TokenKind::Identifier) {
+            if (mi + 3 >= mEnd || m[mi + 2].kind != TokenKind::Colon ||
+                m[mi + 3].kind != TokenKind::Identifier) {
+                err = "malformed metavariable in macro matcher (expected "
+                      "`$name:fragment`)";
+                return -1;
+            }
+            const std::string& name = m[mi + 1].lexeme;
+            const std::string& frag = m[mi + 3].lexeme;
+            const Token* follow = (mi + 4 < mEnd) ? &m[mi + 4] : tailFollow;
+            long n = mtConsumeFrag(frag, a, ai, aEnd, follow);
+            if (n < 0) return -1;
+            b.simple[name].assign(a.begin() + ai, a.begin() + ai + n);
+            mi += 4;
+            ai += static_cast<std::size_t>(n);
+        } else if (mtIsOpen(mt.kind)) {
+            // A literal delimiter group in the matcher: the argument must open
+            // with the same delimiter; match the contents recursively (they
+            // may contain a repetition), then skip past both groups. This is
+            // what lets a derive matcher destructure `struct N { $($f:ident :
+            // $t:ty),* }` — the repetition lives inside the braces.
+            if (ai >= aEnd || a[ai].kind != mt.kind) return -1;
+            std::size_t mClose = mtSkipTree(m, mi) - 1;
+            std::size_t aClose = mtSkipTree(a, ai) - 1;
+            if (!mtMatchRange(m, mi + 1, mClose, a, ai + 1, aClose, b, err))
+                return -1;
+            mi = mClose + 1;
+            ai = aClose + 1;
+        } else {
+            if (ai >= aEnd || !mtTokEq(mt, a[ai])) return -1;
+            ++mi;
+            ++ai;
+        }
+    }
+    return static_cast<long>(ai);
+}
+
+// Match a matcher range against an argument range fully (all of [ai0,aEnd)
+// consumed), handling at most one repetition AT THIS LEVEL. Repetitions nested
+// inside delimiter groups are reached by the recursion in mtMatchExactPrefix.
+bool mtMatchRange(const std::vector<Token>& m, std::size_t mi0,
+                  std::size_t mEnd, const std::vector<Token>& a,
+                  std::size_t ai0, std::size_t aEnd, MacroBindings& b,
+                  std::string& err) {
+    // Locate the first top-level repetition `$(` in this range.
+    std::size_t rstart = mEnd;
+    {
+        int depth = 0;
+        for (std::size_t k = mi0; k < mEnd; ++k) {
+            if (mtIsOpen(m[k].kind)) ++depth;
+            else if (mtIsClose(m[k].kind)) --depth;
+            else if (depth == 0 && m[k].kind == TokenKind::Dollar &&
+                     k + 1 < mEnd && m[k + 1].kind == TokenKind::LParen) {
+                rstart = k;
+                break;
+            }
+        }
+    }
+    if (rstart == mEnd) {
+        long r = mtMatchExactPrefix(m, mi0, mEnd, a, ai0, aEnd, nullptr, b, err);
+        return r >= 0 && static_cast<std::size_t>(r) == aEnd;
+    }
+    std::size_t gOpen = rstart + 1;
+    std::size_t gClose = mtSkipTree(m, gOpen) - 1; // matching ')'
+    std::size_t p = gClose + 1;
+    const Token* sep = nullptr;
+    char op = 0;
+    if (p < mEnd && mtIsOpTok(m[p].kind)) {
+        op = m[p].kind == TokenKind::Star ? '*'
+             : m[p].kind == TokenKind::Plus ? '+' : '?';
+    } else if (p + 1 < mEnd && mtIsOpTok(m[p + 1].kind)) {
+        sep = &m[p];
+        op = m[p + 1].kind == TokenKind::Star ? '*'
+             : m[p + 1].kind == TokenKind::Plus ? '+' : '?';
+        p = p + 1;
+    } else {
+        err = "malformed repetition in macro matcher (expected `*`, `+` or "
+              "`?` after `$( … )`)";
+        return false;
+    }
+    std::size_t afterOp = p + 1;
+    // Prefix m[mi0..rstart).
+    long aAfterPrefix =
+        mtMatchExactPrefix(m, mi0, rstart, a, ai0, aEnd, nullptr, b, err);
+    if (aAfterPrefix < 0) return false;
+    std::size_t ai = static_cast<std::size_t>(aAfterPrefix);
+    // Suffix m[afterOp..mEnd): literal tokens only (no metavariable), peeled
+    // off the argument tail.
+    for (std::size_t s = afterOp; s < mEnd; ++s) {
+        if (m[s].kind == TokenKind::Dollar) {
+            err = "a metavariable after a `$( … )*` repetition is not "
+                  "supported";
+            return false;
+        }
+    }
+    std::size_t sufLen = mEnd - afterOp;
+    if (sufLen > 0) {
+        if (aEnd - ai < sufLen) return false;
+        for (std::size_t s = 0; s < sufLen; ++s)
+            if (!mtTokEq(m[afterOp + s], a[aEnd - sufLen + s])) return false;
+        aEnd -= sufLen;
+    }
+    // Repetition group m[gOpen+1..gClose): repeated iterations, `sep`-separated.
+    std::vector<std::string> subVars;
+    {
+        int depth = 0;
+        for (std::size_t k = gOpen + 1; k < gClose; ++k) {
+            if (mtIsOpen(m[k].kind)) ++depth;
+            else if (mtIsClose(m[k].kind)) --depth;
+            else if (m[k].kind == TokenKind::Dollar && k + 1 < gClose &&
+                     m[k + 1].kind == TokenKind::Identifier)
+                subVars.push_back(m[k + 1].lexeme);
+        }
+    }
+    for (const auto& v : subVars) b.rep[v]; // register (possibly 0 iterations)
+    b.repCount = 0;
+    bool first = true;
+    while (ai < aEnd) {
+        if (!first && sep) {
+            if (ai < aEnd && mtTokEq(*sep, a[ai])) {
+                ++ai;
+                if (ai >= aEnd) break; // tolerate a trailing separator
+            } else {
+                break;
+            }
+        }
+        MacroBindings iter;
+        std::string ierr;
+        long r =
+            mtMatchExactPrefix(m, gOpen + 1, gClose, a, ai, aEnd, sep, iter, ierr);
+        if (r < 0) {
+            if (first) break; // zero iterations
+            return false;     // a separator promised another iteration
+        }
+        if (static_cast<std::size_t>(r) == ai) break; // no progress
+        ai = static_cast<std::size_t>(r);
+        for (const auto& v : subVars) b.rep[v].push_back(iter.simple[v]);
+        ++b.repCount;
+        first = false;
+    }
+    if (op == '+' && b.repCount == 0) return false;
+    if (op == '?' && b.repCount > 1) return false;
+    return ai == aEnd;
+}
+
+// Transcribe a macro body t[ti0..tEnd) under `b`, appending tokens to `out`.
+// `repIndex >= 0` selects the iteration when inside a `$( … )*` group.
+bool mtTranscribe(const std::vector<Token>& t, std::size_t ti0,
+                  std::size_t tEnd, const MacroBindings& b, int repIndex,
+                  std::vector<Token>& out, std::string& err) {
+    std::size_t ti = ti0;
+    while (ti < tEnd) {
+        const Token& tok = t[ti];
+        if (tok.kind == TokenKind::Dollar && ti + 1 < tEnd &&
+            t[ti + 1].kind == TokenKind::LParen) {
+            std::size_t gOpen = ti + 1;
+            std::size_t gClose = mtSkipTree(t, gOpen) - 1;
+            std::size_t p = gClose + 1;
+            const Token* sep = nullptr;
+            if (p < tEnd && mtIsOpTok(t[p].kind)) {
+                // no separator
+            } else if (p + 1 < tEnd && mtIsOpTok(t[p + 1].kind)) {
+                sep = &t[p];
+                p = p + 1;
+            } else {
+                err = "malformed repetition in macro body";
+                return false;
+            }
+            std::size_t afterOp = p + 1;
+            int n = b.repCount < 0 ? 0 : b.repCount;
+            for (int k = 0; k < n; ++k) {
+                if (k > 0 && sep) out.push_back(*sep);
+                if (!mtTranscribe(t, gOpen + 1, gClose, b, k, out, err))
+                    return false;
+            }
+            ti = afterOp;
+        } else if (tok.kind == TokenKind::Dollar && ti + 1 < tEnd &&
+                   t[ti + 1].kind == TokenKind::Identifier) {
+            const std::string& name = t[ti + 1].lexeme;
+            auto rit = b.rep.find(name);
+            if (repIndex >= 0 && rit != b.rep.end()) {
+                const auto& list = rit->second;
+                if (static_cast<std::size_t>(repIndex) < list.size())
+                    out.insert(out.end(), list[repIndex].begin(),
+                               list[repIndex].end());
+            } else {
+                auto sit = b.simple.find(name);
+                if (sit != b.simple.end())
+                    out.insert(out.end(), sit->second.begin(),
+                               sit->second.end());
+                else {
+                    err = "unknown metavariable `$" + name + "` in macro body";
+                    return false;
+                }
+            }
+            ti += 2;
+        } else {
+            out.push_back(tok);
+            ++ti;
+        }
+    }
+    return true;
+}
+
+// The driver: extract `macro_rules!` definitions and rewrite every invocation.
+std::vector<Token> expandMacros(std::vector<Token> toks,
+                                std::vector<ParseError>& errors) {
+    bool any = false;
+    for (const auto& t : toks)
+        if (t.kind == TokenKind::Identifier && t.lexeme == "macro_rules") {
+            any = true;
+            break;
+        }
+    if (!any) return toks;
+
+    std::map<std::string, MacroDef> defs;
+    std::vector<Token> body;
+    body.reserve(toks.size());
+    std::size_t i = 0;
+    while (i < toks.size()) {
+        if (toks[i].kind == TokenKind::Identifier &&
+            toks[i].lexeme == "macro_rules" && i + 3 < toks.size() &&
+            toks[i + 1].kind == TokenKind::Bang &&
+            toks[i + 2].kind == TokenKind::Identifier &&
+            toks[i + 3].kind == TokenKind::LBrace) {
+            std::string name = toks[i + 2].lexeme;
+            std::size_t braceClose = mtSkipTree(toks, i + 3) - 1; // '}'
+            MacroDef def;
+            std::size_t r = i + 4;
+            while (r < braceClose) {
+                if (toks[r].kind == TokenKind::Semi) {
+                    ++r;
+                    continue;
+                }
+                if (!mtIsOpen(toks[r].kind)) {
+                    errors.push_back({"expected `(` to start a macro rule",
+                                      toks[r].line, toks[r].column});
+                    break;
+                }
+                std::size_t mOpen = r;
+                std::size_t mClose = mtSkipTree(toks, mOpen) - 1;
+                MacroRule rule;
+                rule.matcher.assign(toks.begin() + mOpen + 1,
+                                    toks.begin() + mClose);
+                std::size_t fa = mClose + 1;
+                if (fa >= braceClose || toks[fa].kind != TokenKind::FatArrow) {
+                    errors.push_back({"expected `=>` in macro rule",
+                                      toks[mClose].line, toks[mClose].column});
+                    break;
+                }
+                std::size_t tOpen = fa + 1;
+                if (tOpen >= braceClose || !mtIsOpen(toks[tOpen].kind)) {
+                    errors.push_back({"expected `{` for the macro rule body",
+                                      toks[fa].line, toks[fa].column});
+                    break;
+                }
+                std::size_t tClose = mtSkipTree(toks, tOpen) - 1;
+                rule.transcriber.assign(toks.begin() + tOpen + 1,
+                                        toks.begin() + tClose);
+                def.rules.push_back(std::move(rule));
+                r = tClose + 1;
+                if (r < braceClose && toks[r].kind == TokenKind::Semi) ++r;
+            }
+            defs[name] = std::move(def);
+            i = braceClose + 1;
+            continue;
+        }
+        body.push_back(toks[i]);
+        ++i;
+    }
+
+    // v34 Phase 183: user-defined `#[derive(Foo)]`. When a struct / enum is
+    // annotated with a derive whose name has a matching `derive_Foo!` macro,
+    // synthesize a `derive_Foo! { <the item> }` invocation right after the
+    // item — the user's macro then expands it into an `impl`. (Built-in
+    // derives like Clone / Eq / Debug carry no `derive_*` macro and are left
+    // for the AST-level expander in main.cpp.) This is how a library author
+    // writes a custom derive: a `macro_rules! derive_Foo` that destructures
+    // `struct $name { $($f:ident : $t:ty),* }` and emits the impl.
+    {
+        std::vector<Token> withDerives;
+        withDerives.reserve(body.size());
+        std::size_t k = 0;
+        while (k < body.size()) {
+            if (body[k].kind == TokenKind::Pound ||
+                body[k].kind == TokenKind::DocComment) {
+                // Consume a run of attributes / doc comments, collecting any
+                // derive names that have a `derive_<name>` macro.
+                std::size_t scan = k;
+                std::vector<std::string> userDerives;
+                while (scan < body.size() &&
+                       (body[scan].kind == TokenKind::DocComment ||
+                        (body[scan].kind == TokenKind::Pound &&
+                         scan + 1 < body.size() &&
+                         body[scan + 1].kind == TokenKind::LBracket))) {
+                    if (body[scan].kind == TokenKind::DocComment) {
+                        ++scan;
+                        continue;
+                    }
+                    std::size_t br = mtSkipTree(body, scan + 1); // past `]`
+                    if (scan + 2 < body.size() &&
+                        body[scan + 2].kind == TokenKind::Identifier &&
+                        body[scan + 2].lexeme == "derive") {
+                        for (std::size_t z = scan + 3; z + 1 < br; ++z)
+                            if (body[z].kind == TokenKind::Identifier &&
+                                defs.count("derive_" + body[z].lexeme))
+                                userDerives.push_back(body[z].lexeme);
+                    }
+                    scan = br;
+                }
+                // Copy the attributes / docs verbatim.
+                for (std::size_t z = k; z < scan; ++z)
+                    withDerives.push_back(body[z]);
+                std::size_t it = scan;
+                bool isItem =
+                    it < body.size() &&
+                    (body[it].kind == TokenKind::KwStruct ||
+                     body[it].kind == TokenKind::KwEnum ||
+                     (body[it].kind == TokenKind::KwPub && it + 1 < body.size() &&
+                      (body[it + 1].kind == TokenKind::KwStruct ||
+                       body[it + 1].kind == TokenKind::KwEnum)));
+                if (!userDerives.empty() && isItem) {
+                    std::size_t lb = it;
+                    while (lb < body.size() &&
+                           body[lb].kind != TokenKind::LBrace)
+                        ++lb;
+                    if (lb < body.size()) {
+                        std::size_t rb = mtSkipTree(body, lb) - 1; // item `}`
+                        for (std::size_t z = it; z <= rb; ++z)
+                            withDerives.push_back(body[z]);
+                        for (const auto& dn : userDerives) {
+                            std::size_t ln = body[it].line, cn = body[it].column;
+                            withDerives.push_back({TokenKind::Identifier,
+                                                   "derive_" + dn, ln, cn});
+                            withDerives.push_back({TokenKind::Bang, "!", ln, cn});
+                            withDerives.push_back({TokenKind::LBrace, "{", ln, cn});
+                            for (std::size_t z = it; z <= rb; ++z)
+                                withDerives.push_back(body[z]);
+                            withDerives.push_back({TokenKind::RBrace, "}", ln, cn});
+                        }
+                        k = rb + 1;
+                        continue;
+                    }
+                }
+                k = scan;
+                continue;
+            }
+            withDerives.push_back(body[k]);
+            ++k;
+        }
+        body = std::move(withDerives);
+    }
+
+    const int kExpansionCap = 200000;
+    int expansions = 0;
+    std::size_t pos = 0;
+    while (pos < body.size()) {
+        if (body[pos].kind == TokenKind::Identifier &&
+            defs.count(body[pos].lexeme) && pos + 2 < body.size() &&
+            body[pos + 1].kind == TokenKind::Bang &&
+            mtIsOpen(body[pos + 2].kind)) {
+            std::size_t open = pos + 2;
+            std::size_t close = mtSkipTree(body, open) - 1; // matching delim
+            std::vector<Token> args(body.begin() + open + 1,
+                                    body.begin() + close);
+            const MacroDef& def = defs[body[pos].lexeme];
+            std::vector<Token> expansion;
+            bool matched = false;
+            for (const auto& rule : def.rules) {
+                MacroBindings b;
+                std::string err;
+                if (mtMatchRange(rule.matcher, 0, rule.matcher.size(), args, 0,
+                                 args.size(), b, err)) {
+                    std::string terr;
+                    std::vector<Token> out;
+                    if (!mtTranscribe(rule.transcriber, 0,
+                                      rule.transcriber.size(), b, -1, out,
+                                      terr)) {
+                        errors.push_back(
+                            {terr, body[pos].line, body[pos].column});
+                    }
+                    expansion = std::move(out);
+                    matched = true;
+                    break;
+                }
+            }
+            std::size_t macroLine = body[pos].line, macroCol = body[pos].column;
+            std::string macroName = body[pos].lexeme;
+            // Replace the invocation [pos..close] with the expansion either way
+            // (an unmatched invocation drops to nothing + an error, so we don't
+            // loop forever on it).
+            body.erase(body.begin() + pos, body.begin() + close + 1);
+            if (!matched) {
+                errors.push_back({"no macro rule matched `" + macroName + "!`",
+                                  macroLine, macroCol});
+                continue;
+            }
+            if (++expansions > kExpansionCap) {
+                errors.push_back({"macro expansion limit exceeded (possible "
+                                  "infinite recursion)",
+                                  macroLine, macroCol});
+                break;
+            }
+            body.insert(body.begin() + pos, expansion.begin(), expansion.end());
+            continue; // re-scan from pos: the expansion may contain invocations
+        }
+        ++pos;
+    }
+    return body;
+}
+
 class Parser {
 public:
     // v24 Phase 134: filter `///` DocComment tokens out of the stream (so the
     // rest of the parser is untouched) into `docAt_`, keyed by the index of the
     // token that immediately follows the doc run. Decl parsers query it.
-    explicit Parser(std::vector<Token> tokens) {
+    explicit Parser(std::vector<Token> tokens,
+                    std::set<std::string> activeCfg = {})
+        : activeCfg_(std::move(activeCfg)) {
         std::string pending;
         for (auto& t : tokens) {
             if (t.kind == TokenKind::DocComment) {
@@ -34,14 +596,29 @@ public:
 
     ParseResult parseProgram() {
         ast::Program prog;
+        // v34 Phase 186: items gated by a false `#[cfg(...)]` are still parsed
+        // (so their tokens are consumed and the stream stays in sync) but are
+        // routed into this throwaway Program, so they never reach later passes
+        // — that is conditional compilation.
+        ast::Program cfgDiscard;
         while (!check(TokenKind::EndOfInput)) {
             if (errors_.size() > 20) break;
             // v24 Phase 134: grab the doc comment attached to this decl's first
             // token; the decl parser (fn/struct/enum) consumes pendingDeclDoc_.
             pendingDeclDoc_ = takeDocAt(pos_);
-            // Phase 42: `#[derive(...)]` attributes precede a struct/enum; the
-            // parsed list is stashed and consumed by the next struct/enum decl.
+            // Phase 42 / v34 Phase 186: `#[derive(...)]` / `#[cfg(...)]`
+            // attributes precede the item. parseAttributes stashes derives and
+            // sets cfgDropNext_ when a `#[cfg(...)]` predicate is false.
+            cfgDropNext_ = false;
             if (check(TokenKind::Pound)) parseAttributes();
+            parseTopLevelItem(cfgDropNext_ ? cfgDiscard : prog);
+        }
+        return {std::move(prog), std::move(errors_)};
+    }
+
+    // Parse exactly one top-level item into `prog`. Callers pass a throwaway
+    // Program for an item disabled by a false `#[cfg(...)]` (v34 Phase 186).
+    void parseTopLevelItem(ast::Program& prog) {
             if (check(TokenKind::KwFn) ||
                 (peek().kind == TokenKind::Identifier &&
                  peek().lexeme == "async" &&
@@ -163,8 +740,6 @@ public:
                           std::string(tokenKindName(peek().kind)));
                 advance();
             }
-        }
-        return {std::move(prog), std::move(errors_)};
     }
 
 private:
@@ -185,6 +760,12 @@ private:
     }
     std::vector<ParseError> errors_;
     bool restrictStructLit_ = false;
+    // v34 Phase 186: the active conditional-compilation flags (`--cfg foo` /
+    // `--cfg key=val` from the driver). `cfgDropNext_` is set by
+    // parseAttributes when the item's `#[cfg(...)]` predicate is false, so the
+    // top-level loop routes that item into a throwaway Program.
+    std::set<std::string> activeCfg_;
+    bool cfgDropNext_ = false;
     // Phase 24: set by parseOptionalEffectRow when a `! { ... }` row was
     // actually present (even an empty `! { }`), so an extern decl can tell
     // "explicitly pure" (`! { }`) apart from "no row -> default io effect".
@@ -1590,6 +2171,15 @@ private:
                     }
                 }
                 expect(TokenKind::RParen, ")");
+            } else if (attr.lexeme == "cfg") {
+                // v34 Phase 186: `#[cfg(predicate)]` — conditional compilation.
+                // Evaluate the predicate against the active cfg set; if false,
+                // mark the following item to be discarded. Any number of
+                // `#[cfg]`s stack with AND semantics (one false drops the item).
+                expect(TokenKind::LParen, "(");
+                bool enabled = evalCfgPredicate();
+                expect(TokenKind::RParen, ")");
+                if (!enabled) cfgDropNext_ = true;
             } else {
                 while (!check(TokenKind::RBracket) &&
                        !check(TokenKind::EndOfInput))
@@ -1597,6 +2187,47 @@ private:
             }
             expect(TokenKind::RBracket, "]");
         }
+    }
+
+    // v34 Phase 186: evaluate one `#[cfg(...)]` predicate against activeCfg_.
+    // Grammar (recursive):
+    //   pred := `not` `(` pred `)`
+    //         | (`all` | `any`) `(` [ pred (`,` pred)* ] `)`
+    //         | IDENT `=` STRING            -- e.g. feature = "fast"
+    //         | IDENT                       -- a bare flag, e.g. linux
+    // A bare flag `foo` is active iff "foo" is in the set; `key = "val"` is
+    // active iff "key=val" is in the set. The active set is populated from the
+    // driver's `--cfg foo` / `--cfg key=val` options (see main.cpp).
+    bool evalCfgPredicate() {
+        Token id = expect(TokenKind::Identifier, "cfg predicate");
+        if (id.lexeme == "not") {
+            expect(TokenKind::LParen, "(");
+            bool v = evalCfgPredicate();
+            expect(TokenKind::RParen, ")");
+            return !v;
+        }
+        if (id.lexeme == "all" || id.lexeme == "any") {
+            bool isAll = id.lexeme == "all";
+            // `all()` is vacuously true; `any()` is vacuously false.
+            bool acc = isAll;
+            expect(TokenKind::LParen, "(");
+            if (!check(TokenKind::RParen)) {
+                while (true) {
+                    bool v = evalCfgPredicate();
+                    acc = isAll ? (acc && v) : (acc || v);
+                    if (!accept(TokenKind::Comma)) break;
+                    if (check(TokenKind::RParen)) break; // trailing comma
+                }
+            }
+            expect(TokenKind::RParen, ")");
+            return acc;
+        }
+        // `key = "value"` or a bare flag.
+        if (accept(TokenKind::Eq)) {
+            Token val = expect(TokenKind::StringLit, "cfg value string");
+            return activeCfg_.count(id.lexeme + "=" + val.lexeme) > 0;
+        }
+        return activeCfg_.count(id.lexeme) > 0;
     }
 
     ast::ImplDecl parseImplDecl() {
@@ -3148,9 +3779,25 @@ private:
 } // namespace
 
 ParseResult parse(std::string_view source) {
+    return parse(source, {});
+}
+
+// v34 Phase 186: parse with a set of active conditional-compilation flags.
+// Items whose `#[cfg(...)]` predicate is false are dropped during parsing.
+// v34 Phase 182: declarative macros are expanded at the token level here,
+// before parsing — any `macro_rules!`-defined `name!( … )` invocation is
+// rewritten into its body. Macro errors are surfaced ahead of parse errors.
+ParseResult parse(std::string_view source,
+                  const std::set<std::string>& activeCfg) {
     auto tokens = lex(source);
-    Parser p(std::move(tokens));
-    return p.parseProgram();
+    std::vector<ParseError> macroErrors;
+    tokens = expandMacros(std::move(tokens), macroErrors);
+    Parser p(std::move(tokens), activeCfg);
+    auto res = p.parseProgram();
+    if (!macroErrors.empty())
+        res.errors.insert(res.errors.begin(), macroErrors.begin(),
+                          macroErrors.end());
+    return res;
 }
 
 } // namespace kardashev

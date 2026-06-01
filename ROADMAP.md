@@ -10,7 +10,7 @@ full numeric tower, async, and threads. It is well above the median hobby/studen
 compiler in breadth and test discipline. It is **not** a production language: it
 is pre-ecosystem, pre-performance-proven, and MVP-shaped in places.
 
-**Shipped: v1–v33** (Phases 0–181, through `v0.33.0`). The per-version themes are
+**Shipped: v1–v34** (Phases 0–186, through `v0.34.0`). The per-version themes are
 in the [README roadmap table](README.md#roadmap); every phase's detail is in
 [CHANGELOG.md](CHANGELOG.md). v15–v19 built a self-hosted *mini* compiler and a
 differential-fuzzing test surface; v20 took it to real LLVM IR; v21 added a
@@ -247,13 +247,24 @@ effect system "tracking only — no handlers/subtyping".)*
   `wrapping_add/sub/mul`; portable overflow detection (no version-fragile
   `*.with.overflow` intrinsics).
 
-### v34 — metaprogramming
+### v34 — metaprogramming — SHIPPED (`v0.34.0`)
 *(Critic: "no macro system; no operator overloading; comptime limited".)*
-- **182** a **declarative macro** system (`macro_rules!`-style).
-- **183** **user-defined `#[derive]`** on top of macros.
-- **184** **operator overloading** (`Add`/`Index`/`Deref`/…) via traits.
-- **185** generalized **`comptime` / const-fn** (richer compile-time execution).
-- **186** **conditional compilation** / features (`#[cfg(…)]` + `kard.toml`).
+- **182** ✅ a **declarative macro** system (`macro_rules!`-style) — token-level
+  expander; multi-rule, fragment metavariables (`$x:expr|ident|tt|…`), one
+  repetition level `$( … )sep*/+/?`, recursion; expr/stmt/item position.
+- **183** ✅ **user-defined `#[derive]`** on top of macros — `#[derive(Foo)]`
+  synthesizes a `derive_Foo!{ <item> }` expansion; composes with built-in
+  derives. Required making the macro matcher recursive over delimiter groups.
+- **184** ✅ **operator overloading** (`Add`/`Sub`/`Mul`/`Div`) via prelude
+  traits; `a + b` desugars to the impl method. (`Index`/`Deref`/`Neg` +
+  heterogeneous/custom-`Output` deferred.)
+- **185** ✅ generalized **`comptime` / const-fn** — `const fn`s now const-eval
+  imperative `while` loops + variable reassignment + nested `return` (bounded by
+  the step budget).
+- **186** ✅ **conditional compilation** `#[cfg(…)]` — `--cfg NAME` / `--cfg
+  key=value`; `not`/`all`/`any`/`key="val"` predicates; disabled items dropped
+  before type-checking; folded into the AOT cache key. (`kard.toml [features]`
+  auto-feed deferred — a thin follow-on; macro **hygiene** not implemented.)
 
 ### v35 — stdlib depth & runtime
 *(Survey `stdlib-runtime`: BTree/VecDeque, iterator adaptors, buffered I/O,

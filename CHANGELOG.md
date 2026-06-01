@@ -18,6 +18,56 @@ change between minors until 1.0. `1.0.0` is reserved for a language-surface
 pre-tag roadmap history (Phases 0–56), each of which shipped fully green (6 unit
 suites + the smoke aggregate, JIT **and** AOT).
 
+## [0.34.0] — Roadmap v34 "metaprogramming: macros, derive & comptime" (Phases 182-186)
+
+Theme: give the language the tools to abstract over syntax and shift work to
+compile time — declarative macros, user-defined derives, operator overloading,
+richer `const fn` evaluation, and conditional compilation. Every phase is
+differentially gated (JIT vs AOT).
+
+### Added
+- **Declarative `macro_rules!` macros** (Phase 182) — a real token-level macro
+  system. `macro_rules! name { (matcher) => { body }; … }` defines rules, and
+  `name!( … )` / `name![ … ]` / `name!{ … }` invocations are rewritten into the
+  first matching rule's body before parsing, so a macro can expand in
+  expression, statement, OR item position. Supports multiple rules (selected by
+  shape), fragment metavariables (`$x:expr | ident | literal | ty | pat | tt |
+  …`), one level of repetition `$( … )sep* / + / ?` in both matcher and body,
+  and recursion (a variadic `sum!` reduces one element per re-invocation). A new
+  `$` token carries metavariables. The built-in format macros (`format!` /
+  `println!` / `print!`) are untouched and compose with user macros.
+- **User-defined `#[derive(...)]`** (Phase 183) — a library author writes a
+  custom derive as a `macro_rules! derive_Foo` whose matcher destructures the
+  item (e.g. `struct $name { $($f:ident : $t:ty),* }`) and whose body emits an
+  `impl`; `#[derive(Foo)]` then synthesizes the expansion automatically. User
+  and built-in derives (Clone/Eq/Debug/…) compose on the same attribute. The
+  macro matcher is now recursive over delimiter groups, which also enables
+  map-literal-style macros (`m!{ k => v, … }`).
+- **Operator overloading** (Phase 184) — a user type opts into `+` / `-` / `*`
+  / `/` by implementing the prelude `Add` / `Sub` / `Mul` / `Div` trait
+  (`fn add(self, rhs: Self) -> Self`); the binary operator desugars to the
+  method. Operator traits are pure (effect-free), so an `impl` body is pure too.
+- **Richer comptime / `const fn`** (Phase 185) — a `const fn` can now use the
+  imperative `let mut … ; while … { … }` style with variable reassignment and
+  early `return`, all evaluated at compile time (iterative factorial /
+  fibonacci, running sums — usable as `const` values and array lengths). A
+  non-terminating const loop fails against the global step budget instead of
+  hanging the compiler.
+- **`#[cfg(...)]` conditional compilation** (Phase 186) — items can be gated on
+  build flags set with `--cfg NAME` / `--cfg key=value`. Predicates: a bare
+  flag, `not(…)`, `all(…)`, `any(…)`, and `key = "value"`. A disabled item is
+  dropped during parsing (before type checking, so it may even reference
+  undefined types). Active flags fold into the AOT cache key.
+
+### Deferred / honest limitations
+- **Macro hygiene** is not implemented — expansions are unhygienic (avoid
+  capturing identifiers); nested repetitions and a metavariable in the matcher
+  *after* a repetition are rejected with a clear error (never miscompiled).
+- **`#[cfg]` from a `kard.toml` `[features]` table** — the `--cfg` mechanism is
+  the engine; auto-feeding it from a manifest section is a thin follow-on.
+- Operator overloading is homogeneous (`Self`-typed `rhs` and result); `Index` /
+  `Deref` / `Neg` and heterogeneous / custom-`Output` operators are deferred.
+
 ## [0.33.0] — Roadmap v33 "systems-grade: FFI, `unsafe` & overflow control" (Phases 177-181)
 
 Theme: the systems-programmer escape hatch. Raw pointers + `unsafe`, a more

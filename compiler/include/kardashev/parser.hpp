@@ -9,6 +9,7 @@
 #pragma once
 
 #include <cstddef>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -30,5 +31,12 @@ struct ParseResult {
 };
 
 ParseResult parse(std::string_view source);
+
+// v34 Phase 186: parse with active `#[cfg(...)]` flags (`--cfg foo` /
+// `--cfg key=val`). Items whose cfg predicate is false are dropped at parse
+// time, implementing conditional compilation. The no-cfg overload above is
+// equivalent to passing an empty set.
+ParseResult parse(std::string_view source,
+                  const std::set<std::string>& activeCfg);
 
 } // namespace kardashev

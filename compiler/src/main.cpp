@@ -55,6 +55,7 @@
 #include <fstream>
 #include <iostream>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -530,6 +531,19 @@ std::string applyPrelude(const std::string& userSrc) {
     if (userSrc.find("trait Into") == std::string::npos) {
         prelude += "trait Into<U> { fn into(self) -> U; }\n";
     }
+    // v34 Phase 184: operator-overloading traits. A user type opts into an
+    // arithmetic operator by impl'ing the matching trait; `a + b` on that type
+    // desugars (in the typechecker) to `<type>::add(a, b)`. Homogeneous +
+    // by-value form (`self`, `rhs: Self` -> `Self`); primitives keep built-in
+    // arithmetic. Each is gated on the user not already declaring it.
+    if (userSrc.find("trait Add") == std::string::npos)
+        prelude += "trait Add { fn add(self, rhs: Self) -> Self; }\n";
+    if (userSrc.find("trait Sub") == std::string::npos)
+        prelude += "trait Sub { fn sub(self, rhs: Self) -> Self; }\n";
+    if (userSrc.find("trait Mul") == std::string::npos)
+        prelude += "trait Mul { fn mul(self, rhs: Self) -> Self; }\n";
+    if (userSrc.find("trait Div") == std::string::npos)
+        prelude += "trait Div { fn div(self, rhs: Self) -> Self; }\n";
     // Phase 43: runtime string escape decode/encode for JSON-style strings,
     // written in kardashev over str_push_byte / str_char_at. `\\uXXXX` decodes
     // the Latin-1 subset (cp < 256); higher code points become '?' (documented).
@@ -1841,6 +1855,13 @@ bool resolveModules(const std::string& srcRaw,
                      kardashev::ast::Program& out,
                      std::vector<std::string>& errors);
 
+// v34 Phase 186: the active conditional-compilation flags, populated from the
+// driver's `--cfg foo` / `--cfg key=val` options before the compile pipeline
+// runs. Every parse of USER source threads this set so a false `#[cfg(...)]`
+// drops its item. (A file-scope global keeps the recursive resolveModules /
+// cache-key helpers from having to thread it through every call.)
+static std::set<std::string> g_activeCfg;
+
 // Read a file fully into a string. Empty optional on I/O failure.
 std::optional<std::string> readFile(const std::string& path) {
     std::ifstream f(path);
@@ -1864,7 +1885,7 @@ bool resolveModules(const std::string& srcRaw,
                      std::unordered_set<std::string>& visited,
                      kardashev::ast::Program& out,
                      std::vector<std::string>& errors) {
-    auto pr = kardashev::parse(srcRaw);
+    auto pr = kardashev::parse(srcRaw, g_activeCfg);
     if (!pr.ok()) {
         for (const auto& e : pr.errors) {
             errors.push_back("parse error " + std::to_string(e.line) + ":" +
@@ -2182,7 +2203,7 @@ std::optional<kardashev::ast::Program> buildProgram(
         // v24 Phase 130: render the (common single-file) top-level parse errors
         // with an offset-corrected source snippet. If the main file parses but a
         // `mod` file failed, fall back to the collected strings.
-        auto pr = kardashev::parse(src);
+        auto pr = kardashev::parse(src, g_activeCfg);
         if (!pr.ok()) {
             reportParseErrors(pr, srcRaw, "<input>");
         } else {
@@ -2352,7 +2373,7 @@ int runREPL() {
             // here we just validate the accumulated buffer as-is plus the
             // implicit prelude on top.
             std::string trial = accumulated + line + "\n";
-            auto pr = kardashev::parse(applyPrelude(trial));
+            auto pr = kardashev::parse(applyPrelude(trial), g_activeCfg);
             if (!pr.ok()) {
                 reportParseErrors(pr, trial, "<repl>");
                 continue;
@@ -2598,7 +2619,7 @@ void collectFullSource(const std::string& srcRaw, const std::string& parentDir,
                        std::string& acc) {
     acc += srcRaw;
     acc += "\0\0"; // separator so file-boundary shifts change the hash
-    auto pr = kardashev::parse(srcRaw);
+    auto pr = kardashev::parse(srcRaw, g_activeCfg);
     if (!pr.ok()) return; // can't enumerate mods on a broken parse
     for (const auto& m : pr.program.mods) {
         std::string modPath = parentDir + "/" + m.name + ".kd";
@@ -2620,6 +2641,12 @@ std::string computeCacheKey(const std::string& srcRaw,
     material += kCacheFormatVersion;
     material += emitDebug ? "|g=1|" : "|g=0|";
     material += "|O" + std::to_string(static_cast<int>(optLevel)) + "|";
+    // v34 Phase 186: fold the active `--cfg` flags into the key (sorted via
+    // std::set's ordering) so builds with different conditional-compilation
+    // flags never collide in the content-addressed cache.
+    material += "|cfg:";
+    for (const auto& f : g_activeCfg) { material += f; material += ','; }
+    material += "|";
     std::unordered_set<std::string> visited;
     collectFullSource(srcRaw, srcDir, visited, material);
     return hexKey(fnv1a(material, 1469598103934665603ULL /* FNV offset */));
@@ -3045,6 +3072,11 @@ int main(int argc, char** argv) {
             monoReportFlag = true;
         } else if (a == "--emit-c") {
             emitC = true;
+        } else if (a == "--cfg" && i + 1 < argc) {
+            // v34 Phase 186: enable a conditional-compilation flag. Either a
+            // bare name (`--cfg linux` matches `#[cfg(linux)]`) or a key=value
+            // (`--cfg feature=fast` matches `#[cfg(feature = "fast")]`).
+            g_activeCfg.insert(argv[++i]);
         } else if (a == "--explain" && i + 1 < argc) {
             // v24 Phase 133: `kardc --explain Exxxx` — print a code's extended
             // explanation. A standalone command (no input file).
@@ -3087,6 +3119,7 @@ int main(int argc, char** argv) {
                          "       kardc -g ...               # emit DWARF debug info\n"
                          "       kardc --emit-llvm <file.kd> # print LLVM IR to stdout\n"
                          "       kardc --emit-c <file.kd>   # print C source (i64/bool subset) to stdout\n"
+                         "       kardc --cfg NAME ...       # enable a #[cfg(NAME)] flag (also --cfg key=val)\n"
                          "       kardc -W <file.kd>         # lint: warn on unused vars + unreachable code\n"
                          "       kardc --explain Exxxx      # explain a diagnostic error code\n"
                          "       kardc --no-cache ...       # bypass the AOT compile cache\n"

@@ -445,6 +445,41 @@ sh_test(
     data = ["//compiler:kardc"],
 )
 
+# v34 Phase 182: declarative (`macro_rules!`) macros.
+sh_test(
+    name = "smoke_test_phase182",
+    srcs = ["smoke_test_phase182.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v34 Phase 183: user-defined `#[derive(...)]` via derive_* macros.
+sh_test(
+    name = "smoke_test_phase183",
+    srcs = ["smoke_test_phase183.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v34 Phase 184: operator overloading (Add/Sub/Mul/Div via traits).
+sh_test(
+    name = "smoke_test_phase184",
+    srcs = ["smoke_test_phase184.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v34 Phase 185: richer comptime / const-fn (imperative `while` loops + assign).
+sh_test(
+    name = "smoke_test_phase185",
+    srcs = ["smoke_test_phase185.sh"],
+    data = ["//compiler:kardc"],
+)
+
+# v34 Phase 186: `#[cfg(...)]` conditional compilation (--cfg flags).
+sh_test(
+    name = "smoke_test_phase186",
+    srcs = ["smoke_test_phase186.sh"],
+    data = ["//compiler:kardc"],
+)
+
 # v30 Phase 165: C backend closures + fn values (differential + ASan).
 sh_test(
     name = "smoke_test_phase165",
