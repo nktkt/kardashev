@@ -2846,6 +2846,14 @@ private:
         std::size_t line = 1;
         std::size_t column = 1;
     };
+    // v34 Phase 185: thrown by a const `return e;` to unwind to the const fn
+    // boundary, where `evalConstCall` catches it and yields the value. Using an
+    // exception (rather than a bool flag) lets `return` short-circuit out of
+    // arbitrarily nested `if` / `while` blocks inside a const fn — a flag only
+    // unwinds the immediately enclosing block.
+    struct ConstReturn {
+        ConstValue value;
+    };
     // Top-level `const` items by name -> their AST decl (for on-demand eval).
     std::unordered_map<std::string, const ast::ConstDecl*> constDecls_;
     // Memoized evaluated values of top-level consts (name -> value).
@@ -4803,8 +4811,15 @@ private:
                           "' depends on itself",
                       site);
         }
-        ConstValue v = evalConstExpr(*declIt->second->value, /*env=*/nullptr,
-                                     /*depth=*/0);
+        ConstValue v;
+        try {
+            v = evalConstExpr(*declIt->second->value, /*env=*/nullptr,
+                              /*depth=*/0);
+        } catch (const ConstReturn& cr) {
+            // Defensive: a const item whose initializer is a block with a
+            // top-level `return e;` yields that value.
+            v = cr.value;
+        }
         constEvalInProgress_.erase(name);
         constValues_[name] = v;
         return v;
@@ -5128,7 +5143,36 @@ private:
         // supported; a non-tail expr stmt with no effect is a no-op, but a
         // block whose tail is missing (unit value) can't yield an i64/bool.
         ConstEnv local = outer ? *outer : ConstEnv{};
-        for (const auto& s : blk.stmts) {
+        evalConstStmts(blk.stmts, local, depth);
+        // A tail-less block is unit-valued (e.g. an `if c { … } else { … }`
+        // used as a statement, where both arms end in a `;`-statement). We
+        // return a unit sentinel rather than erroring: such a block only ever
+        // reaches here in statement position (its value is dropped), and the
+        // type checker independently guarantees that a const fn / const item
+        // declared with a scalar type actually yields one — so a unit value
+        // can never silently leak out as the const's result.
+        if (!blk.tail)
+            return ConstValue{};  // unit
+        return evalConstExpr(*blk.tail, &local, depth);
+    }
+
+    // v34 Phase 185: run a sequence of const statements against the MUTABLE env
+    // `local`, in order. Beyond plain `let`, this const-evaluates VARIABLE
+    // ASSIGNMENT (`x = e;`, simple ident target) and `while` LOOPS — together
+    // these let a `const fn` use the imperative `let mut … ; while … { … }`
+    // style (e.g. an iterative factorial / fibonacci) at compile time. A
+    // `return e;` throws `ConstReturn` to unwind to the const fn boundary, so
+    // it short-circuits out of any nesting (e.g. an `if` inside the loop).
+    // Non-termination is caught by the global step budget (`kConstEvalMaxSteps`,
+    // checked in `constTick`): every condition + body re-evaluation ticks it,
+    // so a runaway loop fails cleanly rather than hanging the compiler. The loop
+    // body shares `local` (no fresh scope copy) so its mutations persist across
+    // iterations and out to the enclosing block — the imprecision (a body `let`
+    // leaks past the loop) is harmless for const-eval, which only computes a
+    // value.
+    void evalConstStmts(const std::vector<ast::StmtPtr>& stmts,
+                        ConstEnv& local, int depth) {
+        for (const auto& s : stmts) {
             if (auto* let = dynamic_cast<const ast::LetStmt*>(s.get())) {
                 if (!let->tupleNames.empty())
                     throw ConstEvalError{"tuple-destructuring `let` is not "
@@ -5138,32 +5182,62 @@ private:
                     throw ConstEvalError{"`let` without an initializer is not "
                                          "const-evaluable",
                                          let->line, let->column};
-                ConstValue v = evalConstExpr(*let->value, &local, depth);
-                local[let->name] = v;
-            } else if (auto* ret =
+                local[let->name] = evalConstExpr(*let->value, &local, depth);
+            } else if (auto* r =
                            dynamic_cast<const ast::ReturnStmt*>(s.get())) {
-                if (!ret->value)
+                if (!r->value)
                     throw ConstEvalError{"bare `return;` is not "
                                          "const-evaluable (a const fn must "
                                          "yield a value)",
-                                         ret->line, ret->column};
-                // An early `return e;` short-circuits the block's value.
-                return evalConstExpr(*ret->value, &local, depth);
+                                         r->line, r->column};
+                // Unwind to the const fn boundary (caught in evalConstCall).
+                throw ConstReturn{evalConstExpr(*r->value, &local, depth)};
+            } else if (auto* as =
+                           dynamic_cast<const ast::AssignStmt*>(s.get())) {
+                auto* id = dynamic_cast<const ast::IdentExpr*>(as->target.get());
+                if (!id)
+                    throw ConstEvalError{"only simple-variable assignment is "
+                                         "const-evaluable (no field / index "
+                                         "assignment in a const context)",
+                                         as->line, as->column};
+                if (local.find(id->name) == local.end())
+                    throw ConstEvalError{"assignment to `" + id->name +
+                                             "`, which is not a local in scope, "
+                                             "is not const-evaluable",
+                                         as->line, as->column};
+                local[id->name] = evalConstExpr(*as->value, &local, depth);
             } else if (auto* es =
                            dynamic_cast<const ast::ExprStmt*>(s.get())) {
-                // Evaluate for its (absence of) effects; the value is dropped.
-                // This also surfaces an error for a non-const-evaluable stmt.
-                evalConstExpr(*es->expr, &local, depth);
+                if (auto* we =
+                        dynamic_cast<const ast::WhileExpr*>(es->expr.get())) {
+                    while (true) {
+                        ConstValue c =
+                            evalConstExpr(*we->cond, &local, depth);
+                        if (!c.isBool)
+                            throw ConstEvalError{"`while` condition must be a "
+                                                 "bool in a const context",
+                                                 we->line, we->column};
+                        if (c.i == 0)
+                            break;
+                        if (auto* body = dynamic_cast<const ast::BlockExpr*>(
+                                we->body.get())) {
+                            // A `return` inside the loop throws ConstReturn,
+                            // which unwinds straight past this loop.
+                            evalConstStmts(body->stmts, local, depth);
+                            if (body->tail)
+                                evalConstExpr(*body->tail, &local, depth);
+                        }
+                    }
+                } else {
+                    // Evaluate for its (absence of) effects; value dropped.
+                    // Also surfaces an error for a non-const-evaluable stmt.
+                    evalConstExpr(*es->expr, &local, depth);
+                }
             } else {
                 throw ConstEvalError{"statement is not const-evaluable",
                                      s->line, s->column};
             }
         }
-        if (!blk.tail)
-            throw ConstEvalError{"a const block must end in a value "
-                                 "expression",
-                                 blk.line, blk.column};
-        return evalConstExpr(*blk.tail, &local, depth);
     }
 
     ConstValue evalConstCall(const ast::CallExpr& call, ConstEnv* env,
@@ -5193,7 +5267,13 @@ private:
         if (!fn.body) {
             constFail("const fn '" + call.callee + "' has no body", call);
         }
-        return evalConstBlock(*fn.body, &callee, depth + 1);
+        // The fn body is the boundary at which a `return e;` (thrown as
+        // ConstReturn from any nesting depth) yields the fn's value.
+        try {
+            return evalConstBlock(*fn.body, &callee, depth + 1);
+        } catch (const ConstReturn& cr) {
+            return cr.value;
+        }
     }
 
     // Public entry point: evaluate a const-expr that is required to be an
