@@ -31,9 +31,13 @@ diff_run() {
     local cfg=("$@")
     local n; n=$(printf '%s\n' "$expect" | wc -l | tr -d ' ')
     printf '%s' "$src" > "$TMP/$name.kd"
-    local jit; jit=$("$KARDC" "${cfg[@]}" "$TMP/$name.kd" 2>/dev/null | head -n "$n") || true
+    # NOTE: `"${cfg[@]+"${cfg[@]}"}"` (not a bare `"${cfg[@]}"`) so that an EMPTY
+    # array expands to nothing under `set -u` on macOS's bash 3.2 — a bare
+    # expansion there is an "unbound variable" error (bash 5 on Linux tolerates
+    # it), which is exactly what broke this test on the macOS CI runner.
+    local jit; jit=$("$KARDC" "${cfg[@]+"${cfg[@]}"}" "$TMP/$name.kd" 2>/dev/null | head -n "$n") || true
     [[ "$jit" == "$expect" ]] || { echo "FAIL [$name/jit]: expected '$expect' got '$jit'"; exit 1; }
-    "$KARDC" --no-cache "${cfg[@]}" -o "$TMP/$name" "$TMP/$name.kd" >/dev/null 2>&1
+    "$KARDC" --no-cache "${cfg[@]+"${cfg[@]}"}" -o "$TMP/$name" "$TMP/$name.kd" >/dev/null 2>&1
     local aot; aot=$("$TMP/$name" 2>/dev/null | head -n "$n") || true
     [[ "$aot" == "$expect" ]] || { echo "FAIL [$name/aot]: expected '$expect' got '$aot'"; exit 1; }
     echo "PASS: $name (cfg: ${cfg[*]:-none})"
